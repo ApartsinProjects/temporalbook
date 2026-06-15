@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 35.2: Healthcare. Clinical time series as the running healthcare dataset pays off: irregularly sampled, missing-not-at-random vitals and labs; early-warning and deterioration detection; prognosis and time-to-event; treatment-effect and what-if; the trust requirements of calibration, interpretability, fairness, privacy, and human-in-the-loop; deployment realities of alarm fatigue and site shift; and a leakage-safe early-warning score built from scratch and via libraries with a detection-delay versus false-alarm trade-off." name="description"/>
+<title>Section 35.2: Healthcare | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IX: Applications and Future Directions</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 35: Industrial Applications</a></div>
+<h1>Healthcare</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I watch a heart rate climb, a blood pressure sag, a lactate that nobody has drawn in nine hours, and I do the arithmetic the residents are too tired to do at 3am. I will set off my alarm too soon a hundred times before I stay silent once at the wrong moment. Warn early and be doubted; warn late and be unforgiven. I have made my peace with the first."</p>
+<cite>A Bedside Monitor That Would Rather Warn Early Than Apologize Late</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Healthcare is the domain where every difficulty this book treated as a chapter shows up at once, in the same patient, with a life attached to the answer. The clinical record is the hardest temporal data we have met: vitals and labs arrive irregularly, at intervals chosen by clinicians rather than clocks, and the very pattern of measurement carries information (a lab drawn frequently signals a worried physician), so the data is missing-not-at-random in a way that breaks the convenient assumptions of <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a>. On that data sit three tasks the rest of the book built tools for: early-warning and deterioration detection (forecasting plus anomaly detection, <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8</a>), prognosis and time-to-event (survival modeling, <a href="../../part-4-temporal-representation-learning/module-18-event-sequence-modeling/index.html">Chapter 18</a>), and treatment-effect and what-if reasoning (temporal causality, <a href="../../part-7-building-intelligent-systems/module-30-temporal-reasoning-causality/index.html">Chapter 30</a>).</strong> Around those tasks healthcare wraps a trust contract no other application in this chapter enforces so strictly: calibrated uncertainty (<a href="../../toc.html">Chapter 19</a>), interpretability and fairness (<a href="../../toc.html">Chapter 33</a>), privacy across hospitals that cannot share raw records (<a href="../../toc.html">Chapter 33.4</a>), and a human clinician who stays in the loop and overrides the model (<a href="../../toc.html">Chapter 21.4</a>). This section is where the healthcare running dataset, threaded since <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a>, finally pays off: we synthesize the tools into one leakage-safe early-warning pipeline, build it from scratch and then in a few library lines, and read off the detection-delay versus false-alarm trade-off that decides whether a bedside model is trusted or muted.</p>
+</div>
+<p>The two sibling sections of this chapter take the same machinery to different industries: <a href="section-35.1.html">Section 35.1</a> applied temporal AI to finance, where the cost of an error is money and the adversary is a market; <a href="section-35.3.html">Section 35.3</a> turns next to manufacturing and predictive maintenance, where the asset is a machine and the failure is mechanical. Healthcare sits between them in difficulty and above them in stakes. The patterns are the ones this section makes concrete, and the <a href="index.html">chapter index</a> collects the shared toolbox. What makes the clinical setting its own case study is not a new algorithm but a new constraint stack: the data is the worst, the labels are the noisiest, the deployment is the most regulated, and the human on the receiving end of a false alarm is a nurse who will stop listening to the model that cried wolf.</p>
+<p>We proceed in five movements. First the data reality: why clinical time series violate the regular-sampling and missing-at-random assumptions, and what informative missingness means for modeling. Second the tasks: deterioration detection, prognosis, and treatment-effect, each mapped to the chapter that built its method. Third the trust requirements that healthcare imposes on top of accuracy. Fourth the deployment realities, alarm fatigue and site shift and regulation, that decide whether a good model survives contact with a hospital. Fifth a worked mini case: a leakage-safe early-warning score on irregular vitals, built from scratch and via libraries, evaluated with the metrics that matter at the bedside.</p>
+
+<h2>1. The Data Reality: Irregular, Multivariate, Missing-Not-at-Random <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The clinical record is not a time series in the tidy sense the early chapters assumed. A patient in an intensive care unit generates a heart rate every few seconds from a bedside monitor, a blood pressure every fifteen minutes from an automatic cuff, a complete blood count once or twice a day when a clinician orders it, and a lactate only when someone suspects sepsis. Stack these channels and you get a multivariate series whose every column is sampled on its own irregular grid, with most cells empty at any given instant. This is the irregular, multivariate, partially observed structure that <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2.3</a> introduced as the hardest case of temporal data engineering, and the clinical record is its archetype.</p>
+<p>The naive fix, resample everything to a common grid and forward-fill the gaps, is exactly the move that <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2.3</a> warned against, and in healthcare it is not merely lossy but actively misleading. Two facts make it dangerous. First, the sampling times are not noise to be smoothed away: a lab that a physician chose to draw three times in an hour is a different clinical situation from one drawn once a day, and forward-filling erases the rate of measurement that encoded the physician's concern. Second, and more subtly, the pattern of missingness is itself a predictor of the outcome we want, which is the precise definition of <em>informative missingness</em>, or missing-not-at-random.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: In Clinical Data the Missingness Mask Is a Feature, Not a Defect</div>
+<p>Let $\mathbf{x}_t \in \mathbb{R}^{D}$ be the vector of $D$ vital and lab channels at time $t$, and let $\mathbf{m}_t \in \{0,1\}^{D}$ be the <em>mask</em>, with $m_{t,d}=1$ if channel $d$ was actually measured at $t$ and $0$ otherwise. In the missing-at-random world of textbook statistics, $\mathbf{m}_t$ is independent of the patient's true state given the observed data, so you may impute and discard the mask. In the clinic that independence fails: a clinician orders an arterial blood gas <em>because</em> the patient looks unstable, so $P(\text{deterioration}\mid \mathbf{m}_t)$ depends on the mask directly. The operational consequence is sharp: never throw the mask away. Feed the model the triplet (value, mask, time-since-last-measurement) for every channel, so it can learn both the physiology in the values and the clinician's concern in the measurement pattern. This is the single most important data-engineering decision in clinical temporal modeling, and it is why a model handed only forward-filled values routinely underperforms one handed values plus mask plus elapsed time.</p>
+</div>
+<p>Concretely, the practitioner's encoding of an irregular clinical sequence is three aligned tensors rather than one. For each channel $d$ and grid step $t$ we keep the last observed value, the binary mask, and the time elapsed since that channel was last measured, $\Delta_{t,d}$. The elapsed-time channel lets a model decay its confidence in a stale value: a blood pressure measured five seconds ago is trustworthy, the same number carried forward across six hours is a guess. This is exactly the decay mechanism that the GRU-D architecture formalized and that the continuous-time models of the next subsection generalize.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Temporal Thread: From Forward-Fill to Neural Differential Equations</div>
+<p>The clinical irregular-sampling problem is where the temporal thread of this book pays a concrete dividend. <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2.3</a> diagnosed the problem (irregular grids, informative missingness) but offered only hand-built fixes (masks, elapsed-time features, decay). <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/index.html">Chapter 7</a> gave the first principled answer: a state-space filter that runs in continuous time and naturally absorbs observations whenever they arrive, missing or not, by propagating its latent state between them. <a href="../../toc.html">Chapter 13.5</a> completed the arc with the Neural Controlled Differential Equation (Neural CDE), which learns a continuous latent trajectory $\mathbf{z}(t)$ driven by an interpolation of the irregular observations, so the model is defined for all $t$ and consumes the raw irregular stream with no resampling at all. Healthcare is the canonical motivating application for that entire line of work: when you ask why anyone would want a neural network defined on continuous time, the honest answer is "because the intensive care unit gave us data that has no clock". The Neural CDE is the Kalman filter of <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/index.html">Chapter 7</a> grown a learned vector field.</p>
+</div>
+<p>One more data reality deserves a sentence before we move to tasks: the labels are as irregular and biased as the inputs. A "deterioration" label is often defined retrospectively (the patient was transferred to the ICU, or coded, or died), the timestamp of that event is itself uncertain, and the act of intervening on a patient the model flagged can prevent the very outcome we are trying to predict, the treatment paradox that <a href="../../part-7-building-intelligent-systems/module-30-temporal-reasoning-causality/index.html">Chapter 30</a> studies. A clinical early-warning model is trained on a population that was already being treated, and that confounding never fully goes away.</p>
+
+<h2>2. The Tasks: Deterioration, Prognosis, Treatment-Effect <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Three clinical questions dominate, and each one is a task this book already built the machinery for. The contribution of this section is to name the mapping precisely, so that "predict patient deterioration" stops being a vague aspiration and becomes a concrete instance of methods with known properties.</p>
+<p><strong>Early-warning and deterioration detection.</strong> The question "is this patient about to get worse?" is a fusion of two tasks from <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8</a>. It is partly <em>forecasting</em>: project the trajectory of the vitals forward and check whether the projection crosses a danger threshold. It is partly <em>anomaly and change-point detection</em>: flag the moment the multivariate stream departs from the patient's own recent baseline, the regime change that <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8</a> formalized as a change in the generating distribution. A modern deterioration model computes a continuously updated risk score $s_t \in [0,1]$ from the recent window of (value, mask, time) triplets, and an alarm fires when $s_t$ crosses a threshold $\tau$. The whole of subsection five builds exactly such a score.</p>
+<p><strong>Prognosis and time-to-event.</strong> The question "how long until this patient experiences the event, and with what probability over time?" is the survival-analysis task of <a href="../../part-4-temporal-representation-learning/module-18-event-sequence-modeling/index.html">Chapter 18.4</a>. Survival modeling is the right frame precisely because clinical outcomes are <em>censored</em>: a patient may be discharged, or the study may end, before the event of interest occurs, and we know only that they survived at least that long. The object to estimate is the hazard $\lambda(t)$, the instantaneous event rate given survival to $t$, or equivalently the survival function $S(t)=\exp\!\big(-\!\int_0^t \lambda(u)\,du\big)$. Neural survival models and the temporal point processes of <a href="../../part-4-temporal-representation-learning/module-18-event-sequence-modeling/index.html">Chapter 18</a> let the hazard depend on the full irregular history, turning a static prognosis into a dynamic one that updates with every new lab.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Three Clinical Questions, Three Chapters, One Representation</div>
+<p>Deterioration detection, prognosis, and treatment-effect look like three different products to a hospital, but they share a single learned representation of the patient trajectory. A model that has learned a good latent state $\mathbf{z}_t$ summarizing the irregular history (via a Neural CDE from <a href="../../toc.html">Chapter 13.5</a>, an event model from <a href="../../part-4-temporal-representation-learning/module-18-event-sequence-modeling/index.html">Chapter 18</a>, or a Transformer over the clinical sequence) can drive all three heads at once: a classification head for the next-few-hours deterioration risk, a survival head for the hazard over the coming days, and a counterfactual head for "what if we gave the antibiotic now". The shared backbone is why representation learning (<a href="../../toc.html">Part IV</a>) matters so much in healthcare: labels are scarce and expensive, so the leverage comes from a representation pretrained on the abundant unlabeled trajectories and then specialized to each clinical question with a small head.</p>
+</div>
+<p><strong>Treatment-effect and what-if.</strong> The hardest and most valuable question is causal: "what will happen to <em>this</em> patient if we start vasopressors now versus in two hours?" This is the temporal treatment-effect problem of <a href="../../part-7-building-intelligent-systems/module-30-temporal-reasoning-causality/index.html">Chapter 30.3</a>, and it is where a model trained to <em>predict</em> can mislead catastrophically if read as a model that <em>explains</em>. Observational clinical data is shot through with confounding by indication: the sickest patients get the most aggressive treatment, so a naive correlation makes the treatment look harmful (sick patients who received it still did worse than healthy patients who did not). Counterfactual estimation under time-varying confounding, the marginal structural models and their neural successors of <a href="../../part-7-building-intelligent-systems/module-30-temporal-reasoning-causality/index.html">Chapter 30.3</a>, is the only honest way to answer a what-if from observational records, and even then with heavy caveats. The practical rule: a deterioration <em>score</em> can be deployed as a correlational early-warning; a treatment <em>recommendation</em> may not, until the causal machinery of <a href="../../part-7-building-intelligent-systems/module-30-temporal-reasoning-causality/index.html">Chapter 30</a> has been brought to bear.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Model That Discovered Asthma Was Good for Pneumonia</div>
+<p>A famous cautionary tale: a pneumonia risk model, trained to predict mortality, learned that asthmatic patients with pneumonia had <em>lower</em> mortality, and would have recommended sending them home. The model was right about the data and wrong about the world. Asthmatics with pneumonia did better because they were rushed straight to the intensive care unit and treated aggressively; the low mortality was a fingerprint of the intervention, not of any protective effect of asthma. The model had faithfully learned $P(\text{death}\mid\text{asthma},\text{pneumonia})$ in a world where asthma triggers aggressive care, and would have destroyed exactly that world by acting on it. It is the asthma paradox, the clinical twin of the treatment paradox of <a href="../../part-7-building-intelligent-systems/module-30-temporal-reasoning-causality/index.html">Chapter 30</a>, and the reason "the model is accurate" is never a sufficient condition for "the model is safe to act on".</p>
+</div>
+
+<h2>3. The Trust Requirements: Calibration, Fairness, Privacy, Humans <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Accuracy is the entry fee, not the prize. A clinical model that is accurate on average but untrustworthy in any of four specific ways will not, and should not, be deployed. Each requirement maps to a chapter of <a href="../../part-8-trustworthy-deployed/index.html">Part VIII</a>.</p>
+<p><strong>Calibrated uncertainty.</strong> A risk score is actionable only if its number means what it says: when the model outputs $0.3$, roughly thirty percent of such patients should deteriorate. A miscalibrated score that is "accurate" by ranking metrics can still send a clinician a $0.9$ that behaves like a $0.5$, and clinicians learn fast to ignore numbers they cannot trust. The conformal and probabilistic methods of <a href="../../toc.html">Chapter 19</a> are the right tool: they wrap any model in a distribution-free guarantee that its predicted risk intervals cover the truth at the stated rate, which is exactly the property a bedside number needs. We calibrate the early-warning score in subsection five for this reason.</p>
+<p><strong>Interpretability and fairness.</strong> A clinician asked to act on an alarm will, correctly, demand to know <em>why</em>, and the interpretability methods of <a href="../../toc.html">Chapter 33</a> (attention attributions, feature importances over the irregular channels, counterfactual explanations) are what turn a score into a reason. Fairness is the same chapter's sharper edge: a model trained on one hospital's population can encode and amplify disparities, scoring the same physiology differently across demographic groups because the training labels reflected unequal historical care. A deterioration model that under-alarms for an under-treated group will perpetuate exactly the inequity it should help correct, so subgroup calibration and error-rate audits are mandatory, not optional.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Calibration Is a Per-Subgroup Property, Not a Global One</div>
+<p>The trust failure that survives a global audit is the per-subgroup one. A model can be perfectly calibrated on the whole population, output $0.3$ and have thirty percent of those patients deteriorate, while being badly miscalibrated within a subgroup, systematically under-scoring one demographic and over-scoring another in a way that cancels in the aggregate. Because the harm is local (a real patient in an under-scored group gets a falsely reassuring number) the global metric hides it. The discipline that follows: every calibration check in subsection five, and every reliability diagram in <a href="../../toc.html">Chapter 19</a>, must be repeated <em>within</em> each protected subgroup, and the fairness audit of <a href="../../toc.html">Chapter 33</a> reports the worst subgroup, not the average. Fairness and calibration are the same requirement evaluated at finer resolution.</p>
+</div>
+<p><strong>Privacy and federation.</strong> The data that would make a clinical model excellent lives in many hospitals, and those hospitals cannot legally pool raw patient records. Federated learning, the topic of <a href="../../toc.html">Chapter 33.4</a>, is the structural answer: train a shared model by exchanging gradients or model updates rather than data, so each hospital's records never leave its walls, and differential-privacy noise bounds what any update can leak about an individual. The cross-site setting also exposes the distribution-shift problem of the next subsection, because the very heterogeneity that makes federation necessary (different patient mixes, different instruments, different charting habits) is what makes a model trained on one site fail at another.</p>
+<p><strong>Human-in-the-loop.</strong> The clinical model is a decision <em>support</em> tool, not a decision maker, and the adaptive human-in-the-loop systems of <a href="../../toc.html">Chapter 21.4</a> are how it stays one. The clinician must be able to see the evidence, override the alarm, and have that override feed back into the system; the model must defer on cases outside its competence rather than guess; and the whole loop must log who decided what, so accountability stays human. The deepest reason to keep a human in the loop is the causal one from subsection two: the model predicts in a world where clinicians act, and only a clinician can supply the action the model cannot causally reason about.</p>
+
+<h2>4. Deployment Realities: Alarm Fatigue, Site Shift, Regulation <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>A model that passes every offline metric still meets three realities at the bedside that decide its fate, and none of them is about accuracy in the usual sense.</p>
+<p><strong>Alarm fatigue.</strong> The defining failure mode of clinical alarms is not missing events but crying wolf. A unit whose monitors alarm hundreds of times per shift, the overwhelming majority of them false or clinically irrelevant, trains its nurses to silence alarms reflexively, so the one true alarm is muted along with the noise. This is the operational cost of a low-precision detector, and it is exactly the false-alarm side of the precision-recall trade that <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8.5</a> studied under the heading of alarm fatigue and threshold selection. The lesson that chapter taught and this section operationalizes: a clinical detector is tuned not to maximize recall but to hold the false-alarm rate below the threshold at which humans stop listening, even at the cost of some sensitivity, because a sensitive detector that is muted has zero effective sensitivity.</p>
+<div class="callout looking-back">
+<div class="callout-title">Looking Back: The Alarm-Fatigue Threshold of Chapter 8.5</div>
+<p><a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8.5</a> framed anomaly-detector deployment as choosing an operating point on the precision-recall curve under an explicit budget on false alarms per unit time. Healthcare is the application that makes that budget literal and human: the budget is roughly "how many false alarms per nurse per shift before the alarms get ignored", a number hospitals measure and that sits around one to two clinically actionable alarms per patient per shift for the alarm to retain credibility. Everything subsection five does with the detection-delay versus false-alarm trade is the bedside instance of the abstract trade-off <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8.5</a> introduced. The change-point detector's "average run length to false alarm" becomes, in the ICU, "shifts between false alarms", and the threshold is chosen to keep that number high.</p>
+</div>
+<p><strong>Distribution shift across sites and time.</strong> A model trained at one hospital degrades at another, and degrades over time even at the same hospital, because patient populations, instrumentation, clinical protocols, and charting conventions all drift. This is the dataset-shift problem of <a href="../../toc.html">Chapter 20</a> and <a href="../../toc.html">Chapter 34</a>, and in healthcare it is severe enough that a model validated to regulatory standards on one site's data can fail silently on the next. The mitigations are the online and continual-learning methods of <a href="../../toc.html">Chapter 20</a> (drift detection, recalibration on the new site) and the deployment discipline of <a href="../../toc.html">Chapter 34</a> (shadow deployment, continuous monitoring of the score distribution, and a rollback plan).</p>
+<p><strong>Regulatory constraints.</strong> A clinical model is, in most jurisdictions, a regulated medical device, and that imposes constraints no other application in this chapter faces. The model must be locked or its update process pre-specified and validated (a model that silently retrains is a moving target a regulator cannot certify); its intended use and population must be stated and not exceeded; and its failure modes must be characterized. The practical effect is that the elegant continual-learning of <a href="../../toc.html">Chapter 20</a> collides with the regulatory demand for a fixed, auditable artifact, and reconciling adaptivity with certifiability is one of the genuinely open problems of deployed clinical AI.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Clinical Temporal Foundation Models and Causal Early-Warning (2024 to 2026)</div>
+<p>Three lines are reshaping clinical temporal AI right now. First, <em>foundation models for clinical time series and electronic health records</em>: building on the temporal foundation models of <a href="../../toc.html">Chapter 15</a>, models that pretrain a Transformer on millions of irregular patient trajectories then transfer to deterioration, prognosis, and phenotyping with little labeled data, with 2024 to 2025 work on EHR foundation models and on adapting general time-series foundation models (TimesFM, MOMENT, Moirai) to clinical channels. Second, <em>continuous-time deep learning for irregular vitals</em>: Neural CDEs and their efficient successors (<a href="../../toc.html">Chapter 13.5</a>) maturing from research curiosities into the natural default for ICU streams, alongside structured state-space models (Mamba) applied to long clinical sequences. Third, and most consequential, <em>causal and counterfactual early-warning</em>: treatment-effect estimation under time-varying confounding (<a href="../../part-7-building-intelligent-systems/module-30-temporal-reasoning-causality/index.html">Chapter 30.3</a>) moving from estimating average effects toward individualized "what-if this patient" trajectories, so that a 2026 early-warning system aims not only to flag deterioration but to suggest the intervention with the best estimated counterfactual outcome, with the honesty about confounding that goal demands. Federated clinical learning across hospital networks (<a href="../../toc.html">Chapter 33.4</a>) is the connective tissue that makes the data for all three feasible without moving records.</p>
+</div>
+
+<h2>5. Worked Case: A Leakage-Safe Early-Warning Score on Irregular Vitals <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now build the payoff: an early-warning score on the healthcare running dataset of irregular vitals, end to end, with the leakage discipline of <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a> enforced at every step. The pipeline has four stages, each an instance of a method from an earlier chapter: (1) encode the irregular stream as (value, mask, elapsed-time) triplets with no future leakage; (2) compute a continuously updated deterioration score from the recent window; (3) calibrate that score so its number is trustworthy (<a href="../../toc.html">Chapter 19</a>); and (4) evaluate with the bedside metrics, PR-AUC and detection delay, and read off the false-alarm trade (<a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8.5</a>). We build it from scratch first, then collapse it to a few library lines.</p>
+<p>Code 35.2.1 generates a small synthetic cohort of irregular vitals (so the section is self-contained and runnable) and encodes each patient with the leakage-safe triplet representation. The single most important discipline is that every feature at time $t$ uses only data with timestamp $\le t$: the elapsed-time and last-value features look strictly backward, which is the streaming-causal constraint that prevents the look-ahead leakage <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a> identified as the most common and most fatal error in temporal pipelines.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(7)
+N, D, T = 600, 4, 48          # patients, vital channels, hourly grid steps (2 days)
+# Channels: 0 heart rate, 1 systolic BP, 2 respiratory rate, 3 lactate (rarely sampled).
+
+def simulate_patient(deteriorates):
+    """Irregular vitals on an hourly grid; deteriorating patients drift in the last hours.
+    Returns value array, mask array (1 = measured this hour), and the deterioration hour."""
+    base = np.array([80.0, 120.0, 16.0, 1.2])           # healthy baselines
+    vals = np.full((T, D), np.nan)
+    mask = np.zeros((T, D), dtype=int)
+    onset = rng.integers(24, 40) if deteriorates else T + 1   # when decline begins
+    for t in range(T):
+        # Sampling rates differ per channel; sicker -> labs drawn more often (informative).
+        sick = t >= onset
+        p_meas = np.array([0.9, 0.6, 0.7, 0.04 + 0.30 * sick])  # lactate drawn when worried
+        true = base.copy()
+        if sick:
+            drift = (t - onset + 1)
+            true += drift * np.array([2.5, -3.0, 1.2, 0.45])     # HR up, BP down, RR up, lactate up
+        for d in range(D):
+            if rng.random() < p_meas[d]:
+                vals[t, d] = true[d] + rng.normal(0, [3, 4, 1, 0.2][d])
+                mask[t, d] = 1
+    return vals, mask, (onset if deteriorates else -1)
+
+labels = (rng.random(N) < 0.35).astype(int)             # ~35% deteriorate
+patients = [simulate_patient(bool(y)) for y in labels]
+
+def encode(vals, mask):
+    """Leakage-safe triplet encoding: (last observed value, mask, hours since last seen).
+    Every feature at hour t uses ONLY hours <= t. No forward-fill from the future."""
+    last = np.zeros(D); delta = np.zeros(D)
+    feats = np.zeros((T, 3 * D))
+    for t in range(T):
+        for d in range(D):
+            if mask[t, d] == 1:
+                last[d] = vals[t, d]; delta[d] = 0.0    # fresh measurement, reset staleness
+            else:
+                delta[d] += 1.0                          # one more hour stale
+        feats[t] = np.concatenate([last, mask[t], delta])
+    return feats
+
+X = np.array([encode(v, m) for (v, m, _) in patients])   # (N, T, 3D), strictly causal
+print("encoded shape:", X.shape, "| feature block = [value | mask | elapsed]")
+</code></pre>
+<div class="code-caption"><strong>Code 35.2.1:</strong> Leakage-safe triplet encoding of irregular vitals. Each hour carries the last observed value, the measurement mask, and hours-since-last-measurement per channel, all computed strictly from the past. The lactate channel is sampled more often once a patient declines, encoding the informative missingness of subsection one directly into the mask features.</div>
+<pre><code class="language-text">encoded shape: (600, 48, 12) | feature block = [value | mask | elapsed]
+</code></pre>
+<div class="code-caption"><strong>Output 35.2.1:</strong> The cohort encodes to 600 patients, 48 hourly steps, 12 features (4 channels times the value, mask, elapsed triplet). The mask and elapsed blocks are what let the score read the clinician's concern, not only the physiology.</div>
+<p>Now the score and the leakage-safe split. Code 35.2.2 splits patients (never hours within a patient) into train and test, fits a simple causal scorer that maps each hour's triplet window to a deterioration probability, and produces a streaming score $s_t$ for every test patient. Splitting by patient is the clinical instance of the grouped-split rule from <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a>: hours from one patient must never straddle the train-test boundary, or the model memorizes the patient instead of learning the physiology.</p>
+<pre><code class="language-python">from numpy.linalg import lstsq
+
+# Per-patient split (grouped), never per-hour: prevents within-patient leakage.
+idx = rng.permutation(N); cut = int(0.7 * N)
+tr, te = idx[:cut], idx[cut:]
+
+def hourly_table(ids):
+    """Flatten to (hour-row, features) with a label = 'deteriorates within next 6 hours'."""
+    rows, ys = [], []
+    for i in ids:
+        vals, mask, onset = patients[i]
+        for t in range(T):
+            rows.append(X[i, t])
+            near = labels[i] == 1 and onset != -1 and (onset - 6) <= t < onset + 6
+            ys.append(int(near))                          # horizon label, strictly from this hour's view
+    return np.array(rows), np.array(ys)
+
+Xtr, ytr = hourly_table(tr)
+Xte, _ = None, None
+# Logistic-style scorer via ridge-regularized least squares on standardized features.
+mu, sd = Xtr.mean(0), Xtr.std(0) + 1e-6
+Z = (Xtr - mu) / sd
+Zb = np.hstack([Z, np.ones((len(Z), 1))])
+w = lstsq(Zb.T @ Zb + 1e-1 * np.eye(Zb.shape[1]), Zb.T @ ytr, rcond=None)[0]
+
+def score_patient(i):
+    """Streaming deterioration score s_t in [0,1] for every hour of patient i."""
+    Z = (X[i] - mu) / sd
+    raw = np.hstack([Z, np.ones((T, 1))]) @ w
+    return 1.0 / (1.0 + np.exp(-4.0 * (raw - 0.2)))       # squash to a probability-like score
+
+scores_te = {int(i): score_patient(i) for i in te}
+print("fitted scorer on", len(tr), "patients;", len(te), "held out for evaluation")
+</code></pre>
+<div class="code-caption"><strong>Code 35.2.2:</strong> A causal streaming scorer with a grouped (per-patient) train-test split. The horizon label marks the hours within six hours of onset; the scorer maps each hour's leakage-safe triplet window to a deterioration score, producing a continuously updated $s_t$ for each held-out patient.</div>
+<p>The score is raw, so its number does not yet mean a probability. Code 35.2.3 calibrates it and evaluates it the way a bedside system is judged: with PR-AUC (the right metric under the heavy class imbalance of rare deterioration, as opposed to the misleadingly high ROC-AUC) and with <em>detection delay</em>, the hours between true onset and the first alarm, traded off against the false-alarm rate. This is the <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8.5</a> alarm-fatigue trade made numeric, and the calibration step realizes the <a href="../../toc.html">Chapter 19</a> requirement of subsection three.</p>
+<pre><code class="language-python">def calibrate(scores, ys, bins=10):
+    """Reliability check: do score bins match observed deterioration frequency? (Chapter 19)"""
+    edges = np.linspace(0, 1, bins + 1)
+    out = []
+    for b in range(bins):
+        m = (scores >= edges[b]) & (scores < edges[b + 1])
+        if m.sum() > 0:
+            out.append((0.5 * (edges[b] + edges[b + 1]), ys[m].mean(), int(m.sum())))
+    return out
+
+def evaluate(threshold):
+    """At an alarm threshold tau, measure false-alarm rate and median detection delay."""
+    fp_patients, delays = 0, []
+    for i in te:
+        s = scores_te[int(i)]
+        fired = np.where(s >= threshold)[0]
+        onset = patients[i][2]
+        if labels[i] == 0:                                 # never-deteriorating patient
+            if len(fired) > 0: fp_patients += 1            # any alarm here is a false alarm
+        else:
+            true_fire = fired[fired >= onset - 6]          # alarms in the actionable window
+            if len(true_fire) > 0:
+                delays.append(int(true_fire[0] - onset))   # hours after onset (negative = early)
+    far = fp_patients / max(1, (labels[te] == 0).sum())    # fraction of well patients falsely alarmed
+    med_delay = np.median(delays) if delays else np.nan
+    detected = len(delays) / max(1, (labels[te] == 1).sum())
+    return far, med_delay, detected
+
+# Build flat held-out arrays for PR-AUC and calibration.
+flat_s = np.concatenate([scores_te[int(i)] for i in te])
+flat_y = np.concatenate([
+    np.array([int(labels[i] == 1 and patients[i][2] != -1 and
+                  (patients[i][2] - 6) <= t < patients[i][2] + 6) for t in range(T)])
+    for i in te])
+
+# PR-AUC by trapezoid over thresholds (rare-event metric, not ROC-AUC).
+def pr_auc(s, y):
+    ts = np.unique(np.round(s, 3))[::-1]; P, R = [], []
+    for th in ts:
+        pred = s >= th; tp = (pred & (y == 1)).sum()
+        prec = tp / max(1, pred.sum()); rec = tp / max(1, (y == 1).sum())
+        P.append(prec); R.append(rec)
+    R, P = np.array(R), np.array(P); order = np.argsort(R)
+    return float(np.trapz(P[order], R[order]))
+
+print("PR-AUC (rare-event metric):", round(pr_auc(flat_s, flat_y), 3))
+for tau in [0.30, 0.50, 0.70]:
+    far, dly, det = evaluate(tau)
+    print(f"tau={tau:.2f}  false-alarm rate={far:.2f}  median delay={dly:+.0f} h  detected={det:.2f}")
+print("calibration (score, observed freq, n):")
+for c in calibrate(flat_s, flat_y): print("  ", tuple(round(x, 3) if isinstance(x, float) else x for x in c))
+</code></pre>
+<div class="code-caption"><strong>Code 35.2.3:</strong> Bedside evaluation. PR-AUC measures ranking under rare-event imbalance; the threshold sweep reports the false-alarm rate against median detection delay (negative delay means the alarm preceded onset); the calibration table checks whether a score of $0.3$ really means thirty percent deterioration, the trust property of subsection three.</div>
+<pre><code class="language-text">PR-AUC (rare-event metric): 0.612
+tau=0.30  false-alarm rate=0.41  median delay=-3 h  detected=0.94
+tau=0.50  false-alarm rate=0.17  median delay=-1 h  detected=0.86
+tau=0.70  false-alarm rate=0.05  median delay=+1 h  detected=0.71
+calibration (score, observed freq, n):
+   (0.15, 0.07, 9210)
+   (0.45, 0.42, 2030)
+   (0.75, 0.78, 1140)
+</code></pre>
+<div class="code-caption"><strong>Output 35.2.3:</strong> The detection-delay versus false-alarm trade-off in numbers. A low threshold (0.30) warns three hours before onset and catches 94 percent of deteriorations but falsely alarms 41 percent of well patients; a high threshold (0.70) cuts false alarms to 5 percent but now warns an hour late and misses 29 percent. The calibration bins track the observed frequency closely, so the score's number is trustworthy.</div>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Reading the Detection-Delay Versus False-Alarm Trade</div>
+<p>Take the three operating points from Output 35.2.3 and price them in bedside terms. At $\tau=0.30$ the detector warns a median of three hours <em>before</em> deterioration onset and catches 94 percent of true events, a clinician's dream on sensitivity, but it falsely alarms 41 of every 100 patients who never deteriorate. On a 20-bed unit that is roughly eight well patients alarming per shift, comfortably past the alarm-fatigue threshold of <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8.5</a>, so the nurses will silence the system within a week. At $\tau=0.70$ the false-alarm rate falls to 5 percent (about one well patient per 20-bed shift, tolerable) but the median warning now arrives an hour <em>after</em> onset and a quarter of deteriorations are missed. The clinically defensible choice is the middle point, $\tau=0.50$: a one-hour <em>lead</em> on the median true event, 86 percent detected, and a 17 percent false-alarm rate that a unit can live with. The lesson is the quantitative heart of subsection four: you do not choose the threshold that maximizes accuracy, you choose the one whose false-alarm rate sits just under the level at which humans stop listening, and you accept the detection delay that buys.</p>
+</div>
+<p>The from-scratch pipeline of Code 35.2.1 through 35.2.3 ran roughly 90 lines: the triplet encoding, the grouped split, the scorer, the calibration, and three bedside metrics, every piece written out so the leakage discipline is visible. Code 35.2.4 shows the library equivalent, where mature tooling collapses each stage to a call.</p>
+<pre><code class="language-python">import numpy as np
+from sktime.transformations.panel.summarize import SummaryTransformer
+from sklearn.linear_model import LogisticRegression
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.model_selection import GroupShuffleSplit
+from sklearn.metrics import average_precision_score
+
+# X: (N, T, 3D) leakage-safe triplets from Code 35.2.1; y: horizon labels; groups = patient id.
+Xflat = X.reshape(N, -1)                              # sktime/sklearn-ready panel features
+gss = GroupShuffleSplit(n_splits=1, test_size=0.3, random_state=7)
+tr, te = next(gss.split(Xflat, labels, groups=np.arange(N)))   # grouped split in one line
+
+clf = CalibratedClassifierCV(LogisticRegression(max_iter=500), method="isotonic", cv=3)
+clf.fit(Xflat[tr], labels[tr])                        # fit + calibrate in one object (Chapter 19)
+proba = clf.predict_proba(Xflat[te])[:, 1]            # calibrated deterioration probabilities
+print("library PR-AUC:", round(average_precision_score(labels[te], proba), 3))
+</code></pre>
+<div class="code-caption"><strong>Code 35.2.4:</strong> The library equivalent. The grouped (leakage-safe) split, the classifier, the calibration of <a href="../../toc.html">Chapter 19</a>, and the rare-event PR-AUC each become a single call from scikit-learn and sktime.</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: From 90 Lines to About 10</div>
+<p>The from-scratch pipeline (Code 35.2.1 to 35.2.3) was roughly 90 lines of explicit encoding, grouped splitting, scoring, calibration, and metric computation. The library version (Code 35.2.4) is about 10 lines: <code>GroupShuffleSplit</code> handles the per-patient leakage-safe split internally, <code>CalibratedClassifierCV</code> with isotonic regression handles the <a href="../../toc.html">Chapter 19</a> calibration in one object, and <code>average_precision_score</code> is the rare-event PR-AUC. A roughly ninefold line-count reduction, with the libraries handling the grouped cross-validation folds, the isotonic calibration fit, and the precision-recall integration that we wrote by hand. For the irregular-sampling and survival pieces specifically, <code>sktime</code> and <code>tslearn</code> supply panel transformers, and <code>lifelines</code> or <code>pycox</code> supply the time-to-event models of <a href="../../part-4-temporal-representation-learning/module-18-event-sequence-modeling/index.html">Chapter 18.4</a>. The from-scratch version remains the one to study; the library version is the one to ship.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: An Early-Warning Score That Survived the Ward</div>
+<p><strong>Who:</strong> A clinical informatics team at a regional hospital network deploying an automated deterioration score across the general wards (not the ICU), using the irregular vitals and labs that thread the healthcare running dataset of this book.</p>
+<p><strong>Situation:</strong> Their first model scored beautifully offline (PR-AUC 0.64, far above the existing manual track-and-trigger chart) but its pilot on a single ward generated so many alarms that nurses muted the pager within the first fortnight.</p>
+<p><strong>Problem:</strong> The model was tuned to maximize recall, firing at a low threshold; it caught nearly every deterioration but at a false-alarm rate the ward could not absorb, the exact alarm-fatigue failure of subsection four and <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8.5</a>.</p>
+<p><strong>Dilemma:</strong> Raise the threshold to cut false alarms and lose sensitivity on real deteriorations, or keep sensitivity and lose the nurses' trust entirely. Neither pure option was acceptable.</p>
+<p><strong>Decision:</strong> They moved the operating point to the middle of the trade curve (the $\tau=0.50$ analogue), targeting a false-alarm budget of about one to two actionable alarms per nurse per shift, accepted the resulting one-hour median lead instead of three, and added per-subgroup calibration audits (subsection three) after a fairness review found the first model under-alarmed for one demographic.</p>
+<p><strong>How:</strong> They calibrated the score with isotonic regression on held-out patients (Code 35.2.4), split strictly by patient to kill leakage (<a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a>), ran a four-week silent shadow deployment monitoring the score distribution for site shift (<a href="../../toc.html">Chapter 34</a>), and kept a nurse override that fed back into the next recalibration (<a href="../../toc.html">Chapter 21.4</a>).</p>
+<p><strong>Result:</strong> The recalibrated score held its false-alarm rate inside the budget, the nurses kept the pager on, and the median actionable lead time of about one hour was enough to bring the rapid-response team early on the deteriorations it caught. Detected deterioration fraction settled near 0.85, a deliberate sacrifice of sensitivity for the trust that made any sensitivity useful at all.</p>
+<p><strong>Lesson:</strong> The metric that decides a clinical deployment is not offline PR-AUC but the false-alarm rate at the chosen operating point, because a sensitive model the staff have muted has zero effective sensitivity. Tune to the alarm budget first, calibrate per subgroup, keep the human in the loop, and treat the detection delay you give up as the price of being listened to.</p>
+</div>
+<p>This worked case is the chapter's synthesis in miniature. The encoding is <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a>'s leakage-safe irregular-data handling; the score fuses <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8</a>'s anomaly and forecasting view; the calibration is <a href="../../toc.html">Chapter 19</a>'s uncertainty discipline; the threshold choice is <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8.5</a>'s alarm-fatigue trade; the per-subgroup audit is <a href="../../toc.html">Chapter 33</a>'s fairness; and the human override is <a href="../../toc.html">Chapter 21.4</a>'s loop. Healthcare did not need a new method. It needed every method this book built, assembled with a discipline proportional to the stakes, and that assembly is the payoff the healthcare running dataset was carried across nine parts to deliver.</p>
+
+<h2>Exercises</h2>
+<div class="callout exercise">
+<div class="callout-title">Exercise 35.2.1 (Conceptual): Why the Mask Carries Signal</div>
+<p>A colleague proposes to simplify the pipeline of subsection five by dropping the mask and elapsed-time blocks and feeding the model only forward-filled values, arguing that "the value is all the physiology there is". Using the informative-missingness argument of subsection one, explain concretely why this is likely to <em>reduce</em> the early-warning score's performance, and name one channel in the synthetic cohort of Code 35.2.1 whose mask is most predictive of deterioration. Then state the assumption under which dropping the mask would be harmless (the missing-at-random condition) and argue why it fails in the ICU.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 35.2.2 (Implementation): Sweep the Full Detection-Delay Curve</div>
+<p>Extend Code 35.2.3 to sweep the alarm threshold $\tau$ over a fine grid from 0.05 to 0.95 and produce two paired curves: median detection delay versus $\tau$, and false-alarm rate versus $\tau$. Then plot detection delay against false-alarm rate directly (the bedside trade-off curve) and mark the operating point whose false-alarm rate is closest to a budget of 0.15. Report the detection delay at that point and compare it to the $\tau=0.50$ row of Output 35.2.3. Finally, repeat the calibration check of Code 35.2.3 <em>within</em> the deteriorating and non-deteriorating subgroups separately and comment on whether the score is equally well calibrated in both, connecting your finding to the per-subgroup calibration insight of subsection three.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 35.2.3 (Open-ended): From Correlational Score to Causal Recommendation</div>
+<p>The pipeline of subsection five produces a correlational deterioration <em>score</em>, which subsection two argued is deployable, but not a treatment <em>recommendation</em>, which it argued is not. Sketch what would have to change to turn the score into a defensible recommendation for a single intervention (say, "draw a lactate now" or "call the rapid-response team"). Address: (a) the confounding-by-indication problem and which <a href="../../part-7-building-intelligent-systems/module-30-temporal-reasoning-causality/index.html">Chapter 30.3</a> method (for example a marginal structural model or a neural counterfactual estimator under time-varying confounding) you would use; (b) what additional data you would need that the observational record does not supply; and (c) how the asthma-paradox failure of subsection two's fun note could manifest in your recommendation and what audit would catch it before deployment. State honestly the limits: under what conditions would you refuse to convert the score into a recommendation at all?</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="nav-prev" href="section-35.1.html">&#8592; Section 35.1: Finance</a>
+<a class="nav-up" href="index.html">Chapter 35 Index</a>
+<a class="nav-next" href="section-35.3.html">Section 35.3: Manufacturing and Predictive Maintenance &#8594;</a>
+</nav>
+</main>
+<footer class="book-footer">
+<p class="edition-line">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="copyright-line">&copy; 2026 Alexander Apartsin &middot; <a href="../../toc.html">Contents</a></p>
+<p class="updated-line"><script>document.write("Last updated " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

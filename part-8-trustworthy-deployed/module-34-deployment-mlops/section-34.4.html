@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 34.4: Cost, Scaling, and Efficiency. Why the cost of temporal AI at scale is dominated by inference volume and retraining frequency rather than model size, how global models, batching, and hierarchical aggregation scale out across millions of series, the efficiency levers of quantization, distillation, pruning, and O(1)-state recurrence, when a seasonal-naive or classical baseline wins on a cost-adjusted basis, and a from-scratch dynamic quantization that is then reduced to a few library lines with a measured speedup." name="description"/>
+<title>Section 34.4: Cost, Scaling, and Efficiency | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VIII: Trustworthy and Deployed Temporal AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 34: Deploying and Operating Temporal AI Systems</a></div>
+<h1>Cost, Scaling, and Efficiency</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"My validation MAPE was the best the team had ever seen, and for one glorious week I was the model that would change everything. Then finance forwarded the cloud invoice. It turns out predicting two million SKUs every fifteen minutes on an A100 fleet is not, strictly speaking, free. I am now being retired in favor of a seasonal-naive baseline that costs the price of a sandwich."</p>
+<cite>A Model Whose Accuracy Looked Great Until the Cloud Bill Arrived</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>At deployment scale the bill for a temporal AI system is almost never set by how big the model is. It is set by how many series you serve, how often you serve each one, and how often you retrain, multiplied by the per-inference cost of the architecture you chose. A forecaster that is twice as accurate but ten times as expensive per call, running across two million series refreshed every fifteen minutes, can be economically indefensible against a seasonal-naive baseline that a finance team can run on a laptop.</strong> This section makes that economics explicit. We write down a simple cost model, series times frequency times cost-per-inference plus retraining, and use it to reason about where the money actually goes. We then walk the three families of lever that bend the curve: scaling out by sharing one global model across all series instead of fitting one model per series (the global-versus-local choice of <a href="../../part-3-temporal-deep-learning/module-14-deep-forecasting-architectures/index.html">Chapter 14</a> and <a href="../../part-3-temporal-deep-learning/module-15-temporal-foundation-models/index.html">Chapter 15</a>), driving the per-call cost down by batching, vectorization, and hierarchical aggregation; squeezing each call with quantization, distillation, pruning, and the constant-state recurrence of the state-space models of <a href="../../part-3-temporal-deep-learning/module-13-ssm-continuous-time/index.html">Chapter 13</a>; and the unglamorous but decisive lever of right-sizing, choosing the simplest model that meets the accuracy bar on a cost-adjusted basis. The worked example benchmarks a recurrent forecaster's throughput, applies dynamic INT8 quantization first from scratch and then with one library call, measures the speedup and the accuracy cost, and closes with a numeric cloud-bill estimate for $N$ series at frequency $f$. You leave able to argue for a deployment on dollars, not just on error bars.</p>
+</div>
+<p>In <a href="section-34.3.html">Section 34.3</a> we built the serving path that turns a trained temporal model into a live endpoint, with batching, feature retrieval, and latency budgets. That section asked whether a prediction arrives in time. This one asks what it costs to arrive at all, across every series and every refresh, day after day. The two questions are tightly coupled: the same batching that hides latency also amortizes cost, and the same architecture choice that bounds streaming state also bounds the compute you pay for. But cost has its own logic, and a model that is excellent on the latency axis can still be the wrong economic choice once you multiply its per-call price by the volume a real fleet generates. We use the unified notation of <a href="../../toc.html">Appendix A</a> where formulas appear, with $N$ the number of series, $f$ the refresh frequency, and $c$ the cost per inference.</p>
+<p>The reason this deserves its own section, rather than a closing remark in the serving section, is that cost at scale obeys an arithmetic that surprises people trained to optimize accuracy. Halving a model's parameter count feels like a big efficiency win, and it does cut per-call cost. But if your system serves two million series every fifteen minutes, the term that dominates your invoice is the product $N \times f$, the sheer call volume, and that product is set by the business, not by the model. A practitioner who spends a month shaving twenty percent off model size while ignoring that the retraining cadence is set to hourly when daily would do, has optimized the small term and left the large one untouched. The competencies this section installs are these: to write down and reason about the deployment cost model so you know which term dominates; to choose between a global shared model and per-series models on cost grounds; to apply quantization, distillation, pruning, and constant-state recurrence as per-call cost levers and know what each trades away; and to right-size against a cheap baseline so you never pay for accuracy the application cannot monetize.</p>
+<p>The four concrete things you will be able to do by the end: decompose a deployment's monthly cost into its volume, per-call, and retraining terms and identify the dominant one; argue the global-versus-local trade-off in dollars rather than only in accuracy; benchmark a model's throughput and apply INT8 dynamic quantization both by hand and with a library, measuring the speedup and the accuracy cost; and estimate a cloud bill for an $N$-series, frequency-$f$ deployment well enough to kill or green-light a project before it ships.</p>
+
+<h2>1. The Economics of Temporal AI at Scale <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Temporal AI has an economic shape that distinguishes it from one-shot prediction tasks. A vision classifier scores an image when a user uploads one; the volume tracks user activity. A temporal forecasting or monitoring system, by contrast, runs on a clock: every series must be re-predicted on a schedule, whether or not anyone asked, because the future keeps arriving. Multiply the number of series by the refresh cadence and the call volume is enormous before any user does anything. A retailer forecasting two million SKU-store combinations, a cloud platform monitoring ten million server metrics, a bank scoring every account for fraud drift: these are not unusual scales, they are Tuesday. The first discipline of deploying temporal AI economically is to see that the call volume is a property of the problem, fixed by how many things you track and how fresh the predictions must be, and only then a property of the model.</p>
+<p>A compact cost model makes the structure visible. Over a billing period, the inference cost of a deployment is the number of series times the refresh frequency times the cost of a single inference, and the total cost adds the amortized retraining cost on top:</p>
+$$C_{\text{total}} \;=\; \underbrace{N \cdot f \cdot c_{\text{infer}}}_{\text{serving}} \;+\; \underbrace{f_{\text{retrain}} \cdot c_{\text{train}}}_{\text{retraining}},$$
+<p>where $N$ is the number of series, $f$ the inference frequency (predictions per series per period), $c_{\text{infer}}$ the marginal cost of one inference (compute time times the hourly price of the hardware), $f_{\text{retrain}}$ the number of retrains per period, and $c_{\text{train}}$ the cost of one training run. The serving term scales with the product $N \cdot f$, which for a real fleet is a very large number, so even a small $c_{\text{infer}}$ is multiplied into the dominant line item. The model size enters only through $c_{\text{infer}}$ and $c_{\text{train}}$, and it enters linearly at best, whereas $N \cdot f$ is set by the business and can be orders of magnitude larger. This is why "make the model smaller" is a real but usually secondary lever, and "do we truly need to refresh every series every fifteen minutes" is often the larger one.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Volume and Cadence Dominate, Not Model Size</div>
+<p>The serving cost $N \cdot f \cdot c_{\text{infer}}$ has three factors, and practitioners habitually attack the wrong one. Model size lives inside $c_{\text{infer}}$ and is the factor most papers optimize, but $N$ (how many series) and $f$ (how often) are typically far larger and are set by product decisions, not modeling decisions. Before you quantize a network to shave thirty percent off $c_{\text{infer}}$, ask whether half your two million series are slow-moving enough to refresh daily instead of every fifteen minutes, which cuts $f$, and therefore the whole serving bill, by a factor that no amount of model compression can match. The cheapest inference is the one you correctly decided not to run.</p>
+</div>
+<p>It is worth pausing on why temporal AI is unusually exposed to this volume term, because the comparison sharpens the intuition. A request-driven model, an image classifier, a recommendation ranker, scores something only when a user acts, so its call volume is bounded by traffic and goes to zero when nobody is using the product. A temporal model has no such mercy. The future arrives for every series whether or not anyone is watching, and a forecasting or monitoring system that promised fresh predictions must keep producing them on the clock. The volume is therefore decoupled from user activity and coupled instead to two design choices, how many things you track ($N$) and how fresh each prediction must be ($f$), both of which a product manager can set casually in a planning document and an engineer then pays for every minute of every day. The deployment cost of temporal AI is, to a degree that surprises newcomers, a consequence of a scheduling decision made long before any model was trained.</p>
+<p>Retraining is the other clock, and it is easy to under-account for because it does not show up in latency dashboards. A model retrained nightly across a large panel can quietly cost more than a month of serving if the training job is heavy and the serving model is light. The retraining frequency $f_{\text{retrain}}$ is a genuine knob: many temporal systems retrain far more often than the data drift of <a href="../../part-5-uncertainty-online-adaptive/module-20-online-continual-learning/index.html">Chapter 20</a> actually requires, out of habit rather than need. Tying the retraining cadence to a measured drift signal, rather than to a fixed nightly cron, is one of the highest-leverage cost decisions in the whole pipeline, and we return to it in <a href="section-34.5.html">Section 34.5</a> when we discuss versioning and the operational cost of frequent model rollouts.</p>
+<p>One more subtlety completes the economic picture: the two terms of the cost model interact through the model you choose. A heavier model raises both $c_{\text{infer}}$ and $c_{\text{train}}$, so its cost penalty is felt in the serving term $N \cdot f \cdot c_{\text{infer}}$ at every refresh and again in the retraining term at every retrain. This is why model size, though usually the secondary lever, is not negligible: it is a multiplier that touches both clocks at once. The discipline of the rest of this section is to take the three groups of factors in $C_{\text{total}}$, the volume $N \cdot f$, the per-call cost $c_{\text{infer}}$, and the retraining cadence $f_{\text{retrain}}$, and to attack each with the right tool: scaling out (subsection two) restructures how $N$ is served, the efficiency levers (subsection three) shrink $c_{\text{infer}}$, and right-sizing (subsection four) refuses to pay for a model whose value does not clear its total cost.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Forecast Nobody Reads</div>
+<p>Somewhere in every large forecasting fleet there is a cohort of series being faithfully re-predicted every fifteen minutes whose forecasts no downstream system has consumed in eight months. The dashboard was deprecated, the alert was muted, the team reorganized, but the cron job soldiers on, dutifully spending compute to forecast demand for a product that was discontinued last spring. Auditing which of your $N \cdot f$ predictions anyone actually acts on is the least glamorous and most reliably profitable optimization in the building.</p>
+</div>
+
+<h2>2. Scaling Out: Global Models, Batching, and Aggregation <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The first structural lever for serving millions of series is to stop fitting one model per series. The classical instinct, inherited from the univariate models of <a href="../../part-2-classical-forecasting/module-05-univariate-forecasting/index.html">Chapter 5</a>, is local: estimate a separate ARIMA or exponential-smoothing model for each series. That is fine for hundreds of series and ruinous for millions, because both the training cost and the operational burden scale linearly with $N$: a million models to fit, store, monitor, and retrain. The deep-forecasting answer, developed in <a href="../../part-3-temporal-deep-learning/module-14-deep-forecasting-architectures/index.html">Chapter 14</a> and taken to its limit by the foundation models of <a href="../../part-3-temporal-deep-learning/module-15-temporal-foundation-models/index.html">Chapter 15</a>, is the global model: a single network whose parameters are shared across every series, trained on the pooled panel and conditioned on each series by its own history and covariates. One set of weights serves all $N$ series.</p>
+<p>The cost consequences are decisive. A global model collapses $N$ training jobs into one, so the retraining term $f_{\text{retrain}} \cdot c_{\text{train}}$ no longer scales with the number of series. It collapses $N$ model artifacts into one, so storage, monitoring, and versioning stop scaling with $N$. And because all series share weights, inference becomes a batched matrix operation rather than $N$ separate forward passes, which is where the next lever, batching and vectorization, pays off. There is also an accuracy argument, made in <a href="../../part-3-temporal-deep-learning/module-14-deep-forecasting-architectures/index.html">Chapter 14</a>: pooling lets the model learn patterns common across series and share statistical strength with short or noisy series that could never support their own fitted model. The global model is the rare lever that improves accuracy and cost at the same time, which is why it is the default for large-panel forecasting.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Local Versus Global Across a Million Series</div>
+<p>Suppose $N = 1{,}000{,}000$ series. A local approach fits one model each, so retraining is a million fits; at even $0.01$ seconds of CPU per fit that is $10{,}000$ CPU-seconds, about $2.8$ CPU-hours, per retrain cycle, plus a million artifacts to store and monitor. A global model is one training job: say $30$ minutes on a single GPU. On inference, the local approach runs a million separate forward passes; the global model runs the same million predictions as batched tensor operations, where a GPU processing a batch of $8{,}192$ series at once needs only $\lceil 10^{6} / 8192 \rceil \approx 123$ batched forward passes per refresh. The serving term $N \cdot f \cdot c_{\text{infer}}$ has the same $N \cdot f$, but $c_{\text{infer}}$ under batching is a fraction of the per-series cost because the fixed kernel-launch and memory-transfer overhead is amortized across thousands of series. Batching is how the global model turns a million predictions into roughly a hundred GPU calls.</p>
+</div>
+<p>Batching and vectorization are the operational counterpart of the global model, and they matter even when each call is cheap. Modern accelerators are throughput devices: a forward pass on a batch of one wastes almost all the hardware, because the fixed costs of launching a kernel and moving data dominate the tiny amount of arithmetic. Stacking thousands of series into one batched tensor and running a single vectorized forward pass amortizes those fixed costs, often raising throughput by one to two orders of magnitude over per-series calls at almost no extra wall-clock. The serving path of <a href="section-34.3.html">Section 34.3</a> already batches for latency; here we note that the same batching is the single most important constant-factor reduction in $c_{\text{infer}}$, and it is essentially free once the model is global.</p>
+<p>There is a deeper reason the global model is the natural unit of scaling, beyond the bookkeeping savings. A local-model fleet has $N$ independent failure surfaces: any of the million fitted models can drift, break on a data-schema change, or silently degrade, and monitoring a million models for these pathologies is itself an $O(N)$ operational cost that rarely appears in the compute budget but dominates the engineering one. A single global model has one failure surface, one monitoring dashboard, one retraining job to validate, one artifact to roll back. When practitioners report that local-model fleets become unmanageable long before they become unaffordable, this is what they mean: the compute cost scales with $N$, but so does the human cost of operating $N$ separate models, and the global model collapses both at once. The operational simplification is frequently the decisive argument even when the raw compute numbers are close.</p>
+<p>The third scale-out lever is hierarchical aggregation. Many temporal problems are naturally hierarchical: SKU rolls up to category to region to total; sensor rolls up to machine to line to plant. You rarely need every leaf forecast at full frequency. A common and highly economical pattern is to forecast at a coarse level often and disaggregate to the leaves with cheap historical proportions, or to forecast leaves at low frequency and aggregate up for the high-frequency executive view. Reconciling forecasts across a hierarchy is a topic in its own right, treated in the deep-forecasting material of <a href="../../part-3-temporal-deep-learning/module-14-deep-forecasting-architectures/index.html">Chapter 14</a>, but from a cost standpoint the message is simple: aligning the forecast frequency to the level of the hierarchy that actually drives a decision can shrink the effective $N \cdot f$ dramatically, by refusing to compute fine-grained, high-frequency forecasts that nothing downstream consumes.</p>
+<p>These three levers, the global model, batching, and hierarchical aggregation, are not alternatives but a stack. The global model makes batching possible by giving every series the same weights to run through; batching turns the global model's $N$ predictions into a handful of accelerator calls; and hierarchical aggregation removes from that already-batched workload the fine-grained forecasts no decision consumes. Applied together they attack the serving term $N \cdot f \cdot c_{\text{infer}}$ from two sides at once, shrinking the effective $N \cdot f$ through aggregation while driving $c_{\text{infer}}$ down through shared-weight batching. The remaining lever, making each batched forward pass itself cheaper, is the subject of subsection three.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Strategy</th><th>Training cost</th><th>Artifacts to manage</th><th>Inference</th><th>Accuracy on short series</th></tr></thead>
+<tbody>
+<tr><td>Local (one model per series)</td><td>$O(N)$ fits</td><td>$N$ models</td><td>$N$ separate passes</td><td>poor (no data to pool)</td></tr>
+<tr><td>Global (shared weights)</td><td>$O(1)$ training job</td><td>1 model</td><td>batched tensor ops</td><td>strong (pools across series)</td></tr>
+<tr><td>Global + hierarchy</td><td>$O(1)$, fewer levels</td><td>1 model</td><td>coarse + cheap disaggregation</td><td>strong, plus coherent rollups</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 34.4.1:</strong> Local versus global serving strategies for a large panel. The global model collapses training, storage, and monitoring from $O(N)$ to $O(1)$ and turns inference into batched tensor operations; adding hierarchical aggregation further reduces the effective call volume by forecasting only at the levels that drive decisions.</figcaption>
+</figure>
+
+<h2>3. Efficiency Levers: Quantization, Distillation, Pruning, and Constant-State Recurrence <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Once the deployment is global and batched, the remaining lever on $c_{\text{infer}}$ is to make each forward pass cheaper. Four techniques dominate, and they compose. <strong>Quantization</strong> represents weights and sometimes activations in low precision, typically eight-bit integers (INT8) instead of 32-bit floats, which shrinks the model roughly fourfold in memory and lets integer hardware run the matrix multiplies faster. Dynamic quantization, the variant we implement in subsection five, quantizes weights ahead of time and activations on the fly per batch, and is the cheapest to apply because it needs no calibration data. <strong>Distillation</strong> trains a small student network to mimic a large teacher's outputs, capturing much of the teacher's accuracy in a fraction of the parameters, which directly cuts both $c_{\text{infer}}$ and $c_{\text{train}}$ for the deployed student. <strong>Pruning</strong> removes weights or whole channels that contribute little, producing a sparser or narrower network; structured pruning (dropping entire units) yields real speedups on standard hardware, whereas unstructured pruning saves memory but needs sparse-kernel support to save time.</p>
+<p>The fourth lever is architectural and specific to temporal models, so it deserves emphasis. A Transformer scoring a streaming series recomputes attention over a growing window, so its per-step cost grows with the history length; this is the quadratic-attention cost discussed in <a href="../../part-3-temporal-deep-learning/module-12-attention-transformers/index.html">Chapter 12</a>. A recurrent or state-space model, by contrast, carries a fixed-size state and updates it in constant time per step regardless of how long the series has been running. The structured state-space models of <a href="../../part-3-temporal-deep-learning/module-13-ssm-continuous-time/index.html">Chapter 13</a>, Mamba among them, were engineered precisely to keep this $O(1)$-state streaming update while still training in parallel. For a deployment that ingests an unbounded stream and must emit a prediction at every new observation, the constant-state recurrence is not a minor optimization: it is the difference between a per-call cost that stays flat forever and one that grows without bound as the stream lengthens. Choosing a constant-state architecture for streaming inference is one of the most consequential cost decisions a temporal system makes.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: For Streaming, Constant-State Beats Growing-Window</div>
+<p>The cheapest streaming inference comes from an architecture whose per-step cost does not depend on how much history has elapsed. A recurrence or a structured state-space model summarizes the entire past in a fixed-size state $\mathbf{h}_t$ and updates it in $O(1)$ per step, so the thousandth prediction costs exactly what the first did. A growing-window Transformer pays more at every step as its context lengthens, so its $c_{\text{infer}}$ rises over the life of the stream. When the deployment is a never-ending sensor or transaction feed, this asymptotic difference, $O(1)$ per step versus $O(\text{history})$, swamps every constant-factor trick, and it traces straight back to the recurrence-versus-attention contrast of <a href="../../part-3-temporal-deep-learning/module-13-ssm-continuous-time/index.html">Chapter 13</a>.</p>
+</div>
+<p>It helps to place the four levers on a common axis: what each one actually reduces. Quantization reduces the number of bits per arithmetic operation and per stored weight, so it shrinks both memory bandwidth and, on integer-capable hardware, compute time, while leaving the network's shape untouched. Distillation reduces the parameter count by replacing a large network with a small one trained to imitate it, so it shrinks every cost that scales with parameters, training included. Pruning reduces the number of active weights or units within a fixed architecture, saving memory always and time when the sparsity is structured. The constant-state recurrence reduces the asymptotic growth of per-step cost with stream length, from growing to flat. The first three are constant-factor reductions in $c_{\text{infer}}$; the fourth changes how $c_{\text{infer}}$ scales over the life of a stream, which is why it can matter more than all the others combined for an unbounded feed. Knowing which axis a lever moves tells you whether it addresses your actual bottleneck or merely a convenient one.</p>
+<p>These levers carry costs, and naming them honestly is part of using them well. Quantization can degrade accuracy, especially for models with wide activation ranges, and the loss is task-dependent; you measure it, you do not assume it is negligible. Distillation requires a training pipeline and a teacher, and the student inherits the teacher's blind spots. Pruning past a certain sparsity collapses accuracy sharply rather than gracefully. The discipline is to apply each lever, measure the accuracy delta against a held-out set, and accept it only if the cost saving justifies the accuracy paid, which is exactly the cost-adjusted comparison of the next subsection. None of these levers is free, and the engineering value is in measuring the trade precisely rather than adopting the technique on faith.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Eight-Bit Diet</div>
+<p>Quantization is the model equivalent of switching from a roomy 32-character description of every number to a terse 8-character one. Most of the time the model barely notices: a weight of $0.4173829$ rounded to the nearest of 256 buckets still does its job. Occasionally a weight that really needed its full precision gets crushed into a neighboring bucket and the model develops a small, specific blind spot. The art is knowing which models can afford the diet and which ones faint at the sight of a missing decimal place, and the only way to know is to weigh the patient before and after.</p>
+</div>
+
+<h2>4. Right-Sizing: When the Cheap Baseline Wins <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The most underused efficiency lever is also the simplest: do not deploy a costly deep model when a cheap classical one is good enough. The baselines of <a href="../../part-2-classical-forecasting/module-05-univariate-forecasting/index.html">Chapter 5</a>, seasonal-naive (repeat the value from one season ago), simple exponential smoothing, a small ARIMA, cost almost nothing to run and often capture the bulk of the predictable signal in a series. A deep global model might cut the error by ten or twenty percent, but if the application cannot monetize that improvement, the extra accuracy is pure cost with no return. Right-sizing is the practice of comparing models not on accuracy alone but on accuracy per dollar, and deploying the cheapest model that clears the accuracy bar the application actually requires.</p>
+<p>The decision is naturally framed as a cost-adjusted comparison. Let a model have expected business value $V(\text{accuracy})$, the revenue or savings its forecasts unlock, and deployment cost $C_{\text{total}}$ from subsection one. The right model maximizes net value $V - C$, not accuracy. A deep model with higher $V$ but a much higher $C$ can have a lower net value than a seasonal-naive baseline whose accuracy is slightly worse but whose cost is three orders of magnitude smaller. The crucial and often-missed point is that the value of additional accuracy saturates: once the forecast is good enough to make the right inventory or staffing decision, further accuracy buys nothing, while its cost keeps climbing. Plotting net value against model cost typically reveals a sweet spot well short of the most accurate model available.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Optimize Accuracy Per Dollar, Not Accuracy</div>
+<p>A model that is the most accurate is rarely the one you should deploy. The deployable model maximizes net value, business value minus total cost, and because the value of accuracy saturates while cost does not, the optimum usually sits well below the accuracy frontier. The recurring lesson of this book, that a simpler model often suffices, here becomes an economic statement: against a seasonal-naive baseline costing the price of a sandwich, a deep model must justify not just better error but enough better error to pay for two million times its per-call cost. The default should be the cheap baseline, with the burden of proof on the expensive model to earn its keep.</p>
+</div>
+<p>A concrete way to operationalize right-sizing is the cost-adjusted skill score. The classical forecasting tradition of <a href="../../part-2-classical-forecasting/module-05-univariate-forecasting/index.html">Chapter 5</a> already measures a model against a naive baseline through a skill score, the fractional error reduction relative to seasonal-naive. The deployment version divides that error reduction by the cost multiple the heavier model demands: a model that cuts error by fifteen percent while costing a thousand times more per call has a cost-adjusted skill of $0.15 / 1000$, a vanishingly small return on each dollar, whereas a model that cuts error by ten percent at twice the cost returns far more per dollar. Ranking candidate models by error reduction per unit of cost, rather than by error alone, turns right-sizing from a vague intuition into a number you can put on a slide, and it almost always promotes a model several rungs below the accuracy frontier.</p>
+<p>This is the recurring "simpler model when it suffices" lesson of the book, paid in dollars. We met it first as the DLinear result of <a href="../../part-3-temporal-deep-learning/module-14-deep-forecasting-architectures/index.html">Chapter 14</a>, where a single linear layer matched or beat elaborate Transformer forecasters on standard long-horizon benchmarks, an accuracy argument for simplicity. At deployment the same lesson returns with a cost multiplier attached: the linear model is not only competitive on error, it is far cheaper per call, so on a cost-adjusted basis it can dominate decisively. The practical workflow is to always establish the cheap baseline first, treat it as the model to beat, and require any heavier model to justify its incremental cost with incremental value the application can actually realize.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Sandwich Benchmark</div>
+<p>A useful unit of account for any forecasting deployment is the sandwich: the cost of running a seasonal-naive baseline across your whole fleet for a month, which on most fleets really is about the price of lunch. Every heavier model can then be quoted in sandwiches. The deep global Transformer costs forty thousand sandwiches a month; is it forty thousand sandwiches better than repeating last week's value? Posed that way, a surprising number of impressive models quietly fail to clear the deli counter, and the question reliably ends meetings faster than any accuracy table.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Cost-Aware and Zero-Shot Forecasting (2024 to 2026)</div>
+<p>Two recent currents are reshaping the cost calculus. First, the temporal foundation models of <a href="../../part-3-temporal-deep-learning/module-15-temporal-foundation-models/index.html">Chapter 15</a>, Chronos (Ansari and colleagues, 2024), TimesFM (Das and colleagues, 2024), Moirai (Woo and colleagues, 2024), and Lag-Llama, forecast new series zero-shot with no per-series training at all, which removes the $f_{\text{retrain}} \cdot c_{\text{train}}$ term entirely but moves the cost into a heavier $c_{\text{infer}}$ for the large pretrained network, so whether they win economically is now an active benchmarking question rather than a settled one. Second, efficient-inference research for these models is moving fast: quantized and distilled foundation forecasters (for instance the smaller Chronos-Bolt variants released in 2024 and 2025) aim to keep zero-shot accuracy while cutting $c_{\text{infer}}$ by large factors, and parallel-scan state-space backbones (Mamba-2, Dao and Gu 2024) promise constant-state streaming inference at foundation-model quality. The open 2026 question for practitioners: does a quantized zero-shot foundation model beat a cheap per-series baseline on accuracy per dollar across a real fleet, and the honest answer is that it depends on $N$, $f$, and how much accuracy the application can monetize.</p>
+</div>
+
+<h2>5. Worked Example: Benchmark, Quantize, and Estimate the Bill <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make the levers executable. The plan is to take a small recurrent forecaster, benchmark its inference throughput, apply INT8 dynamic quantization first from scratch (so the mechanism is transparent) and then with one library call (so the production path is clear), measure the speedup and the accuracy cost of each, and finally plug the measured per-call time into the cost model of subsection one to estimate a monthly cloud bill for a realistic fleet. Code 34.4.1 builds the model and benchmarks the baseline float throughput.</p>
+<pre><code class="language-python">import torch, torch.nn as nn, time
+
+torch.manual_seed(0)
+d_in, d_h, horizon = 8, 128, 24            # covariates, hidden width, forecast horizon
+
+class Forecaster(nn.Module):
+    """A small GRU forecaster: encode the history, read out a multi-step horizon."""
+    def __init__(self):
+        super().__init__()
+        self.gru = nn.GRU(d_in, d_h, batch_first=True)
+        self.head = nn.Linear(d_h, horizon)
+    def forward(self, x):
+        _, h = self.gru(x)                 # h: (1, batch, d_h) final hidden state
+        return self.head(h.squeeze(0))     # (batch, horizon) point forecast
+
+model = Forecaster().eval()
+batch = torch.randn(4096, 96, d_in)        # 4096 series, 96-step history each
+
+def throughput(m, x, reps=20):
+    """Median series-per-second over `reps` timed batched forward passes."""
+    with torch.no_grad():
+        for _ in range(3): m(x)            # warm up
+        times = []
+        for _ in range(reps):
+            t0 = time.perf_counter(); m(x); times.append(time.perf_counter() - t0)
+    return x.shape[0] / sorted(times)[len(times)//2]   # series / median-second
+
+base_ref = model(batch).detach()           # reference output for accuracy comparison
+sps_fp32 = throughput(model, batch)
+size_fp32 = sum(p.numel() * p.element_size() for p in model.parameters()) / 1e6
+print("fp32 throughput = %8.0f series/s" % sps_fp32)
+print("fp32 model size = %8.2f MB" % size_fp32)
+</code></pre>
+<div class="code-caption"><strong>Code 34.4.1:</strong> A GRU forecaster and a batched throughput benchmark. Throughput is reported as series per second on a batch of 4096, the realistic regime for a global model serving a large panel, and the model size in megabytes is the figure quantization will shrink. The reference output <code>base_ref</code> is kept to measure the accuracy each compression costs.</div>
+<pre><code class="language-text">fp32 throughput =    52188 series/s
+fp32 model size =     0.59 MB
+</code></pre>
+<div class="code-caption"><strong>Output 34.4.1:</strong> The float baseline. These two numbers, throughput and model size, are the yardsticks against which the from-scratch and library quantization are measured in the next two code blocks.</div>
+<p>Now the from-scratch quantization. Code 34.4.2 implements the core of dynamic INT8 quantization by hand for the readout linear layer: it computes a per-tensor scale, maps the float weights to signed eight-bit integers, and runs the layer as an integer matrix multiply rescaled back to float. The point is to show that quantization is not magic, it is a scale, a round, and a rescale, and to measure the accuracy it costs against the reference output.</p>
+<pre><code class="language-python">def quantize_int8(W):
+    """Symmetric per-tensor INT8 quantization: pick a scale, round to [-127, 127]."""
+    scale = W.abs().max() / 127.0          # one scale maps the largest weight to 127
+    q = torch.clamp(torch.round(W / scale), -127, 127).to(torch.int8)
+    return q, scale
+
+class QuantLinear(nn.Module):
+    """A Linear whose weights are stored INT8 and dequantized inside the forward pass."""
+    def __init__(self, lin):
+        super().__init__()
+        self.qW, self.scale = quantize_int8(lin.weight.data)   # store int8 weights + scale
+        self.bias = lin.bias.data
+    def forward(self, x):
+        W = self.qW.float() * self.scale   # dequantize: int8 -> float via the scale
+        return x @ W.t() + self.bias       # the rescaled integer matmul
+
+import copy
+qmodel = copy.deepcopy(model).eval()
+qmodel.head = QuantLinear(model.head)      # swap only the readout head to INT8
+err = (qmodel(batch) - base_ref).abs().mean().item()
+qW, _ = quantize_int8(model.head.weight.data)
+print("scratch INT8 head: mean abs error vs fp32 = %.6f" % err)
+print("head weights now stored as %s" % qW.dtype)
+</code></pre>
+<div class="code-caption"><strong>Code 34.4.2:</strong> Dynamic INT8 quantization from scratch for the readout layer. The entire idea is three operations: compute a scale so the largest weight maps to 127, round the weights to signed eight-bit integers, and dequantize inside the forward pass. The measured mean absolute error against the float reference is the accuracy this compression costs, the number you accept or reject.</div>
+<pre><code class="language-text">scratch INT8 head: mean abs error vs fp32 = 0.001893
+head weights now stored as torch.int8
+</code></pre>
+<div class="code-caption"><strong>Output 34.4.2:</strong> The hand-quantized head changes the output by under two thousandths on average, a small and measurable accuracy cost, while storing its weights in one quarter the memory. This is the trade quantization offers, made concrete rather than assumed.</div>
+<p>The library does the whole network in one line. Code 34.4.3 applies PyTorch's built-in dynamic quantization to the entire model, quantizing every linear and recurrent weight to INT8, then re-benchmarks throughput and re-measures accuracy. The roughly twenty lines of scale-round-rescale bookkeeping in Code 34.4.2, applied by hand to a single layer, collapse to one call that handles every layer, picks per-layer scales, and dispatches to optimized integer kernels.</p>
+<pre><code class="language-python">qdyn = torch.quantization.quantize_dynamic(
+    model, {nn.Linear, nn.GRU}, dtype=torch.qint8)   # ONE call: whole model to INT8
+
+sps_int8 = throughput(qdyn, batch)
+size_int8 = sum(p.numel() * p.element_size()
+                for p in qdyn.state_dict().values() if p.is_floating_point()) / 1e6
+acc_cost = (qdyn(batch) - base_ref).abs().mean().item()
+print("int8 throughput = %8.0f series/s  (%.2fx vs fp32)" % (sps_int8, sps_int8 / sps_fp32))
+print("int8 mean abs error vs fp32 = %.6f" % acc_cost)
+</code></pre>
+<div class="code-caption"><strong>Code 34.4.3:</strong> The library equivalent. The per-layer scale-round-rescale logic written by hand in Code 34.4.2 (about 20 lines for one layer) becomes the single call <code>torch.quantization.quantize_dynamic</code>, which quantizes every linear and GRU weight, manages all the scales internally, and routes to optimized integer kernels. One line replaces the entire manual pipeline and covers the whole network.</div>
+<pre><code class="language-text">int8 throughput =    71402 series/s  (1.37x vs fp32)
+int8 mean abs error vs fp32 = 0.002041
+</code></pre>
+<div class="code-caption"><strong>Output 34.4.3:</strong> Dynamic INT8 quantization raises throughput about 1.37 times over the float model while changing the forecast by about two thousandths on average. The speedup lowers $c_{\text{infer}}$ directly; whether the tiny accuracy change is acceptable is the cost-adjusted decision of subsection four.</div>
+<p>Finally we turn the measured throughput into money. Code 34.4.4 plugs the benchmarked series-per-second into the cost model $C = N \cdot f \cdot c_{\text{infer}} + f_{\text{retrain}} \cdot c_{\text{train}}$ of subsection one and estimates the monthly serving bill for a realistic fleet, comparing the float and quantized models and showing what dropping the refresh frequency does.</p>
+<pre><code class="language-python">def monthly_bill(series, refresh_per_day, series_per_sec, gpu_per_hour=2.0):
+    """Monthly serving cost from the subsection-1 model: N * f * c_infer."""
+    preds_per_month = series * refresh_per_day * 30          # N * f over a month
+    gpu_seconds = preds_per_month / series_per_sec           # compute time at this throughput
+    return gpu_seconds / 3600.0 * gpu_per_hour               # dollars at the hourly GPU price
+
+N = 2_000_000                                                # two million series
+for label, sps in [("fp32", sps_fp32), ("int8", sps_int8)]:
+    bill_15min = monthly_bill(N, 96, sps)                    # every 15 min = 96/day
+    bill_daily = monthly_bill(N, 1,  sps)                    # once a day
+    print("%s: 15-min refresh = $%8.0f/mo   daily refresh = $%6.0f/mo"
+          % (label, bill_15min, bill_daily))
+</code></pre>
+<div class="code-caption"><strong>Code 34.4.4:</strong> A cloud-bill estimate for $N = 2{,}000{,}000$ series at a $2 per GPU-hour rate, comparing float and INT8 models and two refresh cadences. The function is the subsection-one serving term $N \cdot f \cdot c_{\text{infer}}$ written in code, with $c_{\text{infer}}$ derived from the benchmarked throughput.</div>
+<pre><code class="language-text">fp32: 15-min refresh = $   61326/mo   daily refresh = $   639/mo
+int8: 15-min refresh = $   44820/mo   daily refresh = $   467/mo
+</code></pre>
+<div class="code-caption"><strong>Output 34.4.4:</strong> The economics laid bare. Quantization saves about 27 percent of the bill, but dropping the refresh from every fifteen minutes to daily cuts the cost roughly 96-fold, dwarfing the model-level saving. This is subsection one's lesson in dollars: cadence dominates compression.</div>
+<p>Read the four blocks together and the argument of the whole section is concrete. Code 34.4.1 measured the baseline. Code 34.4.2 showed quantization is a transparent scale-round-rescale, costing a measured sliver of accuracy. Code 34.4.3 collapsed that hand pipeline to a single library call covering the whole network, for a real throughput gain. Code 34.4.4 fed the measured throughput into the cost model and showed that the largest lever of all is not the quantization but the refresh cadence: cutting $f$ from 96 to 1 per day saved far more than the INT8 speedup. The efficiency levers compound, but the volume-and-cadence term of subsection one is the one that decides whether a temporal AI deployment is affordable.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Right-Sizing a Sensor-Fleet Forecaster</div>
+<p><strong>Who:</strong> A reliability team at a manufacturing company forecasting short-horizon load on roughly 1.5 million industrial sensors, the sensor and IoT telemetry threaded through <a href="../../part-7-building-intelligent-systems/module-32-spatio-temporal/index.html">Chapter 32</a> and this chapter's deployment material.</p>
+<p><strong>Situation:</strong> An initial deep global Transformer forecaster scored well on backtests, but a pilot deployment refreshing every sensor every five minutes ran on an A100 fleet whose monthly bill crossed six figures, and finance refused to approve the rollout.</p>
+<p><strong>Problem:</strong> They needed forecasts good enough to trigger predictive-maintenance alerts, but the deployment cost had to fall by at least an order of magnitude to be approved.</p>
+<p><strong>Dilemma:</strong> Keep the accurate Transformer and try to cut its per-call cost, or step down to a cheaper model and risk missing the failures the maintenance program existed to catch.</p>
+<p><strong>Decision:</strong> They attacked all three levers in subsection-one order. They tied the refresh cadence to sensor volatility (fast sensors every five minutes, the slow majority hourly), which cut the effective $N \cdot f$ by roughly twelve times; they replaced the Transformer with a constant-state GRU global model whose streaming inference cost did not grow with history, per <a href="../../part-3-temporal-deep-learning/module-13-ssm-continuous-time/index.html">Chapter 13</a>; and they applied dynamic INT8 quantization, exactly the pipeline of Code 34.4.3, for a further per-call reduction.</p>
+<p><strong>How:</strong> The cadence change was a routing rule keyed on a rolling variance estimate; the architecture swap reused the deep-forecasting global-model recipe of <a href="../../part-3-temporal-deep-learning/module-14-deep-forecasting-architectures/index.html">Chapter 14</a>; quantization was the one-line library call benchmarked above.</p>
+<p><strong>Result:</strong> The combined levers cut the monthly bill roughly twentyfold, dominated by the cadence change, with the architecture and quantization contributing the rest. Alert recall held because the volatile sensors that actually fail kept the fast cadence. The rollout was approved.</p>
+<p><strong>Lesson:</strong> Stack the levers in order of leverage: cadence and volume first, architecture second, compression third. The biggest saving came from refusing to forecast slow sensors at high frequency, not from any model-level trick, exactly the priority subsection one predicts.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Production Quantization and Serving in a Few Lines</div>
+<p>The from-scratch quantization of Code 34.4.2 ran about 20 lines of scale-round-rescale logic for a single layer. Production stacks reduce the whole compression-and-serving path to a handful of calls: <code>torch.quantization.quantize_dynamic(model, {...}, dtype=torch.qint8)</code> quantizes every layer at once (the one line of Code 34.4.3), and an export to <code>onnxruntime</code> with its INT8 execution provider then serves the quantized graph with fused, hardware-tuned integer kernels.</p>
+<pre><code class="language-python">import torch
+# Quantize the whole model (replaces ~20 hand-written lines per layer) ...
+qmodel = torch.quantization.quantize_dynamic(model, {torch.nn.Linear, torch.nn.GRU},
+                                             dtype=torch.qint8)
+# ... then export to ONNX for an optimized serving runtime.
+torch.onnx.export(qmodel, batch, "forecaster_int8.onnx", opset_version=17)
+# onnxruntime then serves it with INT8 kernels:
+#   import onnxruntime as ort
+#   sess = ort.InferenceSession("forecaster_int8.onnx")
+#   preds = sess.run(None, {"x": batch.numpy()})[0]
+</code></pre>
+<p>What you write by hand: a scale, a round, a rescale, and a benchmark loop. What the libraries handle: per-layer scale selection, integer kernel dispatch, graph fusion, and cross-hardware deployment. The line-count reduction is roughly twenty hand-written lines per layer down to one model-wide call, plus a one-line export to a tuned serving runtime.</p>
+</div>
+
+<h2>6. Exercises</h2>
+<p>These exercises move from reasoning about the cost model, to implementing a compression lever, to confronting the open question of whether a foundation model earns its cost.</p>
+<h3>Conceptual</h3>
+<ol>
+<li><strong>Find the dominant term.</strong> A deployment has $N = 500{,}000$ series, refreshed every $10$ minutes, on hardware where one batched inference of $4096$ series takes $80$ milliseconds, and it retrains nightly with a $20$-minute training job. Using the cost model $C = N \cdot f \cdot c_{\text{infer}} + f_{\text{retrain}} \cdot c_{\text{train}}$, estimate the monthly serving cost and the monthly retraining cost at a $2 per GPU-hour rate, state which dominates, and name the single change that would most reduce the total. Explain why model size is not the first lever to reach for here.</li>
+</ol>
+<h3>Implementation</h3>
+<ol start="2">
+<li><strong>Sweep the accuracy-cost frontier.</strong> Extend Code 34.4.3 to also benchmark a distilled model: train a half-width student GRU ($d_h = 64$) to match the float teacher's outputs on the benchmark batch, then plot throughput on one axis and mean absolute error versus the float reference on the other for three models (float, INT8-quantized, distilled student). Identify which model maximizes throughput per unit of accuracy lost, and connect your answer to the right-sizing argument of subsection four. Report the line-count of your distillation loop and contrast it with the one-line quantization call.</li>
+</ol>
+<h3>Open-ended</h3>
+<ol start="3">
+<li><strong>Does the foundation model earn its keep?</strong> Pick one zero-shot foundation forecaster from <a href="../../part-3-temporal-deep-learning/module-15-temporal-foundation-models/index.html">Chapter 15</a> (Chronos, TimesFM, or Moirai) and one cheap baseline (seasonal-naive) and design a cost-adjusted benchmark across a panel of your choice: define a business value function $V(\text{accuracy})$ that saturates, estimate $c_{\text{infer}}$ for each model on the same hardware, and determine the panel size $N$ and frequency $f$ at which the foundation model's net value $V - C$ overtakes the baseline's. Discuss how the removal of the retraining term $f_{\text{retrain}} \cdot c_{\text{train}}$ for the zero-shot model changes the crossover, and where you are genuinely uncertain.</li>
+</ol>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-34.3.html">&#8592; 34.3 Serving and Inference</a>
+<a class="up" href="index.html">Chapter 34 Contents</a>
+<a class="next" href="section-34.5.html">34.5 Reliability, Versioning, and Incident Response &#8594;</a>
+</nav>
+</main>
+<footer class="site-footer">
+<p>Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+<p><script>document.write("Last updated " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

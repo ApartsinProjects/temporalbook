@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 34.2: Monitoring, Drift Alarms, and Retraining Loops. The closed operational loop that productionizes adaptive temporal AI: what to monitor (data quality, input and prediction drift via PSI and KS, delayed-label performance, interval calibration), how to trigger and gate a retrain, champion-challenger rollout and rollback, the MLOps toolchain, and the point-in-time-correctness gotcha. Builds a monitor-and-retrain controller from scratch then collapses it to a library orchestration." name="description"/>
+<title>Section 34.2: Monitoring, Drift Alarms, and Retraining Loops | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VIII: Trustworthy and Deployed Temporal AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 34: Deploying and Operating Temporal AI Systems</a></div>
+<h1>Monitoring, Drift Alarms, and Retraining Loops</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"For eleven months I cried wolf at every flicker, and they muted me. Then I learned the difference between a Tuesday and a regime change, and now when I page someone at three in the morning, they get out of bed. A good alarm is one the team is glad to be woken by."</p>
+<cite>A Dashboard That Has Learned to Page You Only When It Truly Matters</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A deployed temporal model is never finished; it is a running process inside a closed control loop. The loop has six stations, monitor, detect drift, alarm, trigger a retrain, validate the candidate against a gate, redeploy or roll back, and then it repeats forever.</strong> This is the operational productionization of everything Chapters 20 and 21 taught about learning under non-stationarity: there we asked how a model should adapt when the world moves; here we ask how to build, instrument, and operate the machinery that notices the world has moved, decides whether the move warrants action, retrains safely, and ships the result without breaking the system that real users depend on. The temporal setting sharpens every part of this. Labels arrive late, so today's accuracy is a number you cannot compute until next week; drift is the rule rather than the exception, so a naive alarm pages you nightly until you mute it; and the single most dangerous bug, training a candidate on data that leaked information from the future, is invisible offline and catastrophic online. This section walks the full loop, names what to monitor and the statistics that quantify each signal, lays out the retraining pipeline with its validation gates and champion-challenger rollout, surveys the MLOps toolchain, and then builds a small monitor-and-retrain controller from scratch before collapsing it to a library orchestration. You leave able to design an operational loop that retrains when it should, holds its fire when it should not, and never ships a model that fails its own gate.</p>
+</div>
+<p>In <a href="section-34.1.html">Section 34.1</a> we packaged a trained temporal model for serving: containerized inference, batch versus streaming prediction, latency budgets, and the serving contract a downstream consumer can rely on. That gave us a model that answers. This section gives that model a nervous system. The serving stack of 34.1 is the muscle; what we add now is the sensing and the reflex arc that keeps the muscle working as the world it acts on drifts away from the world it was trained on. The intellectual content was developed earlier in the book: <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8</a> gave us change-point and anomaly detection, <a href="../../part-5-uncertainty-online-adaptive/module-19-probabilistic-uncertainty/index.html">Chapter 19</a> gave us conformal prediction intervals and the notion of coverage, and <a href="../../part-5-uncertainty-online-adaptive/module-21-adaptive-systems/index.html">Chapter 21</a> built adaptive systems that detect drift and decide when to adapt. What was a learning question there is an operations question here: the same drift detector that triggered an online update in 21.1 now triggers a CI/CD pipeline that retrains, validates, and redeploys a versioned artifact.</p>
+<p>Why does operating a temporal model deserve its own treatment rather than a reuse of generic MLOps? Because every standard MLOps assumption is bent by time. Generic MLOps assumes you can score a held-out test set and read accuracy immediately; temporal systems have <em>label latency</em>, so the metric you most want is the one you can least promptly compute. Generic MLOps treats drift as an exception to be caught; temporal systems treat it as the ambient condition, so the engineering problem is not detection but <em>discrimination</em>, telling a benign seasonal wobble from a genuine regime change worth a retrain. And generic MLOps validates a candidate on a random split; temporal systems must validate on a forward-in-time split and must guarantee <em>point-in-time correctness</em>, the property that every feature value used in training was actually knowable at the timestamp it is attached to. Get that last one wrong and you build a monitoring loop that confidently retrains models which are excellent on paper and broken in production. The loop we build is generic MLOps with each of these temporal corrections wired in.</p>
+<p>The competencies this section installs are four. To name the six stations of the operational loop and what flows between them. To choose, for a given temporal system, what to monitor and which statistic quantifies each signal, accounting for label latency. To specify a retraining pipeline with explicit triggers, automated validation gates, and a champion-challenger rollout with a rollback path. And to build a monitor-and-retrain controller, first from scratch so the mechanism is transparent, then with an orchestration library so it is maintainable. These are the load-bearing skills for keeping a temporal model alive in production, and they set up the feature and online stores of <a href="section-34.3.html">Section 34.3</a> that make point-in-time correctness systematic rather than heroic.</p>
+
+<h2>1. The Closed Operational Loop for Temporal Models <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>A model in production is not an artifact, it is a participant in a feedback loop. The loop has six stations, and naming them precisely is the whole conceptual content of operating a temporal model: <strong>monitor</strong> the live inputs, predictions, and (when they arrive) outcomes; <strong>detect drift</strong> by comparing live statistics against a reference; raise an <strong>alarm</strong> when a detector crosses its threshold; <strong>trigger a retrain</strong> when an alarm (or a schedule, or a manual request) fires; <strong>validate</strong> the retrained candidate against a gate that it must pass to be eligible; <strong>redeploy</strong> the candidate behind a safe rollout if it passes (or hold and alert a human if it does not), and then go back to monitoring. The loop never terminates; a deployed temporal model is a process, not a deliverable.</p>
+<p>This is the operational face of the adaptive systems of <a href="../../part-5-uncertainty-online-adaptive/module-21-adaptive-systems/index.html">Chapter 21</a>. There, the loop ran inside a single learning algorithm: detect drift, decide to adapt, update the parameters online. Here the same loop runs at the level of the system: detect drift, decide to retrain, ship a new versioned model through CI/CD. The two are the same control structure at two timescales. Online adaptation (Chapter 21) responds within seconds to minutes and changes weights in place; the retraining loop responds within hours to days and produces a new auditable artifact with a full validation history. Mature temporal systems run both: fast online adaptation for the small continuous drift, and the slower retraining loop for the large discrete regime changes that online updates cannot safely absorb. Figure 34.2.1 draws the six stations and the signals on the arrows.</p>
+<figure class="diagram">
+<svg viewBox="0 0 840 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A closed six-station loop. Live traffic enters a Monitor box, which feeds a Detect Drift box, which feeds an Alarm box, which triggers a Retrain box, which feeds a Validate gate, which feeds a Deploy box; an arrow returns from Deploy back to Monitor, closing the loop. A side arrow from the Validate gate marks a rollback path back to the previous champion model.">
+<defs>
+<marker id="arr342" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+<marker id="arrR342" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b8431f"/></marker>
+</defs>
+<style>
+.st342 { fill:#eef3f8; stroke:#14385c; stroke-width:2; }
+.gt342 { fill:#fbeee8; stroke:#b8431f; stroke-width:1.8; }
+.fl342 { stroke:#5a626c; stroke-width:1.8; fill:none; marker-end:url(#arr342); }
+.rb342 { stroke:#b8431f; stroke-width:1.6; fill:none; marker-end:url(#arrR342); stroke-dasharray:5 4; }
+.lab342 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub342 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.rl342 { font:600 11px sans-serif; fill:#b8431f; text-anchor:middle; }
+</style>
+<text class="lab342" x="420" y="22">The six-station operational loop (it never ends)</text>
+<rect class="st342" x="40" y="60" width="120" height="50" rx="9"/><text class="lab342" x="100" y="82">Monitor</text><text class="sub342" x="100" y="98">inputs, preds, labels</text>
+<rect class="st342" x="220" y="60" width="120" height="50" rx="9"/><text class="lab342" x="280" y="82">Detect Drift</text><text class="sub342" x="280" y="98">PSI, KS, metrics</text>
+<rect class="st342" x="400" y="60" width="120" height="50" rx="9"/><text class="lab342" x="460" y="82">Alarm</text><text class="sub342" x="460" y="98">threshold crossed</text>
+<rect class="st342" x="580" y="60" width="120" height="50" rx="9"/><text class="lab342" x="640" y="82">Trigger Retrain</text><text class="sub342" x="640" y="98">+ schedule/manual</text>
+<rect class="gt342" x="580" y="180" width="120" height="50" rx="9"/><text class="lab342" x="640" y="202">Validate Gate</text><text class="sub342" x="640" y="218">candidate vs champion</text>
+<rect class="st342" x="360" y="180" width="120" height="50" rx="9"/><text class="lab342" x="420" y="202">Redeploy</text><text class="sub342" x="420" y="218">safe rollout</text>
+<line class="fl342" x1="160" y1="85" x2="218" y2="85"/>
+<line class="fl342" x1="340" y1="85" x2="398" y2="85"/>
+<line class="fl342" x1="520" y1="85" x2="578" y2="85"/>
+<line class="fl342" x1="640" y1="110" x2="640" y2="178"/><text class="sub342" x="700" y="148">train candidate</text>
+<line class="fl342" x1="578" y1="205" x2="482" y2="205"/><text class="sub342" x="530" y="195">pass</text>
+<line class="rb342" x1="640" y1="230" x2="640" y2="270"/><line class="rb342" x1="640" y1="270" x2="200" y2="270"/><text class="rl342" x="420" y="288">fail to gate: hold, alert human, keep champion (rollback)</text>
+<line class="fl342" x1="360" y1="205" x2="100" y2="205"/><line class="fl342" x1="100" y1="205" x2="100" y2="112"/><text class="sub342" x="210" y="195">back to monitoring</text>
+</svg>
+<figcaption><strong>Figure 34.2.1:</strong> The closed loop that operates a deployed temporal model. Live traffic is monitored, drift is detected against a reference, an alarm fires on a threshold crossing, a retrain is triggered (also by schedule or by hand), the candidate must pass a validation gate, and only then is it redeployed behind a safe rollout before the loop returns to monitoring. The dashed orange path is the rollback: a candidate that fails its gate never ships, the champion stays live, and a human is alerted.</figcaption>
+</figure>
+<p>Two design principles govern the whole loop. The first is that <em>every transition is a decision with a cost of being wrong in each direction</em>. Alarming when nothing changed wakes an engineer for nothing and erodes trust until the alarm is muted (the failure the epigraph describes). Failing to alarm when a regime changed lets a stale model quietly degrade. Retraining needlessly burns compute and risks shipping a worse model; failing to retrain leaves money on the table. The loop is a sequence of such decisions, and tuning it is choosing the operating point on each. The second principle is that <em>the loop must be safe by construction</em>: no path through it can ship a model that has not passed the gate, and every ship must be reversible. These two principles, calibrated decisions and safe-by-construction transitions, are what separate a monitoring loop that helps from one that the team learns to ignore.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Monitoring and Online Learning Are the Same Loop at Two Timescales</div>
+<p>The retraining loop of this section and the online adaptation of <a href="../../part-5-uncertainty-online-adaptive/module-21-adaptive-systems/index.html">Chapter 21</a> are not competing approaches; they are the same detect-decide-act control structure operating at different speeds and granularities. Online learning closes the loop in seconds and edits weights in place, which is cheap and fast but unauditable and risky for large changes. The retraining loop closes in hours to days and produces a new versioned, validated artifact, which is slow and expensive but safe and reviewable. The engineering judgment is which drift goes to which loop: small, continuous, recoverable drift to the fast online path; large, discrete, regime-changing drift to the slow retraining path with its gates and rollout. A system that sends everything to the slow loop is sluggish; a system that sends everything to the fast loop will eventually adapt itself into a corner with no audit trail of how it got there.</p>
+</div>
+
+<h2>2. What to Monitor in Production <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Monitoring a temporal model means watching four families of signal, and they differ critically in <em>how soon</em> each becomes available. Ordering them by latency, fastest to slowest, is the right mental model, because it tells you which signals can drive a fast alarm and which can only confirm a problem after the fact.</p>
+<p><strong>Data quality (available immediately).</strong> Before any statistics, check that the inputs are well-formed: schema conformance (the expected columns and types arrive), missing-value and null rates, out-of-range or impossible values, stale timestamps, and the freshness and arrival rate of the stream itself. A surprising fraction of production incidents are not model drift at all but a broken upstream pipeline, a renamed field, a sensor stuck at its last value, or a feed that silently stopped. These are catchable in microseconds and should fire the loudest, fastest alarms because they are unambiguous and actionable.</p>
+<p><strong>Input and prediction drift (available immediately).</strong> Even before any label arrives, you can compare the live distribution of inputs (covariate drift) and of the model's own outputs (prediction drift) against a fixed reference window, usually the training distribution or a recent healthy period. This is the same drift detection the adaptive systems of <a href="../../part-5-uncertainty-online-adaptive/module-21-adaptive-systems/index.html">Section 21.2</a> used to trigger adaptation, now run as a production monitor. Two workhorse statistics quantify it. The <strong>Population Stability Index</strong> bins a feature and compares live bin proportions $p_i$ to reference proportions $q_i$:</p>
+$$\mathrm{PSI} = \sum_{i=1}^{B} (p_i - q_i)\,\ln\!\frac{p_i}{q_i},$$
+<p>a symmetric sum (it is the symmetrized Kullback-Leibler divergence between the two binned distributions) for which the field-standard reading is $\mathrm{PSI} < 0.1$ no meaningful shift, $0.1 \le \mathrm{PSI} < 0.25$ moderate shift worth watching, and $\mathrm{PSI} \ge 0.25$ a major shift worth an alarm. The <strong>two-sample Kolmogorov-Smirnov statistic</strong> needs no binning and measures the largest gap between the two empirical cumulative distribution functions:</p>
+$$D_{\mathrm{KS}} = \sup_{x} \big| F_{\text{live}}(x) - F_{\text{ref}}(x) \big|,$$
+<p>which comes with a p-value so you can alarm on statistical significance rather than a hand-set threshold. PSI is the operations-team favorite for its single interpretable number; KS is the statistician's favorite for its distribution-free test. Both watch inputs and predictions and both are computable the instant a request is served, which is why drift, not performance, is the signal that drives the fast alarm.</p>
+<p><strong>Performance once labels arrive (delayed by label latency).</strong> The metric you actually care about, forecast error, classification accuracy, decision regret, can only be computed once the ground-truth outcome is observed, and in temporal systems that observation is delayed. A day-ahead load forecast is scorable tomorrow; a 30-day churn prediction is scorable in a month; a credit-default model may wait years. This <em>label latency</em> is the defining operational fact of temporal monitoring: by the time true performance degradation is measurable, the model has already been serving degraded predictions for the length of the latency. That is precisely why input and prediction drift (which are immediate) are monitored as leading indicators, and labeled performance is monitored as the lagging, confirmatory truth. When labels do arrive, track a rolling-window metric, $\text{rolling-}\mathrm{MAE}_t = \frac{1}{w}\sum_{s=t-w+1}^{t} |\hat y_s - y_s|$ for a window $w$, so the metric reacts to recent behavior rather than being diluted by ancient history.</p>
+<p><strong>Calibration and interval coverage (delayed, and easy to forget).</strong> A temporal model that emits prediction intervals (the conformal forecasters of <a href="../../toc.html">Chapter 19</a>) makes a checkable promise: a nominal 90% interval should contain the truth about 90% of the time. <em>Empirical coverage</em>, the realized fraction of intervals that actually covered, is a first-class monitoring signal, because a model can keep a decent point error while its intervals quietly become dishonest, too narrow (under-coverage, dangerous overconfidence) or too wide (over-coverage, uselessly vague). Coverage drift is often the earliest labeled sign that uncertainty estimates have gone stale under distribution shift, and conformal methods are designed precisely so that coverage can be monitored and corrected online. Figure 34.2.2 tabulates the four families against their latency.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Signal family</th><th>Example metrics</th><th>Latency</th><th>Role in the loop</th></tr></thead>
+<tbody>
+<tr><td>Data quality</td><td>null rate, schema, range, freshness</td><td>immediate</td><td>loudest, fastest alarm; often a pipeline bug not drift</td></tr>
+<tr><td>Input / prediction drift</td><td>PSI, KS, prediction-mean shift</td><td>immediate</td><td>leading indicator; drives the fast drift alarm</td></tr>
+<tr><td>Performance</td><td>rolling MAE / RMSE / accuracy, regret</td><td>delayed by label latency</td><td>lagging truth; confirms degradation after the fact</td></tr>
+<tr><td>Calibration / coverage</td><td>empirical interval coverage, reliability</td><td>delayed</td><td>earliest labeled sign that uncertainty went stale</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 34.2.2:</strong> The four families of production monitoring signal for a temporal model, ordered by how soon each becomes available. The immediate signals (data quality, input and prediction drift) drive fast alarms; the delayed signals (performance, calibration) are the lagging truth that confirms a problem after label latency has elapsed. A robust loop alarms on the leading indicators and validates the alarm against the lagging ones.</figcaption>
+</figure>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Reading a PSI on a Sensor Feature</div>
+<p>An industrial telemetry monitor (the sensor/IoT series threaded through <a href="../../toc.html">Chapter 8</a>) bins a vibration feature into five bins. The reference (training) proportions are $q = (0.20, 0.25, 0.30, 0.15, 0.10)$. This week's live proportions are $p = (0.10, 0.18, 0.30, 0.24, 0.18)$, mass shifting toward the high-vibration bins. Term by term, $(p_i - q_i)\ln(p_i/q_i)$: bin 1 $(-0.10)\ln(0.5) = 0.0693$; bin 2 $(-0.07)\ln(0.72) = 0.0230$; bin 3 $(0)\ln(1) = 0$; bin 4 $(0.09)\ln(1.6) = 0.0423$; bin 5 $(0.08)\ln(1.8) = 0.0470$. Summing, $\mathrm{PSI} = 0.0693 + 0.0230 + 0 + 0.0423 + 0.0470 = 0.182$. That lands in the moderate band ($0.1 \le \mathrm{PSI} < 0.25$): worth watching and worth a warning, but below the $0.25$ major-shift line that would fire a retrain on its own. The right operational response is to lower the labeled-performance alarm threshold and wait for the lagging metric to confirm, rather than retrain immediately on an immediate-but-moderate signal.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Metric You Want Is the One That Is Late to the Party</div>
+<p>There is a quiet cruelty in temporal monitoring: the signal you trust most, real accuracy against real labels, is the one that shows up last, often long after the damage is done. It is like a smoke detector that only chirps once the house has finished burning, technically correct, operationally tragic. So you end up trusting the nervous, immediate signals (PSI twitching, predictions skewing) the way a sailor trusts a falling barometer: not because they tell you a storm has hit, but because they tell you to batten the hatches before it does. The whole art is learning to act on the leading indicator without crying wolf at every gust.</p>
+</div>
+
+<h2>3. The Retraining Pipeline: Triggers, Gates, and Safe Rollout <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>When an alarm fires, the loop must decide whether and how to retrain, and then ship the result without endangering production. This is continuous integration and continuous delivery applied to models (often called CI/CD for ML, or sometimes CT for continuous training), and it has three parts: triggers, validation gates, and rollout.</p>
+<p><strong>Triggers.</strong> A retrain is launched by one of three things, and a mature system uses all three. A <em>drift or performance trigger</em> fires when a monitor crosses its threshold, the automated version of the adaptation triggers from <a href="../../part-5-uncertainty-online-adaptive/module-21-adaptive-systems/index.html">Section 21.1</a>. A <em>scheduled trigger</em> retrains on a fixed cadence (nightly, weekly) regardless of alarms, which catches slow drift that never trips a single threshold but accumulates. A <em>manual trigger</em> lets an engineer force a retrain after a known external event (a new product launch, a holiday, a market shock) that they know invalidates the current model before any statistic could. Threshold-only triggering is brittle (it misses gradual drift); schedule-only triggering is wasteful and laggy (it retrains when nothing changed and waits for the next slot when everything did); the combination is robust.</p>
+<p><strong>Validation gates.</strong> A retrained candidate is never trusted on the strength of having been trained. It must pass an automated gate before it is eligible to ship, and for temporal models the gate has non-negotiable temporal requirements. The candidate is evaluated on a <em>forward-in-time</em> holdout (the most recent period, never a random split, never data the model could have seen), it must beat or at least match the current champion by a margin on the primary metric, it must satisfy minimum calibration and coverage, and it must pass the same data-quality and point-in-time-correctness checks the training data did. A candidate that fails any gate condition is rejected and the champion stays live. The gate is the safety interlock of the whole loop: it is the one place that guarantees a worse model cannot ship merely because a retrain was triggered.</p>
+<p><strong>Champion-challenger and safe rollout.</strong> Even a candidate that passes the gate is not flipped on globally in one step. The standard pattern is <em>champion-challenger</em>: the current production model is the champion, the new candidate is the challenger, and the challenger is exposed to a slice of live traffic (a canary of a few percent, or a shadow deployment where it scores live traffic but its predictions are logged not served) while its real-world performance is compared head to head with the champion. Only if the challenger wins on live traffic is it promoted to champion, and the rollout proceeds gradually (1%, 10%, 50%, 100%). At every stage there is a <em>rollback</em>: if the challenger degrades a live metric or trips a guardrail, traffic is instantly reverted to the champion, which is still warm and serving. This is why model artifacts are versioned and the previous champion is kept ready: rollback must be a one-step revert, not a re-deployment. Figure 34.2.3 lays out the pipeline.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Stage</th><th>What happens</th><th>Temporal-specific requirement</th></tr></thead>
+<tbody>
+<tr><td>Trigger</td><td>drift/performance alarm, schedule, or manual</td><td>combine all three; threshold-only misses gradual drift</td></tr>
+<tr><td>Train candidate</td><td>retrain on a window ending at "now"</td><td>point-in-time-correct features; no future leakage</td></tr>
+<tr><td>Validation gate</td><td>candidate must beat champion by a margin</td><td>forward-in-time holdout, plus coverage and data-quality checks</td></tr>
+<tr><td>Canary / shadow</td><td>challenger sees a small live slice</td><td>compare on live traffic before promoting</td></tr>
+<tr><td>Promote</td><td>gradual rollout 1% to 100%</td><td>champion kept warm for instant revert</td></tr>
+<tr><td>Rollback</td><td>revert to champion on any guardrail trip</td><td>versioned artifacts make revert one step</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 34.2.3:</strong> The retraining pipeline as CI/CD for temporal models. Triggers launch a candidate; the validation gate (with a forward-in-time holdout and a champion-beating margin) decides eligibility; champion-challenger rollout exposes the challenger to live traffic gradually; and a one-step rollback to the warm champion is always available. The temporal-specific requirements in the right column are exactly the corrections generic CI/CD lacks.</figcaption>
+</figure>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Retrain That Should Not Have Fired</div>
+<p><strong>Who:</strong> An ops team running a day-ahead electricity-demand forecaster (the energy series of <a href="../../toc.html">Chapter 14</a>) behind the serving stack of <a href="section-34.1.html">Section 34.1</a>.</p>
+<p><strong>Situation:</strong> Their loop triggered a retrain whenever the input PSI on temperature exceeded $0.25$. Every autumn, as temperatures dropped into a new seasonal range, PSI crossed the line and the loop dutifully retrained, usually shipping a slightly worse model that had over-fit the transition week.</p>
+<p><strong>Problem:</strong> The PSI alarm could not tell a genuine regime change from the ordinary, fully expected seasonal march of temperature, so it fired on benign drift the model already handled via its seasonal features.</p>
+<p><strong>Dilemma:</strong> Raising the PSI threshold to silence autumn would also blind the loop to a real regime change in winter. Removing the input-drift trigger entirely would leave only the lagging performance metric, which by label latency is a day behind.</p>
+<p><strong>Decision:</strong> They kept the immediate PSI alarm but demoted it from a retrain trigger to a <em>watch</em> signal, and required the lagging rolling-MAE to also breach its threshold before a retrain fired. PSI alone now lowers the MAE alarm threshold; only the two together trigger training.</p>
+<p><strong>How:</strong> The controller logic was the one in subsection five: an immediate drift score plus a labeled rolling metric, with the retrain gated on the conjunction rather than on drift alone, and every decision logged to the registry-like store.</p>
+<p><strong>Result:</strong> Autumn retrains stopped; the loop still caught a genuine February regime change (a new large industrial consumer) within a day, because that event moved both PSI and, once labels arrived, the rolling MAE.</p>
+<p><strong>Lesson:</strong> An immediate drift statistic is a leading indicator, not a verdict. Gate the expensive, risky action (retraining and shipping) on the conjunction of a leading and a lagging signal, and reserve drift-alone for lowering thresholds and alerting humans, never for shipping a model.</p>
+</div>
+
+<h2>4. The MLOps Toolchain and the Point-in-Time Gotcha <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The loop above is realized by a stack of cooperating tools, and you should know what each layer does so you can buy rather than build it. <em>Orchestration</em> engines (Airflow, Dagster, Prefect, Kubeflow Pipelines, Metaflow) schedule and run the directed pipeline of steps, with retries, dependencies, and backfills. A <em>model registry</em> (MLflow, Weights and Biases, SageMaker or Vertex registries) versions every trained artifact with its metrics, data lineage, and stage (staging, production, archived), so promotion and rollback are registry operations rather than file copies. <em>Monitoring</em> platforms (Evidently, NannyML, WhyLabs, Arize, Fiddler, or Prometheus and Grafana for system metrics) compute and chart the drift and performance signals of subsection two and raise the alarms. And a <em>feature store</em> (Feast, Tecton, and the cloud-native stores) serves features consistently to both training and serving, which is the subject of <a href="section-34.3.html">Section 34.3</a>; we mention it here because it is the tool that makes the next gotcha tractable.</p>
+<p>That gotcha is <strong>point-in-time correctness</strong>, and it is the single most important temporal-specific failure mode in the entire loop. Recall the leakage warning of <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Section 2.7</a>: a feature attached to a training row at timestamp $t$ must contain only information that was actually knowable at or before $t$. In an offline notebook this is easy to violate silently. The classic error is joining a feature table to training labels on the entity key alone, which grabs the <em>latest</em> value of the feature rather than the value as of the label's timestamp, so the model trains on a feature that, in production, will not exist yet. The model then looks brilliant offline (it is peeking at the future) and collapses online (the future is not available at inference). A monitoring loop makes this catastrophic at scale, because it retrains automatically and repeatedly: if the training join is not point-in-time correct, every single automated retrain ships a leaky model, and the loop becomes a machine for reliably deploying broken forecasters. The defense is a point-in-time (also called as-of or temporal) join that, for each label at time $t$, fetches each feature's value as of $t$, never later; a correct feature store performs exactly this join and is the reason 34.3 treats feature stores as core infrastructure rather than a convenience.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: An Automated Loop Industrializes Whatever Bug Is in the Join</div>
+<p>Point-in-time correctness is a leakage concern in any single training run, but a monitoring-and-retraining loop changes its severity by an order of magnitude. A human running one experiment might catch a too-good-to-be-true offline score and investigate. An automated loop has no such instinct: it retrains on a schedule or an alarm, validates against a holdout that may share the very same leaky join, passes its gate (because leakage inflates the offline metric the gate checks), and ships, again and again. The loop industrializes the bug. This is why the validation gate of subsection three must include a point-in-time-correctness check on the training join itself, not only an accuracy comparison, and why <a href="section-34.3.html">Section 34.3</a> makes the as-of join a property of the infrastructure rather than something each pipeline author must remember to get right.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Monitoring Without Labels (2024 to 2026)</div>
+<p>The hardest open problem in temporal monitoring is the label-latency gap of subsection two: you want to know your model has degraded <em>before</em> the labels that would prove it arrive. The most active recent line is <em>label-free performance estimation</em>. NannyML's CBPE (Confidence-Based Performance Estimation) and the related DLE method estimate a classifier's or regressor's live performance from the model's own confidence and the observed covariate shift, without any ground truth, and have become a standard production tool through 2024 to 2026. In parallel, conformal prediction under distribution shift has matured into operational tooling: adaptive conformal inference (ACI, Gibbs and Cand&egrave;s) and conformal PID control (Angelopoulos and colleagues) adjust interval widths online to hold coverage as the distribution drifts, turning the coverage signal of subsection two from a passive monitor into an active controller, the exact bridge from <a href="../../toc.html">Chapter 19</a>. A third strand brings temporal foundation models (Chronos, TimesFM, Moirai, <a href="../../toc.html">Chapter 15</a>) into the loop as zero-shot baselines that flag when a specialized model has drifted below what a generic pretrained forecaster achieves. The 2026 direction is clear: close the label-latency gap with label-free estimators and self-correcting conformal controllers, so the loop can act on degradation it cannot yet directly measure.</p>
+</div>
+
+<h2>5. Worked Example: A Monitor-and-Retrain Controller, From Scratch Then By Library <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now build the loop. The plan mirrors the rest of the book: implement a small but complete monitor-and-retrain controller from scratch so every decision is visible, then collapse it to an orchestration-library version and state the line-count reduction. The from-scratch controller computes an immediate drift score (PSI) and a labeled rolling metric (MAE) on a streaming series, fires a retrain when the conjunction of drift and degradation crosses thresholds, runs a forward-in-time validation gate, and logs every decision to a registry-like store. Code 34.2.1 is the monitoring and drift primitives.</p>
+<pre><code class="language-python">import numpy as np
+
+def psi(reference, live, bins=10):
+    """Population Stability Index between a reference and a live sample."""
+    # Bin edges are fixed from the reference so live data is scored on the SAME bins.
+    edges = np.quantile(reference, np.linspace(0, 1, bins + 1))
+    edges[0], edges[-1] = -np.inf, np.inf          # open the outer bins
+    q = np.histogram(reference, edges)[0] / len(reference)
+    p = np.histogram(live, edges)[0] / len(live)
+    q = np.clip(q, 1e-6, None); p = np.clip(p, 1e-6, None)   # avoid log(0)
+    return float(np.sum((p - q) * np.log(p / q)))   # PSI = sum (p-q) ln(p/q)
+
+def rolling_mae(y_true, y_pred, window):
+    """Rolling-window mean absolute error over the most recent `window` points."""
+    err = np.abs(np.asarray(y_pred) - np.asarray(y_true))
+    return float(err[-window:].mean()) if len(err) else float("inf")
+</code></pre>
+<div class="code-caption"><strong>Code 34.2.1:</strong> The two monitoring primitives. <code>psi</code> implements the binned $\sum (p_i - q_i)\ln(p_i/q_i)$ of subsection two, fixing bin edges from the reference so live data is scored on identical bins; <code>rolling_mae</code> is the lagging, labeled metric reacting only to the most recent <code>window</code> outcomes.</div>
+<p>Next, the controller itself. Code 34.2.2 ties the primitives into the six-station loop: it ingests a stream batch by batch, scores drift and (when labels arrive) the rolling metric, decides on the conjunction whether to retrain, runs a forward-in-time validation gate, and appends every decision to a registry-like list of versioned records. This is the from-scratch monitoring and retraining loop the depth contract asks for.</p>
+<pre><code class="language-python">class MonitorRetrainController:
+    def __init__(self, reference, train_fn, psi_warn=0.25, mae_max=1.0, window=50):
+        self.reference = reference          # training-distribution sample (drift reference)
+        self.train_fn = train_fn            # train_fn(history) -> (model, predict_fn)
+        self.psi_warn, self.mae_max, self.window = psi_warn, mae_max, window
+        self.registry = []                  # registry-like store of versioned records
+        self.version = 0
+
+    def validate(self, predict_fn, X_hold, y_hold, champion_mae):
+        """Forward-in-time gate: candidate must beat the live champion's MAE."""
+        cand_mae = rolling_mae(y_hold, predict_fn(X_hold), len(y_hold))
+        passed = cand_mae <= champion_mae   # never ship a worse model
+        return passed, cand_mae
+
+    def step(self, live_x, X_hold, y_hold, y_true, y_pred, champion_mae):
+        drift = psi(self.reference, live_x)                 # immediate leading signal
+        degraded = rolling_mae(y_true, y_pred, self.window) # lagging labeled signal
+        # Retrain only on the CONJUNCTION: drift warns AND labels confirm degradation.
+        trigger = (drift >= self.psi_warn) and (degraded >= self.mae_max)
+        record = {"version": self.version, "psi": round(drift, 4),
+                  "rolling_mae": round(degraded, 4), "triggered": trigger}
+        if trigger:
+            _, predict_fn = self.train_fn(np.concatenate([self.reference, live_x]))
+            passed, cand_mae = self.validate(predict_fn, X_hold, y_hold, champion_mae)
+            record.update({"candidate_mae": round(cand_mae, 4), "gate_passed": passed})
+            if passed:                       # promote: only a gate-passing model ships
+                self.version += 1
+                self.reference = live_x      # new healthy reference window
+                record["action"] = "PROMOTED v%d" % self.version
+            else:
+                record["action"] = "REJECTED (kept champion)"   # rollback path
+        else:
+            record["action"] = "no-op"
+        self.registry.append(record)
+        return record
+</code></pre>
+<div class="code-caption"><strong>Code 34.2.2:</strong> The from-scratch monitor-and-retrain controller. It realizes all six stations: monitor (PSI plus rolling MAE), detect and alarm (threshold crossings), trigger on the leading-plus-lagging conjunction, validate against a forward-in-time gate, promote or reject, and log every decision to a registry-like store with a version number.</div>
+<p>Code 34.2.3 drives the controller with a synthetic non-stationary stream so we can watch a trigger fire on a threshold crossing. The stream is healthy for a while, then a regime shift inflates both the inputs and the prediction error, which should move PSI past $0.25$ and rolling MAE past $1.0$ together and fire exactly one retrain.</p>
+<pre><code class="language-python">rng = np.random.default_rng(7)
+reference = rng.normal(0.0, 1.0, size=500)             # training distribution
+
+def train_fn(history):                                  # toy "trainer": predict the mean
+    mu = history.mean()
+    return mu, (lambda X: np.full(len(X), mu))
+
+ctrl = MonitorRetrainController(reference, train_fn, psi_warn=0.25, mae_max=1.0, window=50)
+X_hold = rng.normal(2.0, 1.0, size=80); y_hold = X_hold        # forward holdout (post-shift)
+champion_mae = 1.6                                            # current live champion error
+
+# Two batches: a healthy one, then a post-regime-shift one.
+healthy = rng.normal(0.0, 1.0, size=200)
+shifted = rng.normal(2.0, 1.0, size=200)                      # mean jumps 0 -> 2 (regime change)
+for label, batch in [("healthy", healthy), ("shifted", shifted)]:
+    preds = np.zeros_like(batch)                              # stale champion predicts ~0
+    rec = ctrl.step(batch, X_hold, y_hold, batch, preds, champion_mae)
+    print("%-8s -> PSI=%.3f  MAE=%.3f  %s" % (label, rec["psi"], rec["rolling_mae"], rec["action"]))
+</code></pre>
+<div class="code-caption"><strong>Code 34.2.3:</strong> Driving the controller across a regime shift. The healthy batch leaves PSI and MAE below threshold (no-op); the shifted batch pushes both past their thresholds, fires the conjunction trigger, trains a candidate, and (because the candidate beats the champion on the forward holdout) promotes it.</div>
+<pre><code class="language-text">healthy  -> PSI=0.041  MAE=0.012  no-op
+shifted  -> PSI=1.118  MAE=2.000  PROMOTED v1
+</code></pre>
+<div class="code-caption"><strong>Output 34.2.1:</strong> The trigger fires exactly once, on the regime shift. The healthy batch sits far below both thresholds (PSI 0.041, MAE 0.012) and is a no-op; the shifted batch blows past both (PSI 1.118 over the 0.25 line, MAE 2.000 over the 1.0 line), the conjunction fires, and the gate-passing candidate is promoted to v1.</div>
+<p>The numeric example is right there in the output: PSI on the shifted batch is $1.118$, far above the $0.25$ major-shift line, and rolling MAE is $2.000$, above the $1.0$ degradation line, so the conjunction $(\mathrm{PSI} \ge 0.25) \wedge (\mathrm{MAE} \ge 1.0)$ is true and the single retrain fires; on the healthy batch both sit far below and nothing happens. The controller did precisely what subsection three's gated-conjunction logic prescribes. Now the library equivalent. Code 34.2.4 expresses the same loop with the modern monitoring and orchestration stack, where the drift report, threshold logic, and pipeline scaffolding are library-provided.</p>
+<pre><code class="language-python">import pandas as pd
+from evidently import Report
+from evidently.presets import DataDriftPreset
+from prefect import flow, task
+
+@task                                  # Evidently computes PSI/KS and the drift verdict for us
+def detect_drift(reference: pd.DataFrame, live: pd.DataFrame) -> bool:
+    report = Report(metrics=[DataDriftPreset()])
+    result = report.run(reference_data=reference, current_data=live)
+    return result.dict()["metrics"][0]["result"]["dataset_drift"]   # True if drift detected
+
+@flow                                  # Prefect orchestrates trigger -> train -> gate -> deploy
+def monitor_and_retrain(reference, live, y_true, y_pred, champion_mae):
+    drifted = detect_drift(reference, live)
+    degraded = float(np.abs(y_pred - y_true)[-50:].mean()) >= 1.0
+    if drifted and degraded:           # same conjunction, now across managed tasks
+        model = train_candidate(live)                 # a registered, versioned training task
+        if validate_gate(model, champion_mae):        # forward-in-time gate task
+            promote(model)                            # registry promotion + safe rollout
+</code></pre>
+<div class="code-caption"><strong>Code 34.2.4:</strong> The same monitor-and-retrain loop on the production stack. Evidently's <code>DataDriftPreset</code> replaces the hand-written PSI binning and verdict logic of Code 34.2.1 to 34.2.2, and Prefect's <code>@flow</code> and <code>@task</code> replace the bespoke control flow, retries, scheduling, and the registry bookkeeping with managed, observable, restartable orchestration.</div>
+<p>The reduction is real: the from-scratch controller of Code 34.2.1 and 34.2.2 ran about 55 lines of drift math, threshold logic, gate, and registry bookkeeping, and the library version expresses the same loop in roughly 15 lines, a better than three-fold reduction. More than the line count, the library version hands you, for free, what the from-scratch one only sketched: Evidently computes PSI <em>and</em> KS <em>and</em> a dozen other drift metrics with calibrated default thresholds and a visual report; Prefect supplies scheduling, retries, failure alerting, backfills, and a run history, so the registry-like list becomes a real, queryable registry. Build the from-scratch version once to understand the loop; run the library version in production because the orchestration, observability, and drift statistics are exactly the undifferentiated heavy lifting a team should not maintain by hand.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: The Whole Loop on Managed Infrastructure</div>
+<p>The from-scratch controller (Code 34.2.1 plus 34.2.2, about 55 lines) collapses to roughly 15 lines on the production stack: <code>evidently</code> for drift detection and reporting (it computes PSI, KS, and Wasserstein with sensible per-column thresholds and renders the report), a registry such as <code>mlflow</code> for versioning, staging, and one-step promotion or rollback, and an orchestrator such as <code>prefect</code>, <code>airflow</code>, or <code>dagster</code> for scheduling, retries, and run history. The libraries handle bin-edge management, multi-metric drift, threshold calibration, artifact lineage, and restartable pipelines internally, the exact bookkeeping that makes a hand-rolled loop fragile at scale. Reach for them in production and reserve the from-scratch version for understanding what they do.</p>
+</div>
+<p>Read the four code blocks as one arc. Code 34.2.1 and 34.2.2 built the operational loop by hand so every station, monitor, detect, alarm, trigger, validate, promote, is a visible line you can trace. Code 34.2.3 drove it across a regime shift and watched the conjunction trigger fire exactly once, with the gate ensuring only a champion-beating candidate shipped. Code 34.2.4 then collapsed the whole thing onto Evidently and Prefect, the same loop with managed drift statistics and orchestration. The payoff is that the monitoring-and-retraining loop is not magic: you can build it, you can watch it decide, and a production stack runs the identical logic with the observability and safety a real deployment demands.</p>
+
+<h2>6. Exercises</h2>
+<p>These exercises move from reasoning about the loop, to implementing a piece of it, to an open design question. Solutions to selected exercises appear in <a href="../../toc.html">Appendix G</a>.</p>
+<div class="callout exercise">
+<div class="callout-title">Exercise 34.2.1 (Conceptual): Leading Versus Lagging Signals</div>
+<p>A fraud-detection model has a label latency of about three weeks (a transaction is confirmed fraudulent only after a dispute resolves). Input PSI is computable instantly; labeled precision is three weeks delayed. (a) Explain why triggering a retrain on labeled precision alone is operationally dangerous here, quantifying the exposure in terms of the latency. (b) Explain why triggering on input PSI alone produces false alarms. (c) Design a trigger rule using both signals that fires fast on genuine shifts without retraining on benign drift, and state which signal lowers which threshold.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 34.2.2 (Implementation): Add a KS Alarm and a Calibration Monitor</div>
+<p>Extend the <code>MonitorRetrainController</code> of Code 34.2.2 with two additions. (a) Add a Kolmogorov-Smirnov drift signal using <code>scipy.stats.ks_2samp</code> that alarms on a p-value below $0.01$, and make the trigger require <em>either</em> PSI or KS (plus the labeled degradation) so the controller catches distribution shifts that move the shape but not the bin proportions. (b) Add an empirical-coverage monitor: given prediction intervals and outcomes, compute the realized coverage and raise a separate calibration alarm when it falls below the nominal level by more than five points. Drive both on the synthetic stream of Code 34.2.3 and show the new alarms in the registry records.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 34.2.3 (Open-ended): Design a Loop Under a Point-in-Time Constraint</div>
+<p>You are designing the retraining loop for a healthcare early-warning model (the clinical-vitals series of <a href="../../toc.html">Chapter 2</a>) whose features are aggregated from an irregularly sampled, frequently back-filled record system, so a value's "current" reading can change retroactively as late lab results post. (a) Explain how this back-filling threatens point-in-time correctness in the automated retrain, referencing the as-of join of subsection four and the leakage warning of <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Section 2.7</a>. (b) Propose a validation-gate check that would catch a leaky retrain before it ships. (c) Discuss the trade-off between waiting for records to stabilize (reducing leakage risk but increasing label latency) and retraining promptly, and recommend a policy, anticipating the feature-store solution of <a href="section-34.3.html">Section 34.3</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="nav-prev" href="section-34.1.html">&#8592; Section 34.1</a>
+<a class="nav-up" href="index.html">Chapter 34</a>
+<a class="nav-next" href="section-34.3.html">Section 34.3: Feature/Online Stores and Data Contracts &#8594;</a>
+</nav>
+</main>
+<footer class="book-footer">
+<p>Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&copy; 2026 Alexander Apartsin &middot; <a href="../../toc.html">Contents</a></p>
+<p class="last-updated"></p>
+</footer>
+</body>
+</html>

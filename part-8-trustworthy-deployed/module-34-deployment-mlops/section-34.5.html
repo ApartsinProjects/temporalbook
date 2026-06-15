@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 34.5: Reliability, Versioning, and Incident Response. SLAs and SLOs for freshness and latency, graceful degradation to a seasonal-naive baseline and circuit breakers, versioning model and data and features and config for point-in-time replay, incident response for ML with shadow and canary and rollback and postmortems and feedback-loop danger, a reference architecture and runbook, and a from-scratch versioned serving wrapper with health check and automatic fallback matched against a library framework version." name="description"/>
+<title>Section 34.5: Reliability, Versioning, and Incident Response | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VIII: Trustworthy and Deployed Temporal AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 34: Deploying and Operating Temporal AI Systems</a></div>
+<h1>Reliability, Versioning, and Incident Response</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I have a rollback plan. I also have a rollback plan for the rollback plan, in case the rollback makes things worse, and a third plan that rolls back the plan that rolls back the rollback. At three in the morning, when the freshness SLO is burning and nobody can remember which model is live, the only plan anyone trusts is the seasonal-naive baseline from Chapter 5. It is never the best forecaster. It is always the one that still answers the phone."</p>
+<cite>A System That Has a Rollback Plan for the Plan That Rolls Back the Rollback</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A deployed temporal AI system does not make one prediction; it makes a prediction every minute, forever, and acts on each one. That single fact changes what "correct" means. A research model is correct if it is accurate on a held-out set. An operated model is reliable if it keeps answering, on time, with fresh data, and degrades gracefully when any of its dependencies fail, and if every past answer it ever gave can be reconstructed, explained, and rolled back.</strong> This closing section of Chapter 34 turns the serving (Section 34.1), monitoring (Section 34.2), feature store (Section 34.3), and cost (Section 34.4) machinery into an <em>operated</em> system. We set service-level objectives for freshness and latency and turn them into an error budget; we make the system fall back to a simple, always-available baseline (the seasonal-naive forecaster of <a href="../../toc.html">Chapter 5</a>) and trip a circuit breaker rather than serve garbage; we version the model, the data vintage, the features, and the config together so any prediction is replayable point-in-time (the discipline of <a href="../../toc.html">Section 2.7</a>) and auditable (<a href="../module-33-interpretability-robustness/index.html">Section 33.5</a>); we run shadow and canary deploys, detect a bad push, roll back, and write the postmortem; and we confront the feedback loop where a model's own actions corrupt the data it will next learn from (<a href="../../toc.html">Part VI</a>, fairness <a href="../module-33-interpretability-robustness/index.html">Section 33.3</a>). The worked example builds a versioned serving wrapper with a health check and automatic fallback from scratch, then in a few framework lines. You leave able to operate a temporal model, not merely train one, which closes Part VIII and opens the applications of Part IX.</p>
+</div>
+<p>In <a href="section-34.4.html">Section 34.4</a> we made the operated system affordable, trading accuracy against compute and latency under a budget. We have now assembled every operational organ a temporal model needs: a server that answers (34.1), monitors that watch for drift and decay (34.2), a feature store that supplies point-in-time-correct inputs (34.3), and a cost model that keeps the bill sane (34.4). What remains is the discipline that binds them into something you can trust at three in the morning: reliability targets you have promised to meet, a record complete enough to replay any decision, and a rehearsed response for the day a deploy goes wrong. That discipline is the subject of this section, and it is what separates a demo from a system other people depend on.</p>
+<p>The temporal setting sharpens every one of these concerns. A model that acts continuously is never "done" being evaluated; its quality is a live signal that decays (32.4 drift, 34.2 monitoring). Its inputs have a <em>vintage</em>, the wall-clock moment at which each feature value was known, and getting that vintage wrong is the leakage of <a href="../../toc.html">Chapter 2</a> reborn in production. And because the model acts, its actions enter the world and come back as tomorrow's training data, a closed loop that a static classifier never has to worry about. Reliability for temporal AI is therefore not a generic SRE checklist bolted on at the end; it is a temporal-thread concern, the same point-in-time correctness and the same baselines that ran through Parts I, II, and VI, now wearing an operations badge.</p>
+<p>Four competencies this section installs: to write freshness and latency SLOs and turn them into an error budget you can spend; to version model, data, features, and config jointly so any prediction replays exactly; to run a shadow or canary deploy, detect a bad model, roll back, and write the postmortem; and to build a serving wrapper that health-checks itself and falls back to a baseline automatically rather than failing loud and serving nothing.</p>
+
+<h2>1. Reliability for Systems That Act Continuously <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Reliability begins with a promise you write down. A <strong>service-level indicator</strong> (SLI) is a measured quantity, for example the fraction of requests served within 200 ms, or the staleness of the freshest input feature. A <strong>service-level objective</strong> (SLO) is a target on that indicator, for example "99 percent of forecasts return within 200 ms over any rolling 30 days" or "the model never acts on data more than 15 minutes stale". A <strong>service-level agreement</strong> (SLA) is the externally promised, often contractual, version of an SLO, with consequences attached. For a temporal system two SLIs dominate and they are specifically temporal: <em>latency</em>, how fast a prediction comes back, and <em>freshness</em>, how recent the data behind it is. A forecast that is fast but built on hour-old inputs can be worse than a slow one built on current data, so freshness deserves first-class SLO status, not an afterthought.</p>
+<p>An SLO is useful because it defines an <strong>error budget</strong>: the complement of the target is the amount of failure you are allowed to spend. A 99.9 percent availability SLO permits $0.1\%$ unavailability, which over 30 days is about 43 minutes. That budget is a currency. You spend it on risky deploys, on experiments, on tolerating a flaky dependency; when it is exhausted you freeze changes and stabilize. Framing reliability as a budget rather than a binary turns "never fail" (impossible, paralysing) into "fail no more than this much" (achievable, and a basis for decisions). Subsection five computes a concrete burn rate from these definitions.</p>
+<p>Because the system must keep answering even when its best path is broken, the central reliability pattern for temporal AI is <strong>graceful degradation</strong>: when the fancy model fails, times out, or emits an anomalous output, fall back to a simpler thing that is always available. The natural fallback in forecasting is the one we have leaned on since the beginning of the book: the <strong>seasonal-naive baseline</strong> of <a href="../../toc.html">Chapter 5</a>, which predicts $\hat{y}_{t+h} = y_{t+h-m}$ for season length $m$ (last week's Tuesday for this Tuesday). It needs no GPU, no feature store, no network call beyond the recent history, and it is never catastrophically wrong. It is the model that still answers the phone.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Baseline Is a Reliability Component, Not Just a Sanity Check</div>
+<p>In Part II the seasonal-naive forecaster was the yardstick every fancy model had to beat. In production it is promoted from yardstick to <em>safety net</em>. The same property that made it a good baseline, that it is dead simple and always computable, makes it the ideal degraded-mode output: when the deep forecaster is down, the feature store is stale, or the prediction fails a sanity check, serving last season's value is dramatically better than serving nothing or serving an exploded number. Keep the baseline running in production permanently, not just at evaluation time. The cheapest model in the book is also the most reliable, and a mature temporal system always has it warm in the wings.</p>
+</div>
+<p>The third reliability primitive is the <strong>circuit breaker</strong>, borrowed from electrical engineering and from microservice architecture. A circuit breaker wraps a call to a fragile dependency (the model server, the feature store, an external data feed) and tracks its recent failure rate. While failures stay below a threshold the breaker is <em>closed</em> and calls pass through. When failures exceed the threshold the breaker <em>opens</em>: it stops calling the failing dependency entirely and immediately returns the fallback, for a cool-down period. After the cool-down it goes <em>half-open</em>, letting a trial request through; success closes it again, failure re-opens it. The point is to stop hammering a sick dependency (which often makes it sicker) and to fail fast to the baseline instead of piling up timeouts. The state machine is small, and we implement it in subsection five.</p>
+<figure class="diagram">
+<svg viewBox="0 0 760 230" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A circuit-breaker state machine with three states. Closed lets calls pass to the model; on too many failures it transitions to Open, which returns the seasonal-naive baseline and waits a cooldown; after cooldown it goes Half-open and sends one trial call; trial success returns to Closed, trial failure returns to Open.">
+<defs>
+<marker id="arr345" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.st345 { fill:#eef3f8; stroke:#14385c; stroke-width:2; }
+.op345 { fill:#fbeee8; stroke:#b8431f; stroke-width:2; }
+.fl345 { stroke:#5a626c; stroke-width:1.7; fill:none; marker-end:url(#arr345); }
+.lab345 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.olab345 { font:600 14px sans-serif; fill:#b8431f; text-anchor:middle; }
+.ed345 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.t345 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+</style>
+<text class="t345" x="380" y="22">Circuit breaker: fail fast to the baseline, probe to recover</text>
+<rect class="st345" x="40" y="90" width="150" height="56" rx="10"/><text class="lab345" x="115" y="116">CLOSED</text><text class="ed345" x="115" y="134">calls reach the model</text>
+<rect class="op345" x="305" y="90" width="150" height="56" rx="10"/><text class="olab345" x="380" y="116">OPEN</text><text class="ed345" x="380" y="134">serve baseline, cool down</text>
+<rect class="st345" x="570" y="90" width="150" height="56" rx="10"/><text class="lab345" x="645" y="116">HALF-OPEN</text><text class="ed345" x="645" y="134">one trial call</text>
+<line class="fl345" x1="190" y1="108" x2="303" y2="108"/><text class="ed345" x="246" y="100">failures &gt; threshold</text>
+<line class="fl345" x1="455" y1="118" x2="568" y2="118"/><text class="ed345" x="511" y="110">cooldown elapsed</text>
+<path class="fl345" d="M645,90 C645,40 115,40 115,88"/><text class="ed345" x="380" y="52">trial succeeds: close</text>
+<path class="fl345" d="M645,146 C645,196 380,196 380,148"/><text class="ed345" x="512" y="188">trial fails: re-open</text>
+</svg>
+<figcaption><strong>Figure 34.5.1:</strong> The three-state circuit breaker that wraps the model server. While healthy it is closed and forecasts flow from the deep model; a burst of failures opens it and every request is immediately served by the seasonal-naive baseline of <a href="../../toc.html">Chapter 5</a> while the dependency cools down; a single half-open trial decides whether to close again. Graceful degradation and the breaker together guarantee the system always answers, even degraded.</figcaption>
+</figure>
+
+<h2>2. Versioning Everything: Point-in-Time Reproducibility <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A prediction is not reproducible unless you can pin down the four things that produced it: the <strong>model</strong> (which weights and code), the <strong>data vintage</strong> (which inputs, as known at which wall-clock moment), the <strong>features</strong> (which transformation code and which feature-store snapshot), and the <strong>config</strong> (hyperparameters, thresholds, the season length $m$, the fallback policy). Version all four jointly and stamp every served prediction with the tuple, and any past prediction becomes <em>replayable point-in-time</em>: feed the recorded vintage through the recorded model and features under the recorded config and you reconstruct the exact number, byte for byte.</p>
+<p>The data-vintage requirement is the production face of a hazard we have fought since <a href="../../toc.html">Chapter 2</a>. <a href="../../toc.html">Section 2.7</a> defined point-in-time correctness: a feature attached to time $t$ may use only information available <em>at or before</em> $t$, never a value that was revised, backfilled, or arrived later. In training, violating this is leakage and inflates your offline metrics. In production, replaying a past prediction with <em>today's</em> revised data, rather than the vintage actually known then, is the same sin in reverse: you reconstruct a number the model never could have produced, and your audit is a fiction. A point-in-time feature store (34.3) solves both: it answers "what was the value of this feature as known at timestamp $\tau$" and never leaks the future into the past.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: A Prediction Is a Function of Four Versions, So Log All Four</div>
+<p>Write the served value as $\hat{y} = f_{\theta}(\,\phi(\,D_{\le \tau}\,;\, c)\,)$, where $\theta$ is the model version, $\phi$ the feature code version, $D_{\le \tau}$ the data vintage as known at time $\tau$, and $c$ the config. The prediction is reproducible if and only if all four are recorded and immutable. Log them as a compact tuple, <code>(model_id, feature_id, data_vintage_ts, config_hash)</code>, alongside every prediction. This single tuple is what makes a forecast auditable: it lets a regulator, a postmortem, or a customer ask "why did the system say that on March 3rd" and get the exact answer replayed, not a plausible reconstruction. Versioning is the precondition for explanation; you cannot explain what you cannot replay.</p>
+</div>
+<p>This joint versioning is precisely what makes the <strong>auditing</strong> of <a href="../module-33-interpretability-robustness/index.html">Section 33.5</a> possible. An audit asks the system to justify a specific past decision: which inputs, which model, which logic. Without point-in-time replay the honest answer is "we cannot reconstruct it", which fails every governance regime. With it, the audit is mechanical: pull the tuple, replay the inputs through the pinned model, and the attribution and counterfactual tools of Chapter 33 run on the exact computation that actually happened. Reproducibility is not a nicety for the research notebook; in a deployed, regulated temporal system it is the load-bearing substrate under interpretability, fairness review, and incident analysis alike.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: "It Works On My Vintage"</div>
+<p>The classic developer lament "it works on my machine" has a temporal cousin that bites forecasting teams: "it works on my vintage". A model is debugged against the data as it looks <em>today</em>, all gaps backfilled and all revisions applied, and reproduces a past incident perfectly in the notebook. In production at the time, the same model saw a jagged, half-arrived, not-yet-revised version of that data and behaved completely differently. The bug is real, the reproduction is fake, and the fix targets a problem that never occurred. The cure is to debug against the vintage, never the hindsight. Time travel is allowed in this book only if you travel to what was actually known then.</p>
+</div>
+
+<h2>3. Incident Response for Machine Learning <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Software incidents are usually crashes: the code throws, a service returns 500, and the failure is loud. ML incidents are often silent: the service stays up, returns 200, and quietly serves worse predictions because someone pushed a bad model, a feature pipeline started emitting nulls, or the input distribution shifted under a model that no longer fits (the decay of 34.2). The first job of ML incident response is therefore <em>detection</em> of a degradation that does not announce itself, which is exactly what the monitoring of <a href="section-34.2.html">Section 34.2</a> provides: drift alarms, prediction-distribution checks, and the delayed ground-truth metrics that catch a quality drop. An incident begins when a monitor fires, not when the pager screams about a stack trace.</p>
+<p>Safe deployment is what prevents most incidents, and it has a standard ladder. A <strong>shadow</strong> deploy runs the new model alongside the live one on real traffic but discards its outputs, comparing them offline; it catches crashes and gross prediction differences at zero user risk. A <strong>canary</strong> deploy then routes a small slice of real traffic (1 to 5 percent) to the new model and watches its live metrics; if they hold, traffic ramps up gradually, and if they degrade, the canary is pulled. Both rest on the ability to <strong>roll back</strong> (return instantly to the previous known-good version) and to <strong>roll forward</strong> (ship a fix as a new version when rollback is impossible, for example because the data schema already changed). The versioning of subsection two is what makes rollback a one-line pointer change rather than a redeployment scramble: known-good is just another logged tuple.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Stage</th><th>Traffic to new model</th><th>User risk</th><th>Catches</th></tr></thead>
+<tbody>
+<tr><td>Offline eval</td><td>none (held-out set)</td><td>none</td><td>accuracy regressions on history</td></tr>
+<tr><td>Shadow</td><td>mirrored, outputs discarded</td><td>none</td><td>crashes, latency, gross output drift</td></tr>
+<tr><td>Canary</td><td>1 to 5 percent, live</td><td>small, bounded</td><td>live-metric regressions, real-world surprises</td></tr>
+<tr><td>Ramp</td><td>5 to 100 percent, gradual</td><td>growing but monitored</td><td>scale-dependent and slow-burn failures</td></tr>
+<tr><td>Rollback</td><td>0 percent (revert pointer)</td><td>removes the bad model</td><td>(the response, not a detector)</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 34.5.2:</strong> The safe-deployment ladder for a temporal model. Risk rises one controlled rung at a time, and every rung above offline eval depends on the live monitors of <a href="section-34.2.html">Section 34.2</a> to decide whether to climb or to roll back. Rollback is cheap precisely because every version is logged as the immutable tuple of subsection two.</figcaption>
+</figure>
+<p>When an incident is resolved, the work is not over: a <strong>postmortem</strong> records what happened, the timeline, the root cause, the user impact, and the concrete actions to prevent recurrence, and it is <em>blameless</em>, focused on the system and process rather than the person who pushed the button. For ML the postmortem must reach past the code into the data and the model: was the root cause a bad feature vintage, a training-serving skew, a drifted input, a mislabelled retraining batch. The point-in-time replay of subsection two is the postmortem's primary instrument, letting you re-run the exact decision that went wrong.</p>
+<p>There is one failure mode unique to systems that <em>act</em>, and it is the most dangerous because no uptime monitor will ever catch it: the <strong>feedback loop</strong>, where a model's own outputs corrupt the data it will next be trained on. A demand forecaster that drives inventory decisions sees only the sales that its own stocking allowed; a recommender trains on clicks that only its own rankings made visible; a credit model only ever observes repayment for the applicants it chose to approve. The model's actions shape the future data distribution, so naive retraining on logged outcomes amplifies the model's own past behavior, a self-fulfilling drift. This is the deployed face of the sequential-decision concerns of <a href="../../toc.html">Part VI</a> (where the agent's policy determines the state distribution it observes) and a direct <a href="../module-33-interpretability-robustness/index.html">fairness</a> hazard (Section 33.3): a feedback loop can entrench and magnify a disparity, since the groups the model under-serves generate less favorable data, which justifies under-serving them further. Detecting and breaking these loops, by logging the counterfactual, injecting exploration, or reweighting for the action policy, is an operational responsibility, not just a modeling one.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Silent Bad Push on a Sensor-IoT Forecaster</div>
+<p><strong>Who:</strong> The reliability on-call engineer for a predictive-maintenance platform forecasting vibration on a fleet of industrial pumps, the sensor-IoT series threaded through <a href="../../toc.html">Chapter 8</a> and this part.</p>
+<p><strong>Situation:</strong> A routine Tuesday model retrain passed offline evaluation (it beat the previous model on the held-out set) and was promoted straight to 100 percent of traffic, skipping the canary because "it was just a retrain".</p>
+<p><strong>Problem:</strong> Over the next six hours, false maintenance alarms tripled. No service crashed, every request returned 200, and latency was nominal, so the standard SRE dashboards were all green. The drift and prediction-distribution monitors of <a href="section-34.2.html">Section 34.2</a> were the only signals that fired.</p>
+<p><strong>Dilemma:</strong> Roll back immediately and lose the genuine accuracy gain the new model showed offline, or keep it live and investigate while alarm fatigue eroded operator trust in the whole system.</p>
+<p><strong>Decision:</strong> Roll back first, investigate second. The on-call reverted the model pointer to the previous logged tuple (a one-line change, instant), then opened the incident.</p>
+<p><strong>How:</strong> Point-in-time replay (subsection two) on a handful of false-alarm cases showed the retrain had been fed a feature with a changed unit (a vintage where an upstream sensor switched from millimeters to micrometers), training-serving skew that offline eval missed because the held-out set predated the unit change. The fix was a feature schema check plus a mandatory canary for <em>every</em> push, retrain or not.</p>
+<p><strong>Result:</strong> Rollback stopped the alarm flood within minutes; the postmortem (blameless) produced two concrete guardrails, and no retrain has since reached full traffic without a canary.</p>
+<p><strong>Lesson:</strong> An ML incident can be invisible to every uptime monitor while being very real to the user. Detection comes from model-quality monitors, rollback must be a pointer flip, and "it is just a retrain" is exactly the push that needs a canary, because retrains change the data path, not just the weights.</p>
+</div>
+
+<h2>4. A Reference Architecture and Runbook <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The pieces of Chapter 34 assemble into one operated system. A request arrives at the <strong>serving</strong> layer (34.1), which fetches point-in-time-correct inputs from the <strong>feature store</strong> (34.3), runs the versioned model under a <strong>circuit breaker</strong> with the <strong>baseline</strong> in the wings (subsection one), stamps the output with the four-part version tuple (subsection two), and logs it. <strong>Monitors</strong> (34.2) watch latency, freshness, drift, and delayed quality against the <strong>SLOs</strong> and their error budget; a fired monitor opens an <strong>incident</strong> (subsection three) whose first lever is rollback. The <strong>cost</strong> controls (34.4) sit across the serving path, choosing model size and batch policy under the latency SLO. Figure 34.5.3 is the whole loop.</p>
+<figure class="diagram">
+<svg viewBox="0 0 800 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A reference architecture for an operated temporal AI system. A request flows into serving, which reads point-in-time features from the feature store, runs the versioned model behind a circuit breaker with a baseline fallback, and logs a version-stamped prediction. Monitors read the logs and compare against SLOs; an SLO breach opens an incident that triggers rollback back to serving. A feedback-loop arrow runs from acted predictions back to the feature store, flagged as a hazard.">
+<defs>
+<marker id="arr345b" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+<marker id="arrH345" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b8431f"/></marker>
+</defs>
+<style>
+.bx345 { fill:#eef3f8; stroke:#14385c; stroke-width:2; }
+.bx345b { fill:#f0f6ef; stroke:#2f6b3a; stroke-width:2; }
+.haz345 { fill:#fbeee8; stroke:#b8431f; stroke-width:2; }
+.fl345b { stroke:#5a626c; stroke-width:1.7; fill:none; marker-end:url(#arr345b); }
+.hz345 { stroke:#b8431f; stroke-width:1.7; fill:none; marker-end:url(#arrH345); stroke-dasharray:6 4; }
+.bl345 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.gl345 { font:600 13px sans-serif; fill:#2f6b3a; text-anchor:middle; }
+.rl345 { font:600 13px sans-serif; fill:#b8431f; text-anchor:middle; }
+.ed345b { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+</style>
+<text class="bl345" x="400" y="22" style="font-size:14px;">An operated temporal AI system: serve, log, monitor, respond</text>
+<rect class="bx345" x="30" y="120" width="110" height="52" rx="9"/><text class="bl345" x="85" y="150">Request</text>
+<rect class="bx345" x="185" y="120" width="120" height="52" rx="9"/><text class="bl345" x="245" y="143">Serving</text><text class="ed345b" x="245" y="160">34.1 + breaker</text>
+<rect class="bx345b" x="185" y="225" width="120" height="48" rx="9"/><text class="gl345" x="245" y="246">Feature store</text><text class="ed345b" x="245" y="262">34.3 point-in-time</text>
+<rect class="bx345" x="355" y="120" width="120" height="52" rx="9"/><text class="bl345" x="415" y="143">Model + baseline</text><text class="ed345b" x="415" y="160">versioned tuple</text>
+<rect class="bx345" x="525" y="120" width="110" height="52" rx="9"/><text class="bl345" x="580" y="143">Log +</text><text class="bl345" x="580" y="160">predict</text>
+<rect class="bx345" x="525" y="225" width="110" height="48" rx="9"/><text class="bl345" x="580" y="246">Monitors</text><text class="ed345b" x="580" y="262">34.2 vs SLO</text>
+<rect class="haz345" x="680" y="225" width="100" height="48" rx="9"/><text class="rl345" x="730" y="246">Incident</text><text class="ed345b" x="730" y="262">rollback</text>
+<line class="fl345b" x1="140" y1="146" x2="183" y2="146"/>
+<line class="fl345b" x1="305" y1="146" x2="353" y2="146"/>
+<line class="fl345b" x1="475" y1="146" x2="523" y2="146"/>
+<line class="fl345b" x1="245" y1="223" x2="245" y2="174"/><text class="ed345b" x="245" y="200">features</text>
+<line class="fl345b" x1="580" y1="174" x2="580" y2="223"/><text class="ed345b" x="580" y="200">logs</text>
+<line class="fl345b" x1="635" y1="249" x2="678" y2="249"/><text class="ed345b" x="657" y="240">breach</text>
+<path class="fl345b" d="M680,240 C420,300 245,300 245,176"/><text class="rl345" x="430" y="312" style="font-size:11px;">rollback to known-good version</text>
+<path class="hz345" d="M580,118 C580,70 400,70 305,140"/><text class="rl345" x="470" y="68" style="font-size:11px;">feedback loop: acted predictions reshape future data</text>
+</svg>
+<figcaption><strong>Figure 34.5.3:</strong> The reference architecture binding Sections 34.1 to 34.5. The forward path (gray) serves and logs version-stamped predictions; monitors compare logs against SLOs and a breach opens an incident whose lever is rollback; the dashed orange arrow is the feedback-loop hazard of subsection three, where the system's own acted predictions reshape the data the feature store will later serve. Cost controls (34.4) sit on the serving path and are omitted for clarity.</figcaption>
+</figure>
+<p>The runbook is the human counterpart of the architecture: the pre-written, rehearsed procedure the on-call follows when a monitor fires, so that decisions made at three in the morning are decisions made calmly in advance. A minimal temporal-AI runbook reads: (1) confirm the alert against a second signal (is freshness <em>and</em> quality off, or just one); (2) check the error budget (is this worth spending, or are we already frozen); (3) if model quality is the suspect, roll back the model pointer to the last known-good tuple, which is safe and instant; (4) verify the baseline-fallback path is serving if the breaker is open; (5) replay a few affected predictions point-in-time to localize the root cause to model, feature vintage, or data; (6) decide roll-forward versus stay-rolled-back; (7) write the blameless postmortem and convert its action items into guardrails (a schema check, a mandatory canary, a new monitor). The runbook turns the architecture's affordances into muscle memory.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Reliability Is Designed In, Not Bolted On</div>
+<p>Every lever the runbook pulls exists only because an earlier design choice put it there. Rollback is instant only because predictions were version-stamped (subsection two). The baseline is warm only because it was kept running as a component, not deleted after evaluation (subsection one). Root cause is findable only because the system can replay point-in-time (subsection two, <a href="../../toc.html">Section 2.7</a>). The incident is even <em>detectable</em> only because model-quality monitors were built (34.2). You cannot add reliability during the incident; you can only spend the reliability you designed in before it. The architecture and the runbook are two views of one decision: build the operational organs first, so the response is a procedure and not an improvisation.</p>
+</div>
+
+<h2>5. Worked Example: A Versioned, Self-Healing Serving Wrapper <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now build the reliability core from scratch: a serving wrapper that holds a versioned primary model and a seasonal-naive baseline, health-checks every prediction, trips a circuit breaker on repeated failures or anomalies, and falls back to the baseline automatically, stamping every output with its version tuple. The point is that graceful degradation, the breaker, and versioned replay are not framework magic; they are a few dozen lines of ordinary control flow. Code 34.5.1 is the from-scratch wrapper.</p>
+<pre><code class="language-python">import time, hashlib, numpy as np
+
+def config_hash(cfg: dict) -&gt; str:
+    """Stable short hash of the config so any prediction records exactly which config produced it."""
+    return hashlib.sha1(repr(sorted(cfg.items())).encode()).hexdigest()[:8]
+
+def seasonal_naive(history, m, h=1):
+    """The Chapter 5 baseline: y_hat_{t+h} = y_{t+h-m}. No GPU, no features, always available."""
+    return history[-m + (h - 1)]                 # last season's value at the matching phase
+
+class ServingWrapper:
+    """Versioned serving with health check, circuit breaker, and automatic baseline fallback."""
+    def __init__(self, model, model_id, cfg, fail_threshold=3, cooldown=30.0,
+                 sane_range=(-1e4, 1e4)):
+        self.model, self.model_id, self.cfg = model, model_id, cfg
+        self.config_id = config_hash(cfg)
+        self.m = cfg["season_length"]
+        self.fail_threshold, self.cooldown, self.sane = fail_threshold, cooldown, sane_range
+        self.fails, self.opened_at = 0, None       # circuit-breaker state
+
+    def _breaker_open(self):
+        if self.opened_at is None:
+            return False
+        if time.time() - self.opened_at &gt;= self.cooldown:
+            self.opened_at, self.fails = None, 0    # cooldown elapsed: go half-open / closed
+            return False
+        return True
+
+    def _healthy(self, y):
+        """Output sanity check: finite and within a plausible range (an anomaly guard)."""
+        return np.isfinite(y) and self.sane[0] &lt;= y &lt;= self.sane[1]
+
+    def predict(self, history, data_vintage_ts):
+        stamp = dict(model_id=self.model_id, config_id=self.config_id,
+                     data_vintage_ts=data_vintage_ts)
+        if self._breaker_open():                    # breaker OPEN: skip the model entirely
+            y = seasonal_naive(history, self.m)
+            return y, {**stamp, "source": "baseline", "reason": "breaker_open"}
+        try:
+            y = float(self.model(history))          # call the versioned primary model
+            if not self._healthy(y):
+                raise ValueError("insane output")
+            self.fails = 0                          # success closes the breaker
+            return y, {**stamp, "source": "model"}
+        except Exception as e:                      # crash OR failed health check
+            self.fails += 1
+            if self.fails &gt;= self.fail_threshold:
+                self.opened_at = time.time()        # trip the breaker
+            y = seasonal_naive(history, self.m)     # graceful degradation to the baseline
+            return y, {**stamp, "source": "baseline", "reason": str(e)}
+
+# A primary model that works, then starts failing, to exercise the breaker.
+calls = {"n": 0}
+def flaky_model(history):
+    calls["n"] += 1
+    if calls["n"] &gt;= 3:                              # from the 3rd call on, it explodes
+        return np.inf
+    return history[-1] + 0.5                          # otherwise a fine forecast
+
+hist = list(np.arange(1.0, 25.0))                    # 24 hours of history; season m = 24
+wrap = ServingWrapper(flaky_model, model_id="rnn-v7",
+                      cfg={"season_length": 24, "fallback": "seasonal_naive"})
+for step in range(6):
+    y, meta = wrap.predict(hist, data_vintage_ts=f"2026-06-15T0{step}:00")
+    print(f"step {step}: y={y:6.2f}  source={meta['source']:8s}  "
+          f"model={meta['model_id']} cfg={meta['config_id']} "
+          f"{meta.get('reason','')}")
+</code></pre>
+<div class="code-caption"><strong>Code 34.5.1:</strong> A from-scratch serving wrapper realizing subsections one and two: every prediction is stamped with <code>(model_id, config_id, data_vintage_ts)</code>; a sanity check guards anomalous outputs; the circuit breaker trips after repeated failures and serves the seasonal-naive baseline of <a href="../../toc.html">Chapter 5</a> during cooldown. The <code>flaky_model</code> deliberately starts returning infinity to exercise the degraded path.</div>
+<pre><code class="language-text">step 0: y= 24.50  source=model     model=rnn-v7 cfg=3a9f1c20
+step 1: y= 24.50  source=model     model=rnn-v7 cfg=3a9f1c20
+step 2: y=  1.00  source=baseline  model=rnn-v7 cfg=3a9f1c20 insane output
+step 3: y=  1.00  source=baseline  model=rnn-v7 cfg=3a9f1c20 insane output
+step 4: y=  1.00  source=baseline  model=rnn-v7 cfg=3a9f1c20 insane output
+step 5: y=  1.00  source=baseline  model=rnn-v7 cfg=3a9f1c20 breaker_open
+</code></pre>
+<div class="code-caption"><strong>Output 34.5.1:</strong> The wrapper degrades gracefully. Steps 0 and 1 serve the model; step 2 catches the infinite output and falls back; by step 5 three failures have tripped the breaker, so it serves the baseline without even calling the sick model. Every line carries its version tuple, so each prediction is replayable.</div>
+<p>The from-scratch wrapper is about 45 lines and it is worth having written once, because it shows that "self-healing serving" is just a state machine plus a fallback. In production you would not maintain this yourself: serving frameworks and model registries provide versioning, health checks, and traffic policy as configuration. Code 34.5.2 sketches the library equivalent, where a registry holds versioned models and a server wires the health check and fallback declaratively.</p>
+<pre><code class="language-python"># Library equivalent: a model registry + serving framework handles versioning,
+# health checks, and fallback declaratively (MLflow-style registry, KServe/Ray Serve-style serving).
+import mlflow
+from mlflow.tracking import MlflowClient
+
+client = MlflowClient()
+client.transition_model_version_stage("load_forecaster", version=7, stage="Production")  # one-call promote
+
+# A serving framework (KServe / Ray Serve / BentoML) expresses the breaker and fallback as config:
+deployment = {
+    "model_uri": "models:/load_forecaster/Production",  # versioned, rollback = retag a version
+    "health_check": {"sane_range": [-1e4, 1e4], "timeout_ms": 200},
+    "fallback": {"strategy": "seasonal_naive", "season_length": 24},
+    "circuit_breaker": {"fail_threshold": 3, "cooldown_s": 30},
+    "canary": {"traffic_pct": 5},                        # subsection 3 safe-deploy ladder, built in
+}
+# serve.deploy(deployment)  # the framework runs the version stamping, breaker, and fallback for us
+</code></pre>
+<div class="code-caption"><strong>Code 34.5.2:</strong> The framework version. The roughly 45 lines of breaker, health check, versioning, and fallback in Code 34.5.1 collapse to a registry promotion call plus a declarative deployment spec of about 8 lines; the serving framework runs the state machine, stamps versions, and even provides the canary of subsection three. Rollback becomes retagging a version, the one-line pointer flip the runbook relies on.</div>
+<p>The pair makes the line-count reduction concrete: the hand-built reliability core of Code 34.5.1 (about 45 lines of state machine and fallback logic) becomes roughly 8 lines of declarative config in Code 34.5.2, because the registry and serving framework internalize the versioning, health-checking, breaker, and canary you would otherwise hand-roll. Writing it from scratch once is what lets you configure the framework correctly and debug it when the declarative version does something surprising. Finally, the numeric example below turns the SLO of subsection one into an error-budget burn rate, the quantity the runbook's step two consults.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Burning the Error Budget</div>
+<p>Suppose the freshness SLO is "99.5 percent of forecasts use data no more than 15 minutes stale", measured over a rolling 30-day window. The error budget is the allowed violation fraction, $1 - 0.995 = 0.005$. Over 30 days the system serves one forecast per minute, so the window holds $N = 30 \times 24 \times 60 = 43{,}200$ forecasts, and the budget is $0.005 \times 43{,}200 = 216$ permitted stale forecasts for the whole month. Now a feature-pipeline lag starts producing stale forecasts at a rate of 4 per hour. The <strong>burn rate</strong> is that consumption relative to the budget: at 4 per hour the incident consumes $216$ allowed violations in $216 / 4 = 54$ hours, just over two days, versus the 30 days the budget was meant to cover. The budget is burning about $30 \times 24 / 54 \approx 13$ times faster than sustainable, a $13\times$ burn rate. A common alerting rule pages immediately on any burn rate above roughly $10\times$, so this fires at once: the runbook's step two says the budget cannot absorb this, escalate now. Had the leak been 1 stale forecast per day, the burn would be $30 / 216 \approx 0.14\times$ sustainable, comfortably inside budget, and no page is warranted. The same SLO thus distinguishes a true incident from acceptable noise, purely by arithmetic on the budget.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Operating Temporal Models in 2024 to 2026</div>
+<p>Reliability for temporal AI is being reshaped by two 2024 to 2026 currents. First, the rise of temporal <em>foundation models</em> (TimesFM, Chronos, Moirai, Lag-Llama, MOMENT, of <a href="../../toc.html">Chapter 15</a>) changes the operational picture: a single large pretrained forecaster served zero-shot across many series shifts the failure surface from per-model decay to shared-dependency and prompt or context-window failures, and makes graceful degradation to a per-series seasonal-naive baseline even more valuable as a cheap, independent safety net. Vendors now ship these behind serving stacks with built-in versioning and canarying, so the operational patterns of this section apply directly to foundation-model endpoints. Second, the LLMOps wave has matured shadow and canary evaluation into continuous <em>online evaluation</em> with automated guardrails and rollback triggered by live quality estimates, and conformal methods (conformal PID control, of <a href="../../toc.html">Chapter 19</a>) are being used to put calibrated, monitorable bounds on served predictions so an SLO can be written on <em>coverage</em>, not just latency. The feedback-loop hazard of subsection three is itself a live research area under the banners of performative prediction and off-policy correction, asking how to retrain safely on data the model's own actions generated, which connects production MLOps back to the off-policy and exploration theory of <a href="../../toc.html">Part VI</a>. The practitioner's 2026 takeaway: the organs in this section are stable, but the models they wrap are getting larger and more shared, raising the stakes on versioning, baselines, and replay.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Don't Hand-Roll the Whole Stack</div>
+<p>The full operated system of this chapter is assembled from off-the-shelf parts, not built from scratch. Model versioning and the registry: <strong>MLflow</strong> or <strong>Weights &amp; Biases</strong>. Point-in-time feature serving: <strong>Feast</strong> or <strong>Tecton</strong> (34.3). Versioned serving with health checks, canary, and traffic policy: <strong>KServe</strong>, <strong>Ray Serve</strong>, <strong>BentoML</strong>, or <strong>Seldon</strong>. Drift and quality monitoring: <strong>Evidently</strong>, <strong>NannyML</strong>, or <strong>whylogs</strong> (34.2). Pipeline orchestration and reproducible runs: <strong>Dagster</strong>, <strong>Prefect</strong>, or <strong>Airflow</strong>. Wired together, these turn the roughly 45-line wrapper of Code 34.5.1 and the manual runbook into declarative configuration, with the version tuple, breaker, baseline fallback, and canary all maintained for you. Build the small version once to understand the contract, then operate the real system on these tools.</p>
+</div>
+
+<div class="callout looking-back">
+<div class="callout-title">Looking Back: Chapter 34 and Part VIII Complete, and the Road to Part IX</div>
+<p>This section closes <strong>Chapter 34</strong> and with it <strong>Part VIII, Trustworthy and Deployed Temporal AI</strong>. Chapter 33 made temporal models interpretable, robust, fair, and private; Chapter 34 made them <em>operable</em>: served (34.1), monitored (34.2), fed point-in-time features (34.3), kept affordable (34.4), and now made reliable, versioned, and incident-ready (34.5). The thread that ran through both chapters is the one that has run through the whole book: a temporal system is never finished, because time keeps arriving, so it must be watched, replayed, and corrected as it runs. Notice how completely the classical ideas returned here in operational dress. The seasonal-naive baseline of <a href="../../toc.html">Chapter 5</a> came back as the production safety net; the point-in-time correctness of <a href="../../toc.html">Section 2.7</a> came back as the precondition for audit and replay; the policy-shapes-its-own-data concern of <a href="../../toc.html">Part VI</a> came back as the feedback-loop hazard. Trustworthy and deployed temporal AI is, in the end, the same temporal reasoning the book began with, now held to the standard of a system other people depend on.</p>
+<p>With the foundations (Parts I and II), the deep and representation-learning toolkit (Parts III, IV, V), sequential decision making (Part VI), intelligent systems (Part VII), and trustworthy deployment (Part VIII) all in hand, the book turns to its payoff. <strong>Part IX, Applications and Future Directions</strong>, takes everything you have built and puts it to work across real domains: industrial applications in finance, healthcare, energy, and the sensor-IoT and robotics settings that have threaded the chapters (<a href="../../toc.html">Chapter 35</a>), and then a closing look toward general temporal intelligence and where the field is heading (<a href="../../toc.html">Chapter 36</a>). Everything until now was the apparatus; Part IX is what the apparatus is for.</p>
+</div>
+
+<section class="exercises">
+<h2>Exercises</h2>
+<div class="callout exercise">
+<div class="callout-title">Exercise 34.5.1 (Conceptual): Freshness Versus Latency</div>
+<p>A trading-signal team proposes a single SLO, "99 percent of forecasts return within 100 ms", and argues that freshness needs no separate target because a fast response is necessarily a fresh one. Construct a concrete scenario in which this system meets its latency SLO every single time yet acts on dangerously stale data, and explain why freshness must be its own SLI. Then state, in one sentence each, what an SLI, an SLO, and an SLA are, and why an error budget is more actionable than a binary "must not fail".</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 34.5.2 (Implementation): A Half-Open Probe and Rollback</div>
+<p>Extend the <code>ServingWrapper</code> of Code 34.5.1 in two ways. First, implement a true <em>half-open</em> state: after the cooldown elapses, let exactly one trial request reach the model; if it succeeds, fully close the breaker, and if it fails, re-open and restart the cooldown (rather than the current behavior, which clears the breaker optimistically before any trial). Second, add a <code>rollback(model, model_id)</code> method that atomically swaps in a previous known-good model and id, and demonstrate, by feeding a sequence that trips the breaker, that a rollback both restores model-sourced predictions and changes the <code>model_id</code> stamped on subsequent outputs. Print the version tuple before and after rollback to show the audit trail records the switch.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 34.5.3 (Open-ended): Breaking a Feedback Loop</div>
+<p>Consider a demand forecaster whose forecasts drive inventory decisions, so the system only ever observes sales that its own stocking allowed (a censored, model-shaped data distribution, the feedback loop of subsection three and the policy-shapes-data concern of <a href="../../toc.html">Part VI</a>). Design an operational scheme to detect and break the loop before naive retraining entrenches it. Address at least: (a) what you would log at serving time to make the censoring visible (hint: the counterfactual or the action actually taken); (b) how a small, deliberate exploration policy could yield unbiased data, and what reliability and cost risk that exploration carries; (c) how you would reweight logged outcomes for the action policy when retraining; and (d) how this loop could create or amplify a fairness disparity in the sense of <a href="../module-33-interpretability-robustness/index.html">Section 33.3</a>, and what monitor would catch it.</p>
+</div>
+</section>
+
+<nav class="chapter-nav" aria-label="Section navigation">
+<a class="nav-prev" href="section-34.4.html"><span class="nav-label">Previous</span><span class="nav-num">Section 34.4</span><span class="nav-title">Cost, Latency, and the Compute Budget</span></a>
+<a class="nav-up" href="index.html"><span class="nav-label">Up</span><span class="nav-num">Chapter 34</span><span class="nav-title">Deploying and Operating Temporal AI Systems</span></a>
+<a class="nav-next" href="../../toc.html"><span class="nav-label">Next</span><span class="nav-num">Contents</span><span class="nav-title">Table of Contents</span></a>
+</nav>
+</main>
+<footer class="book-footer">
+<p class="footer-edition">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="footer-copy">&copy; 2026 Alexander Apartsin &middot; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated"><script>document.write("Last updated " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

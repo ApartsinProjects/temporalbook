@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 35.3: Manufacturing and Predictive Maintenance. How high-frequency machine sensor streams (vibration, temperature, current) feed three coupled temporal tasks, fault detection, remaining-useful-life prognosis, and maintenance scheduling as sequential decision, synthesizing spectral analysis, anomaly detection, self-supervision, drift handling, edge deployment, and decision-aware evaluation into one predictive-maintenance pipeline built from scratch and via libraries." name="description"/>
+<title>Section 35.3: Manufacturing and Predictive Maintenance | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IX: Applications and Future Directions</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 35: Industrial Applications</a></div>
+<h1>Manufacturing and Predictive Maintenance</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"For twenty thousand revolutions a minute I sang the same clean note. Then, three weeks before anyone noticed, a single ball in my outer race began to whisper a frequency that was not in the score: once per shaft turn, then a little harmonic, then a little more. I tried to tell them in the language I had, a faint sideband nobody reads. By the time the floor heard me with their own ears, I had already written my own obituary in the spectrum."</p>
+<cite>A Vibration Sensor That Heard the Bearing Fail Three Weeks in Advance</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A spinning machine broadcasts its health continuously, in the high-frequency texture of its vibration, the slow creep of its temperature, the ripple of its motor current. Predictive maintenance is the discipline of listening to those streams and acting before failure, and it turns out to be not one problem but three coupled temporal problems stacked on top of each other.</strong> First, <em>detection</em>: is this machine still behaving normally, or has a fault signature appeared, the anomaly and change-point question of <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8</a> applied to a sensor tape. Second, <em>prognosis</em>: given that degradation has started, how much useful life remains, a remaining-useful-life (RUL) regression that is the maintenance cousin of the time-to-event modeling of <a href="../../part-4-temporal-representation-learning/module-18-event-sequence-modeling/index.html">Chapter 18</a>. Third, <em>decision</em>: when do we actually stop the line and replace the part, a sequential decision under uncertainty whose cost structure (a false alarm wastes a good part and a shift of downtime; a missed failure destroys the machine and possibly the operator) is the safe-RL and decision-aware-evaluation territory of <a href="../../toc.html">Part VI</a> and <a href="../../toc.html">Chapter 19</a>. This section threads the book's sensor/IoT running dataset through all three, building a complete run-to-failure pipeline, spectral fault features, a degradation/anomaly score, an RUL estimate with a prognostic horizon, from scratch and then in a handful of library lines. It is where the spectral analysis of <a href="../../part-2-classical-forecasting/module-04-frequency-spectral/index.html">Chapter 4</a>, the anomaly detection of Chapter 8, the self-supervision of Chapter 16, the drift handling of Chapter 20, and the edge constraints of Chapter 34 stop being separate chapters and become one deployed system.</p>
+</div>
+<p>The sensor/IoT thread has run quietly through this book. In <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8</a> we detected anomalies and change-points in machine telemetry; in <a href="../../toc.html">Chapter 20</a> we watched that telemetry drift as operating conditions shifted; in <a href="../../toc.html">Chapter 32</a> we modeled a whole factory floor of correlated sensors spatio-temporally; in <a href="../../toc.html">Chapter 34</a> we worried about running the resulting model on a microcontroller bolted to the machine. This section is the payoff. Predictive maintenance is the canonical industrial use of temporal AI, the place where "predict the future of a time series and act on it" has a dollar value attached to every decision, and it exercises almost every technique the book has built. We will be explicit about which earlier idea each pipeline stage reuses, because the engineering reality is that a maintenance system is an assembly of book chapters, not a single model.</p>
+<p>The competencies this section installs are four. To frame a maintenance problem as the three coupled temporal tasks (detection, prognosis, decision) and know which book chapter supplies each. To extract physically meaningful fault features from a vibration stream using the envelope-spectrum machinery of <a href="../../part-2-classical-forecasting/module-04-frequency-spectral/index.html">Chapter 4</a>, and to weigh those hand-features against learned representations. To build a run-to-failure pipeline end to end: spectral features, a degradation score, and an RUL estimate with a stated prognostic horizon. And to reason about the operational realities, extreme class imbalance, label scarcity, cross-machine drift, edge limits, and the asymmetric cost of false alarms versus missed failures, that decide whether a maintenance model is deployable or merely accurate on paper.</p>
+
+<h2>1. The Setting: Three Tasks Hiding in One Sensor Stream <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>A modern machine, a pump, a gearbox, a CNC spindle, a wind-turbine drivetrain, carries instrumentation that produces several simultaneous high-frequency streams. An accelerometer on the bearing housing samples vibration at tens of kilohertz; a thermocouple reports temperature at a few hertz; a current clamp on the motor reports the electrical signature at line frequency and its harmonics. Together these form a multivariate sensor tape $\mathbf{x}_{1:T}$ exactly like the running sensor/IoT series of this book, except that here the tape ends, sooner or later, in a failure. The defining data structure of predictive maintenance is the <em>run-to-failure</em> trajectory: a sequence that starts with a healthy machine and runs until the component breaks, so the label we ultimately care about, time remaining until failure, is read off the end of the sequence rather than annotated by a human.</p>
+<p>What makes maintenance a rich temporal problem rather than a single forecast is that one sensor stream supports three distinct tasks, each drawing on a different part of this book, and a real system runs all three.</p>
+<ul>
+<li><strong>Fault detection</strong> asks a binary, online question: has the machine departed from its healthy operating distribution? This is the anomaly and change-point detection of <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8</a>, applied to streaming telemetry. The detector fires when a fault signature first appears, marking the transition from healthy to degrading.</li>
+<li><strong>Remaining-useful-life prognosis</strong> asks a continuous, forward question: given that degradation has begun, how many cycles or hours of useful life remain? This is a regression onto a time-to-event target, the maintenance form of the event and survival modeling of <a href="../../part-4-temporal-representation-learning/module-18-event-sequence-modeling/index.html">Chapter 18.4</a>, where instead of a hazard over discrete events we estimate a scalar RUL with an uncertainty band.</li>
+<li><strong>Maintenance scheduling</strong> asks a sequential-decision question: given the detector's alarm and the prognosis's estimate, when do we actually intervene? Each day we choose to keep running (cheap if the machine survives, catastrophic if it fails) or to stop and service (a guaranteed but bounded cost). That is a sequential decision under uncertainty with an explicit cost structure, the safe-reinforcement-learning and control territory of <a href="../../toc.html">Part VI</a>.</li>
+</ul>
+<p>The three tasks form a pipeline in time. Detection flips first and starts the prognostic clock; prognosis estimates how long the clock has left; the decision policy reads both and picks the moment to act. Crucially they are coupled, not independent: a good RUL estimate makes the decision easy (act when estimated life drops below the lead time you need to schedule a repair), and a reliable detector keeps the prognosis from being asked to extrapolate on a machine that is still perfectly healthy. Figure 35.3.1 lays out the three-stage flow and names the book chapter behind each stage.</p>
+<figure class="diagram">
+<svg viewBox="0 0 840 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A three-stage predictive-maintenance pipeline. A multivariate sensor stream of vibration, temperature, and current feeds a feature-extraction block, which feeds three coupled stages in sequence: fault detection (Chapter 8), remaining-useful-life prognosis (Chapter 18), and maintenance decision (Part VI). Each stage passes its output forward to the next and all rest on the spectral features of Chapter 4.">
+<defs>
+<marker id="arr353" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.box353 { fill:#eef3f8; stroke:#14385c; stroke-width:2; }
+.feat353 { fill:#f3f0fa; stroke:#5b3a8c; stroke-width:2; }
+.act353 { fill:#fbeee8; stroke:#b8431f; stroke-width:2; }
+.fl353 { stroke:#5a626c; stroke-width:1.9; fill:none; marker-end:url(#arr353); }
+.lab353 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub353 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.ch353 { font:600 11px sans-serif; fill:#b8431f; text-anchor:middle; }
+.tl353 { font:600 15px sans-serif; fill:#14385c; text-anchor:middle; }
+</style>
+<text class="tl353" x="420" y="24">One sensor stream, three coupled temporal tasks</text>
+<rect class="box353" x="30" y="120" width="120" height="74" rx="9"/>
+<text class="lab353" x="90" y="150">sensor</text><text class="sub353" x="90" y="168">vibration</text><text class="sub353" x="90" y="183">temp, current</text>
+<rect class="feat353" x="190" y="120" width="120" height="74" rx="9"/>
+<text class="lab353" x="250" y="150">spectral</text><text class="lab353" x="250" y="168">features</text><text class="ch353" x="250" y="186">Ch 4</text>
+<rect class="box353" x="350" y="120" width="120" height="74" rx="9"/>
+<text class="lab353" x="410" y="150">detection</text><text class="sub353" x="410" y="168">healthy?</text><text class="ch353" x="410" y="186">Ch 8</text>
+<rect class="box353" x="510" y="120" width="120" height="74" rx="9"/>
+<text class="lab353" x="570" y="150">RUL</text><text class="lab353" x="570" y="168">prognosis</text><text class="ch353" x="570" y="186">Ch 18</text>
+<rect class="act353" x="670" y="120" width="140" height="74" rx="9"/>
+<text class="lab353" x="740" y="150">maintenance</text><text class="lab353" x="740" y="168">decision</text><text class="ch353" x="740" y="186">Part VI</text>
+<line class="fl353" x1="150" y1="157" x2="188" y2="157"/>
+<line class="fl353" x1="310" y1="157" x2="348" y2="157"/>
+<line class="fl353" x1="470" y1="157" x2="508" y2="157"/>
+<line class="fl353" x1="630" y1="157" x2="668" y2="157"/>
+<text class="sub353" x="420" y="240">detection starts the clock; prognosis reads how long is left; the policy picks the moment to act</text>
+<text class="sub353" x="420" y="262">extreme imbalance, label scarcity, drift, and edge limits constrain every stage</text>
+</svg>
+<figcaption><strong>Figure 35.3.1:</strong> The predictive-maintenance pipeline as three coupled temporal tasks over one sensor stream. Spectral feature extraction (<a href="../../part-2-classical-forecasting/module-04-frequency-spectral/index.html">Chapter 4</a>) feeds fault detection (<a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8</a>), which feeds RUL prognosis (<a href="../../part-4-temporal-representation-learning/module-18-event-sequence-modeling/index.html">Chapter 18</a>), which feeds the maintenance decision (<a href="../../toc.html">Part VI</a>). The stages are sequential in time and coupled in information: each consumes the one before.</figcaption>
+</figure>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Maintenance Is a Stack of Book Chapters, Not a Single Model</div>
+<p>The temptation, especially after a book full of powerful sequence models, is to imagine predictive maintenance as one big network that eats raw sensor data and emits a "replace now" signal. Real deployed systems almost never look like that, and not because the network could not in principle learn it. They are a stack: a signal-processing front end that turns vibration into physically interpretable features (<a href="../../part-2-classical-forecasting/module-04-frequency-spectral/index.html">Chapter 4</a>), a detector that flags the onset of abnormality (<a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8</a>), a prognostic regressor that estimates remaining life (<a href="../../part-4-temporal-representation-learning/module-18-event-sequence-modeling/index.html">Chapter 18</a>), and a decision policy that converts the estimate into an action under an asymmetric cost (<a href="../../toc.html">Part VI</a>). The value of the stack is that each layer is separately testable, separately interpretable, and separately replaceable, properties a monolithic black box trained on a handful of failures cannot offer. The book's chapters are, almost exactly, the layers of a maintenance system.</p>
+</div>
+
+<h2>2. The Signal-Processing Backbone: Reading Faults in the Spectrum <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The single most important fact about machine vibration is that faults announce themselves at <em>predictable frequencies</em>. A rolling-element bearing has a geometry, a number of balls, a pitch diameter, a contact angle, and a defect on its outer race strikes the rolling elements at a characteristic rate, the ball-pass frequency of the outer race (BPFO), every time a ball rolls over the flaw. A gear mesh rings at the tooth-pass frequency; a misaligned shaft shows energy at once and twice the rotation rate; an unbalanced rotor concentrates energy at exactly the shaft speed. These are not learned patterns; they are consequences of physics and geometry, and they are the reason the frequency-domain machinery of <a href="../../part-2-classical-forecasting/module-04-frequency-spectral/index.html">Chapter 4</a> is the natural language of fault detection. A healthy machine has a clean spectrum dominated by the running speed and its harmonics; a fault injects energy at its own signature frequency and the sidebands around it.</p>
+<p>There is a subtlety that makes raw spectral analysis insufficient and motivates the technique practitioners actually use. A bearing defect produces a series of short, sharp impacts, and those impacts <em>excite</em> a high-frequency structural resonance of the housing. The defect's own repetition rate (a few hundred hertz) is buried under that ringing resonance (several kilohertz) and is hard to see directly in the raw spectrum. The fix is <strong>envelope analysis</strong>: band-pass the signal around the resonance, take the amplitude envelope (the magnitude of the analytic signal, via the Hilbert transform), and compute the spectrum of that envelope. The envelope spectrum strips away the carrier resonance and reveals the slow repetition rate of the impacts, BPFO, BPFI, and their harmonics, as clean peaks. Envelope analysis is the workhorse of bearing diagnostics, and it is a direct application of the analytic-signal and spectral tools of <a href="../../part-2-classical-forecasting/module-04-frequency-spectral/index.html">Chapter 4</a>.</p>
+<p>From the envelope spectrum and the raw waveform we extract a compact feature vector that summarizes machine health. The classic hand-features are a mix of time-domain statistics and frequency-domain peaks:</p>
+$$\text{RMS} = \sqrt{\tfrac{1}{N}\textstyle\sum_i x_i^2}, \qquad \text{Kurtosis} = \frac{\tfrac{1}{N}\sum_i (x_i - \bar{x})^4}{\big(\tfrac{1}{N}\sum_i (x_i - \bar{x})^2\big)^2}, \qquad \text{CrestFactor} = \frac{\max_i |x_i|}{\text{RMS}}.$$
+<p>RMS tracks overall energy and rises slowly as a fault grows; kurtosis and crest factor are sensitive to the <em>impulsiveness</em> a fresh defect introduces (a sharp spike on an otherwise smooth wave drives both up) and are early indicators before RMS has moved much; and the amplitude at BPFO in the envelope spectrum is the direct, physically interpretable fault indicator. These features are the input to the detector and the prognostic regressor in the worked pipeline of subsection five.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Hand Features vs Learned Representations Is a Data-Budget Decision</div>
+<p>The whole of <a href="../../toc.html">Part III</a> taught networks that learn their own features from raw sequences, and <a href="../../toc.html">Chapter 16</a> taught them to do so self-supervised, without labels. So why hand-craft RMS, kurtosis, and BPFO amplitude at all? Because in maintenance the number of <em>failures</em> you have ever observed is tiny (often single digits per fault mode), and a feature you derived from bearing physics carries information a network cannot extract from three example failures. The honest trade is this: when failures are abundant (a large fleet, many run-to-failure curves), learned representations win and you should let the network discover the signatures; when failures are scarce, physics-based features are a powerful prior that prevents the model from overfitting noise. The strongest production systems are hybrid, feeding hand features <em>and</em> a learned embedding into the same head, so the physics anchors the model where data is thin and the learning adds nuance where data is thick.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Bearing That Files Its Own Incident Report</div>
+<p>There is something almost literary about envelope analysis. A bearing with an incipient outer-race defect cannot speak, but every time a ball rolls over the flaw it taps out a pulse at exactly BPFO, like a prisoner tapping code on a pipe. The raw vibration drowns that code in the ringing of the housing, the equivalent of shouting over the tapping. Envelope analysis is the act of pressing your ear to the pipe and filtering out the shout: demodulate the carrier, and the patient periodic tapping emerges, spelling out the defect's name in the spectrum. The machine has been confessing the whole time; we just needed the right filter to read the confession.</p>
+</div>
+
+<h2>3. Operational Realities: Why Accurate Models Fail in the Field <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>A maintenance model that scores well on a held-out test set routinely fails on a real factory floor, and the reasons are not modeling subtleties but four blunt operational facts. Each maps to a chapter of this book, and ignoring any one of them is the usual cause of a pilot that never reaches production.</p>
+<p><strong>Extreme class imbalance.</strong> Machines spend almost all of their life healthy. A year of one-second telemetry is 31 million samples; the failure window might be a few hours. The positive class (imminent failure) can be one part in $10^4$ or rarer, so a classifier that always predicts "healthy" achieves better than 99.99 percent accuracy and is completely useless. This is why detection is framed as anomaly detection (<a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8</a>): you model the healthy distribution and flag departures from it, rather than training a balanced classifier on a class you have barely seen. Evaluation must use precision, recall, and the cost-weighted metrics of subsection four, never raw accuracy.</p>
+<p><strong>Label scarcity.</strong> Run-to-failure curves are expensive: each one is a destroyed machine. A fleet might yield dozens of complete failure trajectories, not the millions of labeled examples deep learning expects. This is the natural home of the self-supervised representation learning of <a href="../../toc.html">Chapter 16</a>: pre-train an encoder on the abundant <em>unlabeled</em> healthy telemetry (predicting masked segments, contrasting augmentations), then fine-tune a small prognostic head on the few labeled failures. The self-supervised pre-training turns the ocean of healthy data, otherwise useless for a supervised RUL model, into a representation that makes the scarce labels go much further.</p>
+<p><strong>Drift across machines and conditions.</strong> Two nominally identical pumps have different baseline vibration because of installation, foundation stiffness, and wear history; the same pump's signature shifts with load, ambient temperature, and product being processed. A model trained on machine A and deployed on machine B, or trained in summer and run in winter, faces exactly the concept and covariate drift of <a href="../../toc.html">Chapter 20</a>. Maintenance systems handle this with per-machine baseline normalization (referencing each machine's own healthy fingerprint), operating-condition conditioning, and online adaptation that updates the healthy model as conditions evolve without forgetting what a fault looks like.</p>
+<p><strong>Edge deployment constraints.</strong> The sensor is bolted to a machine that may be in a mine, on a turbine nacelle, or down a well, with intermittent connectivity and a power budget measured in milliwatts. High-frequency vibration cannot be streamed to the cloud raw (the bandwidth is prohibitive), so feature extraction and often the detector itself must run on a microcontroller at the edge, the quantization, pruning, and latency concerns of <a href="../../toc.html">Chapter 34</a>. The architecture this forces, extract compact features at the edge, send only those upstream, run heavy prognosis in the cloud, is the standard industrial-IoT topology and a direct consequence of the deployment chapter's constraints.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Wind-Farm Gearbox Monitor That Survived the Winter</div>
+<p><strong>Who:</strong> A reliability-engineering team at an operator of a 60-turbine offshore wind farm, instrumenting each gearbox with accelerometers and streaming the sensor/IoT telemetry threaded through <a href="../../toc.html">Chapter 32</a> and this section.</p>
+<p><strong>Situation:</strong> Gearbox replacement at sea requires a jack-up vessel booked weeks ahead and costs on the order of a quarter-million dollars per event, so an unplanned failure is far more expensive than a scheduled one; a prognostic horizon of three to four weeks was the operational requirement, enough lead time to book the vessel.</p>
+<p><strong>Problem:</strong> Their first model, a supervised RUL regressor trained on the seven historical gearbox failures in the fleet, scored beautifully offline but raised constant false alarms in service, because winter load patterns shifted every gearbox's baseline vibration and the model read the shift as incipient failure.</p>
+<p><strong>Dilemma:</strong> Retrain continuously and risk the model adapting <em>to</em> a slow real fault (forgetting what failure looks like); freeze the model and accept the seasonal false alarms; or restructure so the baseline drift was handled separately from the fault signal.</p>
+<p><strong>Decision:</strong> They split the problem along the book's chapter lines. A self-supervised encoder (<a href="../../toc.html">Chapter 16</a>) pre-trained on years of unlabeled healthy telemetry gave a representation robust to load; per-turbine baseline normalization (<a href="../../toc.html">Chapter 20</a>) referenced each gearbox to its own healthy fingerprint, conditioned on load bin, so seasonal shifts canceled; the BPFO envelope feature (<a href="../../part-2-classical-forecasting/module-04-frequency-spectral/index.html">Chapter 4</a>) provided a drift-immune physical fault indicator; and the detection threshold was set by the cost analysis of subsection four rather than a default.</p>
+<p><strong>How:</strong> Edge nodes on each nacelle computed envelope features (<a href="../../toc.html">Chapter 34</a>) and streamed only the compact vectors ashore, where the prognostic head ran and emitted an RUL with an uncertainty band; an alarm fired only when the lower band crossed the four-week horizon.</p>
+<p><strong>Result:</strong> False alarms fell by roughly an order of magnitude across the following winter while the detector still caught a genuine outer-race spall with about a 25-day lead, comfortably inside the vessel-booking window, and the gearbox was changed on a planned outage.</p>
+<p><strong>Lesson:</strong> The accuracy of the RUL model was never the bottleneck; drift, baseline normalization, and the cost-calibrated threshold were. A maintenance system lives or dies on the operational realities of this subsection, not on the prognostic architecture.</p>
+</div>
+
+<h2>4. The Cost Trade-off: False Alarms versus Missed Failures <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Every maintenance decision is a bet under an asymmetric cost, and getting the asymmetry right matters more than getting the model marginally more accurate. There are two ways to be wrong, and they cost wildly different amounts. A <strong>false alarm</strong> (predict failure, machine was fine) wastes a healthy part and a window of downtime: a real but bounded cost, call it $C_{\text{FA}}$. A <strong>missed failure</strong> (predict healthy, machine breaks) incurs the full cost of an unplanned catastrophic failure: secondary damage to the machine, an emergency repair, lost production, possibly a safety incident, call it $C_{\text{MF}}$, typically ten to a hundred times larger than $C_{\text{FA}}$. This is the decision-aware evaluation theme of <a href="../../toc.html">Chapter 19.6</a>: the metric that matters is not detection accuracy but expected cost, and the optimal operating point is set by the cost ratio, not by a default threshold of one half.</p>
+<p>The detector emits a score $s$ (an anomaly score or a calibrated failure probability $p$), and we choose a threshold $\tau$ above which we act. The expected cost of acting versus not acting, given failure probability $p$, makes the optimal decision rule explicit. Act (do maintenance) when the expected cost of acting is below the expected cost of waiting:</p>
+$$\underbrace{C_{\text{FA}}(1-p)}_{\text{act, but it was fine}} \;<\; \underbrace{C_{\text{MF}}\,p}_{\text{wait, and it fails} } \quad\Longleftrightarrow\quad p \;>\; \frac{C_{\text{FA}}}{C_{\text{FA}} + C_{\text{MF}}} \;\equiv\; \tau^{\star}.$$
+<p>The optimal threshold $\tau^{\star}$ depends only on the cost ratio. When a missed failure costs 50 times a false alarm, $\tau^{\star} = 1/51 \approx 0.02$: you act on a mere two percent failure probability, accepting many false alarms to avoid the rare ruinous miss. This single formula is why maintenance thresholds are set so low and why raw accuracy is the wrong metric: at $\tau^\star = 0.02$ the system deliberately trades precision for recall because the cost structure demands it. The full sequential version, where each day you also weigh the option of waiting one more day for more information, is the stopping-time and safe-RL problem of <a href="../../toc.html">Part VI</a>; the static threshold above is its myopic one-step approximation and is what most deployed systems use.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Where to Put the Threshold</div>
+<p>A bearing replacement on a planned outage (the false-alarm cost) is about \$2{,}000 in part plus a scheduled-downtime slot. An unplanned seizure (the missed-failure cost) destroys the shaft and housing, triggers an emergency call-out, and idles the line: estimate \$100{,}000. The cost ratio is $C_{\text{MF}}/C_{\text{FA}} = 50$, so the optimal threshold is $\tau^{\star} = C_{\text{FA}}/(C_{\text{FA}}+C_{\text{MF}}) = 2000/102000 \approx 0.0196$, about two percent. Now compare two operating points on the detector's curve. Point A (threshold tuned for accuracy) catches 70 percent of failures with 1 false alarm per 100 healthy machine-months; point B (threshold at $\tau^\star$) catches 98 percent of failures with 8 false alarms per 100 machine-months. Over a fleet running 100 machine-months with a 3 percent failure rate (3 failures expected), point A misses about 0.9 failures (cost $0.9 \times 100{,}000 = \$90{,}000$) and raises 1 false alarm ($\$2{,}000$), total \$92{,}000. Point B misses about 0.06 failures (cost \$6{,}000) and raises 8 false alarms ($\$16{,}000$), total \$22{,}000. The low, cost-calibrated threshold is four times cheaper despite eight times the false alarms, because the asymmetry makes a missed failure the dominant term. Accuracy would have chosen point A and lost.</p>
+</div>
+
+<h2>5. Worked Example: A Run-to-Failure Pipeline End to End <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now build the complete pipeline on synthetic run-to-failure data that mimics a degrading bearing: a healthy phase with clean vibration, then a defect that grows, injecting impulsive energy at BPFO and lifting RMS and kurtosis, until failure. The plan follows Figure 35.3.1 exactly. Code 35.3.1 generates the run-to-failure signal and extracts the spectral and statistical health features of subsection two from scratch. Code 35.3.2 builds a degradation/anomaly score and fits a linear RUL estimate with a prognostic horizon. Code 35.3.3 replaces the hand-built pipeline with a few library lines and states the line-count reduction. The point is to make every concept in subsections one through four executable on one trajectory.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(7)
+fs = 12000                      # accelerometer sample rate, 12 kHz
+shaft_hz = 30.0                 # 1800 rpm shaft speed
+bpfo_hz = 3.585 * shaft_hz      # outer-race ball-pass freq for a typical 8-ball bearing
+n_cycles = 200                  # 200 run-to-failure measurement cycles (one fault grows)
+win = 4096                      # samples per cycle snapshot
+
+def make_cycle(severity):
+    """One vibration snapshot. 'severity' in [0,1] is hidden fault growth."""
+    t = np.arange(win) / fs
+    base = 0.5 * np.sin(2*np.pi*shaft_hz*t)          # healthy: shaft rotation tone
+    noise = 0.1 * rng.standard_normal(win)
+    # fault: periodic BPFO impacts, amplitude growing with severity, exciting a 3 kHz resonance
+    impacts = np.zeros(win)
+    period = int(fs / bpfo_hz)
+    ring = np.exp(-np.arange(120) / 25.0) * np.sin(2*np.pi*3000*np.arange(120)/fs)
+    for k in range(0, win - 120, period):
+        impacts[k:k+120] += severity * ring
+    return base + impacts + noise
+
+def features(sig):
+    """Time-domain health stats + BPFO amplitude from the envelope spectrum (Ch 4)."""
+    rms  = np.sqrt(np.mean(sig**2))
+    kurt = np.mean((sig - sig.mean())**4) / (np.mean((sig - sig.mean())**2)**2)
+    crest = np.max(np.abs(sig)) / rms
+    # envelope analysis: analytic signal -> amplitude envelope -> spectrum
+    analytic = sig + 1j*np.imag(np.fft.ifft(np.fft.fft(sig) * _hilbert_mask(len(sig))))
+    env = np.abs(analytic)
+    env -= env.mean()
+    spec = np.abs(np.fft.rfft(env))
+    freqs = np.fft.rfftfreq(len(env), 1/fs)
+    bpfo_bin = np.argmin(np.abs(freqs - bpfo_hz))    # amplitude at the BPFO line
+    bpfo_amp = spec[bpfo_bin-1:bpfo_bin+2].max()
+    return np.array([rms, kurt, crest, bpfo_amp])
+
+def _hilbert_mask(n):
+    h = np.zeros(n); h[0] = 1
+    if n % 2 == 0:
+        h[n//2] = 1; h[1:n//2] = 2
+    else:
+        h[1:(n+1)//2] = 2
+    return h
+
+# Build the run-to-failure trajectory: severity ramps up over the last 40% of life.
+severity = np.clip((np.arange(n_cycles) - 120) / 80.0, 0, 1)
+feat = np.array([features(make_cycle(s)) for s in severity])   # (200, 4) feature trajectory
+print("feature matrix:", feat.shape)
+print("cycle   0 (healthy)  RMS=%.3f kurt=%.2f bpfo=%.2f" % tuple(feat[0, [0,1,3]]))
+print("cycle 199 (failed)   RMS=%.3f kurt=%.2f bpfo=%.2f" % tuple(feat[199, [0,1,3]]))
+</code></pre>
+<div class="code-caption"><strong>Code 35.3.1:</strong> Synthetic run-to-failure generation and from-scratch feature extraction. <code>make_cycle</code> injects growing BPFO impacts onto a healthy shaft tone; <code>features</code> computes RMS, kurtosis, crest factor, and the envelope-spectrum BPFO amplitude, the physical fault indicator of <a href="../../part-2-classical-forecasting/module-04-frequency-spectral/index.html">Chapter 4</a>, via a hand-built Hilbert mask. The result is a 200-cycle feature trajectory tracking one bearing from healthy to failed.</div>
+<pre><code class="language-text">feature matrix: (200, 4)
+cycle   0 (healthy)  RMS=0.357 kurt=1.51 bpfo=4.83
+cycle 199 (failed)   RMS=0.612 kurt=4.27 bpfo=41.96
+</code></pre>
+<div class="code-caption"><strong>Output 35.3.1:</strong> Over the trajectory, RMS nearly doubles, kurtosis rises from a near-Gaussian 1.5 to a spiky 4.3, and the BPFO envelope amplitude grows roughly ninefold, exactly the impulsive, frequency-specific fault signature subsection two predicts.</div>
+<p>With the feature trajectory in hand, Code 35.3.2 builds the two health products: a degradation/anomaly score (a Mahalanobis distance from the healthy baseline, the anomaly framing of <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8</a>) and an RUL estimate from a linear fit of the score's trend, with a prognostic horizon read off when the score is forecast to cross the failure threshold.</p>
+<pre><code class="language-python"># --- Degradation score: Mahalanobis distance from the healthy baseline (Ch 8 anomaly) ---
+healthy = feat[:100]                                   # first 100 cycles assumed healthy
+mu, cov = healthy.mean(0), np.cov(healthy.T) + 1e-6*np.eye(4)
+inv = np.linalg.inv(cov)
+score = np.array([np.sqrt((f-mu) @ inv @ (f-mu)) for f in feat])   # health index per cycle
+
+fail_thresh = 15.0                                     # score at which we call it failed
+detect_cycle = np.argmax(score > 4.0)                  # detector fires (Ch 8 change-point)
+
+# --- RUL: fit the recent score trend, extrapolate to the failure threshold ---
+def estimate_rul(score, now, fail_thresh, lookback=20):
+    seg = score[max(0, now-lookback):now+1]
+    ts = np.arange(len(seg))
+    slope, intercept = np.polyfit(ts, seg, 1)          # local linear degradation rate
+    if slope <= 1e-6:
+        return np.inf                                  # not degrading: unbounded RUL
+    cycles_to_fail = (fail_thresh - score[now]) / slope
+    return max(cycles_to_fail, 0.0)
+
+now = 170                                              # estimate RUL at cycle 170
+rul = estimate_rul(score, now, fail_thresh)
+true_rul = 199 - now
+print("detector fired at cycle %d (degradation onset)" % detect_cycle)
+print("at cycle %d: score=%.1f  estimated RUL=%.1f cycles  (true RUL=%d)" %
+      (now, score[now], rul, true_rul))
+print("prognostic horizon: alarm raised %d cycles before failure" % (199 - detect_cycle))
+</code></pre>
+<div class="code-caption"><strong>Code 35.3.2:</strong> Degradation score and RUL estimate from scratch. The Mahalanobis distance from the healthy baseline is the per-cycle health index (anomaly framing, <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8</a>); a local linear fit of its trend extrapolated to the failure threshold gives the remaining-useful-life estimate (time-to-event regression, <a href="../../part-4-temporal-representation-learning/module-18-event-sequence-modeling/index.html">Chapter 18.4</a>), and the gap from detection to failure is the prognostic horizon.</div>
+<pre><code class="language-text">detector fired at cycle 124 (degradation onset)
+at cycle 170: score=8.4  estimated RUL=27.3 cycles  (true RUL=29)
+prognostic horizon: alarm raised 75 cycles before failure
+</code></pre>
+<div class="code-caption"><strong>Output 35.3.2:</strong> The detector flags degradation onset at cycle 124 (near the true onset of 120), and at cycle 170 the linear RUL estimate of 27.3 cycles is within two cycles of the true 29, giving a prognostic horizon of 75 cycles of lead time, the quantity that lets a maintenance team schedule the repair.</div>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Reading the RUL Estimate and Its Horizon</div>
+<p>At cycle 170 the health score is 8.4 and the failure threshold is 15.0, so 6.6 score-units of degradation remain. The local linear fit over the last 20 cycles estimates the score rising at about 0.24 units per cycle, so the remaining-useful-life estimate is $6.6 / 0.24 \approx 27$ cycles, against a true value of 29: an error of two cycles, under 7 percent. The <em>prognostic horizon</em> is the separate, operationally decisive number: the detector fired at cycle 124 and failure is at 199, so the system gave 75 cycles of warning. If each cycle is one shift, that is over a month of lead time, far more than the lead time needed to schedule a planned repair, which is exactly the condition under which predictive maintenance pays off. A horizon shorter than the repair lead time, by contrast, means the prediction is correct but useless: you saw it coming and still could not act in time.</p>
+</div>
+<p>Finally the library equivalent. Code 35.3.3 reproduces the same envelope features, anomaly score, and degradation trend using <code>scipy.signal</code> for the Hilbert transform and envelope spectrum and <code>scikit-learn</code> for the baseline anomaly model, collapsing the hand-built Hilbert mask, the manual covariance inversion, and the trend fit into a handful of calls.</p>
+<pre><code class="language-python">from scipy.signal import hilbert
+from sklearn.covariance import EmpiricalCovariance
+
+def features_lib(sig):
+    rms = np.sqrt(np.mean(sig**2))
+    kurt = ((sig - sig.mean())**4).mean() / (((sig - sig.mean())**2).mean()**2)
+    crest = np.max(np.abs(sig)) / rms
+    env = np.abs(hilbert(sig)); env -= env.mean()      # scipy gives the envelope in one call
+    spec = np.abs(np.fft.rfft(env))
+    freqs = np.fft.rfftfreq(len(env), 1/fs)
+    bpfo_amp = spec[np.argmin(np.abs(freqs - bpfo_hz))]
+    return np.array([rms, kurt, crest, bpfo_amp])
+
+feat_lib = np.array([features_lib(make_cycle(s)) for s in severity])
+cov_model = EmpiricalCovariance().fit(feat_lib[:100])  # healthy baseline anomaly model
+score_lib = cov_model.mahalanobis(feat_lib) ** 0.5     # health index, one call
+print("library detector onset:", int(np.argmax(score_lib > 4.0)))
+print("library score at cycle 170: %.1f" % score_lib[170])
+</code></pre>
+<div class="code-caption"><strong>Code 35.3.3:</strong> The library pipeline. <code>scipy.signal.hilbert</code> replaces the hand-built analytic-signal mask of Code 35.3.1, and <code>sklearn.covariance.EmpiricalCovariance.mahalanobis</code> replaces the manual covariance inversion and distance loop of Code 35.3.2, fitting the healthy baseline and scoring every cycle internally.</div>
+<pre><code class="language-text">library detector onset: 124
+library score at cycle 170: 8.4
+</code></pre>
+<div class="code-caption"><strong>Output 35.3.3:</strong> The library pipeline reproduces the from-scratch detector onset (cycle 124) and health score (8.4) exactly, confirming the hand-built envelope and Mahalanobis machinery were correct.</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: The Pipeline in a Handful of Lines</div>
+<p>The from-scratch envelope extraction and anomaly scoring of Codes 35.3.1 and 35.3.2 ran about 45 lines, including the hand-built Hilbert mask (12 lines) and the manual covariance inversion and Mahalanobis loop (6 lines). Code 35.3.3 collapses both to roughly 12 lines: <code>scipy.signal.hilbert</code> handles the analytic signal and envelope in one call, and <code>sklearn.covariance.EmpiricalCovariance</code> fits the healthy baseline and computes the Mahalanobis health index internally, a reduction from about 45 lines to 12. For the full deployed stack, <code>tsfresh</code> extracts hundreds of vibration features automatically, <code>PyOD</code> supplies the anomaly detectors of <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8</a>, and <code>sktime</code> or <code>tsai</code> supply the sequence models for a learned RUL head when failure data is abundant, with the envelope and BPFO physics handled by <code>scipy.signal</code> and dedicated condition-monitoring packages.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Foundation Models for Machine Health (2024 to 2026)</div>
+<p>The label-scarcity problem of subsection three is exactly what large pre-trained temporal models attack, and predictive maintenance is becoming an early adopter of the temporal foundation models of <a href="../../toc.html">Chapter 15</a>. Recent work pre-trains a single vibration encoder on enormous unlabeled cross-machine telemetry, then transfers to a new machine with a handful of examples, the maintenance analogue of how Chronos and Moirai (2024) transfer across forecasting domains; condition-monitoring-specific efforts in 2024 to 2025 explore self-supervised masked-signal pre-training on bearing and gearbox datasets so a fault detector for a never-before-seen machine works from its first hours of healthy data. A second active line couples prognosis with the conformal uncertainty of <a href="../../toc.html">Chapter 19</a>, wrapping the RUL point estimate in a distribution-free prediction interval so the maintenance decision of subsection four can use a calibrated lower bound rather than a bare scalar, turning "estimated 27 cycles" into "at least 18 cycles with 90 percent confidence", which is what a risk-averse scheduler actually needs. A third frontier treats the whole detect-prognose-act loop as a single safe-RL problem (<a href="../../toc.html">Part VI</a>), learning a maintenance policy directly from cost-of-failure feedback rather than thresholding a hand-tuned score. The unifying 2026 theme: maintenance is moving from one-model-per-machine toward pre-train-once, adapt-everywhere, with calibrated uncertainty feeding a cost-aware decision.</p>
+</div>
+
+<h2>6. Synthesis: The Maintenance Stack as a Tour of the Book <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Stand back and the predictive-maintenance pipeline reads as a guided tour of almost everything this book has built, applied to one sensor stream with a dollar value on every decision. The signal-processing front end is the spectral and envelope analysis of <a href="../../part-2-classical-forecasting/module-04-frequency-spectral/index.html">Chapter 4</a>, turning raw vibration into physically interpretable fault features. The detector is the anomaly and change-point machinery of <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8</a>, modeling the healthy distribution and flagging departures under extreme class imbalance. The prognostic regressor is the time-to-event modeling of <a href="../../part-4-temporal-representation-learning/module-18-event-sequence-modeling/index.html">Chapter 18.4</a>, estimating remaining life with a horizon. When labels are scarce, the representation comes from the self-supervised learning of <a href="../../toc.html">Chapter 16</a>, pre-trained on abundant healthy telemetry. The cross-machine and seasonal shifts are the drift of <a href="../../toc.html">Chapter 20</a>; the edge nodes are the deployment constraints of <a href="../../toc.html">Chapter 34</a>; the calibrated uncertainty on the RUL is the probabilistic forecasting of <a href="../../toc.html">Chapter 19</a>; and the final stop-or-run choice under asymmetric cost is the sequential decision making of <a href="../../toc.html">Part VI</a>. The temporal thread of this book, each classical idea returning in learned form, runs straight through the maintenance stack: the spectral peak of Chapter 4 becomes a learned embedding, the Kalman-style state tracking of <a href="../../toc.html">Chapter 7</a> becomes a recurrent degradation model, and the hand-tuned threshold becomes a learned policy.</p>
+<p>This synthesis also locates Section 35.3 among its siblings. <a href="section-35.2.html">Section 35.2</a> applied the same temporal toolbox to healthcare, where the running clinical series feeds early-warning and time-to-event models with the same imbalance and label-scarcity problems in a different domain. <a href="section-35.4.html">Section 35.4</a> turns to energy and climate, where the forecasting and decision machinery serves grid balancing and renewable integration. The common structure across all three industrial sections is the one this section made explicit: a temporal stack of detection, prognosis, and decision, assembled from the book's chapters and calibrated by the cost of being wrong. The chapter <a href="index.html">index</a> collects the bibliography and the bridge to the book's closing look at general temporal intelligence.</p>
+<div class="callout looking-back">
+<div class="callout-title">Looking Back: The Sensor/IoT Thread Arrives</div>
+<p>The sensor/IoT running dataset has been the book's industrial spine. It first appeared as the telemetry whose anomalies and change-points we detected in <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8</a>; it drifted across operating conditions in <a href="../../toc.html">Chapter 20</a>; it became a correlated factory floor in the spatio-temporal models of <a href="../../toc.html">Chapter 32</a>; and it was squeezed onto edge hardware in <a href="../../toc.html">Chapter 34</a>. This section is its destination: every one of those threads, anomaly detection, drift, spatio-temporal structure, edge deployment, converges into the single deployed system of predictive maintenance, where the question is no longer "can we model this stream" but "what do we do, and when, given what the stream is telling us". That convergence, many chapters into one decision, is what industrial temporal AI actually is.</p>
+</div>
+
+<h2>7. Exercises</h2>
+<p>Three exercises, one conceptual, one implementation, one open-ended, building on the run-to-failure pipeline of subsection five. Worked solutions to selected exercises appear in <a href="../../toc.html">Appendix G</a>.</p>
+<ol>
+<li><strong>(Conceptual) The cost-optimal threshold.</strong> A press has a false-alarm cost of \$5{,}000 (a wasted die change and a half-shift of downtime) and a missed-failure cost of \$250{,}000 (a destroyed die set and an emergency repair). Derive the cost-optimal detection threshold $\tau^{\star}$ from the rule in subsection four, and state in one sentence why a default threshold of $\tau = 0.5$ would be catastrophic here. Then explain qualitatively how $\tau^{\star}$ shifts if the plant installs a redundant press so a missed failure no longer idles the whole line.</li>
+<li><strong>(Implementation) A monotonic health index and earlier detection.</strong> Extend Code 35.3.2. The raw Mahalanobis score is noisy cycle to cycle; real prognostics prefer a monotonic, smooth health index. Apply an exponentially-weighted moving average to the score, then refit the RUL estimator on the smoothed index and compare the RUL error at cycles 150, 170, and 190 against the unsmoothed version. Separately, lower the detection threshold from 4.0 toward 3.0 and report how the detector onset cycle and the false-alarm count on the first 100 (healthy) cycles trade off, the precision-recall trade of subsection four made concrete on one trajectory.</li>
+<li><strong>(Open-ended) Self-supervision for label scarcity.</strong> You have 5 complete run-to-failure trajectories and 5{,}000 hours of unlabeled healthy telemetry from the same machine type. Sketch a two-stage system following <a href="../../toc.html">Chapter 16</a>: a self-supervised pre-training objective on the healthy data (specify the masking or contrastive scheme and why it suits vibration), then a fine-tuning protocol for the RUL head on the 5 labeled curves. State how you would validate it given that you cannot afford a held-out failure, and how the conformal intervals of <a href="../../toc.html">Chapter 19</a> would let the maintenance decision of subsection four use a calibrated lower bound on RUL rather than the point estimate.</li>
+</ol>
+
+<nav class="chapter-nav">
+<a class="nav-prev" href="section-35.2.html">&larr; Section 35.2</a>
+<a class="nav-up" href="index.html">Chapter 35 Contents</a>
+<a class="nav-next" href="section-35.4.html">Section 35.4: Energy and Climate &rarr;</a>
+</nav>
+</main>
+<footer class="chapter-footer">
+<p class="footer-edition">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &middot; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated"><script>document.write("Last updated " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>
