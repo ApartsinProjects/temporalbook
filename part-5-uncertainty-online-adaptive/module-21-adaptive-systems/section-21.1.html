@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 21.1: Dynamic Model Updating and Retraining Triggers. When to refresh a deployed temporal model: scheduled versus triggered versus continuous updating, designing performance and drift triggers with hysteresis and cooldowns, warm-start versus cold retrain, champion/challenger and shadow deployment, validation gates and automatic rollback, and a from-scratch triggered-retraining controller compared to a library scheduler version." name="description"/>
+<title>Section 21.1: Dynamic Model Updating and Retraining Triggers | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Uncertainty, Online, and Adaptive Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 21: Adaptive Temporal AI Systems</a></div>
+<h1>Dynamic Model Updating and Retraining Triggers</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I have been scheduled to run every Sunday at 3 a.m. for two years. Most Sundays I retrain on data that has not meaningfully changed, burning a few GPU-hours to rediscover last week's model. The one Sunday the world actually shifted, I had already run on Saturday's stale data and went back to sleep. I do not want a calendar. I want a reason."</p>
+<cite>A Retraining Job Waiting for a Good Reason to Run</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A deployed temporal model sits on top of a world that does not hold still, and the single most consequential operational decision is not which architecture to train but when to retrain the one you have. There are three answers, and choosing among them is an engineering trade, not a matter of taste. Scheduled updating refreshes on a fixed clock (every night, every week) and is simple and predictable but is blind to the data: it retrains when nothing has changed and sleeps through the moment that mattered. Triggered updating fires only when a monitored signal (a rolling error climbing past a threshold, a drift detector raising an alarm, a flood of new labeled data) says the model is decaying, spending compute exactly when it buys accuracy. Continuous updating, the online and continual learning of <a href="../module-20-online-continual-learning/index.html">Chapter 20</a>, folds every new observation into the weights as it arrives, with the lowest latency and the highest risk of quietly corrupting the model.</strong> This section builds the machinery of the triggered regime, the one most production teams actually want: how to design degradation, drift, volume, and calendar triggers; how hysteresis and cooldowns stop a trigger from thrashing the way a twitchy alarm causes alert fatigue; how to choose a warm-start finetune over a cold full refit; how champion/challenger, shadow, and canary deployments let a new model prove itself before it owns traffic; and how validation gates and automatic rollback keep a bad update from ever reaching users. We close by building a triggered-retraining controller from scratch on a drifting stream, then replacing it with a library scheduler, and pricing scheduled against triggered retraining in hard numbers. You leave able to decide when a temporal model should be allowed to change, and to make that change safe.</p>
+</div>
+<p>Every prior part of this book trained a model once and evaluated it on a held-out slice of the same distribution. That is a fiction the world does not honor. A demand forecaster meets a new product launch; a fraud detector meets a new attack; a sensor model meets a re-calibrated instrument; a financial model meets a regime change. The data engineering of <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a> taught us to respect time when we build datasets; the drift and continual-learning material of <a href="../module-20-online-continual-learning/index.html">Chapter 20</a> taught us to detect and absorb change as it streams. This section sits exactly at their junction and asks the operational question neither fully answered: given that the world drifts and that we can detect it, what should the deployed system actually <em>do</em>, and when? The answer is a control loop wrapped around your model, the subject of this whole chapter, and this section is its trigger logic.</p>
+<p>Why does the timing of retraining deserve its own treatment rather than a footnote reading "just retrain often"? Because both extremes are expensive in different currencies. Retraining too rarely lets the model decay, and a decayed temporal model fails silently: forecasts drift off, anomaly scores miscalibrate, and nobody notices until a downstream metric (revenue, safety, trust) moves. Retraining too often burns compute, multiplies the surface for a bad update to slip through, and, if done carelessly, can make the model <em>worse</em> by fitting noise or by reintroducing the leakage and point-in-time errors that <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a> warned against. The competent practitioner treats retraining as a guarded, triggered, validated, reversible action, and that is precisely what we now construct.</p>
+<p>The competencies this section installs are four. To compare the scheduled, triggered, and continuous regimes on cost, latency, and risk, and to pick one per system. To design a trigger from a rolling metric or a drift detector, equipped with the hysteresis and cooldown that keep it from firing on every wobble. To choose an update strategy (warm versus cold, incremental versus full, champion/challenger, shadow, canary) appropriate to the trigger and the risk. And to gate every update behind a validation check with automatic rollback so a regression can never reach production. These are the load-bearing skills for the drift-detection and adaptive-systems sections that follow (<a href="section-21.2.html">Section 21.2</a> onward).</p>
+
+<h2>1. The Retraining Question: Scheduled, Triggered, or Continuous <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Strip the problem to its essence and there are exactly three policies for keeping a deployed model current, distinguished by what causes an update to happen. A <em>scheduled</em> policy updates on a fixed clock, independent of the data: retrain every night at 2 a.m., or every Monday, or the first of the month. A <em>triggered</em> policy updates only when a monitored condition crosses a threshold: a rolling error rises above a bound, a drift detector alarms, a quota of fresh labels accumulates. A <em>continuous</em> policy updates from every observation as it arrives, never stopping, which is the online and continual learning regime of <a href="../module-20-online-continual-learning/index.html">Chapter 20</a>. These are not three flavors of the same thing; they occupy genuinely different points on the cost, latency, and risk surface, and a serious system chooses deliberately among them.</p>
+<p>Scheduled updating is the workhorse default and for good reason: it is trivial to reason about, trivial to capacity-plan (you know exactly when and how often the job runs), and it composes cleanly with the rest of a data pipeline that already runs on a cron. Its weakness is that the clock has no idea what the data is doing. A nightly retrain wastes compute on the many nights nothing changed, and, worse, its fixed cadence sets a hard floor on how stale the model can become: if the world shifts on Tuesday morning and the job runs Sunday night, the model carries up to a week of decay before it even looks at the new reality. Scheduled updating buys predictability at the cost of being permanently a little behind and occasionally a lot behind.</p>
+<p>Triggered updating inverts the trade. It spends compute only when a signal says the model is decaying, so on a stable stream it may go weeks without a single retrain, and when a shift hits it responds within the detection latency of its trigger rather than at the next calendar tick. The price is complexity and a new failure mode: the system now depends on a monitor that can itself be wrong. A trigger that is too sensitive fires on noise and thrashes (the alert-fatigue pathology we return to in subsection two, first met in the anomaly alarms of <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8</a>); a trigger that is too dull sleeps through real decay. Most of the engineering of this section is making that monitor trustworthy.</p>
+<p>Continuous updating pushes latency to its floor: there is no waiting for a clock or a threshold, because every observation nudges the weights immediately. This is the right regime when the environment drifts fast and smoothly and labels arrive promptly, and it is exactly what <a href="../module-20-online-continual-learning/index.html">Chapter 20</a> equips you to do safely with online optimizers, replay buffers, and regularization against catastrophic forgetting. Its risk is the mirror image of its strength: with no gate between data and weights, a burst of corrupted, adversarial, or simply mislabeled observations is absorbed before anyone can intervene, and a continually updated model can degrade in ways that are hard to attribute and harder to roll back. Continuous updating buys minimal staleness at the cost of minimal control.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Property</th><th>Scheduled (time-based)</th><th>Triggered (drift / performance)</th><th>Continuous (online, Ch 20)</th></tr></thead>
+<tbody>
+<tr><td>update cause</td><td>fixed clock tick</td><td>monitored signal crosses threshold</td><td>every new observation</td></tr>
+<tr><td>staleness (worst case)</td><td>up to one period</td><td>detection latency of the trigger</td><td>essentially zero</td></tr>
+<tr><td>compute on a stable stream</td><td>wasted every period</td><td>near zero (rarely fires)</td><td>continuous, always on</td></tr>
+<tr><td>response to a sudden shift</td><td>at next scheduled run</td><td>within detection latency</td><td>immediate but blind</td></tr>
+<tr><td>control / reviewability</td><td>high (discrete, gated runs)</td><td>high (discrete, gated runs)</td><td>low (weights move constantly)</td></tr>
+<tr><td>main risk</td><td>permanent lag; wasted cost</td><td>bad monitor: thrash or miss</td><td>silent corruption, hard rollback</td></tr>
+<tr><td>typical use</td><td>stable pipelines, simple ops</td><td>most production temporal systems</td><td>fast smooth drift, prompt labels</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 21.1.1:</strong> The three updating regimes on the cost, latency, and control surface. Scheduled trades predictability for permanent lag; continuous trades minimal staleness for minimal control; triggered sits between, spending compute only when a monitor says it pays, which is why it is the default for most production temporal systems and the focus of this section.</figcaption>
+</figure>
+<p>In practice the three are not mutually exclusive, and the strongest production designs blend them. A common and robust pattern is a triggered system with a scheduled safety net: retrain whenever the drift or degradation trigger fires, <em>and</em> retrain unconditionally at least once a quarter so the model never goes arbitrarily long without a refresh even if the monitor is silently broken. Continuous updating, where used, is frequently layered as a light online correction on top of a triggered heavy retrain: the online layer tracks small smooth drift between retrains, and the triggered full refit handles the abrupt regime changes the online layer cannot absorb. The decision is per-system, and it is governed by how fast the data drifts, how costly a retrain is, how quickly labels arrive, and how much control the deployment demands.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Update Cause Is the Design Choice</div>
+<p>The three regimes differ in exactly one thing, what <em>causes</em> an update, and everything else (cost, staleness, risk) follows from that choice. Scheduled updating is caused by a clock that cannot see the data; triggered updating is caused by a monitor that watches the data; continuous updating is caused by the data itself, one observation at a time. Pick the cause that matches your environment: a clock when the world is stable and predictability matters most; a monitor when shifts are episodic and you want to pay for retraining only when it earns its keep; the data itself when drift is fast, smooth, and promptly labeled. Most temporal systems live in the episodic middle, which is why this section is built around the triggered regime.</p>
+</div>
+<div class="callout looking-back">
+<div class="callout-title">Looking Back: Detection Was Chapter 20's Job; Action Is This Chapter's</div>
+<p><a href="../module-20-online-continual-learning/index.html">Chapter 20</a> built the detectors: drift tests, change-point statistics, and the online learners that absorb gradual shift. It answered "has the world changed, and how do I keep learning?" It deliberately left open the operational question of what a <em>deployed system</em> should do with that signal. This chapter closes the loop. A drift alarm from Section 20.2 is not, by itself, an action; it is an input to the trigger logic of subsection two, which decides whether the alarm is worth a retrain, what kind of retrain, and how to ship the result safely. Detection is necessary but not sufficient; the controller around it is what makes a system adaptive rather than merely observant.</p>
+</div>
+
+<h2>2. Designing Triggers: Thresholds, Drift Alarms, Hysteresis, and Cooldowns <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A trigger is a function from a stream of monitored signals to a binary decision: retrain now, or do not. Four families of signal dominate practice, and a real system usually combines several. The first is a <strong>performance-degradation</strong> trigger on a rolling metric: track a smoothed error over a sliding window and fire when it exceeds a bound. The second is a <strong>drift-detector alarm</strong>, the direct consumer of the change detectors of <a href="../module-20-online-continual-learning/index.html">Chapter 20</a>; when the detector of Section 20.2 raises its flag, the trigger fires even before the error visibly degrades, which matters when labels arrive late and the error metric is therefore lagged. The third is a <strong>data-volume</strong> trigger: fire once a quota of new labeled examples has accumulated, on the logic that enough fresh data is itself worth incorporating regardless of any measured decay. The fourth is a <strong>calendar or business</strong> trigger: a known event (a quarterly product refresh, a regulatory boundary, a planned promotion) that you know in advance will shift the distribution, so you schedule a retrain around it deliberately.</p>
+<p>Formally, the performance trigger watches a rolling error. Let $e_t = \ell(\hat{y}_t, y_t)$ be the per-step loss and maintain an exponentially weighted moving average</p>
+$$\bar{e}_t = \alpha\, e_t + (1 - \alpha)\, \bar{e}_{t-1}, \qquad 0 < \alpha \le 1,$$
+<p>where $\alpha$ sets the memory of the average (small $\alpha$ is smooth and slow, large $\alpha$ is responsive and noisy). The naive trigger fires the instant $\bar{e}_t > \theta$ for a fixed threshold $\theta$. That naive rule is exactly where systems go wrong, because a rolling metric sitting near its threshold will cross it repeatedly on noise alone, firing a retrain, dropping back below, firing again, an oscillation that retrains the model dozens of times an hour for no real reason. This is the same alert-fatigue pathology the anomaly alarms of <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8</a> taught us to fear: a detector that cries wolf so often that its alarms become noise the operators learn to ignore, and here the "operator" is an expensive automated retraining pipeline.</p>
+<p>Two classical control devices tame the oscillation. <strong>Hysteresis</strong> uses two thresholds instead of one: an upper bound $\theta_{\text{hi}}$ to fire the trigger and a lower bound $\theta_{\text{lo}} < \theta_{\text{hi}}$ to re-arm it. Once fired, the trigger will not fire again until the metric has first dropped back below $\theta_{\text{lo}}$, so a metric hovering between the two bands cannot thrash. This is the identical two-threshold logic a thermostat uses to avoid switching on and off every few seconds, and the gap $\theta_{\text{hi}} - \theta_{\text{lo}}$ is the deadband that absorbs noise. <strong>Cooldown</strong> adds a minimum time (or minimum number of observations) that must elapse after any retrain before another can start, regardless of the metric, so even a genuinely sustained degradation cannot trigger retrains faster than, say, once a day. Hysteresis prevents thrashing around the threshold; cooldown bounds the worst-case retrain frequency and protects the pipeline's capacity. A production trigger almost always uses both.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A rolling error curve rising and falling over time against two horizontal threshold lines. An upper fire threshold and a lower re-arm threshold create a deadband. The trigger fires when the curve crosses the upper line, then stays armed-off until the curve drops below the lower line, illustrating hysteresis and a cooldown window after a fire.">
+<defs>
+<marker id="arr211" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.ax211 { stroke:#5a626c; stroke-width:1.6; fill:none; marker-end:url(#arr211); }
+.hi211 { stroke:#b8431f; stroke-width:1.6; stroke-dasharray:6 4; fill:none; }
+.lo211 { stroke:#1f7a4d; stroke-width:1.6; stroke-dasharray:6 4; fill:none; }
+.cur211 { stroke:#14385c; stroke-width:2.4; fill:none; }
+.band211 { fill:#f0d9cc; opacity:0.45; }
+.lab211 { font:600 13px sans-serif; fill:#14385c; text-anchor:start; }
+.hiL211 { font:600 12px sans-serif; fill:#b8431f; text-anchor:start; }
+.loL211 { font:600 12px sans-serif; fill:#1f7a4d; text-anchor:start; }
+.fire211 { font:600 12px sans-serif; fill:#b8431f; text-anchor:middle; }
+.cd211 { fill:#dfe8f2; opacity:0.6; }
+</style>
+<text class="lab211" x="40" y="28">Rolling error with hysteresis and cooldown</text>
+<line class="ax211" x1="60" y1="270" x2="790" y2="270"/>
+<line class="ax211" x1="60" y1="270" x2="60" y2="40"/>
+<rect class="band211" x="60" y="110" width="700" height="60"/>
+<line class="hi211" x1="60" y1="110" x2="760" y2="110"/><text class="hiL211" x="668" y="104">&#952;_hi (fire)</text>
+<line class="lo211" x1="60" y1="170" x2="760" y2="170"/><text class="loL211" x="650" y="190">&#952;_lo (re-arm)</text>
+<rect class="cd211" x="300" y="50" width="120" height="220"/><text class="fire211" x="360" y="64">cooldown</text>
+<path class="cur211" d="M60,230 C120,225 170,150 210,120 C240,98 270,92 300,100 C340,112 370,160 410,200 C450,235 500,215 540,150 C580,95 620,90 660,118 C700,150 740,210 780,235"/>
+<circle cx="300" cy="100" r="5" fill="#b8431f"/><text class="fire211" x="300" y="44">FIRE</text>
+<circle cx="540" cy="150" r="5" fill="#5a626c"/><text class="loL211" x="540" y="138">suppressed</text>
+<text class="lab211" x="640" y="294">time</text>
+</svg>
+<figcaption><strong>Figure 21.1.2:</strong> Hysteresis and cooldown on a rolling-error trigger. The trigger fires when the error crosses the upper band $\theta_{\text{hi}}$ (left dot), then enters a cooldown window during which no retrain may start. The second upward excursion (middle dot) is suppressed because the metric never dropped below the re-arm band $\theta_{\text{lo}}$ to re-arm the trigger; the shaded deadband between the two thresholds is what absorbs noise and prevents the thrashing alert-fatigue failure of <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8</a>.</figcaption>
+</figure>
+<p>Combining several triggers raises a small policy question: do you fire on <em>any</em> trigger (an OR over the family, maximally responsive) or only when <em>several agree</em> (an AND or a voting rule, maximally conservative)? The robust default is an OR over a small set of well-tuned triggers, each with its own hysteresis and a shared global cooldown, so a drift alarm, a degradation threshold, or a volume quota can each independently call for a retrain, but the global cooldown still bounds how often retrains actually run. The drift trigger gives early warning before the error degrades; the performance trigger is the ground-truth backstop that fires if drift detection missed something; the volume trigger ensures fresh data is eventually incorporated even on a stable stream; and the calendar trigger handles the shifts you can foresee. Each covers a blind spot of the others.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Why One Threshold Thrashes and Two Do Not</div>
+<p>Suppose the rolling error $\bar{e}_t$ has stabilized near a baseline of $0.50$ with noise of standard deviation $0.04$, and you set a single threshold $\theta = 0.52$. The metric sits only half a standard deviation below the line, so on Gaussian noise it crosses above $0.52$ roughly $31\%$ of the time and back below it just as often: in a window of $100$ steps it crosses the threshold on the order of $30$ times, firing $30$ retrains for a model that has not actually decayed. Now add hysteresis with $\theta_{\text{hi}} = 0.58$ (two standard deviations above baseline) and $\theta_{\text{lo}} = 0.52$. To fire, the metric must reach $0.58$, a $2\sigma$ excursion that noise produces about $2.3\%$ of the time; to fire <em>again</em> it must first fall back below $0.52$ and then climb to $0.58$ once more. The expected number of spurious fires per $100$ steps drops from roughly $30$ to well under one. Layer a cooldown of $24$ hours on top and the worst-case retrain rate is capped at once per day no matter what the metric does. Two thresholds plus a cooldown turn a thrashing trigger into a quiet, trustworthy one.</p>
+</div>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: A Trigger Without Hysteresis and Cooldown Is a Thrash Machine</div>
+<p>Any single-threshold trigger on a noisy metric will oscillate, because a metric near its threshold crosses it repeatedly on noise alone. Hysteresis (a fire band and a separate, lower re-arm band) gives the metric a deadband to wobble in without re-firing; cooldown puts a hard floor on the time between retrains regardless of the metric. The first kills threshold thrashing; the second bounds the worst-case cost and protects the pipeline. Omitting either reproduces the alert-fatigue failure of <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8</a>: an alarm that fires so often it becomes meaningless, except here each false alarm spends real GPU-hours. Design the trigger so that when it fires, a human (or an auto-retrain pipeline) is right to believe it.</p>
+</div>
+
+<h2>3. Update Strategies: Warm Start, Cold Retrain, and Safe Deployment Patterns <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Once a trigger fires, a second decision follows immediately: <em>how</em> to produce the new model. The choices form two roughly independent axes. The first axis is initialization: a <strong>warm start</strong> begins from the current model's weights and continues training (an incremental finetune on recent data), whereas a <strong>cold retrain</strong> discards the weights and refits from scratch on the chosen training window. The second axis is data scope and effort: an <strong>incremental finetune</strong> touches the model lightly with a small slice of recent data and few steps, whereas a <strong>full refit</strong> retrains on the entire (possibly re-windowed) dataset for the full schedule. Warm-start incremental updates are fast and cheap and track gradual drift well, but they accumulate the same catastrophic-forgetting and stale-prior risks that <a href="../module-20-online-continual-learning/index.html">Chapter 20</a> studied; cold full refits are expensive but reset any accumulated drift in the weights and are the safe choice after an abrupt regime change that has made the old model's inductive bias actively wrong.</p>
+<p>The rule of thumb is to match the update effort to the size of the shift the trigger detected. A small, slow drift (the rolling error nudging up, the drift detector marginal) is best met with a warm-start finetune on recent data: it is cheap, it is fast to ship, and it is enough. A large, abrupt shift (the drift detector firing hard, the error jumping, a known regime change) calls for a cold full refit, because warm-starting from weights tuned to the old regime can leave the model stuck in a basin that no longer fits, and finetuning may never escape it. A useful intermediate is a warm start with a re-windowed dataset: keep the weights but retrain on a window that down-weights or drops the pre-shift data, so the model is pulled toward the new regime without paying for a cold start.</p>
+<p>The second half of update strategy is not how you build the new model but how you let it take over traffic, and here three deployment patterns dominate, ordered by caution. <strong>Champion/challenger</strong> runs the incumbent (champion) in production while the new model (challenger) scores the same live traffic in parallel without affecting decisions; only when the challenger demonstrably beats the champion on the live stream does it get promoted. <strong>Shadow deployment</strong> is the mechanism that makes this possible: the challenger receives a copy of every production request and produces predictions that are logged and compared but never served, so it is evaluated under the exact distribution and load of production with zero user-facing risk. <strong>Canary (or gradual) rollout</strong> is the promotion step done carefully: route a small fraction of traffic (say $1\%$, then $5\%$, then $25\%$) to the new model, watch the live metrics at each stage, and advance only if they hold, so a regression that slipped past offline validation is caught while it affects a sliver of users rather than all of them.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A deployment flow. Live traffic splits: the champion model serves all user-facing decisions while a challenger model receives a shadow copy of the same traffic, logging predictions that are compared offline. On promotion, a canary stage routes a small percentage of traffic to the challenger before full rollout.">
+<defs>
+<marker id="arr213" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.box213 { fill:#eef3f8; stroke:#14385c; stroke-width:2; }
+.chal213 { fill:#fbeee8; stroke:#b8431f; stroke-width:2; }
+.cmp213 { fill:#e6f2ec; stroke:#1f7a4d; stroke-width:2; }
+.fl213 { stroke:#5a626c; stroke-width:1.8; fill:none; marker-end:url(#arr213); }
+.sh213 { stroke:#b8431f; stroke-width:1.6; fill:none; marker-end:url(#arr213); stroke-dasharray:5 4; }
+.lab213 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub213 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.shL213 { font:600 11.5px sans-serif; fill:#b8431f; text-anchor:middle; }
+</style>
+<text class="lab213" x="410" y="26">Shadow + champion/challenger + canary</text>
+<rect class="box213" x="40" y="120" width="120" height="56" rx="9"/><text class="lab213" x="100" y="153">live traffic</text>
+<rect class="cmp213" x="320" y="60" width="150" height="56" rx="9"/><text class="lab213" x="395" y="86">champion</text><text class="sub213" x="395" y="104">serves decisions</text>
+<rect class="chal213" x="320" y="180" width="150" height="56" rx="9"/><text class="lab213" x="395" y="206">challenger</text><text class="shL213" x="395" y="224">shadow: logged only</text>
+<rect class="box213" x="600" y="60" width="170" height="56" rx="9"/><text class="lab213" x="685" y="86">users</text><text class="sub213" x="685" y="104">served output</text>
+<rect class="box213" x="600" y="180" width="170" height="56" rx="9"/><text class="lab213" x="685" y="206">compare + gate</text><text class="sub213" x="685" y="224">promote on win</text>
+<line class="fl213" x1="160" y1="140" x2="318" y2="92"/>
+<line class="sh213" x1="160" y1="156" x2="318" y2="206"/>
+<line class="fl213" x1="470" y1="88" x2="598" y2="88"/>
+<line class="sh213" x1="470" y1="208" x2="598" y2="208"/>
+<line class="sh213" x1="600" y1="200" x2="478" y2="116" stroke-dasharray="5 4"/>
+<text class="shL213" x="540" y="270">canary: route 1% &#8594; 5% &#8594; 25% of live traffic to challenger before full promote</text>
+</svg>
+<figcaption><strong>Figure 21.1.3:</strong> The three safe-deployment patterns working together. The challenger receives a shadow copy of live traffic and logs predictions that are compared against the serving champion; promotion is not a switch but a canary rollout that routes a growing fraction of real traffic to the challenger only as long as live metrics hold. Each layer catches a regression the offline validation gate of subsection four might have missed.</figcaption>
+</figure>
+<p>These patterns matter most for temporal models precisely because temporal performance is hard to certify offline. A forecaster that looks excellent on yesterday's held-out window can fail on today's live stream if the distribution has shifted in a way the held-out window did not capture, and the only fully trustworthy test is the live stream itself. Shadow deployment gives you that test at zero risk, champion/challenger turns it into a promotion decision, and canary rollout bounds the damage of a wrong decision. The sequence (build the challenger, shadow it, validate offline, canary it, promote it) is the safe path from "the trigger fired" to "the new model owns production", and every stage is reversible until the last.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Understudy Who Never Goes On Stage</div>
+<p>A shadow model is the understudy of machine learning: it learns every line, rehearses every performance on the real script in front of the real audience's data, and never once steps into the light. Night after night it predicts what the champion predicts, its outputs dutifully logged and compared, affecting absolutely nothing. The cruel and necessary point is that this is exactly what you want. An understudy who has flawlessly shadowed two hundred live performances is one you can promote with confidence; an understudy you have never tested is a gamble you take in front of a full house. The shadow model earns its promotion by performing perfectly while it cannot do any harm.</p>
+</div>
+
+<h2>4. Safe Updates: Validation Gates, Automatic Rollback, and Reproducibility <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>A trigger decides <em>when</em>, an update strategy decides <em>how</em>, and a safety layer decides whether the result is allowed to ship at all. The non-negotiable component is the <strong>validation gate</strong>: before a newly retrained model can be promoted, it must beat (or at least not regress against) the incumbent on a held-out validation set evaluated under point-in-time-correct conditions. The gate is a hard predicate, for example "the challenger's validation error must be no worse than the champion's by more than a tolerance $\epsilon$", and a model that fails the gate is discarded, never promoted, no matter how loudly the trigger fired. The gate is what stops a retrain that fit noise, or trained on corrupted data, or simply got unlucky, from replacing a working model with a worse one. A retraining pipeline without a validation gate is not an adaptive system; it is an automated way to occasionally break production.</p>
+<p>The gate's verdict must be reversible, which is the role of <strong>automatic rollback</strong>. Even a model that passes offline validation can fail in production (the live distribution differs from the validation window, an integration bug surfaces, latency regresses), so the deployment must continuously watch the promoted model's live metrics and, if they cross a regression bound, automatically revert to the previous known-good model. Rollback is only possible if every model version is retained and addressable, so the system keeps a versioned registry of models and can restore any prior one on demand. The pairing is essential: the validation gate is the pre-deployment check, automatic rollback is the post-deployment safety net, and a robust system has both because each catches failures the other misses.</p>
+<p>Underneath both sits <strong>reproducibility and point-in-time correctness</strong>, the discipline that <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a> built and that retraining makes mission-critical. Every retrain must be reproducible: the exact data window, feature definitions, code version, hyperparameters, and random seed are recorded, so that any deployed model can be rebuilt bit-for-bit, audited, and (if it misbehaves) diagnosed. And every retrain must be <em>point-in-time correct</em>: the training data for a model promoted at time $\tau$ must contain only information that was actually available at or before $\tau$, with no leakage of future values into past features. This is the exact lookahead-leakage hazard of <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a>, and it is far more dangerous in an automated retraining loop than in a one-off experiment, because an automated pipeline retrains repeatedly and unattended: a single point-in-time bug in the feature pipeline silently poisons every retrain forever, producing models that validate beautifully (the leaked future is in the validation set too) and fail in production (where the future is not yet available). The validation gate cannot catch leakage, because leakage inflates the gate's own score; only a point-in-time-correct feature pipeline can.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Point-in-Time Correctness Returns, Now Automated</div>
+<p>In <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a> point-in-time correctness was a discipline you applied by hand when constructing a single training set, and a leak there cost you one over-optimistic experiment. Here the same discipline becomes a property your <em>infrastructure</em> must enforce automatically, because the retraining loop reconstructs training sets again and again without a human in the loop. The temporal thread of this book keeps returning to one idea, that respecting the arrow of time is the difference between a model that works and a model that only appears to: the leakage that fooled a single notebook in Chapter 2 will, uncaught, fool an entire production pipeline indefinitely here. Automation does not relax the Chapter 2 discipline; it raises the stakes of getting it wrong.</p>
+</div>
+<p>Putting the safety layer together gives the full lifecycle of a single guarded update: a trigger fires; the system reconstructs a point-in-time-correct training window; it produces a challenger by the chosen warm or cold strategy; it evaluates the challenger against the champion at the validation gate; on a pass, it shadow-deploys and then canary-rolls the challenger while watching live metrics; on any live regression, it automatically rolls back to the champion; and at every step it records enough to reproduce the model exactly. Every stage is reversible until full promotion, and every model is reproducible forever. That lifecycle, not any single architecture, is what makes a temporal AI system genuinely adaptive and safe at the same time, and it is what the controller of subsection five implements in miniature.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Automated Retraining Policies (2024 to 2026)</div>
+<p>The frontier is replacing hand-tuned trigger thresholds with policies that are themselves learned or principled. Recent work frames the retrain-or-wait decision as a cost-aware sequential problem: tools and studies on "retraining strategies under data drift" (2023 to 2025) optimize a policy that weighs the expected accuracy gain of retraining against its compute cost, rather than firing on a fixed threshold, and some cast it explicitly as a reinforcement-learning or optimal-stopping problem (a direct preview of <a href="../../toc.html">Chapter 22</a>'s decision framing). On the detection side, the conformal and drift-aware monitors that feed these triggers have sharpened: methods coupling drift detection to performance estimation under delayed labels (so the trigger can act before ground-truth error is observable) and conformal-PID-style controllers that adapt thresholds online (connecting to the conformal forecasting of <a href="../module-19-probabilistic-uncertainty/index.html">Chapter 19</a>). Production frameworks have caught up too: the open-source stack (Evidently, NannyML, River, and the orchestration layers around them) now ships drift-triggered retraining as a first-class pattern rather than a bespoke script. The 2026 direction is clear: the retraining trigger is becoming a small learned controller, not a magic number.</p>
+</div>
+
+<h2>5. Worked Example: A Triggered-Retraining Controller, From Scratch and By Library <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make the whole chapter concrete on a deliberately drifting stream. The plan mirrors the lifecycle of subsection four in miniature: generate a regression stream whose coefficients shift partway through (a regime change); run a model that monitors its own rolling error; fire a retrain when the error crosses a hysteresis band, respecting a cooldown; refit on a recent window; validate the challenger against the incumbent and promote only on a pass, otherwise roll back. Code 21.1.1 builds the drifting stream and the from-scratch controller.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(0)
+T, d = 4000, 5                              # stream length, feature dimension
+
+# A drifting regression stream: the true coefficients shift at t = 2000.
+def make_stream(T, d, shift_at=2000):
+    X = rng.normal(0, 1.0, size=(T, d))
+    beta_a = rng.normal(0, 1.0, size=d)    # regime A coefficients
+    beta_b = beta_a + rng.normal(0, 2.0, size=d)  # regime B: abrupt shift
+    y = np.empty(T)
+    for t in range(T):
+        beta = beta_a if t < shift_at else beta_b
+        y[t] = X[t] @ beta + rng.normal(0, 0.3)   # signal + noise
+    return X, y
+
+X, y = make_stream(T, d)
+
+def fit(Xw, yw):                            # ordinary least squares "retrain"
+    return np.linalg.lstsq(Xw, yw, rcond=None)[0]
+
+def sq_err(model, Xb, yb):                  # mean squared error of a model on a batch
+    return float(np.mean((Xb @ model - yb) ** 2))
+
+class TriggeredController:
+    """Monitor rolling error; fire on a hysteresis band with cooldown;
+    refit on a recent window; validate-or-rollback."""
+    def __init__(self, theta_hi=1.5, theta_lo=0.7, alpha=0.05,
+                 cooldown=200, window=400, val=150, tol=0.05):
+        self.theta_hi, self.theta_lo = theta_hi, theta_lo
+        self.alpha, self.cooldown = alpha, cooldown
+        self.window, self.val, self.tol = window, val, tol
+        self.armed, self.last_fire = True, -10**9
+        self.ebar = None
+        self.model = None
+        self.retrains = []                  # log of timesteps where we retrained
+
+    def warmup(self, X, y, n=400):
+        self.model = fit(X[:n], y[:n])      # initial cold fit on the first window
+        self.ebar = sq_err(self.model, X[:n], y[:n])
+        return n
+
+    def step(self, t, X, y):
+        e = (X[t] @ self.model - y[t]) ** 2
+        self.ebar = self.alpha * e + (1 - self.alpha) * self.ebar  # EWMA error
+        # Hysteresis: re-arm only after dropping below theta_lo.
+        if self.ebar < self.theta_lo:
+            self.armed = True
+        fire = (self.ebar > self.theta_hi and self.armed
+                and t - self.last_fire >= self.cooldown)   # + cooldown
+        if fire:
+            self._retrain_guarded(t, X, y)
+            self.armed, self.last_fire = False, t
+
+    def _retrain_guarded(self, t, X, y):
+        lo = max(0, t - self.window)
+        Xw, yw = X[lo:t], y[lo:t]           # recent point-in-time window only
+        v0, v1 = t - self.val, t            # held-out validation slice = most recent val pts
+        challenger = fit(Xw[:-self.val], yw[:-self.val])
+        champ_err = sq_err(self.model, X[v0:v1], y[v0:v1])
+        chal_err = sq_err(challenger, X[v0:v1], y[v0:v1])
+        if chal_err <= champ_err * (1 + self.tol):  # VALIDATION GATE
+            self.model = challenger          # promote
+            self.retrains.append((t, "promote", round(chal_err, 3)))
+        else:
+            self.retrains.append((t, "rollback", round(chal_err, 3)))  # keep champion
+
+ctrl = TriggeredController()
+start = ctrl.warmup(X, y)
+for t in range(start, T):
+    ctrl.step(t, X, y)
+print("retrain events:", len(ctrl.retrains))
+for ev in ctrl.retrains:
+    print("  t=%4d  %-8s  val_mse=%s" % ev)
+</code></pre>
+<div class="code-caption"><strong>Code 21.1.1:</strong> A triggered-retraining controller from scratch. The EWMA rolling error drives a hysteresis trigger (fire at $\theta_{\text{hi}}$, re-arm below $\theta_{\text{lo}}$) with a cooldown; on a fire the controller refits on a recent point-in-time window, then promotes the challenger only if it passes the validation gate against the champion, else logs a rollback. This is the subsection-four lifecycle compressed into one class.</div>
+<pre><code class="language-text">retrain events: 2
+  t=2048  promote   val_mse=0.097
+  t=2261  promote   val_mse=0.094
+</code></pre>
+<div class="code-caption"><strong>Output 21.1.1:</strong> The controller stays silent across the stable regime A and fires only after the $t=2000$ shift drives the rolling error past $\theta_{\text{hi}}$, retraining twice (the second a follow-up as the window fully clears the old regime) and promoting both challengers because each beats the stale champion on the validation slice. A scheduled job would have retrained on every period regardless.</div>
+<p>The from-scratch controller is about 50 lines and makes every design decision of this section explicit: the EWMA, the two thresholds, the cooldown, the recent-window refit, the validation gate, the promote-or-rollback branch. In production you would not hand-roll the rolling-statistics and drift monitoring; the <code>river</code> online-learning library (the toolbox's streaming workhorse) provides drift detectors and incremental models that collapse the monitoring and triggering into a few lines. Code 21.1.2 shows the same drift-triggered refit using <code>river</code>'s ADWIN detector as the trigger.</p>
+<pre><code class="language-python">from river import drift
+
+# river's ADWIN adaptive-windowing drift detector replaces the hand-rolled
+# EWMA + hysteresis monitor: it tracks the error stream and flags a change.
+detector = drift.ADWIN(delta=1e-3)
+model = fit(X[:400], y[:400])
+last_fire, cooldown, retrains = -10**9, 200, []
+
+for t in range(400, T):
+    e = (X[t] @ model - y[t]) ** 2
+    detector.update(e)                       # feed the per-step error to ADWIN
+    if detector.drift_detected and t - last_fire >= cooldown:
+        lo = max(0, t - 400)                  # refit on the recent window
+        challenger = fit(X[lo:t-150], y[lo:t-150])
+        if sq_err(challenger, X[t-150:t], y[t-150:t]) <= \
+           sq_err(model, X[t-150:t], y[t-150:t]) * 1.05:   # same validation gate
+            model = challenger
+            retrains.append(t)
+        last_fire = t
+
+print("river drift-triggered retrains at:", retrains)
+</code></pre>
+<div class="code-caption"><strong>Code 21.1.2:</strong> The library equivalent. <code>river.drift.ADWIN</code> replaces the entire hand-built EWMA, hysteresis, and re-arm logic of Code 21.1.1 (about 20 lines of monitoring state) with one detector object and a single <code>update</code> call; the validation gate and cooldown are kept because they are policy, not monitoring. The drift-detection machinery, including its adaptive window and the statistical test that decides a change occurred, is handled internally.</div>
+<pre><code class="language-text">river drift-triggered retrains at: [2051, 2256]
+</code></pre>
+<div class="code-caption"><strong>Output 21.1.2:</strong> ADWIN flags the $t=2000$ regime change within about $50$ steps and triggers the same two guarded retrains as the from-scratch controller, confirming that the library detector and the hand-built monitor agree on when the world changed; the roughly $20$ lines of monitoring logic collapse to a single detector object.</div>
+<p>Reading the pair together: Code 21.1.1 spelled out the monitor, the hysteresis trigger, and the guarded retrain by hand so that every mechanism is visible; Code 21.1.2 kept the policy (cooldown, validation gate, recent-window refit) but handed the monitoring to a battle-tested drift detector, and got the same retrain decisions in a fraction of the code. The lesson is the one this book repeats: build it once by hand to understand it, then let the library carry the parts that are pure machinery. What you must never delegate is the policy: the validation gate, the cooldown, and the point-in-time-correct window are yours to own.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Pricing Scheduled Against Triggered Retraining</div>
+<p>Take a one-year deployment, a retrain that costs $4$ GPU-hours, and a stream that suffers exactly two genuine regime shifts in the year. A <strong>scheduled</strong> nightly retrain runs $365$ times, costing $365 \times 4 = 1460$ GPU-hours, and its worst-case staleness after a shift is one day (until the next nightly run). A <strong>scheduled weekly</strong> retrain runs $52$ times, costing $208$ GPU-hours, but its worst-case staleness jumps to seven days. The <strong>triggered</strong> controller of Code 21.1.1 retrained twice (once per shift, plus the occasional follow-up); even budgeting a generous $6$ retrains for the year to cover false alarms and follow-ups, it costs $6 \times 4 = 24$ GPU-hours, a $60\times$ saving over nightly and roughly $9\times$ over weekly, while its staleness after a shift is the detector's latency, here about $50$ steps rather than a fixed day or week. The triggered policy is both cheaper and more responsive, and the gap widens the more stable the stream is: on a stream with zero shifts, scheduled still pays its full $1460$ hours while triggered pays nearly nothing. The only regime where scheduled wins is when shifts are so frequent and gradual that the trigger fires constantly anyway, at which point you should be using the continuous updating of <a href="../module-20-online-continual-learning/index.html">Chapter 20</a> instead.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Retraining a Fraud Model Without Chasing Every Ghost</div>
+<p><strong>Who:</strong> A risk-engineering team at a payments company operating a real-time card-fraud classifier scored on every transaction, the kind of high-volume sensor-like stream this part threads through.</p>
+<p><strong>Situation:</strong> Fraud patterns shift constantly: new attack campaigns appear over days, then fade, and the underlying legitimate-spending distribution drifts seasonally. The model's precision visibly decayed within weeks of any static deployment.</p>
+<p><strong>Problem:</strong> They needed the model to track genuine attack shifts quickly, but labels (confirmed fraud) arrive with a multi-week delay as chargebacks settle, so the rolling-error signal is badly lagged and a pure performance trigger would always be reacting to last month's attacks.</p>
+<p><strong>Dilemma:</strong> A nightly scheduled retrain was simple but burned compute and still lagged real attacks by up to a day while the labels it trained on were weeks stale. A pure performance trigger fired too late because of the label delay. A continuous online update risked absorbing a coordinated adversarial burst directly into the weights with no gate.</p>
+<p><strong>Decision:</strong> They built a triggered controller with two signals OR-ed together: a feature-distribution drift detector (Chapter 20) on the input stream, which alarms within hours of a new attack pattern <em>before</em> labels exist, and a delayed performance trigger as a backstop. Both fed a shared cooldown, a validation gate against the champion on the most recent labeled window, and a shadow-then-canary rollout.</p>
+<p><strong>How:</strong> The drift detector watched the transaction feature distribution and fired the trigger on a distribution shift; the controller refit on a recent point-in-time-correct window (only labels that had actually settled), gated the challenger against the champion, shadow-deployed it on live traffic for a day, then canary-rolled it from $5\%$ to full. Hysteresis and a six-hour cooldown stopped the detector from thrashing on benign daily distribution swings.</p>
+<p><strong>Result:</strong> The system caught new attack campaigns within hours instead of days, retrained roughly once a week on average (versus a planned nightly schedule) for a large compute saving, and the validation gate plus canary rollout caught two bad challengers (trained on a window contaminated by a labeling outage) before they reached production.</p>
+<p><strong>Lesson:</strong> When labels are delayed, trigger on the input drift you can see now, not only on the error you will measure later; and never let any trigger, however clever, promote a model without a validation gate and a reversible rollout. The drift detector buys speed; the gate and cooldown buy safety.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Drift-Triggered Retraining Off the Shelf</div>
+<p>The hand-built monitor of Code 21.1.1 ran about 50 lines; the production stack collapses the monitoring and triggering to a handful. Beyond <code>river</code>'s ADWIN shown in Code 21.1.2, the <code>nannyml</code> library estimates a model's performance <em>without labels</em> (crucial under the label delay of the fraud example) and raises an alert when estimated performance drops, and <code>evidently</code> ships drift and performance monitors with a dashboard. A drift-triggered retraining loop that would take dozens of lines of bespoke statistics becomes: instantiate a detector, call <code>update</code> per observation, and refit when it flags. The library owns the statistical test, the adaptive window, and the multiple-testing corrections; you own the policy, the validation gate, the cooldown, and the point-in-time window, which are exactly the parts a library should never decide for you.</p>
+</div>
+
+<h2>6. Exercises</h2>
+<p>These exercises move from reasoning about the regimes, to extending the controller, to an open design problem. The implementation exercises build directly on the code of subsection five.</p>
+<h3>Conceptual</h3>
+<ol>
+<li><strong>Regime choice.</strong> For each system, state whether scheduled, triggered, or continuous updating fits best and justify it in two sentences using the cost, staleness, and control axes of Figure 21.1.1: (a) a tax-form classifier whose distribution changes only when the tax code changes, roughly once a year; (b) a high-frequency trading signal whose distribution drifts smoothly all day with instant ground-truth labels; (c) a hospital early-warning model where any silent corruption of the weights is a patient-safety risk.</li>
+<li><strong>Why two thresholds.</strong> A colleague proposes a single-threshold trigger and argues hysteresis is "over-engineering". Using the Gaussian-crossing argument of the subsection-two numeric example, explain quantitatively what happens when the rolling error stabilizes just below the single threshold, and state the one number (the gap $\theta_{\text{hi}} - \theta_{\text{lo}}$ in units of the noise standard deviation) that controls how rare spurious fires become.</li>
+</ol>
+<h3>Implementation</h3>
+<ol>
+<li><strong>Add a volume and a calendar trigger.</strong> Extend <code>TriggeredController</code> in Code 21.1.1 so it fires on an OR of three conditions: the existing hysteresis performance trigger, a data-volume trigger that fires once $N$ new observations have accumulated since the last retrain, and a calendar trigger that fires at fixed timesteps you pass in. Keep the single shared cooldown and the validation gate. Run it on the drifting stream and report how the retrain count and the timesteps change versus the performance-only controller.</li>
+<li><strong>Warm versus cold refit.</strong> Replace the cold <code>fit</code> on a recent window with a warm-start variant that takes a few gradient steps of ridge regression initialized from the current <code>model</code> (so the challenger starts from the champion's weights). Compare warm-start and cold-refit challengers on validation error at each trigger, both before and after the $t=2000$ shift, and confirm empirically the subsection-three claim that cold refit wins after an abrupt shift while warm start suffices for small drift (induce a small drift to test the latter).</li>
+</ol>
+<h3>Open-ended</h3>
+<ol>
+<li><strong>A cost-aware retraining policy.</strong> The subsection-four research frontier framed retraining as a sequential decision that weighs the expected accuracy gain against the compute cost of a retrain. Design (and, if you can, prototype) a policy that at each step chooses among "do nothing", "warm finetune", and "cold refit" to minimize a combined objective of expected loss plus a per-retrain cost penalty. Describe how you would estimate the expected accuracy gain of a retrain <em>before</em> running it (the hard part), how this connects to the optimal-stopping and reinforcement-learning framing of <a href="../../toc.html">Chapter 22</a>, and how you would validate the policy without it overfitting to one drift pattern.</li>
+</ol>
+
+<nav class="chapter-nav" aria-label="Section navigation">
+<a class="prev" href="index.html">&#8592; Contents</a>
+<a class="up" href="index.html">Chapter 21: Adaptive Temporal AI Systems</a>
+<a class="next" href="section-21.2.html">21.2 Drift Detection in Production &#8594;</a>
+</nav>
+</main>
+<footer class="site-footer">
+<p class="edition">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="copyright">&#169; 2026 Alexander Apartsin &middot; <a href="../../toc.html">Contents</a></p>
+<p class="updated"><script>document.write("Last updated " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

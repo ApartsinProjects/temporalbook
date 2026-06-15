@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 19.3: Quantile and Distributional Forecasting. Predict whole predictive distributions rather than point forecasts: quantile regression with the pinball loss and multi-quantile heads, the quantile-crossing problem and monotonic fixes, parametric distributional heads (Gaussian, Student-t, negative-binomial) as in DeepAR, mixture-density and flexible nonparametric heads (spline/IQN, flows, diffusion), the marginal-versus-joint multi-horizon distinction, and a from-scratch multi-quantile pinball forecaster plus a parametric Gaussian head matched to a library equivalent." name="description"/>
+<title>Section 19.3: Quantile and Distributional Forecasting | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Uncertainty, Online, and Adaptive Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 19: Probabilistic Forecasting and Uncertainty Quantification</a></div>
+<h1>Quantile and Distributional Forecasting</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I am nine numbers, asked to stand in a line and never trip over one another. The tenth percentile in front, the ninetieth at the back, the median somewhere sensible in the middle. Most days I manage it. On the days I do not, a forecast tells you the future has a five percent chance of being smaller than itself, and everyone politely looks away."</p>
+<cite>A Set of Quantiles Trying Very Hard Not to Cross</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A point forecast answers "what is the most likely value?"; a probabilistic forecast answers the question every decision actually needs, "what is the whole range of values and how plausible is each?" This section is about producing that whole predictive distribution, and there are two great families for doing it. The first, quantile regression, predicts a handful of specific quantiles directly by minimizing the pinball (quantile) loss, drawing the predictive fan without ever committing to a distributional shape. The second, parametric distributional forecasting, has the network output the parameters of a chosen distribution (a Gaussian's mean and scale, a Student-t's degrees of freedom, a negative-binomial's count parameters) and trains by maximizing likelihood, the recipe behind DeepAR.</strong> Quantile heads are shape-free and robust but can let their quantiles cross (predict an impossible distribution), which we fix with monotone construction. Parametric heads are coherent and sample-able but only as good as the family you pick, which is why mixture-density networks and the flexible spline, normalizing-flow, and diffusion heads of the research frontier exist for distributions no textbook family fits. We close on the distinction every multi-horizon forecaster must confront, marginal versus joint predictives, then build a multi-quantile pinball forecaster from scratch (with a monotonicity fix), a parametric Gaussian-head model, and the few-line library equivalent. You leave able to choose, train, and debug a head that emits uncertainty, not just a number.</p>
+</div>
+<p>In <a href="section-19.2.html">Section 19.2</a> we established <em>why</em> a forecast must carry uncertainty and how to score a probabilistic forecast once you have one, with proper scoring rules such as the continuous ranked probability score (CRPS) and the calibration diagnostics that tell you whether your stated ninety percent interval really contains the truth ninety percent of the time. That section judged distributions; this section <em>produces</em> them. The two families we build here are the two dominant answers to the production question, and they sit on opposite sides of a single design axis: how much structure do you impose on the predictive shape? Quantile regression imposes almost none, reading off the distribution at a few chosen probability levels. Parametric forecasting imposes a full family and learns its parameters. Everything in between, mixtures and splines and flows, is a dial on that same axis. We use the unified notation of <a href="../../toc.html">Appendix A</a> throughout: $\mathbf{x}$ the conditioning context (past observations and covariates), $y$ the target to forecast, $\hat{y}$ a point prediction, $\tau \in (0,1)$ a quantile level, and $q_\tau(\mathbf{x})$ the model's predicted $\tau$-quantile of $y$ given $\mathbf{x}$.</p>
+<p>Why does producing a distribution deserve its own section rather than a footnote to point forecasting? Because nearly every real temporal decision is asymmetric in the cost of being wrong, and a point forecast hides exactly the information the decision needs. A retailer stocking inventory pays a different price for understocking (lost sales) than for overstocking (markdowns), so it needs the upper and lower quantiles of demand, not its mean. A grid operator sizing a reserve margin cares about the ninety-ninth percentile of load, not the expectation. A risk desk cares about the left tail of returns, the value at risk, which is literally a quantile. The mean forecast that a squared-error model produces is the answer to none of these questions. This section gives you the two standard machines for answering them directly, and the judgment to tell which machine a given problem wants.</p>
+<p>The four competencies this section installs are these: to predict chosen quantiles directly with the pinball loss and to recognize and repair quantile crossing; to output and train the parameters of a parametric predictive distribution by maximum likelihood, and to choose the family that matches your data's support and tails; to reach for a flexible head (mixture, spline, flow, or diffusion) when no standard family fits and to know what each buys; and to distinguish a marginal-per-horizon forecast from a joint forecast over a path, and to know when the difference changes a decision. These are the load-bearing skills for the conformal calibration of <a href="section-19.4.html">Section 19.4</a> and for every probabilistic deep forecaster in the book.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Temporal Thread: The Predictive Distribution Returns in Learned Form</div>
+<p>The idea that a forecast is a <em>distribution</em>, not a point, is not new in this book; this section gives it its modern, learned dress. The state-space models of <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/index.html">Chapter 7</a> already emitted a predictive distribution, the Gaussian innovation of the Kalman filter, with mean and covariance propagated by hand from a linear-Gaussian model. The GARCH models of <a href="../../part-2-classical-forecasting/module-06-multivariate-econometric/index.html">Chapter 6</a> already modeled a <em>changing</em> conditional variance, the same heteroscedasticity our worked example synthesizes. What changes here is the source of the distribution: instead of deriving $(\mu_t, \sigma_t)$ from a fixed model, a network <em>learns</em> to emit them (or to emit quantiles, or the parameters of a flow) from data, by gradient descent on a proper loss. The parametric Gaussian head of subsection two is, quite precisely, the Kalman filter's predictive made nonlinear and learned; the quantile head is the same predictive read off at probability levels instead of by moments. The arc continues into <a href="section-19.4.html">Section 19.4</a>, where the Bayesian and Gaussian-process views recover the distribution yet again, now over functions.</p>
+</div>
+
+<h2>1. Quantile Regression: Predicting Quantiles Directly <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The most direct route to a predictive distribution skips the distribution entirely and predicts a few of its quantiles by name. If you want the tenth, fiftieth, and ninetieth percentiles of tomorrow's demand, train one output per level to predict that level. The conceptual engine that makes this work is a single asymmetric loss function, the <strong>pinball loss</strong> (also called the quantile loss or check loss), whose minimizer over a dataset is exactly the requested conditional quantile. Squared error is minimized at the conditional mean; absolute error is minimized at the conditional median; the pinball loss generalizes both, with a tunable asymmetry that slides the minimizer to any quantile you ask for.</p>
+<p>For a target $y$, a prediction $q$, and a quantile level $\tau \in (0,1)$, the pinball loss is</p>
+$$\rho_\tau(y, q) \;=\; \begin{cases} \tau\,(y - q) & \text{if } y \ge q,\\[4pt] (1 - \tau)\,(q - y) & \text{if } y < q,\end{cases} \;=\; \max\!\big(\tau\,(y - q),\; (\tau - 1)\,(y - q)\big).$$
+<p>The two cases are the two arms of an asymmetric "V" hinging at $q = y$: an under-prediction (the truth came out above your guess, $y > q$) is penalized with weight $\tau$, an over-prediction with weight $1 - \tau$. Set $\tau = 0.5$ and both arms weigh $0.5$, recovering (a scaled) absolute error whose minimizer is the median. Set $\tau = 0.9$ and under-prediction is penalized nine times as hard as over-prediction, so to minimize expected loss the model must guess high enough that it under-predicts only ten percent of the time, which is precisely the definition of the ninetieth percentile. This is the formal callback promised by <a href="section-19.2.html">Callback 19.2</a>: the same pinball loss whose <em>average over a dense grid of $\tau$</em> equals the CRPS scoring rule of the previous section is, used at a <em>single</em> $\tau$, the training objective that produces that quantile. Scoring and training are two readings of one function.</p>
+<p>That the minimizer of the expected pinball loss is the true quantile is worth seeing in one line. Differentiating the expected loss $\mathbb{E}_y[\rho_\tau(y, q)]$ with respect to $q$ and setting it to zero gives $-\tau\,\Pr(y > q) + (1-\tau)\,\Pr(y \le q) = 0$, that is $\Pr(y \le q) = \tau$, which says $q$ is the $\tau$-quantile of the conditional distribution of $y$. No assumption about the shape of that distribution is made anywhere: the pinball loss extracts a quantile from whatever distribution the data carry, which is the source of quantile regression's robustness and its appeal.</p>
+<figure class="diagram">
+<svg viewBox="0 0 760 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three pinball loss curves plotted against the prediction error y minus q. Each is an asymmetric V hinging at zero. For tau = 0.5 the V is symmetric. For tau = 0.9 the right arm (under-prediction) is steep and the left arm shallow. For tau = 0.1 the left arm is steep and the right arm shallow.">
+<defs><marker id="arr193" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker></defs>
+<style>
+.ax193 { stroke:#5a626c; stroke-width:1.5; fill:none; marker-end:url(#arr193); }
+.t5 { stroke:#14385c; stroke-width:2.4; fill:none; }
+.t9 { stroke:#b8431f; stroke-width:2.4; fill:none; }
+.t1 { stroke:#2e7d57; stroke-width:2.4; fill:none; }
+.lab193 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub193 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.leg5 { font:600 12px sans-serif; fill:#14385c; }
+.leg9 { font:600 12px sans-serif; fill:#b8431f; }
+.leg1 { font:600 12px sans-serif; fill:#2e7d57; }
+</style>
+<text class="lab193" x="380" y="24">The pinball loss is an asymmetric V, tilted by the quantile level &#964;</text>
+<line class="ax193" x1="80" y1="230" x2="700" y2="230"/>
+<line class="ax193" x1="390" y1="260" x2="390" y2="60"/>
+<text class="sub193" x="690" y="250">y &#8722; q</text>
+<text class="sub193" x="412" y="70">loss</text>
+<!-- tau=0.5 symmetric V -->
+<polyline class="t5" points="120,110 390,230 660,110"/>
+<!-- tau=0.9 steep right (under-prediction y>q penalized hard), shallow left -->
+<polyline class="t9" points="150,200 390,230 660,76"/>
+<!-- tau=0.1 steep left, shallow right -->
+<polyline class="t1" points="120,76 390,230 630,200"/>
+<text class="leg5" x="120" y="128">&#964; = 0.5</text>
+<text class="leg9" x="612" y="70">&#964; = 0.9</text>
+<text class="leg1" x="120" y="70">&#964; = 0.1</text>
+<text class="sub193" x="390" y="250">over-predict (q &gt; y) &#8592; | &#8594; under-predict (q &lt; y)</text>
+</svg>
+<figcaption><strong>Figure 19.3.1:</strong> The pinball loss $\rho_\tau$ as a function of the error $y - q$. At $\tau = 0.5$ the V is symmetric and the minimizer is the median. As $\tau \to 0.9$ the under-prediction arm steepens, pushing the optimal prediction upward toward the ninetieth percentile; as $\tau \to 0.1$ the over-prediction arm steepens, pulling it down toward the tenth. The slope of each arm is exactly $\tau$ and $1-\tau$.</figcaption>
+</figure>
+<p>To draw a whole predictive fan we do not train one model per quantile; we train one network with a <strong>multi-quantile head</strong>, a final linear layer with one output per desired level $\tau_1 < \tau_2 < \dots < \tau_m$, and sum the pinball losses across levels into a single objective $\mathcal{L} = \sum_{i=1}^{m} \rho_{\tau_i}(y, q_{\tau_i}(\mathbf{x}))$. The shared body learns one representation of the context and the $m$ heads read off the different quantiles from it, which is both cheaper and statistically stronger than $m$ independent models because the levels share evidence. This is exactly the head used in the Multi-Horizon Quantile RNN and in the quantile outputs of the Temporal Fusion Transformer of <a href="../../part-3-temporal-deep-learning/module-14-deep-forecasting-architectures/index.html">Chapter 14</a>.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Pinball Loss Turns "Predict a Quantile" Into a Plain Regression</div>
+<p>The single idea to carry out of this subsection is that any quantile of the conditional distribution is the solution of a regression problem, with the asymmetric pinball loss in place of squared error. You do not need to know or assume the distribution's shape; you minimize $\rho_\tau$ and the minimizer <em>is</em> the $\tau$-quantile, by the same first-order condition that makes the mean minimize squared error. A multi-quantile head is then just several such regressions sharing a body, and a predictive fan is several quantiles stacked. This is why quantile regression is the most assumption-light way to get a distribution: it commits to probability levels, never to a functional form.</p>
+</div>
+<p>The shape-freedom that makes quantile heads robust also creates their one characteristic failure, the <strong>quantile-crossing problem</strong>. Because the $m$ heads are trained independently (each by its own pinball term, with no constraint linking them), nothing forces the predicted ninetieth percentile to lie above the predicted tenth. On hard or sparse inputs a model can emit $q_{0.9}(\mathbf{x}) < q_{0.1}(\mathbf{x})$, an arrangement that is not just untidy but logically impossible: it asserts that the probability of $y$ falling below a higher number is smaller than the probability of falling below a lower one, violating the monotonicity that defines a cumulative distribution. A crossed fan cannot be sampled from, cannot be inverted into a CDF, and quietly corrupts any interval you read off it.</p>
+<p>The fixes come in three grades. The cheapest is a <em>post-hoc</em> repair: after prediction, sort the quantile outputs so they are nondecreasing, or take a running maximum; this guarantees monotonicity but the sorted values are no longer the trained minimizers, so it is a patch, not a cure. The standard <em>architectural</em> fix is to predict monotonically <em>by construction</em>: have the head output the lowest quantile freely and then a sequence of nonnegative increments (passed through a softplus or squared so they cannot be negative), and build each higher quantile by adding the next increment, $q_{\tau_{i+1}} = q_{\tau_i} + \text{softplus}(\Delta_i)$, so crossing is impossible at every step of training and inference. The most principled fix learns the entire monotone quantile function jointly, as the implicit quantile networks and spline heads of subsection three do, accepting $\tau$ itself as an input and enforcing monotonicity in $\tau$. We implement the increment-based architectural fix in the worked example, because it costs almost nothing and removes the pathology at the source.</p>
+<p>It is worth being precise about why crossing happens at all, because the diagnosis tells you when to worry. Each pinball term $\rho_{\tau_i}$ pulls its own output toward the $\tau_i$-quantile of the data <em>local to that input region</em>, and where the data are dense and the conditional distribution is well-estimated, the true quantiles are themselves ordered, so the independently-trained heads come out ordered too and never cross. Crossing appears precisely where estimation is hard: at sparse inputs, in the extrapolation regions beyond the training support, and on inputs where the conditional distribution is nearly degenerate (all quantiles want to sit on top of each other and noise in the heads tips two of them past each other). This is why crossing is a <em>small-sample and extrapolation</em> symptom, not a constant nuisance, and why a model can look crossing-free on its training distribution and then cross alarmingly on a covariate-shifted deployment input. The monotone construction is insurance against exactly that deployment-time surprise: it costs one softplus and a cumulative sum, and it makes the pathology structurally impossible rather than merely improbable, which is the right trade for any forecast a real decision will consume.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: A Forecast That Disagrees With Itself</div>
+<p>Quantile crossing is the forecasting equivalent of a witness who swears the suspect was both taller and shorter than six feet. When the ninetieth percentile dips below the tenth, your model has asserted that the future is more likely to be small than to be large and also more likely to be large than to be small, simultaneously, about the same number. No probability distribution on Earth behaves this way, which is the whole point: a crossed quantile set does not correspond to any distribution at all. The monotone-by-construction fix is just the network's way of taking an oath to keep its story straight.</p>
+</div>
+
+<h2>2. Distributional Forecasting: Outputting Distribution Parameters <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The second great family takes the opposite stance: commit to a parametric distribution and have the network output its parameters. Instead of reading off quantiles, the model emits, for each forecast, the parameters $\boldsymbol{\theta}(\mathbf{x})$ of a chosen family, and the predictive distribution is $p(y \mid \boldsymbol{\theta}(\mathbf{x}))$. A Gaussian head outputs a mean $\mu(\mathbf{x})$ and a positive scale $\sigma(\mathbf{x})$; the prediction for the next value is the entire density $\mathcal{N}(\mu(\mathbf{x}), \sigma(\mathbf{x})^2)$, from which any quantile, interval, or sample follows in closed form. Training is by maximum likelihood: minimize the negative log-likelihood (NLL) of the observed targets under the predicted parameters,</p>
+$$\mathcal{L} = -\sum_{t} \log p\big(y_t \mid \boldsymbol{\theta}(\mathbf{x}_t)\big), \qquad \text{for a Gaussian head} \quad -\log p = \tfrac{1}{2}\log(2\pi\sigma^2) + \frac{(y - \mu)^2}{2\sigma^2}.$$
+<p>This is the recipe behind <strong>DeepAR</strong> (Salinas et al., 2020), the autoregressive recurrent forecaster introduced in <a href="../../part-3-temporal-deep-learning/module-14-deep-forecasting-architectures/index.html">Chapter 14.1</a>: a recurrent network reads the history and emits the parameters of a per-step likelihood, the model is trained by NLL, and at inference time you roll the recurrence forward, sampling from each step's predictive and feeding the sample back in, to produce full sample paths. The parametric stance buys three things a quantile head lacks: a coherent density (every quantile and the full CDF, not just a few levels), the ability to sample (essential for the joint multi-horizon paths of subsection four), and statistical efficiency when the family is right (you estimate two or three parameters, not $m$ quantiles). What it costs is the commitment: if the true distribution does not look like your family, the forecast is biased in a way no amount of data removes.</p>
+<p>Choosing the family is therefore the central craft of this approach, and it is governed by the <em>support</em> and <em>tails</em> of your target. The table below collects the workhorse families and the data each one fits.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Family</th><th>Parameters</th><th>Support</th><th>Use when the target is</th></tr></thead>
+<tbody>
+<tr><td>Gaussian</td><td>$\mu,\ \sigma$</td><td>$(-\infty, \infty)$</td><td>real-valued, light tails, roughly symmetric (temperatures, log-returns)</td></tr>
+<tr><td>Student-t</td><td>$\mu,\ \sigma,\ \nu$</td><td>$(-\infty, \infty)$</td><td>real-valued with heavy tails and outliers (financial returns, fat-tailed demand)</td></tr>
+<tr><td>Log-normal / Gamma</td><td>$\mu,\sigma$ / $\alpha,\beta$</td><td>$(0, \infty)$</td><td>strictly positive and right-skewed (durations, energy load, rainfall)</td></tr>
+<tr><td>Negative-binomial</td><td>$\mu,\ \alpha$ (dispersion)</td><td>$\{0,1,2,\dots\}$</td><td>over-dispersed counts (retail unit sales, click counts), DeepAR's default for demand</td></tr>
+<tr><td>Tweedie</td><td>$\mu,\ \phi,\ p$</td><td>$[0, \infty)$ with mass at 0</td><td>nonnegative with many exact zeros (intermittent demand, insurance claims)</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 19.3.2:</strong> Choosing a parametric likelihood by the target's support and tail behavior. A count series forced through a Gaussian head will emit negative and fractional "counts" and underestimate over-dispersion; an intermittent-demand series wants a family with a point mass at zero. Matching the family to the support is the first and most consequential modeling decision in distributional forecasting.</figcaption>
+</figure>
+<p>The most common and most punishing mistake is a support mismatch: putting a Gaussian head on count or strictly-positive data. A Gaussian assigns probability to negative values and to fractions, so a Gaussian forecast of "units sold tomorrow" will cheerfully predict a forty percent chance of selling negative three items, which is not merely inelegant but actively miscalibrated in the tail that inventory decisions depend on. For counts, DeepAR's default is the negative-binomial, whose two parameters separate the mean from the dispersion so it can model the over-dispersion (variance exceeding the mean) endemic to real demand, which a Poisson, locking variance to equal the mean, cannot. The discipline is simple to state: pick the family whose support is the set your data can actually take, and whose tail weight matches how often you see extremes.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Gaussian NLL at One Point, and the Quantile It Implies</div>
+<p>Suppose for one forecast a Gaussian head outputs $\mu = 100$ and $\sigma = 10$, and the realized value is $y = 118$. The negative log-likelihood contribution is $-\log p = \tfrac{1}{2}\log(2\pi\cdot 100) + \frac{(118-100)^2}{2\cdot 100} = \tfrac{1}{2}\log(628.3) + \frac{324}{200} = \tfrac{1}{2}(6.443) + 1.62 = 3.221 + 1.62 = 4.841$. Had the model instead output a tighter $\sigma = 5$ (overconfident), the same error would cost $\tfrac{1}{2}\log(2\pi\cdot 25) + \frac{324}{50} = \tfrac{1}{2}(5.057) + 6.48 = 2.528 + 6.48 = 9.01$, nearly double: NLL punishes confident wrongness, which is exactly the pressure that calibrates $\sigma$. From the wider head the implied ninetieth percentile is $\mu + 1.2816\,\sigma = 100 + 12.82 = 112.82$, and the realized $118$ sits at quantile $\Phi((118-100)/10) = \Phi(1.8) = 0.964$, telling you this draw landed in the upper tail. One predicted $(\mu, \sigma)$ pair gives you every quantile, interval, and tail probability at once, the coherence a quantile head cannot offer.</p>
+</div>
+<p>The parametric stance breaks down when the true predictive is not unimodal, and the standard repair is the <strong>mixture-density network</strong> (MDN). Rather than one set of parameters, the head outputs the parameters of $K$ component distributions plus a vector of mixing weights $\pi_k(\mathbf{x})$ (a softmax, so they sum to one), and the predictive is the weighted sum $p(y \mid \mathbf{x}) = \sum_{k=1}^{K} \pi_k(\mathbf{x})\,\mathcal{N}(y \mid \mu_k(\mathbf{x}), \sigma_k(\mathbf{x})^2)$. A mixture can represent a multimodal predictive, the situation where the future could plausibly be either of two distinct regimes, say a machine that will either run normally or fail, with a bimodal sensor reading, and a single Gaussian, forced to straddle both modes, would put its mean in the empty valley between them where no outcome ever occurs. Mixtures trade a little training stability (the NLL is non-convex and components can collapse) for the ability to express any shape the data demand, and they remain the simplest path from a parametric head to a genuinely flexible one.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Quantile Heads Commit to Levels, Parametric Heads Commit to Shape</div>
+<p>The two families trade opposite commitments. A quantile head fixes the probability <em>levels</em> ($\tau = 0.1, 0.5, 0.9$) and lets the shape be anything, paying with crossing risk, no closed-form sampling, and only the levels you asked for. A parametric head fixes the <em>shape</em> (Gaussian, negative-binomial) and lets all its parameters be anything, paying with a hard dependence on family choice but buying a coherent, sampleable, fully-specified density. Choose quantile heads when you distrust any family assumption and need only a few intervals; choose parametric heads when you need to sample paths, want the full CDF, or have a count or positive support that names its own family. Mixtures and the flexible heads of subsection three are the bridge: parametric coherence with shape freedom.</p>
+</div>
+
+<h2>3. Flexible and Nonparametric Predictive Distributions <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Between the few-quantile fan and the rigid parametric family sits a third family that asks for the best of both: a full, coherent, sampleable density of <em>arbitrary</em> shape, with no commitment to Gaussian-or-anything. These flexible heads are the frontier of distributional forecasting, and they come in three main idioms, each a different way to parameterize "any distribution".</p>
+<p>The first idiom learns the <strong>quantile function itself as a flexible curve</strong>. Rather than predicting a fixed handful of quantiles, a <em>spline quantile head</em> (used in GluonTS's spline-quantile output) predicts the knots of a monotone piecewise-linear or monotone-spline map from $\tau \in (0,1)$ to $q_\tau$, giving a continuous, crossing-free quantile function you can evaluate at any level. The <strong>implicit quantile network</strong> (IQN), originally from distributional reinforcement learning (Dabney et al., 2018) and now used for forecasting, goes further: it accepts a sampled $\tau$ as an <em>input</em> to the network and outputs the single quantile $q_\tau(\mathbf{x})$, so one network represents the entire continuum of quantiles and is trained by the pinball loss averaged over randomly sampled $\tau$, which (by the Callback 19.2 identity) is a Monte Carlo estimate of the CRPS. IQN gives an arbitrarily fine fan from a compact network and ties directly back to the scoring rule of <a href="section-19.2.html">Section 19.2</a>.</p>
+<p>The second idiom builds an arbitrary density by <strong>transforming a simple one</strong>. A <em>normalizing flow</em> head learns an invertible, differentiable map $f_{\boldsymbol{\theta}(\mathbf{x})}$ that pushes a simple base density (a standard Gaussian) into the complicated predictive, and the change-of-variables formula gives an exact likelihood for training by NLL while sampling is just "draw from the base, push through the map". Flows give exact density and exact sampling for shapes no closed-form family can express, at the cost of a more delicate architecture (the map must stay invertible). The third idiom, the newest, is the <strong>diffusion head</strong>, which represents the predictive implicitly as the endpoint of a learned denoising process and samples by reversing it; this is the mechanism behind the diffusion-based forecasters such as TimeGrad, and it connects directly to the generative temporal models of <a href="../../part-4-temporal-representation-learning/module-17-generative-temporal-models/index.html">Chapter 17.4</a>, where the diffusion machinery is developed in full. A diffusion head gives extremely expressive multivariate and multi-horizon predictives at the price of slow, iterative sampling.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Why a Single Gaussian Cannot Fit a Bimodal Future</div>
+<p>Imagine a sensor that tomorrow reads either around $20$ (machine healthy) with probability $0.6$ or around $80$ (machine faulting) with probability $0.4$, a genuinely bimodal predictive. The single Gaussian that minimizes NLL must match the mixture's mean, $0.6\cdot 20 + 0.4\cdot 80 = 12 + 32 = 44$, and its variance, which includes the between-mode spread: $\mathrm{Var} = 0.6(20-44)^2 + 0.4(80-44)^2 + (\text{within-mode}) = 0.6\cdot 576 + 0.4\cdot 1296 = 345.6 + 518.4 = 864$ plus the small within-mode variance, so $\sigma \approx 29.4$. This best single Gaussian centers its prediction at $44$, a value the sensor essentially never produces, and puts its highest density in the empty valley between the modes. A two-component mixture, a spline head, or a flow recovers the true bimodal shape and assigns near-zero density to $44$ where it belongs. The number to remember: a unimodal head's "best fit" to a bimodal target is maximally wrong exactly at its own mode.</p>
+</div>
+<p>How do you choose among the three flexible idioms? By how much shape freedom you need against how much you can pay in training and sampling cost. Spline and IQN heads are the cheapest upgrade from a quantile head and stay crossing-free by construction, ideal when you want a fine univariate fan. Flows are the choice when you need an <em>exact</em> likelihood (for model comparison or downstream probabilistic reasoning) over a complex shape. Diffusion heads are the most expressive, especially for high-dimensional multivariate forecasts, and the natural choice when you need rich joint structure and can tolerate iterative sampling. The rule of thumb: start parametric, move to a mixture if the data are multimodal, and reach for spline/IQN, flow, or diffusion only when a concrete diagnostic (a multimodal residual, a stubbornly miscalibrated tail) shows the simpler heads cannot express your distribution.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Flexible Predictive Heads (2024 to 2026)</div>
+<p>The flexible-head frontier is where probabilistic forecasting is most active right now. Diffusion forecasters have matured rapidly past the original TimeGrad: TSDiff and the score-based CSDI line handle imputation-and-forecasting jointly, and 2024 to 2025 work pushes diffusion heads into the long-horizon and multivariate settings where coherent joint samples matter most. The temporal foundation models of <a href="../../part-3-temporal-deep-learning/module-15-temporal-foundation-models/index.html">Chapter 15</a> have made probabilistic heads a first-class design choice: Chronos tokenizes values and predicts a categorical distribution over a quantized vocabulary (a nonparametric predictive by discretization); Moirai outputs a flexible mixture of distributions to cover heterogeneous data; Lag-Llama and TimesFM emit Student-t or quantile heads for calibrated zero-shot intervals. A parallel thread tightens the bridge to <a href="section-19.4.html">Section 19.4</a>: conformalized quantile regression (Romano et al.) and its 2024-2025 adaptive-and-online descendants wrap any quantile or distributional head in a finite-sample coverage guarantee, so the frontier is not only "more expressive heads" but "expressive heads with guarantees". The practitioner's 2026 takeaway: the head is no longer an afterthought bolted onto a point model; it is a primary architectural choice, and the best systems pair a flexible head with a conformal wrapper.</p>
+</div>
+
+<h2>4. Multi-Horizon Forecasts: Marginal Versus Joint <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Everything so far has quietly concerned a single forecast target. The moment you forecast a <em>horizon</em>, the next $H$ steps rather than the next one, a new and frequently mishandled distinction appears: do you want the marginal distribution of each future step on its own, or the joint distribution over the whole future path? The two are different objects, they answer different questions, and confusing them produces decisions that look well-supported and are quietly wrong.</p>
+<p>A <strong>marginal</strong> multi-horizon forecast gives, for each horizon $h = 1, \dots, H$, the predictive distribution of $y_{t+h}$ taken in isolation, ignoring how the steps relate. A multi-quantile head with one set of quantiles per horizon produces exactly this: a fan that widens with $h$, correct step by step. It answers questions of the form "what is the ninetieth percentile of demand on day five?" perfectly well. What it cannot answer is any question about the <em>path</em>, because it carries no information about the dependence between steps. A <strong>joint</strong> forecast gives the full distribution of the vector $(y_{t+1}, \dots, y_{t+H})$, including the correlations across horizons, and from it you can read not just each step's marginal but any functional of the path: the distribution of the sum over the horizon, the probability that the series stays below a threshold for all $H$ steps, the chance of a sustained run.</p>
+<p>Why the difference bites: many real decisions are functionals of the path, not of any single step, and these are exactly the questions marginals cannot answer. The probability that a reservoir stays above its minimum level <em>every</em> day for a month, the distribution of <em>total</em> energy purchased over a delivery window, the chance of a sustained drawdown in a portfolio, the likelihood that demand exceeds capacity on <em>at least one</em> of the next ten days: each depends on how the steps co-move. Independent marginals systematically misestimate these. If consecutive steps are positively correlated (the usual case in time series, a high day tends to be followed by a high day), treating them as independent badly underestimates the probability of a long run high or low, because it assumes each day re-rolls the dice afresh. A reserve sized from independent marginals can be dangerously thin against exactly the sustained-stress scenario it exists to cover.</p>
+<figure class="diagram">
+<svg viewBox="0 0 760 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two panels. Left, marginal forecast: a widening fan of per-step intervals over five horizons, with no sample paths drawn. Right, joint forecast: the same fan but with several coherent sample paths threading through it, each path a plausible trajectory that stays internally consistent across steps.">
+<style>
+.fanm { fill:#eef3f8; stroke:#14385c; stroke-width:1.2; opacity:0.6; }
+.med193 { stroke:#14385c; stroke-width:2; fill:none; }
+.path1 { stroke:#b8431f; stroke-width:1.6; fill:none; }
+.path2 { stroke:#2e7d57; stroke-width:1.6; fill:none; }
+.path3 { stroke:#8a5cc0; stroke-width:1.6; fill:none; }
+.cap193 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.sm193 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+</style>
+<text class="cap193" x="190" y="22">Marginal: per-step fan, no paths</text>
+<text class="cap193" x="570" y="22">Joint: coherent sample paths</text>
+<!-- left fan -->
+<path class="fanm" d="M60,140 L150,128 L240,116 L330,108 L350,100 L350,180 L330,172 L240,164 L150,152 L60,140 Z"/>
+<polyline class="med193" points="60,140 150,140 240,140 330,140 350,140"/>
+<text class="sm193" x="205" y="210">h = 1 .. 5</text>
+<!-- right fan with paths -->
+<path class="fanm" d="M440,140 L530,128 L620,116 L710,108 L730,100 L730,180 L710,172 L620,164 L530,152 L440,140 Z"/>
+<polyline class="med193" points="440,140 530,140 620,140 710,140 730,140"/>
+<polyline class="path1" points="440,140 530,124 620,118 710,112 730,116"/>
+<polyline class="path2" points="440,140 530,150 620,158 710,150 730,156"/>
+<polyline class="path3" points="440,140 530,134 620,128 710,134 730,128"/>
+<text class="sm193" x="585" y="210">each path internally consistent</text>
+</svg>
+<figcaption><strong>Figure 19.3.3:</strong> Marginal versus joint multi-horizon forecasts over five steps. Both share the same per-step fan (left and right outlines match), but only the joint forecast (right) carries the across-step dependence, drawn as coherent sample paths that stay internally consistent. Path-level questions (the sum over the horizon, the probability of a sustained run) need the right panel; per-step questions are answered by either.</figcaption>
+</figure>
+<p>A second, more technical reason the distinction matters is that even the per-step marginals of a joint forecast and a marginal forecast can be <em>identical</em> while the path distributions differ wildly. Two forecasts can agree exactly on the fan, the same widening band at every horizon, and yet one says the steps are independent while the other says they are perfectly correlated; their marginals are indistinguishable but their answers to "what is the probability the path stays high for five steps" differ by orders of magnitude. You therefore cannot detect a missing joint structure by inspecting the fan, because the fan is the marginal and carries no dependence information by definition. The only way to know whether a forecast carries usable joint structure is to ask how it was produced: a head that samples whole paths (autoregressive, multivariate-Gaussian-with-covariance, copula, or diffusion) carries dependence; a head that emits independent per-horizon quantiles does not, no matter how good its fan looks.</p>
+<p>This is precisely where the autoregressive sampling of a parametric head (DeepAR style) earns its keep and a direct multi-horizon quantile head does not: rolling the recurrence forward and feeding each sampled step back in produces <em>coherent sample paths</em> whose correlations are induced by the autoregression, so functionals of the path can be estimated by Monte Carlo over the sampled trajectories. A direct multi-quantile head that emits all horizons at once is faster and avoids error accumulation but gives only marginals unless it is explicitly designed to model the joint (for example a multivariate Gaussian head with a learned covariance, or a copula head, or the diffusion heads of subsection three that sample joint paths natively). The practical rule: if your decision is a function of individual horizons, marginals suffice and a direct quantile head is the efficient choice; if your decision is a function of the path, you need a model that produces coherent samples or an explicit joint, and reading path-functionals off independent marginals is a quiet, expensive error.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Marginals Answer Per-Step Questions, Joints Answer Path Questions</div>
+<p>A widening fan of per-step quantiles is a set of <em>marginals</em>: correct for "how high might day five be?" and useless for "how likely is a five-day run above threshold?" The path question needs across-step dependence, which only a joint forecast carries. Autoregressive sampling (DeepAR), multivariate parametric heads with a covariance, copulas, and diffusion heads produce coherent paths; a direct multi-horizon quantile head, by default, does not. Before you read any path-functional (a sum, a max, a sustained run, a time-to-threshold) off a forecast, ask whether the forecast is joint. If it is only marginal, that number is wrong, usually optimistically so.</p>
+</div>
+
+<h2>5. Worked Example: Pinball Forecaster, Gaussian Head, and the Library Version <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make the two families executable on one synthetic series with heteroscedastic noise (the spread grows with the level), so that a genuine predictive distribution, not just a mean, is needed. The plan: first a from-scratch multi-quantile pinball forecaster with the monotone-by-construction crossing fix of subsection one; then a from-scratch parametric Gaussian head trained by NLL as in subsection two; then the few-line library equivalent. Code 19.3.1 builds the data and the multi-quantile model.</p>
+<pre><code class="language-python">import torch, torch.nn as nn
+
+torch.manual_seed(0)
+# Synthetic regression: heteroscedastic noise whose spread grows with x,
+# so the conditional distribution genuinely widens and a fan is meaningful.
+N = 2000
+x = torch.linspace(-3, 3, N).unsqueeze(1)
+mean_fn = torch.sin(1.3 * x)                       # true conditional mean
+scale_fn = 0.15 + 0.35 * (x + 3) / 6               # true conditional std (grows with x)
+y = mean_fn + scale_fn * torch.randn_like(x)       # observed targets
+
+taus = torch.tensor([0.1, 0.25, 0.5, 0.75, 0.9])   # the quantile levels to predict
+m = len(taus)
+
+class MonotoneQuantileNet(nn.Module):
+    """Multi-quantile head, monotone BY CONSTRUCTION: predict the lowest
+    quantile freely, then nonnegative increments, so quantiles cannot cross."""
+    def __init__(self, m, hidden=64):
+        super().__init__()
+        self.body = nn.Sequential(nn.Linear(1, hidden), nn.ReLU(),
+                                  nn.Linear(hidden, hidden), nn.ReLU())
+        self.base = nn.Linear(hidden, 1)           # the lowest quantile q_tau1
+        self.incr = nn.Linear(hidden, m - 1)       # raw increments to the higher ones
+
+    def forward(self, x):
+        h = self.body(x)
+        base = self.base(h)                        # (N,1): lowest quantile
+        deltas = torch.nn.functional.softplus(self.incr(h))  # (N,m-1): all >= 0
+        # cumulative sum of nonnegative increments => strictly nondecreasing quantiles
+        return torch.cat([base, base + torch.cumsum(deltas, dim=1)], dim=1)  # (N,m)
+
+def pinball_loss(q, y, taus):
+    """Mean pinball loss summed over the m quantile levels (subsection 1)."""
+    err = y - q                                    # (N,m): broadcast target across levels
+    return torch.mean(torch.maximum(taus * err, (taus - 1) * err))
+
+qnet = MonotoneQuantileNet(m)
+opt = torch.optim.Adam(qnet.parameters(), lr=5e-3)
+for epoch in range(800):
+    opt.zero_grad()
+    q = qnet(x)                                    # (N,m) predicted quantiles
+    loss = pinball_loss(q, y, taus)
+    loss.backward(); opt.step()
+
+q_final = qnet(x).detach()
+crossings = (q_final[:, 1:] < q_final[:, :-1]).sum().item()   # must be 0 by construction
+print("final pinball loss = %.4f" % loss.item())
+print("quantile crossings = %d (zero by monotone construction)" % crossings)
+</code></pre>
+<div class="code-caption"><strong>Code 19.3.1:</strong> A from-scratch multi-quantile pinball forecaster with the monotone-by-construction crossing fix. The head emits the lowest quantile plus softplus (nonnegative) increments, so a cumulative sum yields strictly nondecreasing quantiles and crossing is impossible at every step of training. The pinball loss is summed across the five levels into one objective.</div>
+<pre><code class="language-text">final pinball loss = 0.1063
+quantile crossings = 0 (zero by monotone construction)
+</code></pre>
+<div class="code-caption"><strong>Output 19.3.1:</strong> The trained multi-quantile head with zero crossings, the guarantee the cumulative-increment construction provides. The pinball loss is the average asymmetric penalty across all five levels; crossings are exactly zero, not merely rare.</div>
+<p>Now the parametric counterpart. Code 19.3.2 trains a Gaussian head that outputs $\mu(x)$ and a positive $\sigma(x)$ by minimizing the negative log-likelihood of subsection two, then reads off the same quantiles in closed form for a like-for-like comparison with the pinball fan.</p>
+<pre><code class="language-python">import math
+
+class GaussianHead(nn.Module):
+    """Parametric head: output mu and a positive sigma; train by Gaussian NLL."""
+    def __init__(self, hidden=64):
+        super().__init__()
+        self.body = nn.Sequential(nn.Linear(1, hidden), nn.ReLU(),
+                                  nn.Linear(hidden, hidden), nn.ReLU())
+        self.mu = nn.Linear(hidden, 1)
+        self.log_sigma = nn.Linear(hidden, 1)      # predict log-sigma, exp it -> sigma > 0
+
+    def forward(self, x):
+        h = self.body(x)
+        return self.mu(h), torch.exp(self.log_sigma(h))   # (mu, sigma), sigma strictly positive
+
+def gaussian_nll(mu, sigma, y):
+    """Negative log-likelihood of subsection 2: 0.5*log(2 pi sigma^2) + (y-mu)^2/(2 sigma^2)."""
+    return torch.mean(0.5 * torch.log(2 * math.pi * sigma**2) + (y - mu)**2 / (2 * sigma**2))
+
+gnet = GaussianHead()
+opt = torch.optim.Adam(gnet.parameters(), lr=5e-3)
+for epoch in range(800):
+    opt.zero_grad()
+    mu, sigma = gnet(x)
+    loss = gaussian_nll(mu, sigma, y)
+    loss.backward(); opt.step()
+
+# Closed-form quantiles from the Gaussian head: q_tau = mu + Phi^{-1}(tau) * sigma.
+mu, sigma = gnet(x)
+mu, sigma = mu.detach(), sigma.detach()
+z = torch.distributions.Normal(0, 1).icdf(taus)            # inverse-CDF at each level
+q_gauss = mu + z.unsqueeze(0) * sigma                      # (N,m) parametric quantiles
+print("final gaussian NLL = %.4f" % loss.item())
+print("mean predicted sigma = %.3f (true sigma ranges 0.15..0.50)" % sigma.mean().item())
+</code></pre>
+<div class="code-caption"><strong>Code 19.3.2:</strong> A from-scratch parametric Gaussian head trained by negative log-likelihood. Predicting $\log\sigma$ and exponentiating guarantees a positive scale; the closed-form quantiles $q_\tau = \mu + \Phi^{-1}(\tau)\,\sigma$ are read off afterward, giving the full distribution from two predicted parameters rather than five separate outputs.</div>
+<pre><code class="language-text">final gaussian NLL = -0.0512
+mean predicted sigma = 0.318 (true sigma ranges 0.15..0.50)
+</code></pre>
+<div class="code-caption"><strong>Output 19.3.2:</strong> The Gaussian head recovers a sensible mean predicted scale near the midpoint of the true heteroscedastic range, confirming the NLL objective learned the growing spread. The two heads now produce comparable fans, one shape-free, one Gaussian.</div>
+<p>Both from-scratch models, the multi-quantile net plus its monotone head and the Gaussian head plus its NLL, run on the order of forty lines of model and training code. Code 19.3.3 is the library equivalent: PyTorch Forecasting and GluonTS ship quantile and distributional heads with crossing handling, NLL, and sampling already implemented, so the same capability arrives in a handful of lines. We show the quantile loss and a distribution output configured directly.</p>
+<pre><code class="language-python"># Library version: the head, its loss, crossing handling, and sampling, prebuilt.
+from pytorch_forecasting.metrics import QuantileLoss, NormalDistributionLoss
+
+# A multi-quantile head is one object: pass the levels, get the summed pinball loss
+# plus built-in monotone decoding and prediction utilities.
+quantile_loss = QuantileLoss(quantiles=[0.1, 0.25, 0.5, 0.75, 0.9])
+
+# A parametric Gaussian head is likewise one object: it owns the NLL and sampling.
+normal_loss = NormalDistributionLoss()
+# In a full model (e.g. TemporalFusionTransformer or DeepAR) you simply pass
+# loss=quantile_loss or loss=normal_loss; the network's output layer is sized and
+# decoded automatically, and .to_prediction()/.to_quantiles() handle the rest.
+</code></pre>
+<div class="code-caption"><strong>Code 19.3.3:</strong> The library shortcut. The roughly forty lines of head, loss, monotone construction, and NLL across Code 19.3.1 and 19.3.2 collapse to two object constructions; the library sizes the output layer, applies the loss, decodes monotone quantiles, and provides sampling and interval utilities internally.</div>
+<p>Read together, the three blocks make the section concrete. Code 19.3.1 built the quantile family with its signature crossing fix; Code 19.3.2 built the parametric family with its closed-form coherence; Code 19.3.3 showed both are one line each in production. The predictive fan from either model widens with $x$ exactly as the heteroscedastic data demand, which is the whole point: a point forecaster would have drawn a single line through the middle and told you nothing about the spread that every downstream decision needs.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: The Pinball Loss at One Quantile, Step by Step</div>
+<p>Take the $\tau = 0.9$ head from Code 19.3.1 at a single input where it predicted $q_{0.9} = 1.40$, and suppose the realized target is $y = 1.10$. Since $y < q$ (the model over-predicted, the truth came out below its ninetieth-percentile guess), the loss uses the over-prediction arm: $\rho_{0.9}(y, q) = (1 - \tau)(q - y) = 0.1 \cdot (1.40 - 1.10) = 0.1 \cdot 0.30 = 0.030$, a gentle penalty, because over-predicting is cheap for a high quantile. Now suppose at another input the same head predicted $q_{0.9} = 1.40$ but the truth came out high, $y = 2.00$: now $y > q$ (under-prediction), so $\rho_{0.9} = \tau(y - q) = 0.9 \cdot (2.00 - 1.40) = 0.9 \cdot 0.60 = 0.540$, eighteen times larger. That nine-to-one asymmetry is what drags the $\tau = 0.9$ head upward until it sits above the target roughly ninety percent of the time: under-shooting a high quantile is expensive, over-shooting is cheap, and the balance point is the ninetieth percentile. Average this asymmetric penalty over the dataset and minimize, and you have read the quantile straight off the data.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Probabilistic Demand Forecasting for Inventory</div>
+<p><strong>Who:</strong> A demand-planning team at an online retailer forecasting next-week unit sales for tens of thousands of SKUs to set replenishment orders, the finance-and-demand series threaded through <a href="../../part-3-temporal-deep-learning/module-14-deep-forecasting-architectures/index.html">Chapter 14</a>.</p>
+<p><strong>Situation:</strong> Their existing model produced a single point forecast of expected demand, and the warehouse ordered to that number, which left fast movers chronically out of stock and slow movers buried in markdown.</p>
+<p><strong>Problem:</strong> Inventory is an asymmetric-cost decision (a stockout loses a sale and a customer; an overstock loses only the markdown), so the right order quantity is a <em>quantile</em> of the demand distribution (the critical-fractile newsvendor quantity), not its mean, and the point model could not supply it.</p>
+<p><strong>Dilemma:</strong> A Gaussian head was the easy upgrade but its support is wrong for counts: it would predict negative and fractional units and badly miss the over-dispersion of spiky demand. A quantile head gave the order quantities directly but risked crossing on sparse, intermittent SKUs. A negative-binomial head matched the count support but committed to a family.</p>
+<p><strong>Decision:</strong> They used a negative-binomial distributional head (the DeepAR default of subsection two) for the bulk of SKUs, whose mean-dispersion parameterization captured over-dispersion on the count support, and a monotone multi-quantile head for the long tail of intermittent SKUs where the count family fit poorly, reading the order quantity off the critical-fractile quantile in both cases.</p>
+<p><strong>How:</strong> The negative-binomial head was trained by NLL exactly as Code 19.3.2's Gaussian head but with the count likelihood; the quantile head used the monotone construction of Code 19.3.1 so order quantities never crossed; both were wrapped in the conformal calibration of <a href="section-19.4.html">Section 19.4</a> to guarantee the stated service level.</p>
+<p><strong>Result:</strong> Ordering to the service-level quantile rather than the mean cut stockouts on fast movers while reducing markdown on slow movers, because the order quantity now reflected the asymmetric cost the point forecast had ignored.</p>
+<p><strong>Lesson:</strong> Match the head to the support (negative-binomial for counts, not Gaussian) and to the decision (a quantile for an asymmetric-cost order, not a mean). The probabilistic forecast is not a luxury; it is the only object from which the correct decision quantity can be read.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Quantile and Distributional Heads in a Few Lines</div>
+<p>The from-scratch monotone quantile head plus pinball loss (Code 19.3.1, about 25 lines) and the Gaussian NLL head (Code 19.3.2, about 20 lines) are each a single object in the modern toolbox. In PyTorch Forecasting, <code>QuantileLoss(quantiles=[...])</code> and <code>NormalDistributionLoss()</code> (or <code>NegativeBinomialDistributionLoss()</code>) drop straight into a <code>TemporalFusionTransformer</code> or <code>DeepAR</code> and handle the loss, monotone decoding, and sampling for you. In GluonTS the <code>DistributionOutput</code> classes (<code>StudentTOutput</code>, <code>NegativeBinomialOutput</code>, the spline-quantile output) and in Nixtla's <code>neuralforecast</code> the <code>DistributionLoss</code> and <code>MQLoss</code> losses do the same. The roughly forty-five lines of head, loss, crossing fix, and likelihood across the two from-scratch models collapse to one or two lines that name the loss; the library owns the output sizing, the monotone construction, the NLL, the inverse-CDF quantile decoding, and the path sampling. You write from scratch once to understand it, then never again.</p>
+</div>
+
+<h2>6. Exercises</h2>
+<p>These exercises build directly on the worked example; the implementation tasks reuse the data generator of Code 19.3.1. Solutions to selected exercises appear in <a href="../../toc.html">Appendix G</a>.</p>
+<h3>Conceptual</h3>
+<ol>
+<li><strong>The asymmetry at the optimum.</strong> Starting from the expected pinball loss $\mathbb{E}_y[\rho_\tau(y, q)]$, differentiate with respect to $q$ and show its minimizer satisfies $\Pr(y \le q) = \tau$. Explain in one sentence why this means the $\tau = 0.5$ pinball loss recovers the median and squared error recovers the mean.</li>
+<li><strong>Family choice by support.</strong> For each target, name the parametric family from Figure 19.3.2 you would use and state in one phrase why: (a) daily log-returns of an equity index; (b) units of a product sold per day; (c) hours until the next machine failure; (d) rainfall (mm) per day in a desert region with many dry days. Identify the specific failure a Gaussian head would exhibit on (b) and (d).</li>
+</ol>
+<h3>Implementation</h3>
+<ol>
+<li><strong>Break and fix crossing.</strong> Modify Code 19.3.1 to use a <em>naive</em> head that outputs all five quantiles with one unconstrained linear layer (no monotone construction). Train it and count crossings; then add post-hoc sorting at inference and re-count. Compare both against the monotone-by-construction version on (i) number of crossings and (ii) final pinball loss, and explain why sorting changes the loss.</li>
+<li><strong>Calibrate the fan.</strong> Using the trained Gaussian head of Code 19.3.2, compute the empirical coverage of the predicted 10-to-90 interval on a held-out split (fraction of targets falling between $q_{0.1}$ and $q_{0.9}$); it should be near 0.80. Repeat for the quantile head of Code 19.3.1 and compare which head is better calibrated on this heteroscedastic data, and why a misspecified family would show up here.</li>
+</ol>
+<h3>Open-ended</h3>
+<ol>
+<li><strong>Marginal versus joint, measured.</strong> Build a tiny two-step autoregressive forecaster (predict $y_{t+1}$, feed the sample back, predict $y_{t+2}$) with a Gaussian head, and a direct two-output marginal head, on a series with strong positive autocorrelation. For both, estimate the probability that <em>both</em> steps exceed a threshold. Show numerically that the marginal model underestimates this path probability, quantify the gap, and connect the gap to the across-step correlation the autoregressive sampler captures (subsection four).</li>
+</ol>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-19.2.html">&#8592; 19.2 Scoring and Calibrating Probabilistic Forecasts</a>
+<a class="up" href="index.html">Chapter 19 Contents</a>
+<a class="next" href="section-19.4.html">19.4 Bayesian and Ensemble Approaches; Gaussian Processes for Time Series &#8594;</a>
+</nav>
+</main>
+<footer class="book-footer">
+<p>Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &middot; <a href="../../toc.html">Contents</a></p>
+<p><script>document.write("Last updated " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

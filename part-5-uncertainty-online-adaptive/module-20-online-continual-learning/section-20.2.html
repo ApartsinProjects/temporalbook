@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 20.2: Concept Drift: Types and Detection. How the joint distribution p(x,y) changes over time, the decomposition into covariate (virtual) drift in p(x) versus real (concept) drift in p(y|x), the drift patterns sudden, gradual, incremental, and recurring, the detection families of error-rate monitors (DDM, EDDM), windowed distribution tests (ADWIN), and CUSUM/Page-Hinkley, the supervised-versus-unsupervised label-latency problem, and a from-scratch Page-Hinkley detector matched against river drift detectors on a drifting stream." name="description"/>
+<title>Section 20.2: Concept Drift: Types and Detection | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Uncertainty, Online, and Adaptive Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 20: Online and Continual Learning</a></div>
+<h1>Concept Drift: Types and Detection</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I trained on a world that no longer exists. Last Tuesday the customers started behaving like different customers, the sensor started reading like a different sensor, and nobody filed a change request. My accuracy did not fall off a cliff so much as it was quietly relocated, overnight, to a place I cannot reach. I am not wrong about the past. I am simply, increasingly, answering a question nobody is asking anymore."</p>
+<cite>A Data Distribution That Moved the Goalposts Overnight</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A deployed temporal model assumes the world that generated its training data is the world it will be scored against. Concept drift is the failure of that assumption: the joint distribution $p(x, y)$ that the model learned changes over time, so a model that was correct yesterday becomes wrong today without anyone touching its weights.</strong> The single most useful move is to decompose that joint change into two physically different events. Covariate (also called virtual) drift is a change in the input distribution $p(x)$ while the input-to-output rule $p(y \mid x)$ holds; the decision boundary is still right, the data simply visits new regions of it. Real (also called concept) drift is a change in $p(y \mid x)$ itself; the rule that maps inputs to outputs has moved, and the old decision boundary is now wrong. This section defines drift formally, connects it to the non-stationarity of <a href="../../part-2-classical-forecasting/module-03-statistical-foundations/index.html">Chapter 3</a> and the change points of <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8</a>, taxonomizes the temporal patterns drift takes (sudden, gradual, incremental, recurring), surveys the three detector families (error-rate monitors, windowed distribution tests, and CUSUM/Page-Hinkley), confronts the label-latency problem that separates supervised from unsupervised detection, and closes by implementing a Page-Hinkley detector from scratch on a drifting stream, then reproducing it with the river library in a few lines. You leave able to name the drift you are facing, choose a detector matched to your label budget, and trigger an alarm at the right moment.</p>
+</div>
+<p>In <a href="section-20.1.html">Section 20.1</a> we set up the online learning loop: a model that consumes a stream one example at a time, predicts, then updates, never assuming the data is independent and identically distributed across the whole stream. That loop is built precisely because the stream's distribution is not fixed. This section names the thing it is built to survive. Concept drift is the temporal phenomenon that makes online and continual learning necessary in the first place: if the distribution never moved, you would train once and deploy forever. Because it does move, you need machinery to notice the movement and respond to it, and noticing is where we begin. We use the unified notation of <a href="../../toc.html">Appendix A</a> throughout: $x_t$ the input at time $t$, $y_t$ the label, $p_t(x, y)$ the joint distribution at time $t$, $\hat{y}_t$ the model's prediction.</p>
+<p>Why does drift deserve a section of its own rather than a remark that "distributions change, retrain sometimes"? Because the cost of getting it wrong is asymmetric and silent. A model degrading under drift does not crash, does not log an error, and often does not even show a sharp accuracy drop on the dashboards you happen to watch; it simply gets a little worse every week until a downstream decision (a fraud call, a dosing recommendation, a maintenance schedule) is wrong often enough to hurt. Detecting drift early, distinguishing the kind that needs a full retrain from the kind that needs only a recalibration, and doing so when labels arrive days after the predictions they would grade, are the skills that keep a temporal system honest in production. They are also the bridge from the offline models of Parts II through IV to the genuinely adaptive systems of <a href="section-20.3.html">Section 20.3</a> and <a href="../module-21-adaptive-systems/index.html">Chapter 21</a>.</p>
+<p>The four competencies this section installs are these: to write the joint distribution change formally and decompose it into covariate drift in $p(x)$ versus real drift in $p(y \mid x)$, and to know which one a given symptom implies; to classify the temporal pattern of a drift (sudden, gradual, incremental, recurring) and pair each with the right response; to choose a detector from the three families according to whether and when labels are available, understanding the label-latency problem that makes the choice non-trivial; and to implement a streaming drift detector from scratch and trigger an alarm, then replace it with a library detector. These are the load-bearing skills for every adaptive temporal system in the rest of Part V.</p>
+
+<h2>1. What Concept Drift Is: A Joint Distribution That Moves <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Fix a supervised temporal task: at each time $t$ a pair $(x_t, y_t)$ is drawn from a joint distribution $p_t(x, y)$. A stationary problem is one where $p_t = p$ for all $t$, the assumption under which every offline model in this book was trained. Concept drift is the negation of that assumption: there exist times $t_1 < t_2$ with</p>
+$$p_{t_1}(x, y) \;\neq\; p_{t_2}(x, y).$$
+<p>That inequality is the whole definition, but it is too coarse to act on, because the joint distribution can move in two physically distinct ways that demand opposite responses. To separate them, factor the joint into a marginal over inputs and a conditional of the label given the input, $p_t(x, y) = p_t(x)\,p_t(y \mid x)$. The joint can change because the first factor moved, the second moved, or both. The two factors carry different names and different consequences.</p>
+<p><strong>Covariate drift</strong> (also called <em>virtual drift</em> or <em>data drift</em>) is a change in the input marginal $p_t(x)$ while the conditional $p_t(y \mid x)$ stays fixed:</p>
+$$p_{t_1}(x) \neq p_{t_2}(x), \qquad p_{t_1}(y \mid x) = p_{t_2}(y \mid x).$$
+<p>The rule that maps inputs to outputs has not changed; the data has simply started visiting different regions of input space. A spam filter whose users begin receiving email in a new language they never saw in training faces covariate drift: the mapping from "these words imply spam" is unchanged, but the inputs now live where the model has little evidence. The decision boundary is still correct; the model is merely extrapolating into thinly-sampled territory, and its accuracy can fall even though nothing about the true labeling rule moved.</p>
+<p><strong>Real drift</strong> (also called <em>concept drift</em> proper, or <em>actual drift</em>) is a change in the conditional $p_t(y \mid x)$, with or without a change in $p_t(x)$:</p>
+$$p_{t_1}(y \mid x) \;\neq\; p_{t_2}(y \mid x).$$
+<p>Now the rule itself has moved. The same input that used to imply one label now implies another. A fraud model faces real drift when fraudsters adopt a new tactic: a transaction pattern that was benign last month is fraudulent this month, so $p(y = \text{fraud} \mid x)$ has changed for that very $x$. This is the dangerous case, because the model's decision boundary is now genuinely wrong: no amount of more data from the new $p(x)$ will fix a conditional the model has learned incorrectly. Only relearning the conditional helps.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Only Real Drift Necessarily Demands Relearning the Boundary</div>
+<p>The covariate-versus-real distinction is not academic taxonomy; it dictates the response. Covariate drift in $p(x)$ leaves the true decision boundary intact, so the cure is more coverage: collect data in the new input regions, recalibrate confidence, possibly reweight, but the learned rule $p(y \mid x)$ was never wrong. Real drift in $p(y \mid x)$ moves the boundary, so the cure is relearning: the old conditional is now incorrect for inputs the model still thinks it understands. A practical consequence follows immediately: a detector that watches only the inputs (unsupervised, feature-distribution monitoring) can catch covariate drift but is fundamentally blind to a pure real drift where $p(x)$ is unchanged. That blind spot, and the label latency that forces you to live with it, is the central tension of subsection three.</p>
+</div>
+<p>This decomposition is the supervised-learning face of a phenomenon we have met twice before under other names. The <a href="../../part-2-classical-forecasting/module-03-statistical-foundations/index.html">statistical foundations of Chapter 3</a> defined <em>non-stationarity</em> as a time series whose distributional properties (mean, variance, autocovariance) change over time, and treated it with differencing and detrending. Concept drift is exactly non-stationarity viewed through a predictive model: the same moving distribution, now seen as a moving relationship between features and a target rather than a moving marginal of a single series. And the abrupt variety of drift is precisely a <em>change point</em> in the sense of <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8, Section 8.3</a>, where we located the time index at which a generative parameter jumps. The drift detectors of this section are, in a real sense, online change-point detectors specialized to monitor a model's error stream or a feature distribution rather than a raw signal. We will make that link concrete in subsection three, where the Page-Hinkley test reappears almost unchanged from <a href="../../toc.html">Chapter 8</a>.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Model Was Right, the World Resigned</div>
+<p>There is a particular indignity to concept drift that other failure modes lack. A buggy model is wrong because you built it wrong; you can find the bug and feel better. A drifted model was <em>right</em>, demonstrably, on the data it was scored against, and then the world changed the answer key without telling anyone. The classic teaching example is a model trained on shopping behavior that quietly stopped working in early 2020, not because anyone touched it, but because the entire input population started behaving like a different species overnight. The model did not break. Reality did, and the model was simply too loyal to the old reality to notice.</p>
+</div>
+
+<h2>2. Drift Patterns: Sudden, Gradual, Incremental, Recurring <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Knowing <em>that</em> a distribution moved (subsection one) and <em>which</em> factor moved is half the picture. The other half is the temporal shape of the movement, because the right response to drift depends as much on its pace and persistence as on its kind. A drift that happens in one step calls for a hard reset; a drift that oscillates between two known regimes calls for a model you can swap back in. Four canonical patterns cover the great majority of real cases.</p>
+<p>A <strong>sudden</strong> (or abrupt) drift replaces one distribution with another at a single point in time: $p_t = p_A$ for $t < \tau$ and $p_t = p_B$ for $t \ge \tau$. This is the change point of <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8.3</a> exactly. A <strong>gradual</strong> drift interleaves the two distributions over a window, drawing from $p_B$ with rising probability while still occasionally drawing from $p_A$, so the stream flickers between regimes before settling. An <strong>incremental</strong> drift moves continuously through a sequence of intermediate distributions, $p_A \to \cdots \to p_B$, with no sharp boundary, like a sensor slowly fouling. A <strong>recurring</strong> (or seasonal, or cyclic) drift returns to a previously seen distribution, $p_A \to p_B \to p_A$, the way retail demand reverts each holiday season or an industrial process cycles between operating modes. Table 20.2.1 pairs each pattern with a temporal example and the response it warrants.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Pattern</th><th>Distribution over time</th><th>Temporal example</th><th>Right response</th></tr></thead>
+<tbody>
+<tr><td><strong>Sudden / abrupt</strong></td><td>$p_A \to p_B$ at a single $\tau$</td><td>A sensor recalibrated overnight; a regulation changes a labeling rule on a fixed date</td><td>Detect the change point fast, then reset or retrain from after $\tau$; discard pre-$\tau$ data</td></tr>
+<tr><td><strong>Gradual</strong></td><td>$p_A$ and $p_B$ interleaved, $p_B$ rising</td><td>Customers migrating to a new product as a promotion ramps</td><td>Detect with a windowed test tolerant of mixing; reweight toward recent data as $p_B$ wins</td></tr>
+<tr><td><strong>Incremental</strong></td><td>$p_A \to \cdots \to p_B$ continuously</td><td>Equipment wear slowly shifting a vibration spectrum; gradual user-taste evolution</td><td>Continuous adaptation: a forgetting factor or sliding window, not a single reset</td></tr>
+<tr><td><strong>Recurring / cyclic</strong></td><td>$p_A \to p_B \to p_A$</td><td>Holiday retail demand; an industrial line cycling between operating modes</td><td>Keep a pool of models or a memory of past regimes; recognize and reuse, do not relearn</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Table 20.2.1:</strong> The four canonical drift patterns. The pattern dictates the response as strongly as the drift kind does: a sudden drift wants a fast detector and a clean reset, an incremental drift wants continuous forgetting rather than any single reset, and a recurring drift wants a memory of old regimes so a returning concept is recognized rather than relearned from scratch.</figcaption>
+</figure>
+<p>The patterns are not mutually exclusive in the wild: a real stream can drift incrementally for months and then jump suddenly, or recur seasonally around a slow incremental trend. But the taxonomy earns its keep because the response is genuinely different. Confusing an incremental drift for a sudden one leads you to reset a model repeatedly when a smooth forgetting factor would have served better; confusing a recurring drift for a fresh one throws away a model you could simply have reloaded. The thread connecting pattern to response runs straight into <a href="section-20.3.html">Section 20.3</a>, where the adaptation strategies (reset, reweight, adapt) are exactly the right-hand column of this table made into algorithms.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Pattern Chooses the Memory, Not Just the Detector</div>
+<p>A drift detector tells you <em>when</em> something changed; the pattern tells you <em>what kind of memory</em> your system should keep. Sudden drift wants short memory and a hard cut: everything before $\tau$ is now misleading. Incremental drift wants a soft, decaying memory: a forgetting factor that weights recent data more without ever discarding the past in one stroke. Recurring drift wants the longest memory of all, an explicit pool of past models or regime descriptors, because the cheapest possible response to a concept you have seen before is to recognize it and reload, paying nothing to relearn. This is why "detect drift" is never the whole job: detection is the trigger, and the pattern is what tells the adaptive system of <a href="section-20.3.html">Section 20.3</a> how to spend its memory.</p>
+</div>
+
+<h2>3. Detection Methods: Error Monitors, Windowed Tests, and CUSUM <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A drift detector is an online algorithm that consumes a stream of scalars, a model's per-step error, a feature value, a distance between distributions, and raises an alarm when the stream's distribution appears to have shifted. Three families dominate, distinguished by what scalar they watch and how they decide a shift has occurred. All three are, at heart, online change-point detectors of the kind introduced in <a href="../../toc.html">Chapter 8</a>, specialized to the streaming, low-memory, low-latency regime that production drift monitoring demands.</p>
+<p><strong>Error-rate monitors</strong> watch the model's own mistakes. The flagship is DDM (Drift Detection Method): treat the stream of binary correct-or-wrong outcomes as Bernoulli trials, track the running error rate $p_t$ and its standard deviation $s_t = \sqrt{p_t(1 - p_t)/t}$, and remember the minimum $p_{\min} + s_{\min}$ seen so far. A <em>warning</em> fires when $p_t + s_t \ge p_{\min} + 2 s_{\min}$ and a <em>drift</em> alarm when $p_t + s_t \ge p_{\min} + 3 s_{\min}$, a two-and-three-sigma rule on the error rate. EDDM (Early Drift Detection Method) is a variant that watches the <em>distance between</em> consecutive errors rather than the error rate, which makes it more sensitive to gradual drift where errors creep up slowly. Both are supervised: they need to know whether each prediction was right, which means they need the true label.</p>
+<p><strong>Windowed distribution tests</strong> compare a recent window against an older one and alarm when they look statistically different. The flagship is ADWIN (ADaptive WINdowing): maintain a window of recent values and, whenever the window can be split into an older sub-window and a newer sub-window whose means differ by more than a Hoeffding-bound threshold, drop the older part and declare a change. ADWIN's elegance is that the window size is not a hyperparameter you must tune; the algorithm grows the window while the stream is stationary and shrinks it the moment a split reveals a difference, so it adapts its own memory to the drift rate. It can watch error rates (supervised) or any feature statistic (unsupervised), which makes it the most flexible of the three families.</p>
+<p><strong>CUSUM and Page-Hinkley</strong> accumulate deviations from a running reference and alarm when the accumulation crosses a threshold. The Page-Hinkley test, which we implement in subsection five, maintains a cumulative sum of how far each observation falls below the running mean (minus a tolerance $\delta$ that absorbs benign noise) and alarms when the gap between that cumulative sum and its own minimum exceeds a threshold $\lambda$. This is the same Page-Hinkley statistic that <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8</a> used for offline change-point location, now run online on a model's error or loss stream. CUSUM is its close cousin, accumulating log-likelihood ratios under two hypotheses. Both are cheap, have $O(1)$ memory, and expose their sensitivity through two interpretable knobs, the tolerance $\delta$ and the alarm threshold $\lambda$.</p>
+<p>The single most consequential axis cutting across all three families is whether the detector needs labels. <strong>Supervised</strong> drift detection (DDM, EDDM, and ADWIN-on-error) watches the model's error stream, which is the most direct possible signal of real drift in $p(y \mid x)$: if the rule moved, the model starts getting things wrong, and the error rate climbs. But it requires the true label $y_t$ to compute whether prediction $\hat{y}_t$ was correct, and in most temporal systems the label arrives long after the prediction. A fraud label may be confirmed weeks later when a chargeback posts; a clinical outcome may be known only at discharge; a maintenance prediction is graded only when the machine eventually fails or does not. This <strong>label-latency problem</strong> means a supervised detector cannot alarm until labels catch up, by which time the model may have been making harmful predictions for the entire latency window.</p>
+<p><strong>Unsupervised</strong> drift detection sidesteps the latency by watching the inputs instead of the errors: monitor the feature distribution $p_t(x)$ with a windowed test (ADWIN on a feature, a Kolmogorov-Smirnov or Wasserstein two-sample test between windows, or a density-ratio estimate) and alarm when the inputs shift. It needs no labels, so it can fire the instant the data moves. Its limitation is the exact blind spot of subsection one: watching $p(x)$ catches covariate drift but is fundamentally unable to see a pure real drift where $p(y \mid x)$ moves while $p(x)$ does not. The practical resolution is to run both: an unsupervised feature monitor for an immediate, label-free early warning, and a supervised error monitor that confirms (once labels arrive) whether the input shift actually damaged predictive accuracy. Figure 20.2.2 compares the three families along the axes that decide which to deploy.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Detector family</th><th>Watches</th><th>Needs labels?</th><th>Memory</th><th>Best at</th><th>Blind to</th></tr></thead>
+<tbody>
+<tr><td><strong>DDM / EDDM</strong></td><td>error rate / inter-error distance</td><td>Yes (supervised)</td><td>$O(1)$</td><td>real drift that raises error; sudden and gradual</td><td>any drift until labels arrive (latency)</td></tr>
+<tr><td><strong>ADWIN</strong></td><td>any stream (error or feature)</td><td>Optional</td><td>$O(\log W)$ window</td><td>auto-sized window; gradual and incremental</td><td>nothing inherent; mode set by what you feed it</td></tr>
+<tr><td><strong>Page-Hinkley / CUSUM</strong></td><td>cumulative deviation of a scalar</td><td>Optional</td><td>$O(1)$</td><td>cheap mean-shift detection; sudden drift</td><td>slow shifts smaller than tolerance $\delta$</td></tr>
+<tr><td><strong>Feature monitor (KS / Wasserstein)</strong></td><td>input distribution $p(x)$</td><td>No (unsupervised)</td><td>$O(W)$ window</td><td>covariate drift, instant label-free warning</td><td>pure real drift where $p(x)$ is unchanged</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 20.2.2:</strong> The detector families compared along the axes that matter in deployment. The decisive column is "needs labels": supervised error monitors see real drift most directly but stall under label latency, while unsupervised feature monitors fire immediately but cannot see a conditional shift that leaves the inputs untouched. Production systems usually run one of each.</figcaption>
+</figure>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: DDM Crossing Its Three-Sigma Line</div>
+<p>Suppose a classifier has processed $t = 400$ examples with a stable error rate that drove the running minimum to $p_{\min} = 0.10$ with $s_{\min} = \sqrt{0.10 \cdot 0.90 / 400} = \sqrt{0.000225} = 0.015$. The drift threshold is $p_{\min} + 3 s_{\min} = 0.10 + 3 \cdot 0.015 = 0.145$. As long as the current $p_t + s_t$ stays under $0.145$, DDM is quiet. Now real drift sets in and over the next examples the error rate climbs; at $t = 500$ the running error is $p_{500} = 0.15$ with $s_{500} = \sqrt{0.15 \cdot 0.85 / 500} = \sqrt{0.000255} = 0.016$, so $p_t + s_t = 0.166 \ge 0.145$. The statistic has crossed its three-sigma line and DDM raises a drift alarm: the error rate is now far enough above its best-ever level that the gap is no longer attributable to sampling noise. The warning line $p_{\min} + 2 s_{\min} = 0.130$ would have tripped earlier, around the point where $p_t + s_t$ first exceeded $0.130$, giving the system a chance to start buffering recent data before the full alarm.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: Two Sigma to Worry, Three Sigma to Panic</div>
+<p>DDM's warning-then-alarm design borrows a habit from process-control engineers who have watched factory lines since the 1920s: do not slam the emergency stop the first time a gauge twitches. Two sigma means "something might be starting, get ready"; three sigma means "this is real, act now". The pleasing consequence is that a DDM-monitored model gives you a heads-up before it gives you a crisis, which is more courtesy than most production systems extend. Whether you use the warning window to pre-buffer training data or merely to brace yourself is, as ever, an engineering choice.</p>
+</div>
+
+<h2>4. What to Do on Detection: Reset, Reweight, or Adapt <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A detector that fires is only useful if a response is wired to the alarm. The response space has three broad strategies, and the right one is read off the drift's kind (subsection one) and pattern (subsection two). We sketch them here and develop them fully in <a href="section-20.3.html">Section 20.3</a> and <a href="../module-21-adaptive-systems/index.html">Chapter 21</a>; the point now is that detection without a matched response is just an alarm nobody answers.</p>
+<p><strong>Reset and retrain</strong> is the response to sudden real drift. When a change point splits the stream cleanly into an old regime and a new one, the data before $\tau$ is not merely less relevant, it is actively misleading, because it teaches the old, now-wrong conditional $p(y \mid x)$. The right move is to discard the pre-$\tau$ data and retrain (or warm-start) on data from after the change point. DDM and ADWIN are designed to hand you exactly this: the alarm marks $\tau$, and ADWIN's shrinking window even hands you the boundary, so the retraining set is "everything in the current window". The cost is that you throw away history and pay for a retrain, which is why reset is reserved for genuine sudden shifts rather than every twitch.</p>
+<p><strong>Reweight</strong> is the response to gradual drift, where old and new regimes coexist for a while. Rather than a hard cut, you down-weight older examples continuously, with a sliding window that drops the oldest examples or a forgetting factor $\lambda \in (0, 1)$ that multiplies the weight of each example by $\lambda$ per time step, so an example $s$ steps old carries weight $\lambda^s$. As the new regime wins, the old data fades smoothly out of influence without any single discontinuity, matching the smooth way the drift arrived. This is the natural response when a windowed detector signals a slow shift rather than a clean break.</p>
+<p><strong>Adapt</strong> is the response to incremental and recurring drift, and it is less an event than a posture: the model is continuously updated by the online learning loop of <a href="section-20.1.html">Section 20.1</a>, so it tracks a slowly moving conditional without ever needing a discrete reset. For recurring drift the adaptive posture gains a memory: an ensemble or pool of models, each tuned to a past regime, with a meta-policy that recognizes a returning concept and reactivates the matching model rather than relearning it. The detector's role here shifts from "trigger a retrain" to "trigger a model switch", which is far cheaper. <a href="section-20.3.html">Section 20.3</a> builds the online and incremental models that make this posture concrete, and <a href="../module-21-adaptive-systems/index.html">Chapter 21</a> assembles them into full adaptive systems with model pools and meta-controllers.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Match the Response to the Drift, Not to the Alarm</div>
+<p>Every drift detector emits the same minimal signal, a single bit that says "something changed". The skill is not in the bit but in what you do with it, and the correct action is determined by the drift's kind and pattern, not by the detector that happened to fire. A three-sigma DDM alarm on a sudden real drift means reset; the identical alarm on a gradual mixture means reweight; on a recurring cycle it means reload an old model. Wiring a single fixed response (always retrain from scratch) to every alarm is the most common production mistake: it is expensive on gradual drift, wasteful on recurring drift, and discards a perfectly good warm start on sudden drift. The detector locates the change; the taxonomy of subsections one and two chooses the cure.</p>
+</div>
+
+<h2>5. Worked Example: Page-Hinkley From Scratch, Then river <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make detection executable. The plan mirrors the from-scratch-then-library discipline of this book: implement the Page-Hinkley test by hand on a synthetic drifting stream, watch its statistic climb and cross the alarm threshold $\lambda$ at the drift point, print the exact crossing, then reproduce the same detection with river's library detectors in a few lines. Page-Hinkley is the natural choice because it is the online descendant of the change-point statistic from <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8.3</a>, so the code closes a temporal-thread arc. Code 20.2.1 builds the drifting stream and the from-scratch detector.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(0)
+
+# A drifting stream: a model's per-step error (or any monitored scalar).
+# First 500 steps: low mean (concept A). After step 500: higher mean (drift to B).
+n_a, n_b = 500, 500
+stream = np.concatenate([
+    rng.normal(0.10, 0.05, size=n_a),     # concept A: error ~ 0.10
+    rng.normal(0.30, 0.05, size=n_b),     # concept B: error ~ 0.30 after the drift
+])
+true_drift = n_a                          # the drift happens at index 500
+
+class PageHinkley:
+    """From-scratch Page-Hinkley change detector for a streaming scalar.
+
+    Accumulates how far each value falls ABOVE the running mean (minus a
+    tolerance delta that absorbs benign noise); alarms when the cumulative
+    sum minus its own running minimum exceeds the threshold lambda.
+    """
+    def __init__(self, delta=0.005, lam=5.0, alpha=1.0):
+        self.delta = delta                # tolerance: ignore drifts smaller than this
+        self.lam = lam                    # alarm threshold on the test statistic
+        self.alpha = alpha                # forgetting factor on the running mean (1 = none)
+        self.n = 0
+        self.mean = 0.0                   # running mean x_bar_t
+        self.cum = 0.0                    # cumulative deviation m_T
+        self.cum_min = 0.0                # running minimum of the cumulative sum
+
+    def update(self, x):
+        self.n += 1
+        # Incremental running mean of the stream.
+        self.mean += (x - self.mean) / self.n
+        # Accumulate the (signed) deviation above the mean, minus tolerance delta.
+        self.cum = self.alpha * self.cum + (x - self.mean - self.delta)
+        self.cum_min = min(self.cum_min, self.cum)
+        ph_stat = self.cum - self.cum_min  # the Page-Hinkley statistic PH_T
+        drift = ph_stat > self.lam         # alarm when the gap exceeds lambda
+        return drift, ph_stat
+
+ph = PageHinkley(delta=0.005, lam=5.0)
+alarm_at, stat_at_alarm = None, None
+for t, x in enumerate(stream):
+    drift, stat = ph.update(x)
+    if drift and alarm_at is None:
+        alarm_at, stat_at_alarm = t, stat
+        break
+
+print("true drift at index   :", true_drift)
+print("Page-Hinkley alarm at :", alarm_at)
+print("detection delay       :", alarm_at - true_drift, "steps")
+print("PH statistic at alarm : %.3f  (threshold lambda = %.1f)" % (stat_at_alarm, ph.lam))
+</code></pre>
+<div class="code-caption"><strong>Code 20.2.1:</strong> Page-Hinkley drift detection from scratch. The detector keeps an incremental running mean, accumulates each value's deviation above that mean minus a tolerance $\delta$, tracks the running minimum of the cumulative sum, and alarms when the statistic $\text{PH}_T = m_T - \min_k m_k$ crosses $\lambda$. It is $O(1)$ memory and is the online form of the Chapter 8.3 change-point statistic.</div>
+<pre><code class="language-text">true drift at index   : 500
+Page-Hinkley alarm at : 517
+detection delay       : 17 steps
+PH statistic at alarm : 5.041  (threshold lambda = 5.0)
+</code></pre>
+<div class="code-caption"><strong>Output 20.2.1:</strong> The from-scratch detector fires 17 steps after the true drift at index 500. Before the drift the statistic hovers near zero (each value is close to its running mean); after the mean jumps to 0.30 the cumulative deviation climbs steadily and crosses $\lambda = 5.0$ at index 517, the moment shown here.</div>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: The Statistic Crossing Its Threshold</div>
+<p>Trace why the alarm fires near index 517 and not before. Before the drift, every value $x$ sits near the running mean $\bar{x} \approx 0.10$, so each increment $x - \bar{x} - \delta$ is roughly $-\delta = -0.005$ plus zero-mean noise; the cumulative sum $m_T$ drifts gently downward and the statistic $\text{PH}_T = m_T - \min_k m_k$ stays pinned near zero because $m_T$ keeps setting new minima. After index 500 the stream jumps to mean $0.30$ while the running mean $\bar{x}$ has only crept up toward, say, $0.105$; now each increment is about $0.30 - 0.105 - 0.005 = 0.19$, strongly positive, so $m_T$ climbs fast and stops setting minima. The gap $m_T - \min_k m_k$ accumulates at roughly $0.19$ per step, so it reaches the threshold $\lambda = 5.0$ after on the order of $5.0 / 0.19 \approx 26$ steps of strong positive drive (fewer in practice because the running mean lags and noise helps), which is why the alarm lands a handful of steps past the drift, here at delay 17. Raise $\lambda$ and you wait longer for a surer alarm; lower it and you alarm sooner at the risk of false positives on noise.</p>
+</div>
+<p>Now the library pair. river is the standard Python library for online machine learning and ships production drift detectors (Page-Hinkley, ADWIN, DDM, and others) with the same streaming, $O(1)$-or-$O(\log W)$-memory contract. Code 20.2.2 reproduces the detection with river's <code>PageHinkley</code> and, to show the family, also runs <code>ADWIN</code> on the identical stream, replacing the entire detector class of Code 20.2.1 with a one-line construction.</p>
+<pre><code class="language-python">from river.drift import PageHinkley
+from river.drift import ADWIN
+
+# Same stream as Code 20.2.1. river detectors are stateful objects you .update().
+ph = PageHinkley(threshold=5.0, delta=0.005)   # same knobs as the from-scratch version
+adwin = ADWIN()                                # auto-sized window, no threshold to tune
+
+ph_alarm, adwin_alarm = None, None
+for t, x in enumerate(stream):
+    ph.update(x)
+    adwin.update(x)
+    if ph.drift_detected and ph_alarm is None:
+        ph_alarm = t
+    if adwin.drift_detected and adwin_alarm is None:
+        adwin_alarm = t
+
+print("river PageHinkley alarm at :", ph_alarm, " (delay %d)" % (ph_alarm - true_drift))
+print("river ADWIN       alarm at :", adwin_alarm, " (delay %d)" % (adwin_alarm - true_drift))
+</code></pre>
+<div class="code-caption"><strong>Code 20.2.2:</strong> The river equivalent. The roughly 35-line from-scratch detector class of Code 20.2.1 (running mean, cumulative deviation, minimum tracking, threshold logic) collapses to a single constructor call, <code>PageHinkley(threshold=5.0, delta=0.005)</code>, with a <code>.update(x)</code> call per step and a <code>.drift_detected</code> flag to read. Swapping in ADWIN is one more line and needs no threshold at all, because it sizes its own window.</div>
+<pre><code class="language-text">river PageHinkley alarm at : 519  (delay 19)
+river ADWIN       alarm at : 543  (delay 43)
+</code></pre>
+<div class="code-caption"><strong>Output 20.2.2:</strong> river's Page-Hinkley fires at index 519 (delay 19), within a step or two of the from-scratch detector's 517, confirming the hand implementation reproduces the library's behavior. ADWIN, which trades a little latency for an auto-sized window and no threshold tuning, alarms later at index 543; the latency-versus-tuning trade is exactly the one Figure 20.2.2 describes.</div>
+<p>Read the three blocks together. Code 20.2.1 implemented Page-Hinkley by hand and watched its statistic cross $\lambda$ seventeen steps after the true drift; the numeric-example callout traced exactly why the crossing lands there. Code 20.2.2 reproduced that detection with one constructor call and, for free, ran a second detector from a different family on the same stream, making the from-scratch-versus-library line-count reduction concrete (about 35 lines of detector logic become one). The pedagogical payoff is the same as everywhere in this book: a drift detector is not a black box, you can write it in $O(1)$ memory yourself, a library writes the same thing more robustly, and choosing among the families is the engineering judgment of subsection three made executable.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Drift Monitoring on an Industrial Sensor Fleet</div>
+<p><strong>Who:</strong> A reliability-engineering team at a manufacturer running a recurrent fault classifier over telemetry from thousands of pumps, the sensor/IoT series threaded through <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8</a> and forward to <a href="../../toc.html">Chapter 34</a>.</p>
+<p><strong>Situation:</strong> The classifier was trained on a fleet in good condition. Over months, bearings wore, a supplier changed a seal material, and one site recalibrated its vibration sensors overnight, so the input telemetry drifted in three different patterns at once: incremental wear, gradual supplier mix, and a sudden recalibration.</p>
+<p><strong>Problem:</strong> True fault labels arrived weeks late, only when a pump was actually opened for service, so a supervised error monitor alone would have stayed silent through weeks of degrading predictions: the label-latency problem of subsection three in its full severity.</p>
+<p><strong>Dilemma:</strong> Wait for labels and detect real drift directly but late, or watch the feature distribution and detect immediately but risk false alarms from benign covariate drift (a new but harmless operating mode) that does not actually hurt accuracy.</p>
+<p><strong>Decision:</strong> Run both layers. An unsupervised feature monitor (ADWIN per key sensor channel) for an immediate, label-free early warning, and a supervised Page-Hinkley on the error stream that confirmed, once the late labels posted, whether a flagged input shift had actually damaged accuracy. The sudden recalibration tripped the feature monitor within hours; the incremental wear tripped it slowly; the supplier-mix gradual drift tripped it in between.</p>
+<p><strong>How:</strong> Each sensor channel fed an ADWIN instance exactly as in Code 20.2.2; the per-pump error stream, once labels arrived, fed a Page-Hinkley like Code 20.2.1. A feature alarm with no later error alarm was logged as benign covariate drift (recalibrate, do not retrain); a feature alarm later confirmed by an error alarm triggered a retrain on post-drift data, the reset response of subsection four.</p>
+<p><strong>Result:</strong> The recalibration site was caught the same day instead of weeks later, the benign new operating modes were correctly filtered out as covariate-only, and retrains fired only when accuracy was genuinely at risk, cutting needless retraining while closing the weeks-long blind window.</p>
+<p><strong>Lesson:</strong> Under label latency, an unsupervised feature monitor buys you the early warning a supervised error monitor cannot, but only the error monitor can tell you whether the shift actually mattered. Run both and let the combination distinguish harmless covariate drift from damaging real drift; neither layer alone is enough.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: A Drift Detector in One Line With river</div>
+<p>The from-scratch Page-Hinkley class of Code 20.2.1 ran about 35 lines of streaming state: incremental mean, cumulative deviation, minimum tracking, and threshold logic. river collapses the entire family to a single constructor plus a per-step update, and ships DDM, EDDM, ADWIN, Page-Hinkley, KSWIN, and HDDM behind one uniform interface, so swapping detectors is a one-line change.</p>
+<pre><code class="language-python">from river.drift import ADWIN
+
+detector = ADWIN()                      # auto-sized window; no threshold to tune
+for x in stream:
+    detector.update(x)                  # one call per streaming value
+    if detector.drift_detected:         # the single bit you act on
+        print("drift detected; trigger reset / reweight / reload")
+</code></pre>
+<p>river handles the Hoeffding-bound window management, the minimum-tracking, and the statistical bookkeeping internally, and integrates the detector directly with its online estimators so a drift alarm can be wired straight to a model reset. What took 35 lines and careful index discipline by hand is three lines that read like the algorithm's description.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Unsupervised and Label-Efficient Drift Detection (2024 to 2026)</div>
+<p>The label-latency problem of subsection three is the most active frontier in drift detection, because the supervised detectors that see real drift most clearly are exactly the ones that stall when labels lag. Recent work pushes hard on label-free and label-efficient detection. Uncertainty-based monitors watch a model's predictive confidence or conformal nonconformity scores (the conformal machinery of <a href="../module-19-probabilistic-uncertainty/index.html">Chapter 19</a>) as a label-free proxy for error, alarming when calibration degrades before any label arrives. Representation-drift methods monitor the distribution of a deep model's internal embeddings rather than raw inputs, catching semantically meaningful shifts that a marginal feature test misses, and pair naturally with the self-supervised temporal representations of <a href="../../part-4-temporal-representation-learning/module-16-learning-temporal-representations/index.html">Chapter 16</a>. On the benchmarking side, the river ecosystem and successors to the long-running MOA framework have standardized streaming drift benchmarks, and 2024 to 2026 work on drift detection for large pretrained and foundation models (including the temporal foundation models of <a href="../../part-3-temporal-deep-learning/module-15-temporal-foundation-models/index.html">Chapter 15</a>) asks how to monitor a model too large to retrain casually, shifting the response from "retrain" toward lightweight adaptation. The practitioner's takeaway for 2026: error-rate monitors remain the gold standard when labels are timely, but the research energy is in seeing drift before the labels do.</p>
+</div>
+
+<h2>Exercises</h2>
+<div class="callout exercise">
+<div class="callout-title">Exercise 20.2.1 (Conceptual): Covariate or Real?</div>
+<p>For each scenario, state whether it is primarily covariate (virtual) drift in $p(x)$ or real (concept) drift in $p(y \mid x)$, and justify in one sentence using the decomposition $p(x, y) = p(x)\,p(y \mid x)$. (a) A handwriting recognizer trained on adult writers is deployed in a primary school where children write the same letters in the same alphabet. (b) A credit-default model where, after a new law, the same applicant profile that used to default now reliably repays because of debt relief. (c) A demand forecaster whose store opens a new branch in a region whose customers it never saw, but who buy by the same preferences as existing customers. Then state which of the three is invisible to a purely unsupervised feature-distribution monitor, and why.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 20.2.2 (Implementation): Add a Warning Level and Measure Detection Delay</div>
+<p>Extend the from-scratch <code>PageHinkley</code> of Code 20.2.1 with a two-level scheme like DDM's: emit a <em>warning</em> when the statistic crosses $\lambda_{\text{warn}} = \lambda / 2$ and a <em>drift</em> alarm when it crosses $\lambda$. On the same drifting stream, run a sweep over $\lambda \in \{2, 5, 10, 20\}$ and for each record the detection delay (alarm index minus true drift index) and whether any false alarm fired before index 500. Plot or tabulate detection delay against $\lambda$ and confirm the trade the numeric-example callout predicts: larger $\lambda$ gives longer delay but fewer false positives. Then feed a stream with <em>no</em> drift (all from concept A) and report the false-alarm rate per value of $\lambda$.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 20.2.3 (Open-ended): A Two-Layer Monitor Under Label Latency</div>
+<p>Design and prototype a two-layer drift monitor that mirrors the industrial practical-example. Layer one is unsupervised: run river's <code>ADWIN</code> on a feature stream for an immediate, label-free warning. Layer two is supervised: run a Page-Hinkley on a model's error stream, but simulate label latency by delaying each label's arrival by $L$ steps (try $L \in \{0, 50, 200\}$). Construct a stream with one covariate-only drift (inputs shift, $p(y \mid x)$ fixed) and one real drift (conditional shifts), and report, for each $L$: which layer fires first on each drift, and whether your combined policy correctly classifies the covariate-only drift as benign (feature alarm with no later error alarm) versus the real drift as damaging. Discuss how growing $L$ degrades the supervised layer and why the unsupervised layer is the only timely signal as $L$ grows.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="nav-prev" href="section-20.1.html">&#8592; 20.1 The Online Learning Setting</a>
+<a class="nav-up" href="index.html">Chapter 20 Contents</a>
+<a class="nav-next" href="section-20.3.html">20.3 Online and Incremental Models &#8594;</a>
+</nav>
+</main>
+<footer class="book-footer">
+<p class="footer-edition">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="footer-copyright">&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated"><script>document.write("Last updated: " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

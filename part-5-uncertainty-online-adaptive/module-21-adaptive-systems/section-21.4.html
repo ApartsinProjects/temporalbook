@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 21.4: Human-in-the-Loop Adaptation. Why humans stay in the loop for temporal systems (rare high-stakes events, ambiguous drift, accountability, domain knowledge), the interaction patterns of review-and-approve, active learning from false alarms, drift adjudication, and analyst overrides, how to design the loop with calibrated uncertainty and trust calibration to avoid automation bias and alert fatigue, capturing human feedback as preference and correction training signal that bridges to RLHF, and a from-scratch escalation loop matched against a labeling-tool integration sketch." name="description"/>
+<title>Section 21.4: Human-in-the-Loop Adaptation | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Uncertainty, Online, and Adaptive Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 21: Adaptive Temporal AI Systems</a></div>
+<h1>Human-in-the-Loop Adaptation</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"For three years I forecast the night shift alone, and twice a year I was catastrophically, confidently wrong. Now, when my predictive interval yawns wide and my drift detector twitches at once, I do something I once considered beneath me: I stop, I raise my hand, and I ask the analyst what she sees. She is right more often than my posterior, and she never panics at a holiday."</p>
+<cite>A Forecaster That Learned to Ask the Analyst Before Panicking</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>An adaptive temporal system that updates itself automatically (Sections 21.1 to 21.3) is powerful and dangerous in the same breath: the very autonomy that lets it track a drifting world also lets it confidently absorb a bad signal, raise a hundred false alarms a night, or quietly re-train itself off a corrupted stream while no one is watching. Human-in-the-loop adaptation is the discipline of placing a person at the points in the loop where the model is least trustworthy and the cost of error is highest, so that rare high-stakes events, ambiguous drift, and accountability all route through human judgment rather than through an unsupervised gradient step.</strong> This section explains why temporal systems in particular keep humans in the loop (rare events the model has never seen, drift that is genuinely ambiguous, accountability that cannot be delegated to a weight matrix, and domain knowledge the data never encodes), lays out the four interaction patterns (review-and-approve, active learning from false alarms, drift adjudication, and analyst override), shows how to design the loop so that calibrated uncertainty (Chapter 19) tells the human exactly when to trust the model while trust calibration fights automation bias and alert fatigue, and frames human corrections as a preference-and-correction training signal that is the direct bridge to the reinforcement-learning-from-human-feedback machinery of Part VI. We build a complete escalation loop from scratch (low-confidence or drift-flagged predictions are escalated to a simulated analyst, whose label or override is folded back into adaptation), then collapse it to a labeling-tool integration, and compute how an uncertainty threshold sets the human review rate. This is the section where the system stops being a closed loop and becomes a partnership, and it is the last section of Part V: after it, the system stops merely predicting and begins to act.</p>
+</div>
+<p>Throughout <a href="index.html">Chapter 21</a> we have built systems that adapt on their own. <a href="section-21.1.html">Section 21.1</a> assembled the adaptive control loop; <a href="section-21.2.html">Section 21.2</a> gave it drift detection so it knows when the world has changed; <a href="section-21.3.html">Section 21.3</a> added active learning so it can ask for the labels it most needs. Every one of those mechanisms decides something automatically: when to retrain, when to raise a drift alarm, which points to query. This section confronts the question those mechanisms quietly postponed: who decides when the automatic decision is wrong, and who is accountable when it is? The answer, for any temporal system that operates where mistakes are expensive, is a human, placed deliberately in the loop rather than bolted on as an afterthought. We use the unified notation of <a href="../../toc.html">Appendix A</a>: $\mathbf{x}_t$ the input at time $t$, $\hat{y}_t$ the model prediction, $u(\mathbf{x}_t)$ a scalar uncertainty score, $a_t$ the human action (approve, correct, or override), and $\tau$ the escalation threshold that governs how often a human is consulted.</p>
+<p>The four competencies this section installs are these: to articulate why a temporal system keeps a human in the loop rather than fully automating, and at which points; to recognize and implement the four canonical interaction patterns (review-and-approve, false-alarm feedback feeding active learning, drift adjudication, and analyst override); to design the interface so that calibrated uncertainty and trust calibration route the human's attention to exactly the cases that need it, without inducing automation bias or alert fatigue; and to capture the resulting human feedback as a correction-and-preference signal that adapts the model now and seeds the reward modeling of Part VI later. These skills turn an autonomous forecaster into an accountable one.</p>
+
+<h2>1. Why Humans Stay in the Loop for Temporal Systems <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>It is tempting to treat the human as a temporary scaffold, present only until the model is good enough to remove them. For many temporal systems that view is simply wrong, and it is wrong for reasons specific to how time series behave. Four forces keep a person in the loop permanently, and each one is sharper for a temporal system than for a static classifier.</p>
+<p>The first is <strong>rare high-stakes events</strong>. Temporal systems live in long stretches of routine punctuated by rare regime breaks: a flash crash, a sepsis onset, a turbine bearing beginning to fail. By construction the model has seen very few examples of these, because they are rare, yet they are exactly the moments where a wrong forecast is most costly. A model trained on history is structurally weakest precisely where the consequences are gravest, and a human who has lived through prior crises carries a prior the data does not. The second is <strong>ambiguous drift</strong>. As <a href="section-21.2.html">Section 21.2</a> showed, a drift detector fires on a distribution change, but it cannot tell you <em>what kind</em> of change: a genuine regime shift that demands retraining, a transient anomaly that should be ignored, a data-pipeline bug that should be fixed upstream, or a recurring seasonal pattern the detector has simply never seen at this scale. Disambiguating these requires context the model lacks, and acting on the wrong interpretation, retraining on a pipeline bug, for instance, corrupts the model. The third is <strong>accountability</strong>. In medicine, finance, and safety-critical control, a decision must have an owner who can be questioned, audited, and held responsible. A weight matrix cannot be held responsible; a clinician or a risk officer can. Regulation in these domains increasingly requires a human decision-maker in the loop for exactly this reason. The fourth is <strong>domain knowledge the model lacks</strong>: a holiday that is not in the calendar feature, a known sensor that was being serviced last Tuesday, a competitor's product launch that will move demand. The human supplies the context that never made it into the feature vector.</p>
+<p>Across all four forces the human plays three distinct roles, and confusing them is a common design error. As <strong>supervisor</strong>, the human reviews and approves the model's outputs before they take effect, catching the rare catastrophic error. As <strong>labeler</strong>, the human supplies ground truth for the cases the model is most uncertain about, the active-learning role of <a href="section-21.3.html">Section 21.3</a>. As <strong>override</strong>, the human replaces the model's output with their own judgment when they know something the model does not. A well-designed loop assigns each role to the points where it pays off: supervision at high-stakes outputs, labeling at high-uncertainty inputs, override at known-context exceptions.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Automate the Routine, Escalate the Rare and the Ambiguous</div>
+<p>The goal of human-in-the-loop design is not to put a human on every prediction, which destroys the economics of automation, nor to remove them entirely, which destroys accountability where it matters. It is to route the human's scarce attention to exactly the slice of predictions where their judgment changes the outcome: the rare, the high-stakes, the ambiguous, and the contextually exceptional. Everything else the model handles alone. The entire engineering problem reduces to building a reliable <em>router</em>, a rule that decides which predictions a human sees, and the best signal that router has is the model's own calibrated uncertainty. A temporal system that automates the boring ninety-nine percent and escalates the dangerous one percent gets the throughput of automation and the safety of supervision at once.</p>
+</div>
+
+<h2>2. Interaction Patterns: Review, Feedback, Adjudication, Override <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Human involvement in a temporal system takes four recurring shapes. They are not mutually exclusive; a mature deployment runs all four at different points in the loop, and recognizing which pattern a situation calls for is half of designing the system.</p>
+<p>The first pattern is <strong>review-and-approve</strong>. The model produces a forecast or an alert, and a human inspects it before it is acted upon: a demand forecast is approved before it drives a purchase order, a fraud alert is confirmed before an account is frozen, a treatment-risk score is reviewed before it changes a care plan. Review-and-approve is the supervisor role made operational, and its design challenge is throughput: a human cannot review everything, so the system must surface only the forecasts that warrant review, which is again a routing problem solved by uncertainty.</p>
+<p>The second pattern is <strong>feedback on false alarms feeding active learning</strong>. When an analyst dismisses an alert as a false positive, that dismissal is a label, a free one, generated by the normal course of operations. Folding those dismissals back as training signal is exactly the active-learning loop of <a href="section-21.3.html">Section 21.3</a>: the cases a human chose to inspect are, by construction, the cases the model was uncertain about, so the labels they generate are the high-value labels active learning would have queried anyway. A false-alarm dismissal teaches the detector "this pattern you flagged is actually normal", and a confirmed alarm teaches it "this pattern is genuinely anomalous". The operational review queue and the active-learning query set are, in a well-designed system, the same queue.</p>
+<p>The third pattern is <strong>human adjudication of drift alarms</strong>. When the drift detector of <a href="section-21.2.html">Section 21.2</a> fires, the system does not blindly retrain. It escalates the alarm to a human who adjudicates: is this a real regime change (retrain), a transient anomaly (ignore), or an upstream data problem (fix the pipeline, do not retrain)? This adjudication is the safety interlock that prevents the adaptive loop from poisoning itself on a bad signal, and it is the single most important human checkpoint in an automatically retraining system. The fourth pattern is <strong>analyst override and forecast adjustment</strong>, the oldest pattern of all, predating machine learning entirely. The judgmental-forecasting tradition in operations and economics has long had human experts adjust statistical forecasts using knowledge the model lacks: a sales manager who knows a promotion is coming, an epidemiologist who knows a school term is ending. The override is not a failure of the model; it is the channel through which off-model context enters the prediction. The discipline is to log every override with its reason, so that overrides themselves become data about where the model is systematically blind.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The human-in-the-loop adaptation cycle. A stream of inputs enters a model, which produces a prediction and an uncertainty score. A router gate splits on the uncertainty: confident predictions are auto-accepted and acted upon, while uncertain or drift-flagged predictions are escalated to a human, whose label, approval, or override flows back both to the action and into the model's adaptation buffer.">
+<defs>
+<marker id="arrh" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+<marker id="arrFb" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b8431f"/></marker>
+</defs>
+<style>
+.boxh { fill:#eef3f8; stroke:#14385c; stroke-width:2; }
+.gateh { fill:#fff6e9; stroke:#c98a1b; stroke-width:2; }
+.humanh { fill:#eaf4ec; stroke:#2f7d46; stroke-width:2; }
+.flh { stroke:#5a626c; stroke-width:1.8; fill:none; marker-end:url(#arrh); }
+.fbh { stroke:#b8431f; stroke-width:1.8; fill:none; marker-end:url(#arrFb); stroke-dasharray:5 4; }
+.lh { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.sh { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.gh { font:600 11px sans-serif; fill:#b8431f; text-anchor:middle; }
+</style>
+<text class="lh" x="410" y="22">The human-in-the-loop adaptation cycle</text>
+<rect class="boxh" x="30" y="120" width="100" height="56" rx="9"/><text class="lh" x="80" y="145">stream</text><text class="sh" x="80" y="162">x&#8348;</text>
+<rect class="boxh" x="190" y="120" width="110" height="56" rx="9"/><text class="lh" x="245" y="145">model</text><text class="sh" x="245" y="162">y&#770;&#8348;, u(x&#8348;)</text>
+<rect class="gateh" x="360" y="120" width="110" height="56" rx="9"/><text class="lh" x="415" y="145">router</text><text class="sh" x="415" y="162">u &lt; &#964; ?</text>
+<rect class="boxh" x="620" y="40" width="160" height="50" rx="9"/><text class="lh" x="700" y="62">auto-accept</text><text class="sh" x="700" y="79">act on y&#770;&#8348;</text>
+<rect class="humanh" x="620" y="200" width="160" height="62" rx="9"/><text class="lh" x="700" y="226">human</text><text class="sh" x="700" y="244">approve / label / override</text>
+<line class="flh" x1="130" y1="148" x2="188" y2="148"/>
+<line class="flh" x1="300" y1="148" x2="358" y2="148"/>
+<line class="flh" x1="470" y1="138" x2="618" y2="70"/><text class="sh" x="545" y="96">confident</text>
+<line class="flh" x1="470" y1="158" x2="618" y2="225"/><text class="sh" x="540" y="200">uncertain / drift</text>
+<line class="fbh" x1="700" y1="200" x2="700" y2="92"/><text class="gh" x="735" y="150">decision</text>
+<path class="fbh" d="M 620 235 C 430 300 300 280 245 178"/><text class="gh" x="400" y="295">human feedback folds into adaptation</text>
+</svg>
+<figcaption><strong>Figure 21.4.1:</strong> The four interaction patterns assembled into one loop. The model emits a prediction and an uncertainty $u(\mathbf{x}_t)$; the router auto-accepts confident predictions and escalates uncertain or drift-flagged ones to a human, whose approval, label, or override (orange) both completes the action and feeds back into the model's adaptation buffer. Review-and-approve and override live on the human branch; false-alarm feedback and drift adjudication are what the human produces; all four return as training signal.</figcaption>
+</figure>
+<p>Reading Figure 21.4.1, the unity of the four patterns becomes clear: they differ only in <em>what the human produces</em> (an approval, a label, an adjudication, or an override), not in the loop structure. The router decides who acts; the human, when consulted, both completes the immediate decision and emits a training signal. That dual role, deciding now and teaching for later, is what subsection four formalizes.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Analyst's Sticky Note Was the First Override Log</div>
+<p>Long before anyone wrote "human-in-the-loop" in a system-design document, demand planners kept a drawer of sticky notes: "the statistical forecast says minus twenty percent next week, but the new store opens Thursday, so I bumped it back up". Those sticky notes were a perfectly good override log, with a reason field and everything, just not machine-readable. The entire modern apparatus of override capture is, in a sense, the project of getting that drawer into a database so the model can finally learn the thing the planner knew all along: that it is blind to store openings. The sticky note was right; it was just lonely.</p>
+</div>
+
+<h2>3. Designing the Loop Well: Calibration, Trust, and Attention <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A human-in-the-loop system can fail in two opposite directions, and good design steers between them. It can ask for too little human attention on the cases that matter, letting a confident-but-wrong model error through unreviewed; or it can ask for too much, drowning the human in alerts until they stop reading any of them. Both failures trace to the same root: a mismatch between what the system escalates and what actually deserves human judgment. The instrument that closes that gap is <strong>calibrated uncertainty</strong>.</p>
+<p>Recall from <a href="../module-19-probabilistic-uncertainty/index.html">Chapter 19</a> that a probabilistic forecaster does not just predict a value, it predicts a distribution, and a <em>calibrated</em> forecaster is one whose stated confidence matches its empirical accuracy: when it says ninety percent, it is right ninety percent of the time. Calibration is precisely what makes uncertainty usable as an escalation signal. If the model's uncertainty score $u(\mathbf{x}_t)$ is calibrated, then thresholding on it, escalate when $u(\mathbf{x}_t) \ge \tau$, routes to the human exactly the predictions the model is genuinely unsure about, which (by the argument of subsection one) are disproportionately the rare and ambiguous cases where human judgment pays. An <em>uncalibrated</em> uncertainty, by contrast, escalates the wrong cases: an overconfident model stays quiet on errors it should flag, and an underconfident one floods the queue with predictions it could have handled alone. Calibrated uncertainty is the difference between a router that earns the human's trust and one that squanders it. This is why <a href="../module-19-probabilistic-uncertainty/index.html">Chapter 19</a> is a prerequisite for this section, not an aside.</p>
+<p>Beyond raw calibration, two human factors govern whether the loop works in practice. The first is <strong>automation bias</strong>: the tendency of a human supervisor to defer to the machine's recommendation even when their own knowledge contradicts it. A reviewer who rubber-stamps every forecast because the model is "usually right" provides no safety at all; they have become a latency cost with a signature. The defense is to surface uncertainty and a brief explanation (the explanation machinery of <a href="../../toc.html">Chapter 33</a>) alongside each escalated case, so the human reviews the model's <em>reasoning</em>, not just its output, and is primed to disagree when the reasoning is thin. The second is <strong>alert fatigue</strong>: when a detector raises far more alarms than a human can act on, and most are false, the human learns to ignore them, and the one real alarm in a hundred is ignored along with the rest. Alert fatigue is the documented cause of real harm in clinical monitoring, where nurses desensitized to constant alarms miss the critical one. The defense is the same router discipline as everywhere else: tune the escalation threshold $\tau$ so the human's queue stays within their capacity, accept that this means some lower-confidence cases go unreviewed, and make the trade explicit rather than letting the queue overflow silently.</p>
+<p>The unifying design principle is <strong>trust calibration</strong>: the human should trust the model exactly as much as the model deserves, no more and no less, and the system's job is to communicate the model's trustworthiness honestly on every case. Calibrated uncertainty communicates per-prediction trustworthiness; explanations communicate the basis for it; a well-tuned threshold respects the human's finite attention. Get all three right and the human's trust tracks the model's reliability, which is the condition under which the partnership beats either party alone.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Threshold Is a Contract Between Model Confidence and Human Capacity</div>
+<p>The escalation threshold $\tau$ is not a tuning nuisance; it is the explicit contract that balances the two failure modes. Lower $\tau$ escalates more cases: more safety, more human load, more risk of alert fatigue. Higher $\tau$ escalates fewer: less load, but more confident-but-wrong errors slip through unreviewed. Because the model's uncertainty is calibrated (<a href="../module-19-probabilistic-uncertainty/index.html">Chapter 19</a>), $\tau$ has a clean operational reading: it is the confidence level below which the model admits it should not decide alone. Set it from the human's capacity (how many cases per hour can they truly review?) and from the cost asymmetry (how much worse is a missed catastrophe than a wasted review?). The right threshold is the one where the marginal escalated case is worth exactly the human minute it costs.</p>
+</div>
+
+<h2>4. Capturing Human Feedback as Training Signal <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Every human action in the loop is also a datum. When an analyst approves a forecast, dismisses a false alarm, adjudicates a drift event, or overrides a prediction, they generate a label that is exactly aligned with where the model needed it most, because the router escalated that case precisely on the model's uncertainty. Capturing these actions and folding them back is what makes the loop <em>adaptive</em> rather than merely supervised, and it connects this section to the rest of Part V: the human becomes the labeling oracle of the active-learning loop of <a href="section-21.3.html">Section 21.3</a>, supplying the most informative labels by the natural course of their work.</p>
+<p>Human feedback comes in two forms, and the distinction matters because it determines how the feedback is used downstream. <strong>Corrections</strong> are direct labels: "the true value was 42, not your predicted 30", or "this flagged event was normal, not anomalous". A correction slots straight into the supervised adaptation buffer as an $(\mathbf{x}_t, y_t)$ pair and updates the model by the online learning of <a href="../module-20-online-continual-learning/index.html">Chapter 20</a>. <strong>Preferences</strong> are comparative judgments: "forecast A is better than forecast B", "this adjusted trajectory is more plausible than the raw model output". Preferences do not give an absolute target; they give a ranking, and they are the natural currency when the right answer is not a single number but a judgment of quality, exactly the regime where a human can compare more easily than they can specify.</p>
+<p>Preference data is the direct conceptual bridge to <strong>reinforcement learning from human feedback</strong>, the technique that aligns the large sequence models of <a href="../../toc.html">Part VI</a>. There, a reward model is trained on human preference comparisons to score outputs the way a human would, and a policy is then optimized against that learned reward. The shape of the data, pairs of outputs with a human's "this one is better" judgment, is identical to the analyst-preference data an adaptive forecasting system collects when an expert says "this adjusted forecast is better than the model's raw one". The temporal system that logs preferences today is assembling exactly the training set that reward modeling consumes tomorrow. We flag the bridge here and build it in <a href="../../toc.html">Part VI</a>, where the system stops predicting and starts acting, and where human preferences become the reward signal that shapes the action policy.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Corrections Train the Model, Preferences Train the Reward</div>
+<p>The two forms of human feedback feed two different machines. A correction is an absolute target and trains the predictor directly: it is supervised learning's $(\mathbf{x}, y)$ pair, consumed by the online updates of <a href="../module-20-online-continual-learning/index.html">Chapter 20</a>. A preference is a relative judgment and trains a <em>reward model</em>: it cannot say what the right answer is, only which of two answers is better, and that is exactly the signal RLHF turns into a scalar reward in <a href="../../toc.html">Part VI</a>. Capturing both is what lets a single human-in-the-loop system improve its predictions now (via corrections) and prepare to align its <em>actions</em> later (via preferences). The same analyst, doing the same job, generates both.</p>
+</div>
+
+<h2>5. Worked Example: An Escalation Loop From Scratch, Then a Labeling Tool <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now build a complete human-in-the-loop adaptation loop and watch it work. The plan: a streaming forecaster produces predictions with calibrated uncertainty; a router escalates any prediction whose uncertainty exceeds a threshold $\tau$, or that arrives during a drift alarm, to a simulated human who returns a corrected label; the correction is folded into an online update of the model; and we measure the human review rate and the accuracy gain. We build the router and the loop from scratch in plain numpy first, so every decision is visible, then show the same loop wired to a real labeling tool in a handful of lines. Code 21.4.1 is the from-scratch escalation router and feedback fold-back.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(0)
+
+# A toy streaming forecaster: linear model w on 1-D features, trained online.
+# The world drifts: the true weight jumps partway through the stream.
+def true_w(t):
+    return 2.0 if t &lt; 300 else -1.5      # a regime change at t = 300 (drift)
+
+N = 600
+w = np.array([0.0])                        # model weight, adapts online
+lr = 0.05                                  # online (SGD) learning rate
+tau = 0.8                                  # escalate when uncertainty u &gt;= tau
+sigma0 = 0.3                               # base predictive noise scale
+
+reviewed = 0                               # count of human escalations
+sq_err = []                                # per-step squared error, to track accuracy
+
+def uncertainty(x, residual_var):
+    """Calibrated-ish score: grows with input magnitude and recent residual variance."""
+    return 1.0 - np.exp(-(abs(x) * residual_var))   # in [0, 1): 0 = certain, ->1 = unsure
+
+resid_var = 0.1                            # running estimate of residual variance
+drift_alarm = False
+for t in range(N):
+    x = rng.normal(0, 1.0)
+    y = true_w(t) * x + rng.normal(0, sigma0)        # ground truth (latent until labeled)
+    y_hat = w[0] * x                                  # model prediction
+    u = uncertainty(x, resid_var)                    # the escalation signal
+
+    # ROUTER: escalate on high uncertainty OR during a drift alarm.
+    if u &gt;= tau or drift_alarm:
+        reviewed += 1
+        label = y                                     # SIMULATED human returns the true label
+        # Fold the human correction back: one online SGD step on the (x, label) pair.
+        grad = (w[0] * x - label) * x
+        w[0] -= lr * grad
+    # else: auto-accept y_hat, no human, no label, no update.
+
+    err = (y_hat - y) ** 2
+    sq_err.append(err)
+    resid_var = 0.99 * resid_var + 0.01 * err         # update residual-variance estimate
+    drift_alarm = (t in (300, 301, 302, 303, 304))    # drift detector fires right after the jump
+
+review_rate = reviewed / N
+print("human review rate   = %.3f  (%d of %d escalated)" % (review_rate, reviewed, N))
+print("RMSE first half     = %.3f" % np.sqrt(np.mean(sq_err[:300])))
+print("RMSE second half    = %.3f" % np.sqrt(np.mean(sq_err[300:])))
+</code></pre>
+<div class="code-caption"><strong>Code 21.4.1:</strong> A human-in-the-loop adaptation loop from scratch. The router escalates a prediction to the simulated human only when uncertainty <code>u</code> crosses the threshold <code>tau</code> or a drift alarm is active; the human's returned label is folded back as one online gradient step. Confident predictions are auto-accepted with no human cost and no update. The drift alarm at the regime change forces escalation exactly when the model is most stale.</div>
+<pre><code class="language-text">human review rate   = 0.318  (191 of 600 escalated)
+RMSE first half     = 0.642
+RMSE second half    = 0.701
+</code></pre>
+<div class="code-caption"><strong>Output 21.4.1:</strong> The loop escalated about a third of predictions, adapted online from the human corrections, and recovered after the regime change at t=300 because the drift alarm forced human labels exactly when the model had gone stale. Without escalation the second-half error would have stayed pinned to the wrong regime.</div>
+<p>The structure to notice in Code 21.4.1 is that the human is consulted on a minority of steps (about thirty-two percent here), yet those steps carry the model through a regime change it would otherwise never have seen labeled, because the drift alarm at t=300 forces escalation precisely when the auto-accept path would have kept feeding the stale weight forward. The router spends the human's attention where it changes the outcome. Code 21.4.2 makes the cost-of-the-threshold concrete by sweeping $\tau$ and reading off the review rate.</p>
+<pre><code class="language-python">def run(tau):
+    """Re-run the loop for a given threshold, returning (review_rate, second_half_rmse)."""
+    w = np.array([0.0]); resid_var = 0.1; reviewed = 0; errs = []
+    r = np.random.default_rng(0)
+    for t in range(N):
+        x = r.normal(0, 1.0)
+        y = true_w(t) * x + r.normal(0, sigma0)
+        y_hat = w[0] * x
+        u = 1.0 - np.exp(-(abs(x) * resid_var))
+        drift = t in (300, 301, 302, 303, 304)
+        if u &gt;= tau or drift:
+            reviewed += 1
+            w[0] -= lr * ((w[0] * x - y) * x)
+        e = (y_hat - y) ** 2; errs.append(e)
+        resid_var = 0.99 * resid_var + 0.01 * e
+    return reviewed / N, np.sqrt(np.mean(errs[300:]))
+
+for tau in (0.5, 0.7, 0.9, 0.99):
+    rate, rmse = run(tau)
+    print("tau = %.2f  ->  review rate = %.3f   second-half RMSE = %.3f" % (tau, rate, rmse))
+</code></pre>
+<div class="code-caption"><strong>Code 21.4.2:</strong> Sweeping the escalation threshold $\tau$. As $\tau$ rises the router escalates fewer predictions (lower human review rate) but adapts less, so error after the regime change climbs. The sweep makes the threshold-as-contract of subsection three a measurable curve rather than an abstraction.</div>
+<pre><code class="language-text">tau = 0.50  ->  review rate = 0.503   second-half RMSE = 0.668
+tau = 0.70  ->  review rate = 0.382   second-half RMSE = 0.689
+tau = 0.90  ->  review rate = 0.205   second-half RMSE = 0.748
+tau = 0.99  ->  review rate = 0.038   second-half RMSE = 0.969
+</code></pre>
+<div class="code-caption"><strong>Output 21.4.2:</strong> The threshold trades human load against accuracy monotonically: dropping the review rate from 50 percent to under 4 percent (tau 0.50 to 0.99) lets post-drift RMSE climb from 0.67 to 0.97. The "right" tau is where the marginal review is worth its accuracy gain.</div>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: An Uncertainty Threshold Sets the Human Review Rate</div>
+<p>Suppose the model's calibrated uncertainty score $u(\mathbf{x}_t)$ is, over a stream, distributed roughly uniformly on $[0, 1]$ (a convenient idealization). Then escalating when $u \ge \tau$ reviews exactly the top $1 - \tau$ fraction of cases: $\tau = 0.8$ escalates the most-uncertain twenty percent, $\tau = 0.95$ escalates the most-uncertain five percent. If the stream runs at one prediction per second, that is $3600 \times 0.05 = 180$ escalations per hour at $\tau = 0.95$, versus $720$ per hour at $\tau = 0.8$. Now suppose one analyst can genuinely review $120$ cases per hour before alert fatigue sets in. Then $\tau = 0.8$ (720 per hour) overflows them six-to-one and the queue rots; $\tau = 0.95$ (180 per hour) still overflows mildly; only $\tau \approx 0.967$ (the top $3.3$ percent, about $120$ per hour) fits their capacity. The threshold is not chosen for statistical elegance: it is solved backward from the human's throughput. The sweep in Output 21.4.2 shows the same backward-from-capacity logic on the toy stream, where review rate falls smoothly from 50 percent to under 4 percent as $\tau$ rises.</p>
+</div>
+<p>The from-scratch loop of Code 21.4.1 is about thirty-five lines, and it hand-rolls the queue, the simulated human, and the fold-back. In production none of that is bespoke: a labeling tool such as Label Studio (or its many cousins) provides the review queue, the annotator interface, the storage of labels with reasons, and a webhook that fires when a human submits a decision. Code 21.4.3 sketches the same escalation loop wired to such a tool: the router decides what to enqueue; the tool handles the human interaction; a callback folds the returned label back into adaptation.</p>
+<pre><code class="language-python"># Sketch: the same loop wired to a labeling tool (Label Studio-style client).
+from label_studio_sdk import Client                # production labeling platform
+
+ls = Client(url="http://localhost:8080", api_key="...")
+project = ls.get_project(id=1)                      # a pre-built review interface
+
+def on_human_submit(annotation):                    # webhook: fires when a human decides
+    x, label = annotation["task"]["x"], annotation["result"]["value"]
+    model.online_update(x, label)                   # fold correction back, one call
+
+for x, y_hat, u in stream_predictions():            # the router, unchanged in spirit
+    if u &gt;= tau or drift_detector.alarm():           # escalate uncertain or drift-flagged
+        project.import_tasks([{"x": x.tolist(), "y_hat": float(y_hat)}])  # enqueue for a human
+    else:
+        act_on(y_hat)                               # auto-accept the confident prediction
+# Label Studio runs the queue, the UI, the reason-logging, and the webhook for us.
+</code></pre>
+<div class="code-caption"><strong>Code 21.4.3:</strong> The same escalation loop on a real labeling tool. The router logic (escalate when uncertain or drift-flagged) is unchanged, but the queue management, the human-facing review interface, the storage of labels with reasons, and the submit webhook are all handled by Label Studio. The bespoke ~35-line queue-and-human harness of Code 21.4.1 collapses to enqueue-and-callback, roughly 10 lines of glue, with the entire annotation UI and audit log provided.</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: The Annotation Platform Is the Human Interface</div>
+<p>The from-scratch loop of Code 21.4.1 simulated the human with one line (<code>label = y</code>) precisely because the real human interface, a queue, a review UI, label storage with reason fields, reviewer-agreement tracking, and a webhook, is exactly what a labeling platform provides off the shelf. Label Studio, Prodigy, and Argilla each turn the ~35-line bespoke harness into the ~10-line enqueue-and-callback of Code 21.4.3, and they add what the toy loop omits entirely: a real annotator UI, multi-reviewer adjudication, audit logging of who decided what and why, and active-learning sampling hooks that connect straight to the query strategies of <a href="section-21.3.html">Section 21.3</a>. The line you do <em>not</em> write is the one that matters most: you stop simulating the human and plug in a real one, with their judgment, their context, and their accountability, while the platform handles everything between the router and the analyst.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Sepsis Early-Warning System That Earns the Nurses' Trust</div>
+<p><strong>Who:</strong> A hospital deploying a recurrent early-warning model on the irregularly-sampled vitals stream of the healthcare dataset threaded through <a href="../../toc.html">Chapter 18</a>, predicting sepsis risk hours before clinical onset.</p>
+<p><strong>Situation:</strong> The first version raised a risk alert whenever the predicted probability crossed a fixed cutoff. Within a week nurses were getting dozens of alerts per shift, the overwhelming majority false, and they had begun silencing the alarm entirely.</p>
+<p><strong>Problem:</strong> Classic alert fatigue. A loud, uncalibrated alarm that fires far above the staff's capacity to act trains the staff to ignore it, so the one true early sepsis warning was being dismissed along with the noise, the exact harm subsection three warns of.</p>
+<p><strong>Dilemma:</strong> Raise the cutoff to cut the alert volume, and miss real cases; keep it low for sensitivity, and keep the fatigue. Neither extreme is acceptable when the missed case can be fatal.</p>
+<p><strong>Decision:</strong> They recalibrated the model's probabilities (<a href="../module-19-probabilistic-uncertainty/index.html">Chapter 19</a>) so the stated risk matched empirical sepsis rates, then set the escalation threshold backward from nurse capacity (about three reviewable alerts per nurse per shift), and attached to each alert a short explanation of the contributing vitals (<a href="../../toc.html">Chapter 33</a>) so the nurse reviewed the reasoning, not just a number.</p>
+<p><strong>How:</strong> Each surviving alert went to a review queue exactly as in Code 21.4.3; the nurse's confirm-or-dismiss was logged with a reason and folded back as a correction (<a href="../module-20-online-continual-learning/index.html">Chapter 20</a>), so dismissed false alarms taught the model which patterns were benign, the active-learning loop of <a href="section-21.3.html">Section 21.3</a> running on the operational queue.</p>
+<p><strong>Result:</strong> Alert volume fell to a level nurses could genuinely review, calibrated probabilities and explanations rebuilt their trust so they engaged with each alert, and the folded-back dismissals steadily cut the false-positive rate. The system caught real early sepsis because the staff were no longer ignoring it.</p>
+<p><strong>Lesson:</strong> A human-in-the-loop temporal system is only as good as the human's trust in it, and that trust is engineered: calibrate the uncertainty, set the threshold from human capacity, explain the reasoning, and fold every human decision back. Volume without calibration buys fatigue; calibration without explanation buys automation bias; the loop needs all of it.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Human-AI Teaming for Temporal Decisions (2024 to 2026)</div>
+<p>The frontier is moving from "human reviews model output" to genuine human-AI teaming, where the system reasons about <em>when</em> to defer. Learning-to-defer and learning-to-complement frameworks (building on Mozannar and Sontag's deferral work and extended through 2024 to 2025 to sequential and time-series settings) train a router jointly with the predictor, so the model learns the cases where the human is more accurate and defers exactly those, rather than thresholding a fixed uncertainty. On the feedback side, the RLHF and direct-preference-optimization (DPO) techniques that align large models are being adapted to temporal forecasting and control, turning analyst preference logs into reward signals for forecast-adjustment policies, the explicit bridge this section draws to <a href="../../toc.html">Part VI</a>. A third active line is conformal-prediction-driven escalation (<a href="../module-19-probabilistic-uncertainty/index.html">Chapter 19</a>): using a distribution-free prediction set's <em>size</em> as the escalation trigger, so the human is consulted precisely when the conformal set is too wide to act on, which gives the router a finite-sample coverage guarantee rather than a heuristic threshold. The 2026 practitioner's stance: the human is not a fallback for a weak model but a permanent teammate whose attention is itself an optimized resource, and learning to allocate that attention is becoming a first-class modeling problem.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Model That Cried Wolf</div>
+<p>There is a reason the oldest cautionary tale about false alarms is about a shepherd and not a statistician: alert fatigue is a human universal, older than machine learning by a few thousand years. The boy who cried wolf had a perfectly fine recall (he never missed a wolf) and a catastrophic precision (he invented several), and the villagers did exactly what overwhelmed nurses and traders do, they recalibrated their own trust downward until they ignored him entirely, including the once it was real. The moral the fable never states: the boy needed a calibrated uncertainty score and a threshold tuned to the villagers' patience. He had neither, and the sheep paid for it.</p>
+</div>
+
+<h2>Exercises</h2>
+<p>These exercises ask you to reason about the loop, extend the from-scratch implementation, and confront an open design question. Solutions to selected exercises appear in <a href="../../toc.html">Appendix G</a>.</p>
+<h3>Conceptual</h3>
+<ol>
+<li><strong>The four patterns, placed.</strong> For each of the four interaction patterns of subsection two (review-and-approve, false-alarm feedback, drift adjudication, override), name the point in the loop where it acts (input, prediction, alarm, or output) and which of the three human roles (supervisor, labeler, override) it realizes. Then explain why human adjudication of a drift alarm (<a href="section-21.2.html">Section 21.2</a>) is the single most safety-critical checkpoint in an automatically retraining system: what specifically goes wrong if the system retrains on every drift alarm without human adjudication?</li>
+<li><strong>Calibration as the router's currency.</strong> Argue why an <em>uncalibrated</em> uncertainty score makes the escalation router of subsection three fail in both directions at once. Give a concrete scenario for an overconfident model (errors slip through unreviewed) and one for an underconfident model (the human queue overflows), and explain why recalibration (<a href="../module-19-probabilistic-uncertainty/index.html">Chapter 19</a>), not a different threshold, is the fix in both cases.</li>
+</ol>
+<h3>Implementation</h3>
+<ol>
+<li><strong>Preference feedback, not just corrections.</strong> Extend Code 21.4.1 so the simulated human, instead of returning a corrected label, returns a <em>preference</em> between the model's forecast and a perturbed alternative (a comparison, as in subsection four). Accumulate these preferences into a small dataset of (better, worse) forecast pairs, and write a comment block explaining how this dataset would seed the reward model of <a href="../../toc.html">Part VI</a>. You do not need to train the reward model, just collect the data in the right shape.</li>
+<li><strong>Capacity-constrained threshold.</strong> Modify the threshold sweep of Code 21.4.2 to solve the inverse problem of the numeric-example callout: given a fixed human capacity of $C$ reviews over the $N=600$ stream, find the threshold $\tau$ whose review rate lands as close as possible to $C/N$ from below (never overflowing capacity), and report the resulting second-half RMSE. Run it for $C \in \{30, 90, 180\}$ and comment on the accuracy cost of a tighter capacity budget.</li>
+</ol>
+<h3>Open-ended</h3>
+<ol>
+<li><strong>Designing against automation bias.</strong> The practical-example callout fixed alert fatigue, but automation bias (subsection three) is the opposite failure: the human defers to a confident-but-wrong model. Design a loop that actively guards against automation bias for a high-stakes temporal decision of your choice (clinical, financial, or industrial). Consider: forcing the reviewer to record a reason before approving, occasionally injecting known-wrong "attention-check" forecasts, surfacing a contrasting explanation (<a href="../../toc.html">Chapter 33</a>) rather than a confirming one, and measuring reviewer disagreement rate as a health metric. Discuss what you would log to detect automation bias creeping in over months of deployment, and the ethical tension in deliberately testing your own reviewers.</li>
+</ol>
+
+<nav class="chapter-nav">
+<a class="nav-prev" href="section-21.3.html"><span class="nav-label">Previous</span><span class="nav-num">Section 21.3</span><span class="nav-title">Active Learning for Temporal Data</span></a>
+<a class="nav-up" href="index.html"><span class="nav-label">Up</span><span class="nav-num">Chapter 21</span><span class="nav-title">Adaptive Temporal AI Systems</span></a>
+<a class="nav-next" href="../../toc.html"><span class="nav-label">Next</span><span class="nav-num">Contents</span><span class="nav-title">Table of Contents</span></a>
+</nav>
+<div class="callout looking-back">
+<div class="callout-title">Looking Back: The End of Part V, and the Turn Toward Action</div>
+<p>This section closes <a href="index.html">Chapter 21</a> and with it all of <strong>Part V: Uncertainty, Online, and Adaptive Learning</strong>. Trace the arc: <a href="../module-19-probabilistic-uncertainty/index.html">Chapter 19</a> taught the system to <em>quantify</em> what it does not know, replacing point forecasts with calibrated distributions and conformal sets. <a href="../module-20-online-continual-learning/index.html">Chapter 20</a> taught it to <em>keep learning</em> as the world drifts, updating online without forgetting. <a href="index.html">Chapter 21</a> assembled those into a self-managing adaptive system: a control loop (21.1) that watches for drift (21.2), queries the labels it most needs (21.3), and (this section) routes its least-trustworthy decisions to a human teammate. The thread that ran through all of Part V is honest uncertainty: a system that knows when it does not know can retrain at the right time, query the right point, and escalate the right case. But every system in Part V still only <em>predicts</em>. It forecasts a value, quantifies a doubt, flags a change, asks a question, and then waits. It never chooses an action and lives with the consequence. That is the line <a href="../../toc.html">Part VI: Sequential Decision Making</a> crosses. There the system stops being an observer that predicts and becomes an agent that acts: <a href="../../toc.html">Chapter 22</a> formalizes the Markov decision process, where a prediction becomes a policy and a loss becomes a reward, and the human preferences this section taught us to capture become, in <a href="../../toc.html">Part VI</a>, the reward signal that shapes what the agent does. The forecaster learned to ask the analyst before panicking. Next, it learns to act.</p>
+</div>
+</main>
+<footer class="site-footer">
+<p class="footer-edition">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &middot; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated"><script>document.write("Last updated: " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

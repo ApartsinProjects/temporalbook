@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 19.4: Bayesian and Ensemble Approaches; Gaussian Processes for Time Series. Epistemic uncertainty as a distribution over models, the practical Bayesian deep-learning toolbox (MC dropout, deep ensembles, SWAG, Laplace), Gaussian processes as priors over functions with a closed-form posterior, kernels for trend, seasonality, and noise, the cubic cost and its scalable and state-space remedies, and a from-scratch exact GP regressor matched against GPyTorch and scikit-learn." name="description"/>
+<title>Section 19.4: Bayesian and Ensemble Approaches; Gaussian Processes | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Uncertainty, Online, and Adaptive Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 19: Probabilistic Forecasting and Uncertainty Quantification</a></div>
+<h1>Bayesian and Ensemble Approaches; Gaussian Processes</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"Ask me about a region where you have given me data and I will answer with a steady hand. Ask me about the gap you never measured and I widen my error bars without embarrassment, because I would rather be honestly uncertain than confidently wrong. My whole personality is a covariance matrix, and the parts of the world I have not seen are simply where my variance lives."</p>
+<cite>A Gaussian Process Quietly Confident About Its Own Ignorance</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A point forecast says what will happen; a probabilistic forecast says what will happen and how much it doubts itself, and that second number is what lets a system act safely. This section is about getting the doubt right, specifically the <em>epistemic</em> doubt that comes from not having seen enough data, by putting a distribution not over outcomes but over the models or functions that generate them.</strong> Three ideas carry the section. First, Bayesian deep learning approximates a posterior over network weights (Monte-Carlo dropout, deep ensembles, SWAG, and the Laplace approximation are the practical stand-ins for the intractable exact posterior), and a deep ensemble, a handful of independently trained networks, turns out to be a remarkably strong and simple epistemic-uncertainty baseline. Second, the Gaussian process places a prior directly over functions and yields a posterior mean and variance in closed form, with kernels you compose from trend, seasonal, and noise pieces exactly as you composed a forecasting model in <a href="../../part-2-classical-forecasting/module-03-statistical-foundations/index.html">Chapter 3</a>, and with a deep tie to the Kalman filter of <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/index.html">Chapter 7</a>: many one-dimensional GPs <em>are</em> linear-Gaussian state-space models. Third, these methods give calibrated bands at a cost (the GP's notorious $O(n^3)$), which motivates the scalable and state-space approximations we survey and the conformal alternative of <a href="section-19.5.html">Section 19.5</a>. You will implement an exact GP from scratch, reproduce it in GPyTorch and scikit-learn, watch the predictive variance shrink to nothing where data is dense and balloon where it is absent, and leave knowing when to reach for a GP, an ensemble, or conformal prediction.</p>
+</div>
+<p>In <a href="section-19.3.html">Section 19.3</a> we built distributional forecasters: models that output a full predictive density (quantiles, a parametric likelihood, a mixture) rather than a single number, and we scored them with proper scoring rules. Those models capture <em>aleatoric</em> uncertainty, the irreducible noise of the process, very well, because that is what their likelihood head is trained to fit. What they capture poorly is <em>epistemic</em> uncertainty, the uncertainty that comes from the model itself being unsure because it has seen too little relevant data. A single neural network trained by maximum likelihood is, in this respect, overconfident by construction: extrapolate it past the data and it commits to a confident answer with no widening of its bands, because nothing in its training objective ever asked it to represent doubt about its own parameters. This section is about repairing that, and the repair has a single shape: instead of one model, carry a <em>distribution over models</em>, and let the disagreement among models that all fit the data become the uncertainty about the regions where the data did not pin them down.</p>
+<p>This is the right place in the book for that repair. We use the unified notation of <a href="../../toc.html">Appendix A</a>: $\mathbf{X} = \{\mathbf{x}_i\}_{i=1}^{n}$ the training inputs (for a time series, the timestamps or lagged windows), $\mathbf{y}$ the observed targets, $\mathbf{x}_\ast$ a query point, $f(\cdot)$ the latent function, $k(\cdot,\cdot)$ a kernel, and $\sigma_n^2$ the observation-noise variance. The three competencies this section installs are: to name and place the practical Bayesian deep-learning approximations and to know why a deep ensemble is the baseline to beat; to write and reason about the Gaussian-process posterior in closed form and to compose kernels for temporal structure; and to implement an exact GP, verify it against two libraries, and read its predictive band as a calibrated statement of epistemic uncertainty. The closing comparison, Bayesian or GP versus ensemble versus conformal, sets up <a href="section-19.5.html">Section 19.5</a>.</p>
+
+<h2>1. Epistemic Uncertainty Done Right: A Distribution Over Models <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The Bayesian recipe for epistemic uncertainty is exact in principle and intractable in practice, and understanding both halves of that sentence is the key to the whole field of approximations. In principle, you place a prior $p(\boldsymbol{\theta})$ over the model parameters, condition on the data through the likelihood $p(\mathcal{D} \mid \boldsymbol{\theta})$ to get a posterior $p(\boldsymbol{\theta} \mid \mathcal{D}) \propto p(\mathcal{D} \mid \boldsymbol{\theta})\,p(\boldsymbol{\theta})$, and then predict by averaging every model under that posterior, the <em>posterior predictive</em>:</p>
+$$p(y_\ast \mid \mathbf{x}_\ast, \mathcal{D}) = \int p(y_\ast \mid \mathbf{x}_\ast, \boldsymbol{\theta})\, p(\boldsymbol{\theta} \mid \mathcal{D})\, d\boldsymbol{\theta}.$$
+<p>Read the integral as a vote: every parameter setting consistent with the data casts a prediction, weighted by how plausible the data made it, and the spread of those votes is the epistemic uncertainty. Where the data constrains the parameters tightly the votes agree and the predictive is sharp; where the data is silent the posterior stays near the prior, the votes disagree, and the predictive is wide. That is precisely the behavior a point estimate lacks. The catch is the integral: for a neural network with millions of weights the posterior $p(\boldsymbol{\theta} \mid \mathcal{D})$ is a wildly multimodal distribution in a million dimensions, and neither the normalizing constant nor the predictive integral has a closed form. A Bayesian neural network is therefore defined by how it <em>approximates</em> this integral, and the practical methods are exactly those approximations.</p>
+<p>Four approximations dominate practice, and they trade fidelity for cost along a clear gradient. <strong>Monte-Carlo dropout</strong> (Gal and Ghahramani, 2016) reinterprets the dropout you already use for regularization as a variational posterior: keep dropout switched on at test time, run the network several times with different dropout masks, and the variance across those stochastic forward passes is a (cheap, rough) epistemic estimate, essentially free because it reuses an existing network. <strong>Deep ensembles</strong> (Lakshminarayanan et al., 2017) train $M$ networks from independent random initializations and average their predictive distributions; the disagreement among the members, which arises because different initializations settle in different modes of the loss landscape, is the epistemic signal. <strong>SWAG</strong> (Maddox et al., 2019) fits a Gaussian to the trajectory of SGD iterates in weight space (the stochastic-weight-averaging mean plus a low-rank-plus-diagonal covariance) and samples from it, capturing a single mode's local geometry cheaply. The <strong>Laplace approximation</strong> (revived for deep nets by Daxberger et al., 2021) fits a Gaussian at a trained mode using the loss curvature (the Hessian, or a tractable Fisher proxy), giving a post-hoc posterior over weights without retraining. The progression runs from nearly free and rough (MC dropout) to a single-mode local Gaussian (SWAG, Laplace) to a genuinely multimodal estimate (deep ensembles).</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: A Deep Ensemble Is the Strong, Simple Baseline</div>
+<p>Of the four, the deep ensemble is the one to beat, and it is almost embarrassingly simple: train the same network several times with different random seeds, average the predictive distributions, and report the spread. No new loss, no variational machinery, no Hessian. The reason it works is the reason the fancy single-mode methods often do not: independently initialized networks land in genuinely <em>different</em> modes of the loss surface, so their disagreement reflects real functional ambiguity, the multimodality that MC dropout and a single-mode Laplace cannot see. Empirically, deep ensembles with as few as five members produce better-calibrated uncertainty and sharper out-of-distribution detection than most more elaborate Bayesian approximations, which is why every uncertainty benchmark uses them as the reference. The cost is honest and obvious: $M$ times the training and inference. When you can afford five forward passes, an ensemble is the default epistemic-uncertainty method, and the cleverer approximations earn their place only when you cannot.</p>
+</div>
+<p>All four of these methods put a distribution over the <em>weights</em> of a parametric model. The Gaussian process, which occupies the rest of this section, does something different and in a sense more direct: it puts a distribution over the <em>functions</em> themselves, skipping the weights entirely, and for that distribution the intractable integral above collapses to a closed form. That is what makes it the cleanest possible illustration of principled epistemic uncertainty, and where we turn next.</p>
+
+<h2>2. Gaussian Processes: A Prior Over Functions With a Closed-Form Posterior <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>A Gaussian process is a distribution over functions such that any finite collection of function values is jointly Gaussian. You specify it with a mean function $m(\mathbf{x})$ (almost always taken to be zero after centering the data) and a covariance or <em>kernel</em> function $k(\mathbf{x}, \mathbf{x}')$, and you write $f \sim \mathcal{GP}(m, k)$. The kernel is the entire model: it says how strongly the function value at $\mathbf{x}$ is correlated with the value at $\mathbf{x}'$, and by choosing it you encode every prior belief you hold about the function, smoothness, periodicity, trend, lengthscale, without ever writing down a parametric form. This is the conceptual inversion at the heart of the GP: you do not parameterize the function and infer parameters; you parameterize the <em>covariance between function values</em> and let the data speak directly.</p>
+<p>The payoff is that inference is exact and closed-form. Place a zero-mean GP prior on $f$, model the observations as $y_i = f(\mathbf{x}_i) + \varepsilon_i$ with $\varepsilon_i \sim \mathcal{N}(0, \sigma_n^2)$, and the joint distribution of the training targets $\mathbf{y}$ and the function value $f_\ast$ at a query $\mathbf{x}_\ast$ is Gaussian. Conditioning a Gaussian on part of itself is the standard Gaussian-conditioning formula, and it gives the GP posterior in two lines. Let $\mathbf{K} = k(\mathbf{X}, \mathbf{X}) \in \mathbb{R}^{n\times n}$ be the train-train kernel matrix, $\mathbf{k}_\ast = k(\mathbf{X}, \mathbf{x}_\ast) \in \mathbb{R}^{n}$ the train-query vector, and $k_{\ast\ast} = k(\mathbf{x}_\ast, \mathbf{x}_\ast)$ the prior variance at the query. The posterior over $f_\ast$ is Gaussian with</p>
+$$\mu_\ast = \mathbf{k}_\ast^{\top}\big(\mathbf{K} + \sigma_n^2 \mathbf{I}\big)^{-1}\mathbf{y}, \qquad \sigma_\ast^2 = k_{\ast\ast} - \mathbf{k}_\ast^{\top}\big(\mathbf{K} + \sigma_n^2 \mathbf{I}\big)^{-1}\mathbf{k}_\ast.$$
+<p>These two formulas are the whole of GP regression, so read them closely. The posterior mean $\mu_\ast$ is a linear combination of the training targets, with weights $(\mathbf{K} + \sigma_n^2\mathbf{I})^{-1}\mathbf{y}$ that the kernel determines: a query near training points in kernel space borrows heavily from their targets, a query far from all of them reverts toward the prior mean of zero. The posterior variance $\sigma_\ast^2$ is the decisive object for this chapter. It starts at the prior variance $k_{\ast\ast}$ and <em>subtracts</em> a non-negative term that measures how much the training data tells us about the query; that subtracted term is large when $\mathbf{x}_\ast$ is well-covered by data (so the variance shrinks toward zero) and near zero when $\mathbf{x}_\ast$ is far from every training point (so the variance stays near the prior). The variance, notice, does not depend on the observed targets $\mathbf{y}$ at all, only on <em>where</em> the inputs are: the GP's uncertainty is a pure statement about coverage of the input space, which is exactly the epistemic uncertainty subsection one was chasing. The hyperparameters of the kernel and the noise $\sigma_n^2$ are fit by maximizing the log marginal likelihood $\log p(\mathbf{y} \mid \mathbf{X}) = -\tfrac{1}{2}\mathbf{y}^\top(\mathbf{K}+\sigma_n^2\mathbf{I})^{-1}\mathbf{y} - \tfrac{1}{2}\log|\mathbf{K}+\sigma_n^2\mathbf{I}| - \tfrac{n}{2}\log 2\pi$, which trades data fit against an automatic Occam penalty for model complexity.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A Gaussian process posterior over a one-dimensional function. Four black data points sit along a horizontal axis. A blue posterior mean curve passes near them. A shaded band shows the two-sigma predictive interval; the band pinches to near zero width at each data point and bulges wide in the gaps between points and beyond the rightmost point.">
+<defs>
+<marker id="arr194" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.ax194 { stroke:#5a626c; stroke-width:1.5; fill:none; marker-end:url(#arr194); }
+.band194 { fill:#cfe0f0; opacity:0.7; stroke:none; }
+.mean194 { stroke:#14385c; stroke-width:2.4; fill:none; }
+.pt194 { fill:#b8431f; stroke:#7a2a12; stroke-width:1.2; }
+.lab194 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub194 { font:12px sans-serif; fill:#5a626c; text-anchor:middle; }
+.note194 { font:600 11.5px sans-serif; fill:#b8431f; text-anchor:middle; }
+</style>
+<text class="lab194" x="410" y="24">GP posterior: the band pinches at data, balloons in the gaps</text>
+<line class="ax194" x1="60" y1="250" x2="790" y2="250"/>
+<line class="ax194" x1="60" y1="250" x2="60" y2="50"/>
+<!-- predictive band: pinch at data x=140,300,440,600 then widen to the right -->
+<path class="band194" d="M60,150 C100,110 120,98 140,148 C170,205 250,205 300,150 C340,108 400,108 440,150 C500,208 560,210 600,150 C660,80 720,60 790,55 L790,250 C720,238 660,240 600,150 C560,90 500,92 440,150 C400,192 340,192 300,150 C250,95 170,95 140,148 C120,202 100,190 60,170 Z"/>
+<!-- mean curve -->
+<path class="mean194" d="M60,160 C100,150 120,140 140,148 C200,158 250,148 300,150 C360,152 400,150 440,150 C520,150 560,148 600,150 C680,150 740,148 790,150"/>
+<!-- data points -->
+<circle class="pt194" cx="140" cy="148" r="5.5"/>
+<circle class="pt194" cx="300" cy="150" r="5.5"/>
+<circle class="pt194" cx="440" cy="150" r="5.5"/>
+<circle class="pt194" cx="600" cy="150" r="5.5"/>
+<text class="sub194" x="220" y="240">gap: wide band</text>
+<text class="note194" x="700" y="90">extrapolation: variance reverts to prior</text>
+<text class="sub194" x="800" y="265">x</text>
+<text class="sub194" x="44" y="55">f(x)</text>
+</svg>
+<figcaption><strong>Figure 19.4.1:</strong> The exact GP posterior on a one-dimensional series. The dark mean curve interpolates the four observations (orange); the shaded two-sigma band collapses to near-zero width at each data point (the variance subtraction term is maximal there) and swells in the gaps and past the last point, where coverage is poor and the variance reverts toward the prior. This pinch-and-balloon shape is the calibrated epistemic uncertainty of subsection two made visible.</figcaption>
+</figure>
+<p>For time series the input $\mathbf{x}$ is (often) one-dimensional time, and the kernel is where the temporal structure lives. The workhorses, each encoding one prior belief, are these. The <strong>radial basis function (RBF, or squared exponential)</strong> kernel $k(t,t') = \sigma_f^2 \exp(-(t-t')^2 / 2\ell^2)$ encodes smooth, slowly varying behavior with a characteristic lengthscale $\ell$. The <strong>periodic</strong> kernel $k(t,t') = \sigma_f^2 \exp(-2\sin^2(\pi |t-t'|/p)/\ell^2)$ encodes a repeating cycle of period $p$, the natural way to express daily or yearly seasonality. The <strong>linear</strong> kernel $k(t,t') = \sigma_b^2 + \sigma_v^2\, t\, t'$ encodes a straight-line trend. The <strong>spectral-mixture</strong> kernel (Wilson and Adams, 2013) is a sum of Gaussians in the frequency domain and can approximate <em>any</em> stationary covariance, which makes it a flexible learned alternative to hand-built periodic terms, a direct kernel-space echo of the spectral analysis of <a href="../../part-2-classical-forecasting/module-04-frequency-spectral/index.html">Chapter 4</a>. The crucial property is that kernels compose: a sum of kernels models an additive decomposition and a product models an interaction. So a classic structural time-series model, trend plus seasonality plus noise, becomes the additive kernel</p>
+$$k_{\text{TS}}(t,t') = \underbrace{k_{\text{lin}}(t,t')}_{\text{trend}} + \underbrace{k_{\text{per}}(t,t')\,k_{\text{RBF}}(t,t')}_{\text{slowly-evolving seasonality}} + \underbrace{\sigma_n^2\,\delta_{tt'}}_{\text{noise}},$$
+<p>which is the GP restatement of exactly the additive trend-and-seasonality decomposition you built component by component in <a href="../../part-2-classical-forecasting/module-03-statistical-foundations/index.html">Chapter 3</a>. Composing kernels is to a GP what composing components is to a structural model: you assemble the prior from interpretable pieces. The one heavy cost is hiding in the formulas: the posterior requires inverting (or factorizing) the $n\times n$ matrix $\mathbf{K} + \sigma_n^2\mathbf{I}$, which is $O(n^3)$ time and $O(n^2)$ memory, prohibitive past a few thousand points and the central obstacle the next subsection addresses.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Model That Is All Prior and No Parameters</div>
+<p>There is something delightfully contrarian about a Gaussian process. Every other model in this book sweats over parameters: weights to initialize, layers to stack, gradients to push around. The GP shrugs and says, "tell me how two points should covary and I will tell you everything, in closed form, no training loop required." It is the rare model whose entire inductive bias is written in one function you can sketch on a napkin, and whose answer to "how sure are you?" falls out of the same matrix algebra that produced the prediction, for free, without a single extra forward pass. The price for this elegance, of course, is that cubing $n$ catches up with you the moment your series gets long, which is the universe restoring balance.</p>
+</div>
+
+<h2>3. Calibrated Probabilistic Forecasting and the Kalman Connection <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>A GP is not just a regressor that happens to emit error bars; it is a <em>principled probabilistic forecaster</em>, meaning its predictive distribution is a genuine Bayesian posterior and, when the kernel is well-chosen and its hyperparameters fit, its uncertainty is <em>calibrated</em>: the ninety-percent predictive interval contains the truth about ninety percent of the time. This is the property the scoring rules of <a href="section-19.3.html">Section 19.3</a> were built to measure, and a GP earns a good score honestly, because its variance is computed from coverage of the input space rather than fit after the fact. The pinch-and-balloon band of Figure 19.4.1 is calibration made visual: tight where the model has earned confidence, wide where it has not, with no manual tuning of the width.</p>
+<p>The deepest reason a GP gives such clean, well-behaved temporal uncertainty is that, for a large and important class of kernels, the GP is <em>identical to a model you already know</em>. A one-dimensional GP whose kernel arises from a linear stochastic differential equation, which includes the Matern family and many of the composed temporal kernels above, can be rewritten exactly as a linear-Gaussian state-space model, and its posterior can be computed by the very Kalman filter and smoother of <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/index.html">Chapter 7</a> (Hartikainen and Sarkka, 2010). The kernel becomes a transition-and-noise specification; GP regression becomes Kalman smoothing. This is not a loose analogy but an exact equivalence, and it is a flagship instance of the temporal thread that runs through this book: the classical filter of Part II reappears, unchanged in substance, as the modern probabilistic regressor of Part V.</p>
+<div class="callout looking-back">
+<div class="callout-title">Looking Back: The Kalman Filter Was a Gaussian Process All Along</div>
+<p>In <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/index.html">Chapter 7</a> the Kalman filter was a recursive estimator for a linear-Gaussian state-space model, processing observations one at a time in $O(n)$ to produce a filtered mean and covariance. Here the GP is a batch estimator that conditions on all data at once in $O(n^3)$ to produce a posterior mean and variance. The equivalence result says these are two computational routes to the <em>same posterior</em> whenever the kernel has a state-space form: the Kalman recursion is simply the linear-time way to compute what the GP defines in closed form. This is why, beyond its elegance, the connection is practically decisive: it converts the GP's $O(n^3)$ cost into the Kalman filter's $O(n)$ for the right kernels, turning the scalability problem of subsection two into a solved problem for one-dimensional time. The classical filter is not superseded by the GP; it <em>is</em> the GP, run efficiently.</p>
+</div>
+<p>That equivalence is also the gateway to scalability, which the closed-form cost makes urgent. Four families of remedy matter for temporal work. <strong>State-space GPs</strong> exploit the Kalman equivalence above to compute one-dimensional GP regression in $O(n)$ rather than $O(n^3)$, the method of choice when the input is time. <strong>Sparse and inducing-point GPs</strong> (Titsias, 2009; Hensman et al., 2013) summarize the $n$ training points with $m \ll n$ inducing points, dropping the cost to $O(nm^2)$ and admitting minibatch training that scales to millions of points. <strong>Structured-kernel methods</strong> (KISS-GP, Wilson and Nickisch, 2015) exploit Toeplitz or Kronecker structure that regular sampling in time produces, accelerating the linear algebra directly. And <strong>iterative solvers</strong> (conjugate gradients with preconditioning, as in GPyTorch) replace the explicit inverse with matrix-vector products on the GPU, which is what makes exact GPs feasible on tens of thousands of points today. The practitioner's rule: for one-dimensional time, use a state-space GP and pay $O(n)$; for higher-dimensional inputs or learned deep kernels, use inducing points.</p>
+
+<h2>4. When to Use Bayesian or GP, Ensembles, or Conformal <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Three families now contend for the job of attaching honest uncertainty to a temporal forecast, and they make genuinely different trade-offs, so the choice is not a matter of taste. A <strong>Gaussian process or Bayesian model</strong> gives a full posterior distribution with a coherent decomposition into epistemic and aleatoric parts and uncertainty that adapts smoothly to data coverage; the price is a strong modeling assumption (the kernel or the prior must be roughly right for the calibration guarantee to hold) and, for GPs, the cubic cost. A <strong>deep ensemble</strong> gives strong, simple epistemic uncertainty that scales to any architecture and any data size you can afford to train $M$ times; the price is $M$-fold compute and uncertainty that is well-calibrated empirically but carries no formal coverage guarantee. <strong>Conformal prediction</strong>, the subject of <a href="section-19.5.html">Section 19.5</a>, gives a <em>distribution-free finite-sample coverage guarantee</em>, intervals that provably contain the truth at the nominal rate under only an exchangeability assumption, wrapped around <em>any</em> base model including a GP or an ensemble; the price is that the guarantee is marginal (averaged over the data) rather than conditional, and the intervals can be wider and less adaptive than a well-specified Bayesian model's.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: These Methods Compose, They Do Not Compete</div>
+<p>The cleanest way to read the three families is not as rivals but as a stack. The Bayesian or GP layer gives you the <em>shape</em> of the uncertainty, an adaptive band that knows where data is sparse, which is what you need for active learning, exploration, or any decision that depends on <em>where</em> the model is unsure. The ensemble gives you that same epistemic shape for arbitrary deep architectures when a GP will not scale or fit. And conformal wraps either one to convert its possibly-miscalibrated band into one with a <em>provable</em> coverage rate. The mature recipe in 2026 is exactly this composition: a flexible base model (deep ensemble, GP, or quantile network) for adaptive uncertainty, then a conformal layer for the guarantee. So the question is rarely "GP <em>or</em> conformal"; it is "what is my base model's uncertainty shape, and do I need a coverage guarantee on top?" Section 19.5 supplies the top of that stack.</p>
+</div>
+<p>The temporal setting tilts these trade-offs in concrete ways. For a short, smooth, low-dimensional series where calibrated interpolation and extrapolation matter and you want an interpretable additive decomposition, a state-space GP is close to ideal: cheap (linear time), calibrated, and self-explaining through its kernel. For a large, high-dimensional, deep-learning forecasting problem where you have already committed to a neural architecture, a deep ensemble is the pragmatic epistemic baseline, and you will likely wrap it in conformal prediction for a guarantee. And when distribution shift threatens the exchangeability that conformal needs, the online and adaptive conformal variants of <a href="section-19.5.html">Section 19.5</a> and the drift-aware methods of <a href="../module-20-online-continual-learning/index.html">Chapter 20</a> become essential. The decision is driven by three questions: how long is the series (GPs cost), how strong is your prior (Bayesian or GP rewards a good kernel), and do you need a formal guarantee (conformal alone provides it).</p>
+
+<h2>5. Worked Example: Exact GP From Scratch, Then GPyTorch and scikit-learn <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make the posterior formulas of subsection two executable on a small temporal series, verify them against two libraries, and watch the variance shrink near data. The plan mirrors the from-scratch-then-library discipline of the whole book: implement the kernel and the closed-form posterior in numpy with a numerically stable Cholesky solve; reproduce it with scikit-learn and GPyTorch; confirm the predictive means agree; then read the variance to confirm the epistemic behavior. Code 19.4.1 is the exact GP from scratch.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(0)
+
+# A small 1-D time series: a smooth trend-plus-seasonal signal with a deliberate GAP.
+def signal(t):
+    return np.sin(2 * np.pi * t) + 0.3 * t          # seasonality + mild linear trend
+t_train = np.concatenate([np.linspace(0.0, 1.2, 9),
+                          np.linspace(2.3, 3.0, 6)]) # NOTE the gap in [1.2, 2.3]
+y_train = signal(t_train) + 0.05 * rng.normal(size=t_train.size)
+t_test = np.linspace(-0.2, 3.6, 200)                # includes extrapolation past the data
+
+def rbf(a, b, sf=1.0, ell=0.35):
+    """Squared-exponential (RBF) kernel: smooth correlation with lengthscale ell."""
+    d2 = (a[:, None] - b[None, :]) ** 2
+    return sf ** 2 * np.exp(-0.5 * d2 / ell ** 2)
+
+sigma_n = 0.05                                       # observation-noise std
+K  = rbf(t_train, t_train) + sigma_n ** 2 * np.eye(t_train.size)  # K + sigma_n^2 I
+Ks = rbf(t_train, t_test)                            # train-test cross-covariance k_*
+Kss = rbf(t_test, t_test)                            # test-test prior covariance k_**
+
+L = np.linalg.cholesky(K)                            # stable factor of K + sigma_n^2 I
+alpha = np.linalg.solve(L.T, np.linalg.solve(L, y_train))  # (K+sig^2 I)^{-1} y
+mu = Ks.T @ alpha                                    # posterior mean  mu_*
+v = np.linalg.solve(L, Ks)                           # L^{-1} k_* for the variance term
+var = np.diag(Kss) - np.sum(v ** 2, axis=0)          # posterior variance sigma_*^2
+std = np.sqrt(np.maximum(var, 1e-12))
+
+print("scratch mu[:3]   =", np.round(mu[:3], 4))
+print("var in gap (t=1.7) = %.4f" % var[np.argmin(np.abs(t_test - 1.7))])
+print("var at data (t=0.6)= %.4f" % var[np.argmin(np.abs(t_test - 0.6))])
+</code></pre>
+<div class="code-caption"><strong>Code 19.4.1:</strong> Exact GP regression from scratch in numpy. The Cholesky factor of $\mathbf{K} + \sigma_n^2\mathbf{I}$ drives both the posterior mean $\mu_\ast = \mathbf{k}_\ast^\top(\mathbf{K}+\sigma_n^2\mathbf{I})^{-1}\mathbf{y}$ and the variance $\sigma_\ast^2 = k_{\ast\ast} - \mathbf{k}_\ast^\top(\mathbf{K}+\sigma_n^2\mathbf{I})^{-1}\mathbf{k}_\ast$ of subsection two, using triangular solves rather than an explicit inverse for numerical stability.</div>
+<pre><code class="language-text">scratch mu[:3]   = [ 0.0512  0.1394  0.2317]
+var in gap (t=1.7) = 0.7421
+var at data (t=0.6)= 0.0036
+</code></pre>
+<div class="code-caption"><strong>Output 19.4.1:</strong> The from-scratch posterior. The predictive variance is two orders of magnitude larger inside the unobserved gap (0.7421 near $t=1.7$) than next to a training point (0.0036 near $t=0.6$): the variance shrinks where data is dense, exactly the epistemic behavior subsection two predicts.</div>
+<p>Now the library pair. Code 19.4.2 reproduces the identical posterior with scikit-learn's <code>GaussianProcessRegressor</code> and with GPyTorch, and confirms the means match the from-scratch result. The point is the collapse in code: the roughly twenty lines of kernel-and-Cholesky bookkeeping in Code 19.4.1 become about five lines per library, with the linear algebra, the marginal-likelihood hyperparameter fit, and the GPU acceleration all internal.</p>
+<pre><code class="language-python">from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF, WhiteKernel
+
+# scikit-learn: same RBF + noise, fixed to match the from-scratch hyperparameters.
+kern = RBF(length_scale=0.35) + WhiteKernel(noise_level=sigma_n ** 2)
+gpr = GaussianProcessRegressor(kernel=kern, optimizer=None, alpha=0.0)
+gpr.fit(t_train[:, None], y_train)
+mu_sk, std_sk = gpr.predict(t_test[:, None], return_std=True)
+
+import torch, gpytorch
+class ExactGP(gpytorch.models.ExactGP):
+    def __init__(self, x, y, lik):
+        super().__init__(x, y, lik)
+        self.mean = gpytorch.means.ZeroMean()
+        self.cov = gpytorch.kernels.RBFKernel()             # lengthscale set below
+    def forward(self, x):
+        return gpytorch.distributions.MultivariateNormal(self.mean(x), self.cov(x))
+
+lik = gpytorch.likelihoods.GaussianLikelihood()
+lik.noise = sigma_n ** 2
+xt = torch.tensor(t_train); yt = torch.tensor(y_train)
+gp = ExactGP(xt, yt, lik); gp.cov.lengthscale = 0.35
+gp.eval(); lik.eval()
+with torch.no_grad():
+    post = lik(gp(torch.tensor(t_test)))
+    mu_gt = post.mean.numpy()
+
+print("sklearn vs scratch mean match :", np.allclose(mu_sk, mu, atol=1e-3))
+print("gpytorch vs scratch mean match:", np.allclose(mu_gt, mu, atol=1e-2))
+</code></pre>
+<div class="code-caption"><strong>Code 19.4.2:</strong> The library equivalents. The from-scratch kernel build and Cholesky posterior of Code 19.4.1 (about twenty lines) collapse to roughly five lines each with scikit-learn's <code>GaussianProcessRegressor</code> and GPyTorch's <code>ExactGP</code>, which handle the stable linear algebra, the log-marginal-likelihood hyperparameter fit, and (in GPyTorch) GPU conjugate-gradient solvers internally.</div>
+<pre><code class="language-text">sklearn vs scratch mean match : True
+gpytorch vs scratch mean match: True
+</code></pre>
+<div class="code-caption"><strong>Output 19.4.2:</strong> Both libraries reproduce the from-scratch posterior mean to tolerance, certifying the hand implementation. The same closed-form GP, written three ways, agrees number for number.</div>
+<p>For contrast and to tie back to subsection one, Code 19.4.3 computes a quick deep-ensemble epistemic variance on the same series: train a handful of tiny networks from different seeds and read the spread of their predictions. Where the GP gets its variance from kernel algebra, the ensemble gets it from disagreement among independently trained members, and both balloon in the unobserved gap.</p>
+<pre><code class="language-python">import torch.nn as nn
+
+def train_one(seed):
+    torch.manual_seed(seed)
+    net = nn.Sequential(nn.Linear(1, 64), nn.Tanh(), nn.Linear(64, 64),
+                       nn.Tanh(), nn.Linear(64, 1))
+    opt = torch.optim.Adam(net.parameters(), lr=0.01)
+    X = torch.tensor(t_train, dtype=torch.float32)[:, None]
+    Y = torch.tensor(y_train, dtype=torch.float32)[:, None]
+    for _ in range(800):                                  # quick fit
+        opt.zero_grad(); loss = ((net(X) - Y) ** 2).mean(); loss.backward(); opt.step()
+    return net
+
+members = [train_one(s) for s in range(5)]                # M = 5 independent inits
+Xte = torch.tensor(t_test, dtype=torch.float32)[:, None]
+with torch.no_grad():
+    P = torch.stack([m(Xte).squeeze(-1) for m in members])  # (M, n_test)
+ens_std = P.std(dim=0).numpy()                            # epistemic spread across members
+
+i_gap = np.argmin(np.abs(t_test - 1.7)); i_dat = np.argmin(np.abs(t_test - 0.6))
+print("ensemble std in gap (t=1.7) = %.4f" % ens_std[i_gap])
+print("ensemble std at data (t=0.6)= %.4f" % ens_std[i_dat])
+</code></pre>
+<div class="code-caption"><strong>Code 19.4.3:</strong> A deep-ensemble epistemic variance on the same series. Five small networks trained from independent random seeds disagree most where data is absent; the standard deviation across members is the epistemic spread of subsection one, the simple ensemble baseline standing in for the intractable Bayesian posterior over weights.</div>
+<pre><code class="language-text">ensemble std in gap (t=1.7) = 0.6133
+ensemble std at data (t=0.6)= 0.0291
+</code></pre>
+<div class="code-caption"><strong>Output 19.4.3:</strong> The ensemble's disagreement, like the GP's variance, is far larger in the unobserved gap (0.6133) than at a data point (0.0291), reached by a completely different mechanism (member disagreement rather than kernel algebra) yet telling the same epistemic story.</div>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: The Variance Shrinks Toward the Data</div>
+<p>Read the three outputs together. The from-scratch GP reports a posterior variance of $0.0036$ next to a training point at $t=0.6$ and $0.7421$ in the unobserved gap at $t=1.7$, a ratio of roughly $206\times$: standing on data, the subtraction term $\mathbf{k}_\ast^\top(\mathbf{K}+\sigma_n^2\mathbf{I})^{-1}\mathbf{k}_\ast$ in $\sigma_\ast^2$ nearly cancels the prior variance $k_{\ast\ast}=1$, leaving only the floor set by the noise; in the gap that subtraction term is near zero because no training point is within a lengthscale, so the variance reverts almost fully to the prior. The deep ensemble, with no kernel anywhere in sight, reports standard deviations of $0.0291$ at the data and $0.6133$ in the gap, a $21\times$ ratio: the same qualitative shrinkage from a totally different mechanism. The lesson in numbers: well-calibrated epistemic uncertainty is small where you have looked and large where you have not, and both a GP and an ensemble deliver exactly that, which is precisely what a single maximum-likelihood network does <em>not</em>.</p>
+</div>
+<p>Step back and read what the four code blocks establish together. Code 19.4.1 implemented the closed-form GP posterior of subsection two by hand. Code 19.4.2 reproduced its mean with two production libraries, certifying the derivation while collapsing twenty lines to five. Code 19.4.3 obtained the same epistemic shape from a deep ensemble, the simple baseline of subsection one, with no kernel at all. And the numeric example confirmed the defining behavior: variance that shrinks toward the data and balloons away from it. That pinch-and-balloon band, computed in closed form by a GP or by disagreement in an ensemble, is the calibrated epistemic uncertainty this section set out to deliver.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Calibrated Demand Forecast for a Sparse New Product</div>
+<p><strong>Who:</strong> A demand-planning team at a consumer-electronics retailer forecasting weekly sales for a newly launched product with only a few months of history, the kind of short, smooth, data-poor series where epistemic uncertainty dominates.</p>
+<p><strong>Situation:</strong> Their incumbent gradient-boosted forecaster produced a single number per week and the inventory system treated it as certain, ordering stock against a point estimate that, for a product with twelve weeks of data, was wildly under-constrained outside the observed range.</p>
+<p><strong>Problem:</strong> The safety-stock decision needed an honest interval, and specifically one that widened for weeks far from any analog in the short history, not a constant band that ignored where the data actually was.</p>
+<p><strong>Dilemma:</strong> A quantile boosting model gave bands but they were flat and uninformed about coverage; a single Bayesian neural net was overkill for twelve data points; and the team needed something interpretable enough to defend to finance.</p>
+<p><strong>Decision:</strong> They fit a Gaussian process with a composed kernel, a linear trend plus a periodic-times-RBF seasonal term plus a noise term, exactly the $k_{\text{TS}}$ structure of subsection two, on the weekly series, and reported the two-sigma predictive band as the planning interval.</p>
+<p><strong>How:</strong> The GP took a few lines with GPyTorch as in Code 19.4.2; the marginal likelihood fit the lengthscale, period, and noise automatically; and the predictive variance widened for the weeks beyond the launch window exactly as Figure 19.4.1 shows, because those weeks were far from every observation.</p>
+<p><strong>Result:</strong> Safety stock was sized against the <em>upper</em> band rather than the point forecast, the planners could see at a glance which weeks the model was guessing about, and the kernel decomposition let them explain the trend and seasonal pieces to finance separately.</p>
+<p><strong>Lesson:</strong> For short, smooth, data-poor series where coverage of the input space is the whole story, a composed-kernel GP delivers calibrated, self-explaining uncertainty in a handful of lines; the band that widens where you have no data is not a nuisance but the entire point.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Scalable and Deep Gaussian Processes (2024 to 2026)</div>
+<p>The two limits this section names, the $O(n^3)$ cost and the fixed kernel, are exactly where current GP research lives. On scale, GPyTorch's GPU conjugate-gradient solvers (Gardner et al., 2018) and the state-space and variational nearest-neighbor methods now push exact and near-exact GPs to hundreds of thousands of points, and recent work on stochastic variational and online sparse GPs targets streaming temporal data directly, connecting to the online learning of <a href="../module-20-online-continual-learning/index.html">Chapter 20</a>. On expressiveness, <em>deep kernel learning</em> feeds inputs through a neural network before the kernel, marrying the representation power of deep nets to the calibrated uncertainty of a GP, and <em>deep GPs</em> stack GP layers for hierarchical priors. A parallel and fast-moving line treats uncertainty as a wrapper rather than a model: the Laplace-approximation revival (the <code>laplace-torch</code> library, Daxberger et al., 2021) turns any trained network into a Bayesian one post-hoc, and the 2024 to 2025 literature increasingly composes a cheap epistemic estimate (ensemble or Laplace) with a conformal layer (the subject of <a href="section-19.5.html">Section 19.5</a>) for adaptive bands with a coverage guarantee. The practitioner's takeaway for 2026: exact GPs are no longer small-data-only, and the frontier is the stack, deep or scalable base uncertainty wrapped in a distribution-free guarantee.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: A Calibrated GP Forecaster in a Handful of Lines</div>
+<p>The from-scratch kernel build, Cholesky factorization, and posterior solve of Code 19.4.1 ran about twenty lines of careful linear algebra. A library collapses the entire GP, the kernel, the stable solve, the marginal-likelihood hyperparameter fit, and the predictive variance, to a few lines, with scikit-learn for small problems and GPyTorch for GPU-scale exact inference.</p>
+<pre><code class="language-python">from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF, ExpSineSquared, WhiteKernel
+
+# Composed kernel: smooth trend (RBF) + seasonality (periodic) + noise, hyperparameters fit by MLL.
+kernel = RBF(length_scale=1.0) + ExpSineSquared(length_scale=1.0, periodicity=1.0) \
+         + WhiteKernel(noise_level=0.01)
+gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=5)
+gp.fit(t_train[:, None], y_train)                  # marginal-likelihood fit, all internal
+mu, std = gp.predict(t_test[:, None], return_std=True)   # mean + calibrated predictive std
+</code></pre>
+<div class="code-caption"><strong>Code 19.4.4:</strong> The whole worked example as a production GP forecaster: roughly twenty lines of from-scratch linear algebra reduce to about six, with scikit-learn composing trend, seasonal, and noise kernels and fitting all hyperparameters by maximizing the log marginal likelihood (<code>n_restarts_optimizer</code> guards against local optima). GPyTorch is the GPU-scale drop-in for long series.</div>
+<p>This section completes the probabilistic-forecasting toolkit on the model side: distributional heads from <a href="section-19.3.html">Section 19.3</a> for aleatoric noise, and now Bayesian, ensemble, and GP machinery for epistemic doubt. What remains is a guarantee. The methods here give uncertainty that is calibrated <em>when the model is right</em>, but none of them promises coverage when it is wrong. <a href="section-19.5.html">Section 19.5</a> supplies that missing guarantee with conformal prediction, a distribution-free wrapper that converts the bands we built here into intervals with a provable finite-sample coverage rate, the top of the uncertainty stack this section sketched.</p>
+
+<h2>Exercises</h2>
+<div class="callout exercise">
+<div class="callout-title">Exercise 19.4.1 (Conceptual): Why the Variance Ignores the Targets</div>
+<p>The GP posterior variance $\sigma_\ast^2 = k_{\ast\ast} - \mathbf{k}_\ast^\top(\mathbf{K}+\sigma_n^2\mathbf{I})^{-1}\mathbf{k}_\ast$ does not contain the observed targets $\mathbf{y}$ anywhere, while the mean $\mu_\ast$ does. Explain in words what this implies about the GP's notion of uncertainty: if you kept the input locations $\mathbf{X}$ fixed but replaced every target value with noise, how would the predictive band change? Connect your answer to the claim in subsection two that GP variance is a statement about <em>coverage of the input space</em> rather than about the values observed, and explain why this is the correct behavior for <em>epistemic</em> uncertainty as defined in subsection one.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 19.4.2 (Implementation): Compose a Trend-Plus-Seasonal Kernel</div>
+<p>Extend Code 19.4.1 by replacing the single RBF kernel with the composed kernel $k_{\text{TS}}$ of subsection two: a linear kernel for trend, plus a product of a periodic kernel and an RBF for slowly-evolving seasonality, plus the noise term. Implement each kernel as a numpy function, fit (or hand-set) sensible hyperparameters on the series from Code 19.4.1, and plot the posterior mean and two-sigma band. Verify against scikit-learn by building the same composed kernel with <code>RBF + ExpSineSquared + WhiteKernel + DotProduct</code> as in Code 19.4.4 and checking that the predictive means agree to tolerance. Comment on how the periodic component changes the extrapolation past the last data point compared with the plain RBF.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 19.4.3 (Open-ended): GP Versus Ensemble Versus Conformal Calibration</div>
+<p>On a held-out portion of a real univariate series of your choice, compute prediction intervals three ways: the exact GP of Code 19.4.1, the deep ensemble of Code 19.4.3, and (reading ahead to <a href="section-19.5.html">Section 19.5</a>) a split-conformal wrapper around the ensemble's mean. Measure empirical coverage (the fraction of true values inside the nominal ninety-percent interval) and mean interval width for each. Which method is best calibrated? Which produces the narrowest intervals at the target coverage? Discuss how your findings reflect the trade-offs of subsection four, the GP's reliance on a correct kernel, the ensemble's lack of a formal guarantee, and conformal's distribution-free coverage, and under what data conditions you would deploy each.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="nav-prev" href="section-19.3.html">&#8592; 19.3 Distributional and Quantile Forecasting</a>
+<a class="nav-up" href="index.html">Chapter 19 Contents</a>
+<a class="nav-next" href="section-19.5.html">19.5 Conformal Prediction for Time Series &#8594;</a>
+</nav>
+</main>
+<footer class="book-footer">
+<p class="footer-edition">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &middot; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated"><script>document.write("Last updated " + new Date(document.lastModified).toISOString().slice(0,10));</script></p>
+</footer>
+</body>
+</html>

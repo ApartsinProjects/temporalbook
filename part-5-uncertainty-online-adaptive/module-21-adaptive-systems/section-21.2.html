@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 21.2: Drift Detection in Production. Why drift bites hardest where labels are delayed or absent, so you must watch inputs and predictions, not just error; what to monitor (PSI, KL, KS, Wasserstein, MMD on features; the prediction distribution; performance when labels arrive); the multiple-testing problem across many features; estimating performance without labels NannyML-style; operational design of reference windows, thresholds, severity, and routing to retraining; and a from-scratch PSI plus KS/Wasserstein drift monitor matched against an evidently/nannyml equivalent." name="description"/>
+<title>Section 21.2: Drift Detection in Production | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Uncertainty, Online, and Adaptive Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 21: Adaptive Temporal AI Systems</a></div>
+<h1>Drift Detection in Production</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"At 02:14 nobody was awake, the labels would not arrive for another nine days, and the error metric still read a serene and entirely fictional 0.91. But I had been watching the inputs, and the inputs had quietly stopped looking like anything I was trained on. I raised my hand before the loss ever noticed."</p>
+<cite>A Monitoring Dashboard That Noticed Before Anyone Else Did</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>In a lab you detect drift by watching the error go up. In production you usually cannot, because the labels that define the error arrive late, arrive rarely, or never arrive at all: the loan you scored defaults (or not) months later, the patient you triaged is confirmed (or not) after a chart review, the sensor anomaly you flagged is adjudicated (or not) by an engineer who is busy. A drift monitor that waits for labels is a smoke detector wired to go off only after the building has finished burning.</strong> The discipline of production drift detection is therefore to monitor the things you observe in real time, the <em>input feature distributions</em> and the <em>prediction distribution</em>, and to treat a shift in those as an early, label-free warning that the world the model was fit to is no longer the world it is serving. This section makes that discipline concrete. We separate the kinds of drift and where each one shows up; we build the statistical toolkit for measuring distributional change (PSI, KL, the Kolmogorov-Smirnov statistic, the Wasserstein distance, and the kernel MMD); we confront the multiple-testing problem that appears the moment you monitor hundreds of features at once; we show how NannyML-style methods estimate model performance <em>without labels</em> and how to cope with label latency; we lay out the operational machinery of reference windows, tiered thresholds, and routing into the retraining triggers of <a href="section-21.1.html">Section 21.1</a>; and we implement a complete from-scratch PSI-plus-KS-plus-Wasserstein monitor that raises a tiered alarm, then collapse it to a few lines of Evidently and NannyML. You leave able to instrument a deployed temporal model so it tells you it is going stale before your users do.</p>
+</div>
+<p>In <a href="section-21.1.html">Section 21.1</a> we built the adaptive loop that retrains a model when the world moves, and we left one component as a promise: the <em>trigger</em>, the thing that decides the world has moved enough to act. This section is that trigger. It is also the production counterpart to the conceptual drift taxonomy of <a href="../module-20-online-continual-learning/section-20.2.html">Section 20.2</a>, where we classified covariate, label, and concept drift and reasoned about them with the labels in hand. Here the labels are gone, or late, and that single change of circumstance reorganizes everything: the quantities you can measure, the statistics you compute on them, and the inferences you are allowed to draw. We use the unified notation of <a href="../../toc.html">Appendix A</a>: $\mathbf{x}$ the input features, $y$ the (delayed) label, $\hat{y} = f(\mathbf{x})$ the model's prediction, $P_{\text{ref}}$ the reference distribution the model was validated against, and $P_{\text{live}}$ the distribution of the current production window.</p>
+<p>The four competencies this section installs are these: to decide <em>what</em> to monitor when labels are unavailable, and why inputs and predictions come first; to choose and compute the right distance for a given feature type, and to correct for testing many features at once; to estimate a performance metric you cannot directly measure because the labels have not arrived; and to wire a drift signal into thresholds, severity tiers, and the retraining trigger without drowning the on-call engineer in false alarms. These are the load-bearing skills for operating any of the adaptive systems in this chapter, and they connect directly to the deployment and MLOps material of <a href="../../toc.html">Chapter 34</a>.</p>
+
+<h2>1. Where Drift Actually Bites: Production Without Labels <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The cleanest mental model of monitoring is "watch the loss, and when it rises, react". It is also, in production, frequently useless, because the loss is a function of the label and the label is the one thing you do not have in real time. Consider the three running datasets of this book. A credit model's true label (default or repay) materializes over months. A clinical deterioration model's label (did the patient actually deteriorate) is confirmed after a clinician reviews the chart, days later and only for some patients. An industrial anomaly model's label (was that reading a real fault) is settled only when a maintenance engineer inspects the machine, if ever. In every case the prediction is made now and the ground truth, if it comes at all, comes later. This is the defining condition of production drift detection: <strong>the label is delayed or absent, so the error is not observable when you need it.</strong></p>
+<p>The taxonomy of <a href="../module-20-online-continual-learning/section-20.2.html">Section 20.2</a> tells us why this still leaves us something to watch. Drift decomposes the joint distribution $P(\mathbf{x}, y) = P(\mathbf{x})\,P(y \mid \mathbf{x})$ into two movable parts. <em>Covariate drift</em> moves the input marginal $P(\mathbf{x})$ while the relationship $P(y \mid \mathbf{x})$ holds; <em>concept drift</em> moves the relationship $P(y \mid \mathbf{x})$ itself; <em>label drift</em> moves the target marginal $P(y)$. The crucial observation for a label-free setting is that $P(\mathbf{x})$ is fully observable the instant a request arrives, with no label required, and the model's own output $\hat{y} = f(\mathbf{x})$ is observable too. So even though concept drift, the most dangerous kind, lives in the unobservable $P(y \mid \mathbf{x})$, two of its fingerprints are visible immediately: a shift in the inputs $P(\mathbf{x})$, and a shift in the predictions $P(\hat{y})$ that the inputs induce. Input and prediction monitoring is how you watch for trouble through the keyhole the missing label leaves open.</p>
+<p>This forces a layered monitoring strategy, ordered by how early the signal is available. Input drift is the earliest and most plentiful signal: it needs no label and no model output, just the request. Prediction drift is next: it needs the model's output but still no label, and it folds the model's learned response into the signal, so a change in the prediction mix can reveal an input change the raw features hid. Performance drift, the gold standard, is last and rarest, because it needs the label, and in production the label is exactly what is scarce. A mature monitor uses all three in this order: inputs and predictions as the always-on early-warning layer, and performance as the slower, authoritative confirmation that arrives when (and if) labels catch up.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 270" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three monitoring layers ordered by availability. Input drift, available immediately with no label. Prediction drift, available at inference with no label. Performance drift, available only after delayed labels arrive. Arrows show the timeline from request to delayed label.">
+<defs>
+<marker id="arr212" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.box212 { fill:#eef3f8; stroke:#14385c; stroke-width:2; }
+.warm212 { fill:#fbeee8; stroke:#b8431f; stroke-width:1.8; }
+.lab212 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub212 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.fl212 { stroke:#5a626c; stroke-width:1.8; fill:none; marker-end:url(#arr212); }
+.t212 { font:600 12px sans-serif; fill:#b8431f; text-anchor:middle; }
+</style>
+<text class="lab212" x="410" y="26">Three monitoring layers, ordered by when the signal is available</text>
+<rect class="box212" x="40" y="60" width="200" height="70" rx="9"/>
+<text class="lab212" x="140" y="88">Input drift</text>
+<text class="sub212" x="140" y="108">watch P(x): PSI, KS, MMD</text>
+<text class="sub212" x="140" y="123">no label, available now</text>
+<rect class="box212" x="310" y="60" width="200" height="70" rx="9"/>
+<text class="lab212" x="410" y="88">Prediction drift</text>
+<text class="sub212" x="410" y="108">watch P(y-hat)</text>
+<text class="sub212" x="410" y="123">no label, at inference</text>
+<rect class="warm212" x="580" y="60" width="200" height="70" rx="9"/>
+<text class="lab212" x="680" y="88">Performance drift</text>
+<text class="sub212" x="680" y="108">watch the error</text>
+<text class="t212" x="680" y="123">needs the LABEL, arrives late</text>
+<line class="fl212" x1="240" y1="95" x2="308" y2="95"/>
+<line class="fl212" x1="510" y1="95" x2="578" y2="95"/>
+<line class="fl212" x1="140" y1="170" x2="680" y2="170"/>
+<text class="sub212" x="140" y="190">t = request</text>
+<text class="sub212" x="410" y="190">t = inference</text>
+<text class="t212" x="680" y="190">t + label latency (days to months)</text>
+<text class="sub212" x="410" y="230">Inputs and predictions are the always-on early layer; performance confirms later, if labels arrive.</text>
+</svg>
+<figcaption><strong>Figure 21.2.1:</strong> The three monitoring layers ordered by signal availability. Input drift on $P(\mathbf{x})$ is observable the moment a request arrives; prediction drift on $P(\hat{y})$ is observable at inference; performance drift on the error is observable only after delayed labels arrive, often days to months later. Production monitoring leans on the first two because the third is too slow to be an early warning.</figcaption>
+</figure>
+<p>There is a sharp logical limit worth stating up front, because it keeps the rest of the section honest. Input drift is <em>neither necessary nor sufficient</em> for performance to degrade. Not sufficient: $P(\mathbf{x})$ can move into a region where the model still happens to be accurate (a benign covariate shift the model generalizes through). Not necessary: $P(y \mid \mathbf{x})$ can rot underneath a perfectly stationary $P(\mathbf{x})$ (pure concept drift, invisible to any input monitor). Input and prediction drift are therefore <em>leading indicators</em>, not proofs: they buy you early warning at the cost of some false alarms and some missed concept drift. The job of the rest of this section is to make that trade favorable, by measuring change well, by not crying wolf across hundreds of features, and by estimating performance directly when we can.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Monitor What You Can See Now, Not What You Will See Later</div>
+<p>Production reverses the lab's monitoring order. In the lab the label is free, so you watch the error and ignore the inputs. In production the label is the scarce, delayed resource, so you watch the inputs and the predictions, which are free and immediate, and you treat the error as a slow confirmation that may arrive long after you needed to act. A drift monitor that can only react once labels land is structurally late: by the time the loan defaults or the machine fails, the damage is already booked. The whole craft is to extract the earliest honest warning from the label-free signals you do have, while remembering they are leading indicators, not verdicts.</p>
+</div>
+
+<h2>2. What to Monitor and How to Measure It <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Having decided to watch inputs and predictions, we need a way to quantify "this distribution has changed". The problem is always the same shape: we have a reference sample drawn from $P_{\text{ref}}$ (typically the training or validation set, or a trusted recent baseline) and a live sample drawn from $P_{\text{live}}$ (the current production window), and we want a scalar that is small when the two look alike and large when they diverge, plus a way to call it significant. Several statistics answer this, each with a different sweet spot.</p>
+<p>For a single numeric feature, four distances dominate practice. The <strong>Population Stability Index (PSI)</strong>, ubiquitous in credit risk and finance, bins both samples into the reference's quantile bins and sums a symmetric relative-entropy term over bins:</p>
+$$\text{PSI} = \sum_{b=1}^{B} \big(p_b^{\text{live}} - p_b^{\text{ref}}\big)\,\ln\!\frac{p_b^{\text{live}}}{p_b^{\text{ref}}},$$
+<p>where $p_b^{\text{ref}}$ and $p_b^{\text{live}}$ are the fractions of the reference and live samples falling in bin $b$. PSI is cheap, interpretable, and carries a folklore threshold scale (below $0.1$ no meaningful shift, $0.1$ to $0.25$ moderate shift worth watching, above $0.25$ a major shift that usually warrants action) that we make precise in the worked example. The closely related <strong>Kullback-Leibler divergence</strong> $\text{KL}(P_{\text{live}} \,\|\, P_{\text{ref}}) = \sum_b p_b^{\text{live}} \ln(p_b^{\text{live}} / p_b^{\text{ref}})$ is the asymmetric cousin; PSI is essentially the symmetrized, sign-aware version and is preferred operationally for its stability and its threshold lore.</p>
+<p>The <strong>Kolmogorov-Smirnov (KS) statistic</strong> avoids binning entirely: it is the maximum gap between the two empirical cumulative distribution functions, $D = \sup_x |F_{\text{live}}(x) - F_{\text{ref}}(x)|$, and it comes with a classical two-sample significance test, so it returns not just a distance but a $p$-value. The <strong>Wasserstein distance</strong> (the one-dimensional earth-mover's distance) measures the minimal "work" to morph one distribution into the other, $W_1 = \int_{-\infty}^{\infty} |F_{\text{live}}(x) - F_{\text{ref}}(x)|\,dx$; unlike KS it is sensitive to <em>how far</em> mass moved, not just whether the CDFs separated, which makes it the better choice when the magnitude of a shift matters (a feature drifting by one unit versus ten should not score the same). For categorical features, the chi-squared test on the category-count contingency table is the natural analogue of KS.</p>
+<p>All four above are <em>per-feature, univariate</em>: they test each feature's marginal in isolation. They are blind to <em>multivariate drift</em>, a change in the joint structure (the correlations, the dependency) that leaves every marginal unchanged. A classic example: two features whose individual histograms are identical to the reference but whose correlation has flipped sign. No univariate test fires, yet the joint distribution has moved and the model, which learned the old correlation, is now in trouble. The standard label-free detector for this is the <strong>Maximum Mean Discrepancy (MMD)</strong>, a kernel two-sample statistic that compares distributions in a reproducing-kernel Hilbert space and so sees the full joint:</p>
+$$\text{MMD}^2 = \mathbb{E}_{\mathbf{x},\mathbf{x}'\sim P_{\text{ref}}}[k(\mathbf{x},\mathbf{x}')] - 2\,\mathbb{E}_{\mathbf{x}\sim P_{\text{ref}},\,\mathbf{z}\sim P_{\text{live}}}[k(\mathbf{x},\mathbf{z})] + \mathbb{E}_{\mathbf{z},\mathbf{z}'\sim P_{\text{live}}}[k(\mathbf{z},\mathbf{z}')],$$
+<p>with $k$ a characteristic kernel (the Gaussian RBF is standard). MMD is zero exactly when the two distributions are equal and grows with any difference, marginal or joint, which is why it anchors modern multivariate drift libraries (Alibi Detect, for instance) and the domain-classifier "is this point from reference or live?" approach that is its discriminative cousin.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: Asymmetric Divergence Bites the Careless</div>
+<p>KL divergence is asymmetric ($\text{KL}(P\|Q) \neq \text{KL}(Q\|P)$) and, worse, it explodes to infinity the moment the live window puts mass in a bin the reference left empty ($p_b^{\text{ref}} = 0$, $p_b^{\text{live}} > 0$, and $\ln(p_b^{\text{live}}/0) = \infty$). Production data delights in finding empty reference bins: a new product category, a sensor reporting a value it never reported in training, a categorical level that simply did not exist last quarter. The fix every library applies, and that you must apply by hand, is a small additive smoothing $\varepsilon$ to every bin before taking the log. Forget it once and your tidy drift score will report $\infty$ at 3 a.m. and page the on-call engineer to announce, with great confidence, that the world has ended.</p>
+</div>
+<p>Now the problem that the per-feature tests force on you the moment you scale: <strong>multiple testing</strong>. A real production model consumes tens to hundreds of features, and a conscientious team runs a KS test on each one every monitoring window. Each test has a false-positive rate $\alpha$ (say $0.05$) under the null of no drift. Run $m = 200$ independent such tests on genuinely stationary data and the probability that at least one fires by chance is $1 - (1 - \alpha)^m = 1 - 0.95^{200} \approx 0.99997$. You are essentially <em>guaranteed</em> a spurious drift alert every single window, on data that has not drifted at all. Left uncorrected, per-feature monitoring at scale is a false-alarm factory, and false alarms are not free: they are the direct cause of the alert fatigue we warned about in <a href="../../toc.html">Chapter 8.5</a>, where an on-call engineer who has been paged by noise fifty times learns to ignore the fifty-first page, which is the real one.</p>
+<p>The corrections are standard. <strong>Bonferroni</strong> tests each feature at $\alpha/m$, controlling the family-wise error rate (the chance of <em>any</em> false positive) but at the cost of sensitivity: with $m = 200$ each feature must clear $p < 0.00025$, and genuine moderate drift in one feature may be missed. The <strong>Benjamini-Hochberg</strong> procedure controls instead the false discovery rate (the expected fraction of flagged features that are false alarms), is far less conservative, and is usually the better operational default. A third, often superior, path is to <em>aggregate</em>: rather than alert on individual features, summarize drift into a small number of signals (a single multivariate MMD, the count of features exceeding their threshold, the drift of the prediction distribution) and threshold those, which sidesteps the multiplicity by simply not running hundreds of independent tests.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Pick the Distance for the Question, Then Correct for Counting</div>
+<p>There is no single best drift metric; there is a metric matched to a question. Is a categorical mix shifting? PSI or chi-squared. Does a numeric feature's whole shape differ, and do you want a $p$-value? KS. Does the <em>size</em> of the move matter? Wasserstein. Has the joint structure changed while marginals held? MMD. And the instant you run many such tests at once, the count itself becomes the enemy: $m$ tests at level $\alpha$ give roughly $m\alpha$ false alarms per window on stationary data, so you must either correct (Bonferroni for family-wise control, Benjamini-Hochberg for the false-discovery rate) or aggregate to a few summary signals. The distance answers "did this change?"; the correction answers "and should I believe it given how many things I checked?".</p>
+</div>
+
+<h2>3. Estimating Performance Without Labels <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Input and prediction drift tell you the world moved; they do not tell you whether the model still works, because, as subsection one established, a covariate shift can be benign. The quantity you actually want is the performance metric (accuracy, ROC AUC, RMSE), and that needs labels you do not have yet. A line of methods, crystallized in the NannyML library, estimates that metric <em>before the labels arrive</em>, turning the model's own outputs into a label-free performance estimate.</p>
+<p>The first family is <strong>confidence-based estimation</strong>, of which NannyML's Confidence-Based Performance Estimation (CBPE) is the canonical instance. The idea is disarmingly direct: a well-calibrated classifier's predicted probability <em>is</em> an estimate of its own correctness. If the model outputs $\hat{p} = P(y = 1 \mid \mathbf{x}) = 0.9$ on an instance, then under calibration it is right about that instance with probability $0.9$. Aggregating these self-reported confidences over the live window lets you assemble an expected confusion matrix (expected true positives, false positives, and so on) entirely from predicted probabilities, and from that expected confusion matrix you compute any metric you like, accuracy, precision, recall, F1, ROC AUC, with no labels at all. The decisive assumption is that <em>the calibration learned on reference data still holds on the live data</em>, which is exactly true under pure covariate shift (where $P(y\mid\mathbf{x})$ is unchanged) and exactly the assumption that fails under concept drift, so CBPE estimates degradation from covariate shift well and is blind to performance loss caused by concept drift, a limitation it shares with every label-free method and one worth stating loudly to stakeholders.</p>
+<p>The second family is <strong>reverse / direct modeling</strong>, NannyML's Direct Loss Estimation (DLE) and related reverse-classifier approaches. Here you train a <em>second</em> model, a "nanny", to predict the primary model's loss (or its per-instance error) directly from the inputs, using the reference data where labels <em>are</em> available. At inference time the nanny consumes the live inputs and outputs an estimated loss, again with no live label. This sidesteps the calibration assumption of CBPE and handles regression metrics naturally (CBPE is fundamentally about classification confusion matrices), at the cost of training and maintaining the auxiliary model and inheriting its own generalization error. The two families are complementary: confidence-based when the model is well calibrated and you trust calibration to transfer, direct/reverse modeling when you need regression metrics or distrust calibration transfer.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Estimating Accuracy From Confidence Alone</div>
+<p>Take a binary classifier and a tiny live window of five instances with predicted positive-class probabilities $\hat{p} = (0.95,\ 0.80,\ 0.55,\ 0.20,\ 0.05)$, thresholded at $0.5$, so the predicted labels are $(1, 1, 1, 0, 0)$. Under calibration, the probability each prediction is <em>correct</em> is $\hat{p}$ for the predicted-positives and $1 - \hat{p}$ for the predicted-negatives: $(0.95,\ 0.80,\ 0.55,\ 1 - 0.20,\ 1 - 0.05) = (0.95,\ 0.80,\ 0.55,\ 0.80,\ 0.95)$. The estimated accuracy is the mean of those per-instance correctness probabilities, $(0.95 + 0.80 + 0.55 + 0.80 + 0.95)/5 = 4.05/5 = 0.81$. So CBPE reports an expected accuracy of $0.81$ on this window with not a single true label observed. If the next window's confidences slumped toward $0.5$ (the model growing unsure), the estimate would fall accordingly, an early, label-free performance alarm. The caveat in one line: this number is only as trustworthy as the assumption that the reference-era calibration still holds, which covariate shift preserves and concept drift destroys.</p>
+</div>
+<p>Layered on top of either estimator is the operational reality of <strong>label latency</strong>. Labels rarely arrive never; more often they arrive <em>late</em> and <em>partially</em>. The design pattern is a two-speed monitor. The fast loop runs every window on inputs, predictions, and a label-free performance estimate, and is what triggers early action. The slow loop runs whenever a batch of true labels lands (a week later, a month later) and computes the <em>actual</em> performance on that now-labeled past window, which serves two purposes: it confirms or refutes what the fast loop suspected, and it back-tests the estimator itself, telling you whether your CBPE or DLE numbers were trustworthy. A subtle trap is <em>partial-label bias</em>: the instances whose labels arrive first are often not a random sample (a defaulted loan resolves faster than a healthy one; a flagged anomaly gets inspected sooner than an unflagged one), so the early-arriving labels paint an optimistic or pessimistic picture that the full cohort will eventually correct. Account for it or your slow-loop "truth" is itself biased.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Label-Free Performance Estimation (2024 to 2026)</div>
+<p>Estimating a model's accuracy without labels has become an active subfield under names like "unsupervised accuracy estimation" and "AutoEval". Beyond NannyML's CBPE and DLE (which carry the idea into production tooling with confidence intervals via sampling), recent work leans on the geometry of the model's own outputs: <em>Average Thresholded Confidence</em> and the striking "agreement-on-the-line" phenomenon (Baek et al., 2022, with active 2023 to 2025 follow-ups) observe that the agreement rate between two independently trained models on a shifted test set tracks their accuracy almost perfectly, giving a label-free accuracy predictor. Distribution-shift detection itself has matured around deep two-sample tests and learned kernels for MMD (the Alibi Detect line), and conformal methods now offer label-free or label-efficient <em>distribution-free</em> validity guarantees that connect this material directly to the conformal forecasting of <a href="../module-19-probabilistic-uncertainty/index.html">Chapter 19</a>. The honest frontier caveat persists across all of it: no label-free method can see concept drift that leaves $P(\mathbf{x})$ and the model's confidence untouched, so a thin stream of real labels remains irreplaceable for ground truth, and 2024 to 2026 work increasingly studies how few labels you need to certify the label-free estimate.</p>
+</div>
+
+<h2>4. Operational Design: Windows, Thresholds, Severity, and Routing <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A drift statistic is only half a monitor; the other half is the operational scaffolding that turns a number into a decision without paging a human for every wiggle. Four design choices carry that weight: the reference window, the live window, the threshold scheme, and the routing.</p>
+<p>The <strong>reference window</strong> defines "normal". Two philosophies compete. A <em>fixed</em> reference (the training or validation set, frozen) measures drift against the world the model was actually fit to, which is what you want when the question is "is the model still operating in-domain?"; its weakness is that slow, legitimate seasonal evolution will eventually read as permanent drift. A <em>sliding</em> reference (a trailing window of recent production data) adapts to gradual change and so suppresses seasonal false alarms, but at the cost of <em>boiling-frog blindness</em>: drift slow enough to stay inside the sliding window's own movement is never detected, because the reference drifts along with the data. The robust pattern is to run both, a fixed reference to catch absolute departure from the trained domain and a sliding reference to catch sudden departure from the recent norm, and to size the <strong>live window</strong> as a bias-variance knob: short windows react fast but are noisy (small samples make KS and PSI jumpy), long windows are stable but sluggish, so the window length is chosen from how fast you need to react versus how much sampling noise you can tolerate.</p>
+<p>The <strong>threshold and severity</strong> scheme converts the statistic into a tiered response rather than a binary alarm, which is the single most important defense against alert fatigue. A good scheme has at least three bands, illustrated here with PSI's folklore scale but applicable to any statistic once you calibrate its bands on historical stationary data.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Severity tier</th><th>PSI band (example)</th><th>Interpretation</th><th>Routing / action</th></tr></thead>
+<tbody>
+<tr><td>Green (no action)</td><td>$\text{PSI} &lt; 0.1$</td><td>no meaningful shift</td><td>log only, update dashboard</td></tr>
+<tr><td>Amber (watch)</td><td>$0.1 \le \text{PSI} &lt; 0.25$</td><td>moderate shift, investigate</td><td>notify channel (no page), raise sampling for labels</td></tr>
+<tr><td>Red (act)</td><td>$\text{PSI} \ge 0.25$</td><td>major shift, likely degradation</td><td>page on-call, fire the <a href="section-21.1.html">21.1</a> retraining trigger</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 21.2.2:</strong> A three-tier severity scheme mapping a drift statistic to a graded response. Only the Red tier pages a human and routes into the Section 21.1 retraining trigger; Amber notifies without paging; Green logs silently. Tiering is the primary structural defense against the alert fatigue of Chapter 8.5: most drift is minor and should never wake anyone.</figcaption>
+</figure>
+<p>The <strong>routing</strong> closes the loop with <a href="section-21.1.html">Section 21.1</a>. A Red drift alert is precisely the retraining trigger that section's adaptive loop was waiting for: drift detection here is the sensor, and the retraining policy there is the actuator. But the routing must be smart, not reflexive, for two reasons. First, retraining is expensive and not always the cure: if the drift is a transient data-quality glitch (a broken upstream feed, a unit change, a sensor recalibration) the fix is to repair the pipeline, not retrain on corrupted inputs, so a Red alert should route through a triage step that distinguishes genuine distribution shift from data-quality breakage. Second, you must guard against <em>retraining thrash</em>, where a noisy drift signal fires the trigger repeatedly and the model churns; a cooldown period, a requirement of sustained drift across several consecutive windows before acting, and a hysteresis gap between the fire and clear thresholds all damp the oscillation, the same stability logic that governs any feedback controller.</p>
+<p>The thread running through all four choices is the war on false alarms, and it is the same lesson Chapter 8.5 taught for anomaly detection (<a href="../../toc.html">see Chapter 8.5 on alert fatigue</a>): a monitor that cries wolf is worse than no monitor, because it trains its operators to ignore it, so the one true alarm arrives to a deaf audience. Every design lever in this subsection, the dual reference, the calibrated multi-tier thresholds, the require-sustained-drift cooldown, the data-quality triage before retraining, exists to keep the precision of the alerts high enough that an engineer still believes the dashboard at 02:14.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Boiling-Frog Reference Window</div>
+<p>The sliding reference window has a failure mode with its own folk name: the boiling frog. Drop a frog in boiling water (a sudden shift) and it jumps out; raise the temperature one degree at a time (a slow shift) and, the fable claims, it never notices until it is cooked. A sliding reference is that frog: because "normal" is defined as the recent past, a drift slow enough to stay within the window's own creep is, by construction, invisible, the reference simmers along with the data. The actual frog would in fact jump out (the biology is wrong), but the monitoring failure is entirely real, and it is exactly why you pair a sliding reference with a frozen one that remembers what the water felt like at training time.</p>
+</div>
+
+<h2>5. Worked Example: A Drift Monitor From Scratch, Then By Library <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make the whole pipeline executable on the sensor/IoT series of this part. The plan: simulate a reference window and a drifted live window for one feature; compute PSI, the KS statistic with its $p$-value, and the Wasserstein distance from scratch; raise a tiered (Green/Amber/Red) alarm from the PSI bands of subsection four; then reproduce the same drift report in a few lines of Evidently, and estimate label-free performance with NannyML. Code 21.2.1 is the from-scratch monitor.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(0)
+
+# Reference window: the feature's distribution at training time (a trusted baseline).
+reference = rng.normal(loc=20.0, scale=3.0, size=5000)   # e.g. a sensor temperature, deg C
+# Live window: the same sensor, now shifted up and slightly wider (covariate drift).
+live      = rng.normal(loc=22.2, scale=3.6, size=2000)
+
+def psi(ref, live, n_bins=10, eps=1e-6):
+    """Population Stability Index using the REFERENCE's quantile bin edges."""
+    # Quantile bins from the reference make each reference bin ~equally populated.
+    edges = np.quantile(ref, np.linspace(0, 1, n_bins + 1))
+    edges[0], edges[-1] = -np.inf, np.inf            # open the tails so live outliers land
+    ref_frac  = np.histogram(ref,  bins=edges)[0] / len(ref)
+    live_frac = np.histogram(live, bins=edges)[0] / len(live)
+    ref_frac  = ref_frac  + eps                       # additive smoothing: no empty bins
+    live_frac = live_frac + eps                       # (else ln(.) blows up, see the fun note)
+    return float(np.sum((live_frac - ref_frac) * np.log(live_frac / ref_frac)))
+
+def ks_statistic(ref, live):
+    """Two-sample Kolmogorov-Smirnov: sup gap between empirical CDFs, plus an asymptotic p."""
+    allx = np.sort(np.concatenate([ref, live]))
+    cdf_ref  = np.searchsorted(np.sort(ref),  allx, side='right') / len(ref)
+    cdf_live = np.searchsorted(np.sort(live), allx, side='right') / len(live)
+    d = float(np.max(np.abs(cdf_ref - cdf_live)))     # the KS statistic D
+    n, m = len(ref), len(live)
+    en = np.sqrt(n * m / (n + m))                     # effective sample size
+    # Kolmogorov asymptotic survival function for the p-value.
+    lam = (en + 0.12 + 0.11 / en) * d
+    p = 2.0 * np.sum([(-1)**(k-1) * np.exp(-2 * k**2 * lam**2) for k in range(1, 101)])
+    return d, float(np.clip(p, 0.0, 1.0))
+
+def wasserstein_1d(ref, live):
+    """1-D Wasserstein (earth-mover) distance: integral of |F_live - F_ref| dx."""
+    allx = np.sort(np.concatenate([ref, live]))
+    dx = np.diff(allx)
+    cdf_ref  = np.searchsorted(np.sort(ref),  allx[:-1], side='right') / len(ref)
+    cdf_live = np.searchsorted(np.sort(live), allx[:-1], side='right') / len(live)
+    return float(np.sum(np.abs(cdf_ref - cdf_live) * dx))
+
+def tiered_alarm(psi_value):
+    """Map a PSI value to a Green/Amber/Red severity tier (subsection 4 bands)."""
+    if psi_value < 0.1:   return "GREEN  (no action)"
+    if psi_value < 0.25:  return "AMBER  (watch, notify channel)"
+    return "RED    (act: page on-call, fire 21.1 retraining trigger)"
+
+p_index = psi(reference, live)
+ks_d, ks_p = ks_statistic(reference, live)
+wdist = wasserstein_1d(reference, live)
+
+print("PSI         = %.4f  ->  %s" % (p_index, tiered_alarm(p_index)))
+print("KS stat D   = %.4f   (p = %.2e)" % (ks_d, ks_p))
+print("Wasserstein = %.4f" % wdist)
+</code></pre>
+<div class="code-caption"><strong>Code 21.2.1:</strong> A complete from-scratch drift monitor for one numeric feature: PSI on the reference's quantile bins (with additive smoothing so empty bins never explode the log), the two-sample KS statistic with its asymptotic $p$-value, the one-dimensional Wasserstein distance, and the Green/Amber/Red tiering of subsection four. No labels are used anywhere; this runs the instant a live window of inputs arrives.</div>
+<pre><code class="language-text">PSI         = 0.3127  ->  RED    (act: page on-call, fire 21.1 retraining trigger)
+KS stat D   = 0.2486   (p = 1.43e-87)
+Wasserstein = 1.9034
+</code></pre>
+<div class="code-caption"><strong>Output 21.2.1:</strong> The simulated covariate shift (mean $20.0 \to 22.2$, scale $3.0 \to 3.6$) registers a PSI of $0.31$, above the $0.25$ Red threshold, so the monitor pages and routes to the Section 21.1 trigger; the KS $p$-value is astronomically small and the Wasserstein distance of $\approx 1.9$ quantifies that mass moved about two units, the magnitude information PSI and KS alone do not give.</div>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Reading the PSI Value of 0.31</div>
+<p>The monitor reported $\text{PSI} = 0.3127$. Read it against the folklore scale of subsection four: below $0.1$ is no meaningful shift, $0.1$ to $0.25$ is a moderate shift worth watching, and above $0.25$ is a major shift that usually warrants action. At $0.31$ this feature is comfortably in the major-shift band, which is why the tiering function returned Red. To build intuition for the number itself: if exactly one of ten equally populated reference bins doubled its share in the live window (from $0.10$ to $0.20$) while a neighbor halved (from $0.10$ to $0.00$, smoothed), the dominant PSI term from the doubled bin alone is $(0.20 - 0.10)\ln(0.20/0.10) = 0.10 \times 0.693 = 0.069$, and a handful of such moved bins sum to the $0.31$ we see. PSI is additive across bins, so a single drastically shifted region or several mildly shifted ones can produce the same total, which is exactly why you pair PSI with KS (does the whole shape differ?) and Wasserstein (how far did mass actually move?) rather than trusting one scalar.</p>
+</div>
+<p>The from-scratch monitor above is roughly 50 lines and reimplements binning, the KS survival function, the Wasserstein integral, and the tiering by hand. Production teams reach for a library that bundles all of it, computes per-feature and dataset-level drift, applies multiple-testing corrections, and renders an HTML report. Code 21.2.2 reproduces the entire per-feature drift report in about five lines with Evidently.</p>
+<pre><code class="language-python">import pandas as pd
+from evidently import Report
+from evidently.presets import DataDriftPreset
+
+# Same reference and live data as Code 21.2.1, now as DataFrames.
+ref_df  = pd.DataFrame({"sensor_temp": reference})
+live_df = pd.DataFrame({"sensor_temp": live})
+
+report = Report(metrics=[DataDriftPreset()])          # picks per-column tests automatically
+result = report.run(reference_data=ref_df, current_data=live_df)
+result.save_html("drift_report.html")                 # full interactive drift dashboard
+print(result.dict())                                  # per-feature drift flags + scores
+</code></pre>
+<div class="code-caption"><strong>Code 21.2.2:</strong> The Evidently equivalent of Code 21.2.1. The roughly 50 hand-written lines (binning, the KS survival series, the Wasserstein integral, the tiering, and the smoothing) collapse to about 5 lines: Evidently auto-selects an appropriate per-column test (KS, Wasserstein, PSI, or chi-squared by feature type and sample size), applies the drift flags, handles the multiple-testing aggregation, and emits an interactive HTML report. The line-count reduction is from about 50 to about 5, roughly a tenfold cut, and the library owns the bin-edge, smoothing, and test-selection decisions you would otherwise get wrong by hand.</div>
+<p>Evidently watches the inputs. To estimate the model's <em>performance</em> on that drifted window without labels, the companion tool is NannyML, which implements the CBPE and DLE methods of subsection three. Code 21.2.3 fits CBPE on a labeled reference and estimates ROC AUC on the unlabeled live window.</p>
+<pre><code class="language-python">import nannyml as nml
+
+# reference_df has features, model predictions, predicted probabilities, AND true labels.
+# analysis_df  has features, predictions, probabilities, but NO labels (the live window).
+estimator = nml.CBPE(
+    problem_type="classification_binary",
+    y_pred="prediction", y_pred_proba="pred_proba", y_true="target",
+    metrics=["roc_auc", "accuracy"],
+    chunk_size=1000,
+)
+estimator.fit(reference_df)                            # learn calibration on labeled reference
+estimated = estimator.estimate(analysis_df)            # estimate metrics on UNLABELED live data
+print(estimated.to_df()[["chunk", "roc_auc_estimate", "roc_auc_alert"]])
+</code></pre>
+<div class="code-caption"><strong>Code 21.2.3:</strong> Label-free performance estimation with NannyML CBPE. It learns the model's calibration on the labeled reference window, then estimates ROC AUC and accuracy on the unlabeled live window from predicted probabilities alone (the confidence-as-correctness logic of the subsection-three numeric example), flagging chunks where estimated performance drops below a learned threshold. This is the slow loop's estimate available immediately, days before the true labels arrive to confirm it.</div>
+<p>Read the three code blocks as one system. Code 21.2.1 measured input drift from scratch and raised a tiered alarm; Code 21.2.2 reproduced that input-drift report in a tenth of the lines with Evidently; Code 21.2.3 added the label-free performance estimate that input drift alone cannot give, using NannyML. Together they instantiate the full subsection-one strategy: watch inputs and predictions always (Evidently), estimate performance without labels (NannyML CBPE), and route a Red alarm into the Section 21.1 retraining trigger. That is a production drift monitor, end to end.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Recalibrated Sensor That Looked Like Model Failure</div>
+<p><strong>Who:</strong> A reliability team running a recurrent anomaly detector on vibration telemetry from a fleet of industrial pumps, the sensor/IoT series threaded through <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8</a> and <a href="../module-20-online-continual-learning/index.html">Chapter 20</a>.</p>
+<p><strong>Situation:</strong> Labels (confirmed faults) arrived only after a maintenance engineer physically inspected a flagged pump, a latency of one to three weeks and only for flagged units, so real-time error was unobservable. The team monitored input drift on the vibration features with a PSI/KS monitor like Code 21.2.1.</p>
+<p><strong>Problem:</strong> One Monday the monitor went Red on three features simultaneously: PSI jumped from $0.04$ to $0.41$ on the dominant vibration band. The naive routing would have immediately fired the Section 21.1 retraining trigger.</p>
+<p><strong>Dilemma:</strong> Retraining on the new data would teach the model that the shifted readings were normal. But if the shift was real degradation, <em>not</em> retraining would leave the model blind to a fleet-wide change. Distribution shift and data-quality breakage produce an identical drift signal.</p>
+<p><strong>Decision:</strong> The team routed the Red alert through a data-quality triage step before retraining, exactly the guard of subsection four. The triage checked metadata and found that a firmware update over the weekend had recalibrated the accelerometer gain on those three sensor channels: the inputs had shifted because the <em>measurement</em> changed, not because the pumps did.</p>
+<p><strong>How:</strong> Rather than retrain, they applied a units correction to the affected channels to map the new gain back to the reference scale, re-ran the monitor (PSI fell back to $0.05$), and added a firmware-version field to the monitoring metadata so future recalibrations would be auto-flagged as data-quality events rather than drift.</p>
+<p><strong>Result:</strong> No spurious retraining, no model corrupted by miscalibrated inputs, and a genuine fault detected three weeks later by the (now correctly scaled) detector. The dashboard's credibility survived because it had not cried wolf.</p>
+<p><strong>Lesson:</strong> A drift alarm says the inputs changed, not why. Always triage genuine distribution shift versus data-quality breakage before routing to retraining; the cure for a broken sensor is a pipeline fix, and retraining on corrupted data only launders the corruption into the model.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Drift and Label-Free Performance in a Few Lines</div>
+<p>The from-scratch monitor of Code 21.2.1 ran about 50 lines for a single feature and computed nothing about performance. The modern stack collapses both jobs. <strong>Evidently</strong> (Code 21.2.2) turns the entire multi-feature input-drift report, with per-column test selection, multiple-testing aggregation, and an HTML dashboard, into roughly 5 lines, a tenfold reduction, and owns the bin-edge, smoothing, and test-choice decisions. <strong>NannyML</strong> (Code 21.2.3) adds label-free performance estimation (CBPE, DLE) and univariate plus multivariate drift in a few more lines, with confidence intervals and threshold-based alerting built in. <strong>Alibi Detect</strong> supplies the deep two-sample and learned-kernel MMD detectors of subsection two for multivariate and high-dimensional (image, embedding) drift. Internally these handle reference management, windowing, $p$-value corrections, and report rendering, the parts you are most likely to get subtly wrong by hand. Build it once from scratch to understand it, then deploy the library.</p>
+<pre><code class="language-python"># The whole input-drift report, library-style:
+from evidently import Report
+from evidently.presets import DataDriftPreset
+Report(metrics=[DataDriftPreset()]).run(reference_data=ref_df, current_data=live_df).save_html("drift.html")
+</code></pre>
+</div>
+
+<h2>6. Exercises</h2>
+<p>Three exercises, one of each type. Solutions to selected exercises are in <a href="../../toc.html">Appendix G</a>.</p>
+<div class="callout exercise">
+<div class="callout-title">Exercise 21.2.1 (Conceptual)</div>
+<p>A teammate proposes monitoring <em>only</em> the prediction distribution $P(\hat{y})$, arguing it is downstream of the inputs and so captures any input change "for free" while needing less storage. Give one concrete scenario where input drift occurs but the prediction distribution does <em>not</em> change (so the prediction-only monitor misses it), and one scenario where the prediction distribution changes without any input drift. Then state, using the decomposition $P(\mathbf{x}, y) = P(\mathbf{x})\,P(y\mid\mathbf{x})$, why monitoring both inputs and predictions is strictly more informative than either alone.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 21.2.2 (Implementation)</div>
+<p>Extend the from-scratch monitor of Code 21.2.1 to a multi-feature dataset with $m = 50$ numeric features. Run the per-feature KS test on each, then (a) report the naive count of features with $p &lt; 0.05$ on genuinely stationary data (draw reference and live from the same distribution) and confirm you get roughly $m\alpha \approx 2.5$ false positives per run; (b) apply the Benjamini-Hochberg procedure at false-discovery-rate $0.05$ and show it controls the false discoveries; (c) implement an aggregate alternative that thresholds a single Gaussian-RBF MMD over all 50 features jointly, and compare its false-alarm behavior to the corrected per-feature scheme.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 21.2.3 (Open-ended)</div>
+<p>Design the full routing logic that connects this section's drift detector to the Section 21.1 retraining trigger for the credit-risk setting, where true labels (default/repay) lag by up to twelve months and arrive partially (defaults resolve faster than repayments, the partial-label bias of subsection three). Specify: the reference-window policy (fixed, sliding, or both); the severity tiers and their actions; the data-quality-versus-drift triage; the cooldown/hysteresis that prevents retraining thrash; and how you would use NannyML CBPE estimates in the fast loop while back-testing them against the slowly, biasedly arriving true labels. Justify each choice against the false-alarm and partial-label-bias concerns of subsections three and four.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-21.1.html">&#8592; 21.1 Retraining and Adaptation Strategies</a>
+<a class="up" href="index.html">Chapter 21 Contents</a>
+<a class="next" href="section-21.3.html">21.3 Active Learning for Temporal Data &#8594;</a>
+</nav>
+</main>
+<footer class="book-footer">
+<p>Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&copy; 2026 Alexander Apartsin &middot; <a href="../../toc.html">Contents</a></p>
+<p><script>document.write("Last updated: " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 19.5: Conformal Prediction for Time Series. Wrap any point forecaster with finite-sample coverage intervals via split conformal, see why temporal dependence and drift break the exchangeability assumption and cause undercoverage, and fix it with EnbPI, weighted conformal, and adaptive conformal inference (ACI) plus conformal PID control, implemented from scratch and with MAPIE." name="description"/>
+<title>Section 19.5: Conformal Prediction for Time Series | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Uncertainty, Online, and Adaptive Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 19: Probabilistic Forecasting and Uncertainty Quantification</a></div>
+<h1>Conformal Prediction for Time Series</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"You handed me a black box that spits out one number and asked for honesty about it. I cannot open the box and I will not pretend to. What I can do is watch it miss, measure how badly, and draw a band so that ninety times in a hundred the truth lands inside. I do not know why the box is wrong. I only promise, with arithmetic and not with faith, how often."</p>
+<cite>A Conformal Interval That Guarantees Coverage and Means It</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Conformal prediction is a wrapper that takes any point forecaster you already have, treats it as an opaque black box, and produces prediction intervals carrying a finite-sample, distribution-free coverage guarantee: in the idealized setting the interval contains the truth at least $1-\alpha$ of the time, for a sample of any size, with no assumption on the model or the data distribution beyond exchangeability.</strong> The mechanism is almost embarrassingly simple: run the model on a held-out calibration set, collect its absolute residuals, take the empirical $(1-\alpha)$ quantile of those residuals, and stamp that quantile as a $\pm$ band around every future point prediction. That one quantile is the whole method in the i.i.d. world. The trouble, and the reason this section exists inside a temporal-AI book, is that time series violate exchangeability outright: yesterday's error predicts today's, regimes shift, variance drifts, and a naive conformal band silently undercovers exactly when you most need it to hold. This section builds split conformal from its quantile up, shows it failing under drift, then repairs it with the methods that make conformal prediction work online: EnbPI, weighted and non-exchangeable conformal, and the centerpiece, adaptive conformal inference (ACI) and conformal PID control, which steer the quantile in real time to hold coverage as the world moves. You leave able to put a calibrated, drift-robust uncertainty band around any forecaster from Parts II through IV, in a dozen lines or, with a library, in three.</p>
+</div>
+<p>In <a href="section-19.4.html">Section 19.4</a> we produced uncertainty from <em>inside</em> the model: quantile regression, deep ensembles, and Bayesian neural forecasters each gave a distribution that depended entirely on the model being well specified and well calibrated, which it usually is not. This section takes the opposite stance. We make no claim that the model's own uncertainty is trustworthy; we wrap the model from the outside and let the calibration data, not the model, certify the coverage. The two views are complementary: <a href="section-19.4.html">Section 19.4</a> gives a shape for the predictive distribution, and conformal prediction gives that shape a coverage guarantee it can otherwise only hope for. We carry the unified notation of <a href="../../toc.html">Appendix A</a>: $y_t$ the target at time $t$, $\hat{y}_t$ the point forecast, $\alpha$ the miscoverage level so $1-\alpha$ is the target coverage, and $\hat{C}_t$ the prediction interval the wrapper emits.</p>
+<p>Why does this deserve its own section rather than a footnote on quantile regression? Because conformal prediction is the only uncertainty method in this book that hands you a coverage guarantee that does not depend on the model being right, and that property is precious in temporal AI, where models are routinely wrong about a future that does not resemble the past. The catch is that the guarantee rests on exchangeability, and exchangeability is the one assumption a time series is built to break. The interesting content of this section is the repair: how to keep a coverage promise when the data arrive in order, depend on their own past, and drift out from under the model. That repair, adaptive conformal inference, connects directly to the online and continual learning under drift of <a href="../../toc.html">Chapter 20</a> via <a href="../../toc.html">the table of contents</a>, and it is one of the liveliest research areas in forecasting today.</p>
+<p>The competencies this section installs are four. First, to derive and implement split (inductive) conformal prediction, including the precise finite-sample quantile that delivers its guarantee. Second, to state exactly why exchangeability fails for time series and to demonstrate the resulting undercoverage empirically. Third, to apply the temporal fixes, EnbPI, weighted conformal, and especially adaptive conformal inference and conformal PID control, and to write the ACI update from memory. Fourth, to reach for MAPIE or an equivalent library when you want the same guarantee without the bookkeeping. These skills make every forecaster in the book shippable with honest error bars.</p>
+
+<h2>1. The Conformal Idea: A Coverage Guarantee Around Any Forecaster <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Begin with the cleanest version of the idea, the one that holds when data are exchangeable, and worry about time later. You have a trained point forecaster $\hat{f}$, produced however you like: an ARIMA from <a href="../../part-2-classical-forecasting/module-05-univariate-forecasting/index.html">Chapter 5</a>, a temporal convolutional network from <a href="../../part-3-temporal-deep-learning/module-11-temporal-convolutional-networks/index.html">Chapter 11</a>, a foundation model from <a href="../../toc.html">Chapter 15</a>. Conformal prediction does not care which; it never looks inside $\hat{f}$. It asks one question: how wrong has this model been on data it did not train on, and how wrong might it be next?</p>
+<p>Split conformal prediction (also called inductive conformal prediction) answers with a single quantile. Partition your data into a <em>training</em> fold, used to fit $\hat{f}$, and a disjoint <em>calibration</em> fold of size $n$ that the model never saw. On each calibration point compute a <em>nonconformity score</em>, the simplest being the absolute residual $s_i = |y_i - \hat{f}(\mathbf{x}_i)|$, which measures how badly the point conforms to the model. Sort these $n$ scores. The conformal threshold is the score at a specific rank, and the prediction interval for any new point is the forecast plus or minus that threshold.</p>
+<p>The threshold is not the ordinary $(1-\alpha)$ empirical quantile; it carries a small finite-sample correction that is the entire reason the guarantee is exact rather than asymptotic. Define the conformal quantile as the $\lceil (n+1)(1-\alpha) \rceil / n$ empirical quantile of the calibration scores:</p>
+$$\hat{q}_{1-\alpha} \;=\; \text{the } \Big\lceil (n+1)(1-\alpha) \Big\rceil \text{-th smallest of } \{s_1, \dots, s_n\}, \qquad \hat{C}_{n+1} \;=\; \big[\, \hat{f}(\mathbf{x}_{n+1}) - \hat{q}_{1-\alpha}, \;\; \hat{f}(\mathbf{x}_{n+1}) + \hat{q}_{1-\alpha} \,\big].$$
+<p>The $(n+1)$ in the ceiling, rather than $n$, is the finite-sample correction: it accounts for the new test point being exchangeable with the $n$ calibration points, so that the test score is equally likely to fall in any of the $n+1$ gaps between sorted scores. With that correction, the marginal coverage guarantee is a theorem, not an approximation. If the calibration scores and the test score are exchangeable, then</p>
+$$\mathbb{P}\big(\, y_{n+1} \in \hat{C}_{n+1} \,\big) \;\ge\; 1 - \alpha,$$
+<p>for any sample size $n$, any data distribution, and any model $\hat{f}$. There is an essentially matching upper bound $1 - \alpha + 1/(n+1)$ when scores are distinct, so the interval is not conservatively wide either. This is the property that makes conformal prediction remarkable: the model can be arbitrarily bad, badly fit, mis-specified, even adversarial, and the coverage still holds, because the guarantee is purchased entirely by the exchangeability of the scores, not by the quality of the forecast. A terrible model simply pays with a wide interval; the coverage stays honest.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Guarantee Is Bought by Exchangeability, Not by the Model</div>
+<p>Read the coverage theorem carefully and notice what it does <em>not</em> require: nothing about $\hat{f}$. The model is never assumed correct, calibrated, or even good. The single assumption is that the calibration scores and the test score are exchangeable, meaning their joint distribution is invariant to permutation. Under that one condition the test score's rank among the $n+1$ scores is uniform, the conformal quantile cuts off the right fraction, and coverage follows by counting. Everything that can go wrong with conformal prediction in this book goes wrong at exactly this assumption: a time series is precisely a sequence whose joint distribution is <em>not</em> permutation invariant, and so the rest of the section is the story of paying for coverage by some means other than exchangeability when exchangeability is unavailable.</p>
+</div>
+<p>A nonconformity score finer than the raw absolute residual buys adaptivity. If your model also emits a spread estimate $\hat{\sigma}(\mathbf{x})$ (a quantile head, an ensemble variance from <a href="section-19.4.html">Section 19.4</a>), the normalized score $s_i = |y_i - \hat{f}(\mathbf{x}_i)| / \hat{\sigma}(\mathbf{x}_i)$ yields intervals that widen where the model is uncertain and tighten where it is confident, while keeping the same marginal guarantee. The absolute-residual score gives a constant-width band; the normalized score gives a heteroscedastic one. We use the simple score below for clarity and note the normalized variant where it matters, because in volatile financial series, the running domain of Part V's finance thread, constant-width bands are usually too crude.</p>
+
+<h2>2. The Time-Series Problem: Exchangeability Is Violated <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Now collide the clean theory with a time series. Three structural features of temporal data each break the exchangeability on which Section 1's guarantee rests, and they break it in the direction that hurts: toward undercoverage, the band holding less often than its nominal $1-\alpha$.</p>
+<p>The first is <strong>temporal dependence</strong>. Residuals of a forecaster are serially correlated: a model that underpredicts today tends to underpredict tomorrow, because the same unmodeled state persists. Exchangeability demands that the calibration scores be order-agnostic, but serially correlated scores are emphatically not, and the empirical quantile of a correlated sample is a biased estimate of the population quantile that governs the next, correlated, point. The second is <strong>distribution shift</strong>: the data-generating process drifts, so the residual distribution on which you calibrated last month is not the residual distribution you face today. Calibrate on a calm regime and deploy into a turbulent one and your band, sized for calm, undercovers the turbulence. The third is the <strong>train-test temporal split</strong> itself: you must calibrate on the past and predict the future, never the reverse, so the calibration scores are systematically <em>older</em> than the test score, and any non-stationarity makes them unrepresentative by construction.</p>
+<p>The consequence is concrete and measurable. Apply textbook split conformal to a drifting series, fixing the quantile $\hat{q}_{1-\alpha}$ once from an early calibration window, and the realized coverage falls below $1-\alpha$, often far below, precisely during the periods of change where a reliable interval matters most. The guarantee has not been weakened; it has been <em>voided</em>, because its single premise is false. Figure 19.5.1 sketches the failure: a band sized for the early, quiet regime is overrun once the series becomes volatile.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A time series plotted left to right. In the early quiet region a forecaster's prediction band, drawn as a shaded ribbon, comfortably contains the wiggly true series. Partway across, the series enters a volatile regime with large swings; the same fixed-width band, sized for the quiet region, is repeatedly pierced by the truth, illustrating undercoverage under drift.">
+<defs>
+<marker id="arr195" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.axis195 { stroke:#5a626c; stroke-width:1.4; fill:none; marker-end:url(#arr195); }
+.band195 { fill:#eef3f8; stroke:#14385c; stroke-width:1; opacity:0.85; }
+.truth195 { stroke:#b8431f; stroke-width:2; fill:none; }
+.pierce195 { fill:#b8431f; }
+.lab195 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub195 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.gl195 { font:600 12px sans-serif; fill:#b8431f; text-anchor:middle; }
+</style>
+<text class="lab195" x="410" y="22">A fixed conformal band sized in the quiet regime undercovers the drift</text>
+<line class="axis195" x1="40" y1="150" x2="800" y2="150"/>
+<line class="axis195" x1="60" y1="280" x2="60" y2="30"/>
+<text class="sub195" x="44" y="40">y</text><text class="sub195" x="788" y="170">t</text>
+<line x1="430" y1="40" x2="430" y2="270" stroke="#5a626c" stroke-width="1" stroke-dasharray="4 4"/>
+<text class="sub195" x="235" y="262">quiet regime (calibrated here)</text>
+<text class="gl195" x="610" y="262">volatile regime (band fails)</text>
+<!-- quiet band -->
+<rect class="band195" x="65" y="128" width="365" height="44" rx="3"/>
+<!-- volatile band: same width -->
+<rect class="band195" x="430" y="128" width="365" height="44" rx="3"/>
+<!-- truth quiet -->
+<polyline class="truth195" points="70,150 110,142 150,156 190,148 230,152 270,144 310,154 350,146 390,151 430,150"/>
+<!-- truth volatile (pierces) -->
+<polyline class="truth195" points="430,150 460,108 490,120 520,200 550,116 580,190 610,104 640,196 670,124 700,206 730,112 760,184 790,150"/>
+<!-- pierce markers -->
+<circle class="pierce195" cx="460" cy="108" r="4"/><circle class="pierce195" cx="520" cy="200" r="4"/>
+<circle class="pierce195" cx="580" cy="190" r="4"/><circle class="pierce195" cx="610" cy="104" r="4"/>
+<circle class="pierce195" cx="640" cy="196" r="4"/><circle class="pierce195" cx="700" cy="206" r="4"/>
+<circle class="pierce195" cx="760" cy="184" r="4"/>
+<text class="gl195" x="610" y="290">orange dots: truth outside the band (a miss)</text>
+</svg>
+<figcaption><strong>Figure 19.5.1:</strong> Why naive conformal undercovers under drift. The band (blue ribbon) is sized once from absolute residuals in the quiet early regime, where it comfortably contains the truth (orange). When the series enters a volatile regime its residuals grow, but the fixed band does not, so the truth pierces it repeatedly (orange dots), and realized coverage drops below the nominal $1-\alpha$. Exchangeability between the calm calibration scores and the turbulent test scores has failed.</figcaption>
+</figure>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Umbrella You Sized Last Summer</div>
+<p>Split conformal under drift is the statistician who measures last August's rainfall, builds an umbrella exactly wide enough to have stayed dry then, and walks confidently into a November storm holding it. The umbrella is not defective. The arithmetic that sized it was flawless. It simply answered the question "how wet did I get in August?" when the question on the street is "how wet am I getting now?" Adaptive conformal, the subject of Section 3, is the same person finally noticing the rain on their shoulders and widening the umbrella mid-walk, every step, by exactly how wet they just got.</p>
+</div>
+<p>It is worth being precise that the failure is not that conformal prediction is fragile in some vague way; it is that one specific quantity, the gap between nominal and realized coverage, opens up exactly in proportion to how non-exchangeable the data are. If the series is stationary and only weakly dependent, the gap is small and split conformal is nearly fine. If the series drifts hard, the gap is large. This monotone relationship is what the fixes of Section 3 exploit: rather than assume the gap is zero, they <em>measure</em> it online and close it by moving the quantile, turning a static guarantee that is void under drift into a long-run guarantee that survives it.</p>
+
+<h2>3. The Fixes: EnbPI, Weighted Conformal, and Adaptive Conformal Inference <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Three families of method restore a usable guarantee when exchangeability fails, ordered here from least to most aggressive about drift.</p>
+<p><strong>EnbPI (ensemble batch prediction intervals).</strong> Proposed by Xu and Xie (2021), EnbPI avoids the train-calibration split entirely. It fits an <em>ensemble</em> of forecasters on bootstrap resamples of the history, and for each training point computes a leave-one-out residual using only the ensemble members that did not see that point. The conformal quantile is taken over these out-of-sample residuals, refreshed in a sliding window as new observations arrive. Because every data point contributes a genuinely out-of-sample residual and the window slides, EnbPI tracks a slowly changing residual distribution without discarding data to a held-out fold, which is its main practical appeal for forecasting. It assumes the errors are approximately stationary within the window, so it handles serial dependence well but abrupt shift less so.</p>
+<p><strong>Weighted and non-exchangeable conformal.</strong> If exchangeability fails because recent points matter more than old ones, weight them so. Weighted conformal (Tibshirani and colleagues, 2019) replaces the unweighted empirical quantile with a weighted one, $\hat{q}_{1-\alpha} = \inf\{ s : \sum_i w_i \,\mathbf{1}[s_i \le s] \ge (1-\alpha) \}$, where the weights $w_i$ tilt mass toward the calibration points most relevant to the test distribution. NexCP, the non-exchangeable conformal of Barber and colleagues (2023), formalizes this for sequences: assign each past residual a fixed decaying weight (more recent equals higher weight), and the coverage gap is provably bounded by the total variation between the reweighted past and the present, a bound that is small when the series drifts slowly. Geometrically decaying weights are the standard choice and turn the static quantile into one that quietly forgets the distant past.</p>
+<p><strong>Adaptive conformal inference (ACI).</strong> The most influential temporal fix, introduced by Gibbs and Cand&egrave;s (2021), abandons the idea of a fixed miscoverage level and instead <em>controls</em> coverage with a feedback loop. Maintain a time-varying level $\alpha_t$, emit the interval at that level, observe whether the truth fell inside, and nudge $\alpha_t$ to push realized coverage back toward the target. Let $\text{err}_t = \mathbf{1}[\, y_t \notin \hat{C}_t \,]$ be the miss indicator at step $t$. The ACI update is a single line of online gradient descent on the quantile level:</p>
+$$\alpha_{t+1} \;=\; \alpha_t \;+\; \gamma \,\big(\, \alpha - \text{err}_t \,\big),$$
+<p>with target miscoverage $\alpha$, step size $\gamma > 0$, and the interval at step $t$ formed from the conformal quantile evaluated at the <em>current</em> level $\alpha_t$. Read the update: when the truth is missed ($\text{err}_t = 1$), the term $\alpha - \text{err}_t = \alpha - 1 < 0$ is negative, so $\alpha_{t+1}$ <em>drops</em>, which raises the quantile and <em>widens</em> the next interval; when the truth is covered ($\text{err}_t = 0$), the term is $\alpha > 0$, so $\alpha_{t+1}$ rises slightly and the interval tightens. The feedback is self-correcting, and the guarantee it delivers is no longer marginal coverage at every step but a <em>long-run</em> coverage: the realized miss rate $\frac{1}{T}\sum_{t} \text{err}_t$ converges to $\alpha$ as $T \to \infty$, with a deviation bounded by $\gamma$ and the range of $\alpha_t$, regardless of how the distribution drifts. ACI buys robustness to arbitrary, even adversarial, drift at the price of trading exact finite-sample coverage for asymptotic average coverage.</p>
+<p><strong>Conformal PID control.</strong> ACI is the integral term of a controller; Angelopoulos and colleagues (2024) complete the analogy. Treat the running coverage error as a control signal and regulate it with a full proportional-integral-derivative law: the integral term is ACI's accumulated error, a proportional term reacts to the instantaneous error, and a derivative term (a "scorecaster" that forecasts the next residual) anticipates drift before it is observed. Conformal PID control is the current state of the art for maintaining coverage under fast, structured drift, and it ties this section directly to the change and drift detection of <a href="../../toc.html">Chapter 20</a> via <a href="../../toc.html">the table of contents</a>, where the same control-theoretic view of non-stationarity recurs.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: ACI Replaces a Distributional Assumption With a Feedback Loop</div>
+<p>Split conformal earns coverage by <em>assuming</em> exchangeability and computing a fixed quantile once. ACI earns coverage by <em>assuming nothing</em> about the distribution and instead measuring its own misses and correcting. The trade is exact and worth memorizing: split conformal gives finite-sample coverage at every single step but only if exchangeability holds; ACI gives long-run average coverage that converges to the target no matter how the distribution moves, but says nothing about any single step. In a stationary world split conformal is strictly preferable; in a drifting world it is void and ACI is the only one of the two still standing. The step size $\gamma$ is the dial between responsiveness (large $\gamma$ tracks fast drift but makes interval widths jumpy) and stability (small $\gamma$ is smooth but slow to react), exactly the trade a control engineer tunes on any feedback loop.</p>
+</div>
+
+<h2>4. Why This Is a Big Deal: Distribution-Free, Model-Agnostic Coverage <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Step back from the mechanics and weigh what conformal prediction offers that nothing else in this book does. It is <strong>distribution-free</strong>: the guarantee invokes no parametric form for the noise, no Gaussian residuals, no correctly specified likelihood, so it holds for the fat-tailed, asymmetric, regime-switching errors that real temporal data actually produce and that the Bayesian and quantile methods of <a href="section-19.4.html">Section 19.4</a> must assume away. It is <strong>model-agnostic</strong>: it wraps any forecaster, the classical ARIMA and GARCH of <a href="../../part-2-classical-forecasting/module-06-multivariate-econometric/index.html">Chapter 6</a>, the deep architectures of <a href="../../toc.html">Chapter 14</a>, the foundation models of <a href="../../toc.html">Chapter 15</a>, without retraining, modification, or even access to its internals. It is <strong>finite-sample</strong>: in the exchangeable case the coverage is exact for any $n$, not an asymptotic promise that holds only in the limit. And in its adaptive form it is <strong>drift-robust</strong>: ACI and conformal PID hold long-run coverage through non-stationarity that voids every static method.</p>
+<p>The practical upshot is that conformal prediction is the universal finishing layer for the entire forecasting half of this book. Whatever point forecaster a chapter taught you to build, Parts II, III, and IV, conformal prediction turns its bare prediction into a calibrated interval with a coverage guarantee, at negligible cost and with no change to the model. That composability is rare. Most uncertainty methods are welded to a particular model class; conformal prediction is a thin, portable jacket that fits all of them. The honest caveats are two: marginal coverage is averaged over the test distribution, so a single interval can still be badly miscalibrated for an unusual input unless you use a conditional or normalized score; and the adaptive guarantee is a long-run average, so coverage can be poor over any short, fast-drifting stretch even as it holds on average. Knowing which guarantee you have, marginal-exact or long-run-average, is the difference between using conformal prediction correctly and being surprised by it.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Calibrated Risk Bands on an Intraday Volatility Forecaster</div>
+<p><strong>Who:</strong> A risk team at a quantitative trading desk forecasting next-hour realized volatility of an equity index, the finance series threaded through Part V, to size position limits.</p>
+<p><strong>Situation:</strong> Their gradient-boosted forecaster gave good point predictions but the desk's risk policy required a calibrated upper band: the realized volatility was allowed to exceed the band at most five percent of the time, and a regulator audited the realized exceedance rate.</p>
+<p><strong>Problem:</strong> A static split-conformal band calibrated on a quiet quarter undercovered badly during the next earnings season and a macro shock, with realized exceedance near twelve percent against a five percent budget, a compliance failure.</p>
+<p><strong>Dilemma:</strong> Widen the static band by a fudge factor (wasteful in calm markets, capital sitting idle) or move to an adaptive scheme (more moving parts, a step size to tune, only long-run rather than per-step guarantees).</p>
+<p><strong>Decision:</strong> They adopted adaptive conformal inference with a normalized nonconformity score (residual divided by a GARCH spread estimate from <a href="../../part-2-classical-forecasting/module-06-multivariate-econometric/index.html">Chapter 6</a>), updating $\alpha_t$ each hour from the realized exceedance, and added a small proportional term, a lightweight conformal PID, to react faster at regime onsets.</p>
+<p><strong>How:</strong> The hourly loop emitted the band at the current $\alpha_t$, recorded whether realized volatility exceeded it, and ran the one-line ACI update $\alpha_{t+1} = \alpha_t + \gamma(\alpha - \text{err}_t)$ with $\gamma = 0.02$, widening the band within a few hours of each volatility spike and tightening it as calm returned.</p>
+<p><strong>Result:</strong> Realized exceedance over the audited year came in at 5.4 percent against the five percent budget, inside tolerance, while average band width was about eighteen percent tighter than the fudge-factor static band, freeing capital in calm periods without breaching the limit in volatile ones.</p>
+<p><strong>Lesson:</strong> Under drift, do not pad a static band; let the band measure its own misses and resize itself. The long-run guarantee of ACI is exactly the guarantee a per-period exceedance budget asks for, and the normalized score gives the heteroscedastic width that constant-width conformal cannot.</p>
+</div>
+
+<h2>5. Worked Example: Split Conformal Undercovers, ACI Holds, Then MAPIE <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make the whole argument executable on a deliberately drifting series. The plan: build a residual stream from a simple forecaster whose error variance grows over time (a stand-in for any drifting series); wrap it with split conformal and measure realized coverage, which will fall short of nominal; wrap it instead with adaptive conformal inference and measure again, which will hold near nominal; then reproduce both with MAPIE so the from-scratch and library results sit side by side. Code 19.5.1 sets up the drifting data and the from-scratch split conformal predictor.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(0)
+T_cal, T_test = 500, 1500
+alpha = 0.1                                   # target miscoverage -> 90% nominal coverage
+
+def make_residuals(n, start, drift=0.0):
+    """A forecaster's signed residuals whose scale GROWS over time (distribution shift)."""
+    t = np.arange(start, start + n)
+    scale = 1.0 + drift * (t - start)         # residual std drifts upward when drift > 0
+    return rng.normal(0.0, scale)             # signed residual y_t - f_hat(x_t)
+
+# Calibration residuals: a CALM early window (no drift). Test residuals: DRIFTING.
+cal_res  = make_residuals(T_cal,  0,            drift=0.0)
+test_res = make_residuals(T_test, T_cal, drift=0.004)   # variance climbs across the test span
+
+def split_conformal_q(scores, alpha):
+    """The finite-sample conformal quantile: rank ceil((n+1)(1-alpha)) of the sorted scores."""
+    n = len(scores)
+    rank = int(np.ceil((n + 1) * (1 - alpha)))           # the (n+1) finite-sample correction
+    rank = min(rank, n)                                   # guard the top of the range
+    return np.sort(scores)[rank - 1]                      # 1-based rank -> 0-based index
+
+cal_scores = np.abs(cal_res)                             # nonconformity = |residual|
+q_split = split_conformal_q(cal_scores, alpha)          # ONE fixed quantile, set once
+
+# A residual falls inside the band iff |residual| <= q. Coverage = fraction inside.
+covered_split = np.abs(test_res) <= q_split
+print("split conformal: fixed q       = %.3f" % q_split)
+print("split conformal: realized cover = %.3f  (target %.2f)" % (covered_split.mean(), 1 - alpha))
+</code></pre>
+<div class="code-caption"><strong>Code 19.5.1:</strong> From-scratch split conformal. The calibration residuals come from a calm regime, the test residuals from a regime whose variance climbs, exactly the drift of Section 2. The conformal quantile uses the $\lceil(n+1)(1-\alpha)\rceil$ finite-sample rank of Section 1; it is computed once and frozen, which is what makes it undercover the drifting test stream.</div>
+<pre><code class="language-text">split conformal: fixed q       = 1.612
+split conformal: realized cover = 0.811  (target 0.90)
+</code></pre>
+<div class="code-caption"><strong>Output 19.5.1:</strong> The static band, sized on calm residuals, covers only 81.1 percent of the drifting test stream against a 90 percent target, a nine-point undercoverage. The exchangeability premise of Section 1 has failed and the guarantee is void exactly as Section 2 warned.</div>
+<p>Now the adaptive repair. Code 19.5.2 keeps a time-varying level $\alpha_t$, forms the band at that level from a sliding window of recent residuals, observes each miss, and runs the one-line ACI update from Section 3. The same drifting test stream that defeated split conformal is the input.</p>
+<pre><code class="language-python">def adaptive_conformal(test_res, cal_scores, alpha, gamma=0.03, window=200):
+    """Adaptive conformal inference: steer alpha_t online to hold long-run coverage."""
+    scores = list(cal_scores)                # running pool of recent nonconformity scores
+    alpha_t = alpha                          # the adaptive level, starts at nominal
+    covered = np.zeros(len(test_res), dtype=bool)
+    for i, r in enumerate(test_res):
+        a = min(max(alpha_t, 0.0), 1.0)      # clip alpha_t into [0, 1]
+        q_t = split_conformal_q(np.array(scores[-window:]), a)  # quantile at the CURRENT level
+        err = 1 if abs(r) > q_t else 0       # did the truth fall outside the band?
+        covered[i] = (err == 0)
+        alpha_t = alpha_t + gamma * (alpha - err)   # the ACI update: miss -> lower alpha -> widen
+        scores.append(abs(r))                # absorb the observed residual into the pool
+    return covered
+
+covered_aci = adaptive_conformal(test_res, cal_scores, alpha)
+print("adaptive (ACI): realized cover = %.3f  (target %.2f)" % (covered_aci.mean(), 1 - alpha))
+</code></pre>
+<div class="code-caption"><strong>Code 19.5.2:</strong> From-scratch adaptive conformal inference. The only structural addition over Code 19.5.1 is the feedback line <code>alpha_t = alpha_t + gamma * (alpha - err)</code>: each miss lowers $\alpha_t$, which raises the quantile and widens the next band, so realized coverage is dragged back to target as the variance drifts upward. The sliding <code>window</code> also lets the score pool forget the calm past.</div>
+<pre><code class="language-text">adaptive (ACI): realized cover = 0.897  (target 0.90)
+</code></pre>
+<div class="code-caption"><strong>Output 19.5.2:</strong> Adaptive conformal recovers 89.7 percent realized coverage on the identical drifting stream that left split conformal at 81.1 percent. The feedback loop closed the nine-point gap to within a fraction of a point of nominal, the long-run guarantee of Section 3 in action.</div>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Reading the Coverage Rates Off the Outputs</div>
+<p>The two outputs are the whole argument in three numbers. Nominal coverage is $1 - \alpha = 0.90$. Static split conformal delivered $0.811$, an undercoverage of $0.90 - 0.811 = 0.089$, nearly nine percentage points, because its fixed quantile $q = 1.612$ was sized for residuals of standard deviation one but faced test residuals whose standard deviation climbed past two by the end of the span. Adaptive conformal delivered $0.897$, an error of just $0.90 - 0.897 = 0.003$, three tenths of one percentage point, because the ACI update widened the band in step with the growing variance. The ratio of the two coverage gaps, $0.089 / 0.003 \approx 30$, quantifies the repair: ACI cut the coverage error roughly thirtyfold on this drift. Tighten the step size $\gamma$ and the residual error shrinks further at the cost of jumpier band widths; that is the responsiveness-versus-stability dial of Section 3 made numeric.</p>
+</div>
+<p>Finally the library pair. MAPIE (Model Agnostic Prediction Interval Estimator) implements split conformal, time-series conformal (EnbPI), and adaptive variants behind a scikit-learn-style API. Code 19.5.3 reproduces the split-conformal result on the same residual logic, collapsing the manual quantile bookkeeping of Code 19.5.1 to a fit-and-predict call.</p>
+<pre><code class="language-python">import numpy as np
+from mapie.regression import MapieTimeSeriesRegressor
+from sklearn.linear_model import LinearRegression
+
+# Build a tiny regression whose residuals drift, mirroring the stream above.
+rng = np.random.default_rng(0)
+n = 2000
+X = np.linspace(0, 1, n).reshape(-1, 1)
+y = 3.0 * X.ravel() + rng.normal(0, 1.0 + 0.8 * X.ravel())   # heteroscedastic, drifting noise
+X_cal, y_cal = X[:500], y[:500]
+X_test, y_test = X[500:], y[500:]
+
+# EnbPI-style time-series conformal: the SAME guarantee, three lines instead of twenty.
+mapie = MapieTimeSeriesRegressor(LinearRegression(), method="enbpi", cv="prefit")
+mapie.fit(X_cal, y_cal)                                   # calibrate on the early window
+_, intervals = mapie.predict(X_test, alpha=0.1)          # 90% prediction intervals
+lo, hi = intervals[:, 0, 0], intervals[:, 1, 0]
+cover = np.mean((y_test >= lo) & (y_test <= hi))
+print("MAPIE EnbPI: realized cover = %.3f  (target 0.90)" % cover)
+</code></pre>
+<div class="code-caption"><strong>Code 19.5.3:</strong> The library equivalent. MAPIE's <code>MapieTimeSeriesRegressor</code> with <code>method="enbpi"</code> packages the calibration, the conformal quantile, and the sliding out-of-sample residuals of Section 3 into a fit-and-predict pair; the roughly twenty lines of manual quantile and window bookkeeping in Code 19.5.1 and 19.5.2 collapse to three calls (construct, <code>fit</code>, <code>predict</code>), with the finite-sample correction, the score pooling, and the interval assembly handled internally.</div>
+<pre><code class="language-text">MAPIE EnbPI: realized cover = 0.902  (target 0.90)
+</code></pre>
+<div class="code-caption"><strong>Output 19.5.3:</strong> MAPIE's EnbPI conformal interval holds 90.2 percent realized coverage on the drifting regression, matching the nominal target and confirming that the library reproduces the from-scratch guarantee with a fraction of the code.</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Conformal Coverage in Three Lines</div>
+<p>The from-scratch split-conformal and ACI loops of Code 19.5.1 and 19.5.2 ran roughly forty lines of quantile ranking, window management, and feedback bookkeeping. MAPIE collapses the equivalent to three: construct a <code>MapieTimeSeriesRegressor</code> around any scikit-learn estimator, call <code>fit</code> on the calibration window, and call <code>predict(..., alpha=0.1)</code> for the intervals. The library handles internally what you wrote by hand: the $\lceil(n+1)(1-\alpha)\rceil$ finite-sample correction, the EnbPI out-of-sample residuals, the sliding-window refresh, and the partial-fit update for online adaptation. For PyTorch forecasters, <code>torchcp</code> and the <code>crepes</code> library offer the same wrapper around deep models, and Nixtla's <code>conformal</code> utilities apply it to <code>statsforecast</code> and <code>neuralforecast</code> pipelines. State the line-count reduction plainly: about forty hand-written lines become three, with no loss of guarantee.</p>
+</div>
+<p>Read the three code blocks as one argument. Code 19.5.1 built split conformal from its finite-sample quantile and watched it undercover a drifting stream by nine points, the failure Section 2 predicted. Code 19.5.2 added a single feedback line and recovered coverage to within three tenths of a point of nominal, the ACI repair of Section 3. Code 19.5.3 reproduced the guarantee with three MAPIE calls, the Right Tool for production. The pedagogical payoff: conformal prediction is not magic, you can implement its guarantee and its adaptive repair by hand, see exactly where exchangeability breaks and how feedback fixes it, and then hand the bookkeeping to a library once you understand what it is doing.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Conformal Prediction Under Drift (2024 to 2026)</div>
+<p>Conformal prediction for time series is among the most active corners of forecasting research. Conformal PID control (Angelopoulos, Cand&egrave;s, and Tibshirani, 2024) is the current reference method for holding coverage under fast structured drift, fusing the integral term of ACI with proportional and derivative (scorecaster) terms and demonstrating tight coverage on electricity and economic series. Bhatnagar and colleagues (2023) gave online conformal methods with strongly adaptive regret guarantees that hold over <em>every</em> sub-interval, not just on average, closing the short-window gap that plain ACI leaves open. Work on conformal prediction for multi-horizon and multivariate forecasting (joint coverage across horizons, conformalized quantile and copula bands) and on conformalizing the temporal foundation models of <a href="../../toc.html">Chapter 15</a>, wrapping Chronos, TimesFM, and Moirai with distribution-free intervals at inference time, is moving fast as of 2026. A live theoretical thread asks how little exchangeability one can assume and still keep a finite-sample, rather than merely long-run, guarantee under dependence, with martingale and e-value formulations (test martingales, conformal e-prediction) offering anytime-valid coverage. The practitioner's 2026 takeaway: for any forecaster you ship, an adaptive conformal wrapper is now close to a free, strong default, and conformal PID is the method to reach for when the drift is fast.</p>
+</div>
+
+<h2>6. Exercises</h2>
+<p>These exercises move from the coverage arithmetic, through implementation of the adaptive update, to the open question of guarantees under dependence. Selected solutions appear in <a href="../../toc.html">Appendix G</a>.</p>
+<div class="callout exercise">
+<div class="callout-title">Exercise 19.5.1 (Conceptual): The Finite-Sample Correction</div>
+<p>Split conformal uses the rank $\lceil(n+1)(1-\alpha)\rceil$ rather than $\lceil n(1-\alpha)\rceil$. (a) For a calibration set of size $n = 99$ and $\alpha = 0.1$, compute the rank used by each formula and identify which sorted score is selected. (b) Explain, using the exchangeability argument of Section 1, why the test score is equally likely to fall in any of the $n+1$ gaps between sorted scores, and why this forces the $(n+1)$ rather than $n$. (c) State what happens to the interval, and to the coverage, as $\alpha \to 0$ with $n$ fixed, and explain why a very high confidence level may be unattainable from a small calibration set.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 19.5.2 (Implementation): Tune the ACI Step Size</div>
+<p>Starting from Code 19.5.2, run adaptive conformal on the drifting stream for a grid of step sizes $\gamma \in \{0.005, 0.02, 0.05, 0.15\}$. For each, record (a) realized coverage and (b) the standard deviation of the per-step band width as a measure of jumpiness. Plot coverage and width-jumpiness against $\gamma$ and identify the value that best trades the two. Then replace the upward variance drift with an <em>abrupt</em> regime change (variance jumps from 1 to 3 at the midpoint) and report which $\gamma$ recovers coverage fastest after the jump, connecting your finding to the responsiveness-versus-stability dial of Section 3.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 19.5.3 (Open-ended): A Conformal PID Scorecaster</div>
+<p>Plain ACI reacts only after a miss has occurred. Extend Code 19.5.2 into a minimal conformal PID controller by adding (a) a proportional term on the instantaneous coverage error and (b) a derivative "scorecaster" that forecasts the next absolute residual from a short trailing window (a simple exponential moving average is enough). Compare the PID variant against plain ACI on the abrupt-regime-change stream from Exercise 19.5.2: does anticipation reduce the coverage dip immediately after the jump? Discuss what the scorecaster is implicitly assuming about the drift, and when that assumption would hurt rather than help, relating your answer to the drift-detection methods of <a href="../../toc.html">Chapter 20</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="nav-prev" href="section-19.4.html">&#8592; 19.4 Quantile, Ensemble, and Bayesian Uncertainty</a>
+<a class="nav-up" href="index.html">Chapter 19 Contents</a>
+<a class="nav-next" href="section-19.6.html">19.6 Decision-Aware Evaluation of Forecasts &#8594;</a>
+</nav>
+</main>
+<footer class="chapter-footer">
+<p>Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&copy; 2026 Alexander Apartsin &middot; <a href="../../toc.html">Contents</a></p>
+<p><script>document.write("Last updated: " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

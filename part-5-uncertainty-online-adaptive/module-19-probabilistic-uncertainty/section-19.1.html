@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 19.1: Point vs Probabilistic Forecasts. Why a single number is dangerous for decisions that need the full distribution, the aleatoric versus epistemic decomposition of uncertainty, the three forms a probabilistic forecast can take (density, quantiles, samples), how a point forecast is the loss-optimal summary of a predictive distribution, and a from-scratch construction that turns one point forecaster into a probabilistic one three ways, matched against a library probabilistic forecaster." name="description"/>
+<title>Section 19.1: Point vs Probabilistic Forecasts | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Uncertainty, Online, and Adaptive Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 19: Probabilistic Forecasting and Uncertainty Quantification</a></div>
+<h1>Point vs Probabilistic Forecasts</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They asked me for tomorrow's demand and I said four hundred and twelve, crisp and confident, and everyone wrote it down as if it were a fact. Nobody asked how sure I was, which is fortunate, because the honest answer was somewhere between two hundred and six hundred, and on a bad day I would not have ruled out zero."</p>
+<cite>A Point Forecast Hiding How Little It Actually Knows</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Every forecaster in Parts II, III, and IV that we have built so far returns a single number per future step, a point forecast, and that single number is a lie of omission: it reports the model's best guess while silently discarding the one thing a decision-maker most needs, namely how wrong that guess could plausibly be.</strong> A point forecast collapses an entire predictive distribution $p(y \mid x)$ down to one of its summaries, and which summary you get is dictated, whether you realize it or not, by the loss you trained on: minimize squared error and the optimal point is the mean, minimize absolute error and it is the median. The distribution that was collapsed is where all the decision-relevant content lives. Inventory policy depends on a high quantile of demand, not its mean; financial risk depends on the left tail of returns, not their expectation; capacity planning depends on the spread, not the center. This section makes the case that decisions need distributions, decomposes forecast uncertainty into the irreducible aleatoric part and the reducible epistemic part, lays out the three concrete forms a probabilistic forecast can take (a full density, a set of quantiles or intervals, or a bag of samples), shows precisely how a point forecaster is the loss-optimal summary of a probabilistic one, and then turns a single point forecaster from earlier in the book into a probabilistic forecaster three different ways from scratch before collapsing all of it into a few lines of a modern library. You leave able to recognize when a point forecast is dangerous and to upgrade any point model you own into one that reports its own uncertainty.</p>
+</div>
+<p>Everything in the book up to this chapter has, with few exceptions, returned a point forecast: the ARIMA model of <a href="../../part-2-classical-forecasting/module-05-univariate-forecasting/index.html">Chapter 5</a> returned a conditional mean, the deep forecasting architectures of <a href="../../part-3-temporal-deep-learning/module-14-deep-forecasting-architectures/index.html">Chapter 14</a> returned a single predicted trajectory, and the representation models of Part IV produced one embedding-driven prediction per horizon. A point forecast answers the question "what is the single most likely value of $y$?" and stops there. The thesis of this chapter is that for almost every real decision this is the wrong question. The right question is "what is the distribution of $y$, given everything I know?", because it is the distribution, not its center, that a downstream decision consumes. We argued in the opening chapter that the purpose of a temporal model is to support a decision (the decision-making thesis of <a href="../../toc.html">Section 1.3</a>), and a decision under uncertainty is, by definition, an operation on a distribution. We use the unified notation of <a href="../../toc.html">Appendix A</a> throughout: $\mathbf{x}$ the conditioning information (past observations and covariates), $y$ the future target, $p(y \mid \mathbf{x})$ the predictive distribution, $\hat{y}$ a point forecast.</p>
+<p>Why open Part V here rather than with a specific technique? Because uncertainty quantification is not a single algorithm bolted onto forecasting: it is a reframing of what a forecast <em>is</em>. Once you accept that the object a forecaster should emit is a distribution, the rest of this chapter (proper scoring rules in <a href="section-19.2.html">Section 19.2</a>, quantile and distributional regression in <a href="section-19.3.html">Section 19.3</a>, deep probabilistic models in <a href="section-19.4.html">Section 19.4</a>, conformal prediction in <a href="section-19.5.html">Section 19.5</a>, and the evaluation protocols in <a href="section-19.6.html">Section 19.6</a>) becomes a structured study of how to produce, parameterize, calibrate, and score that distribution. This section installs the conceptual foundation: what a probabilistic forecast is, where its uncertainty comes from, what shapes it can take, and how it relates to the point forecasts you already know how to build.</p>
+<p>The competencies this section installs are four. To articulate, with a concrete decision, why collapsing a distribution to a point destroys decision-relevant information. To decompose predictive uncertainty into aleatoric and epistemic components and to say which data or model changes reduce which. To recognize the three interchangeable representations of a probabilistic forecast and convert between them. And to take any point forecaster you own and turn it into a calibrated probabilistic forecaster, both by hand and with one library call. These are the load-bearing skills for the rest of Part V and for the decision-making chapters of Part VI, where a policy acts on a belief, not on a guess.</p>
+
+<h2>1. Why a Single Number Is Dangerous: Decisions Need the Distribution <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Consider a warehouse deciding how many units of a product to stock for tomorrow. A point forecast says demand will be 412 units, so a naive policy stocks 412. But stocking decisions are asymmetric: the cost of stocking one unit too few (a lost sale, an unhappy customer, perhaps a contractual penalty) is rarely equal to the cost of stocking one unit too many (the holding cost of unsold inventory). The classical newsvendor solution does not stock the mean demand at all: it stocks a <em>quantile</em> of the demand distribution, specifically the quantile at level $\tau = c_u / (c_u + c_o)$, where $c_u$ is the per-unit underage cost and $c_o$ the per-unit overage cost. If lost sales cost three times as much as holding, the optimal stock is the 75th percentile of demand, which might be 520 units, not 412. The point forecast of 412 is not merely imprecise here: it is answering a question nobody asked. The decision needs a quantile, and a quantile is a property of a distribution that a point forecast has thrown away.</p>
+<p>This pattern, a decision that depends on the distribution rather than its center, is the rule and not the exception. Three canonical examples make the point across domains, and each recurs later in the book:</p>
+<ul>
+<li><strong>Inventory and supply chain.</strong> The order quantity is a cost-weighted quantile of demand (the newsvendor rule above). Two demand distributions with the same mean but different spread call for different orders; a point forecast cannot tell them apart.</li>
+<li><strong>Financial risk.</strong> Value-at-Risk and Expected Shortfall, the quantities a risk desk actually reports and that regulators require, are explicitly a left-tail quantile and a tail mean of the return distribution. The expected return is nearly irrelevant to position sizing; the tail is everything. We return to this with the finance series in <a href="section-19.4.html">Section 19.4</a>.</li>
+<li><strong>Capacity and staffing.</strong> A call center or a power grid sizes capacity to meet demand with a target service level, say "enough to cover demand 99% of the time". That is a high quantile of the load distribution. Provision to the mean and you are under capacity roughly half the time.</li>
+</ul>
+<p>In every case the decision is an operation on the distribution: a quantile, a tail expectation, a probability of exceeding a threshold. A point forecast supplies none of these. The collapse from distribution to point is lossy in exactly the dimension the decision cares about, and worse, it is silently lossy: the point forecast looks like a complete answer, so the missing uncertainty is easy to forget until a tail event arrives and the decision made on the mean turns out to have been a coin flip. Figure 19.1.1 contrasts two predictive distributions that share a mean but imply very different decisions.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two predictive distributions over demand sharing the same mean of 412. A narrow distribution is tightly peaked at 412; a wide distribution is spread out. A vertical line marks the shared mean, and a second vertical line further right marks the 75th percentile, which sits far to the right of the mean for the wide distribution and only slightly right for the narrow one.">
+<defs>
+<marker id="arr191" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.axis191 { stroke:#5a626c; stroke-width:1.6; fill:none; marker-end:url(#arr191); }
+.narrow191 { fill:#dce8f4; stroke:#14385c; stroke-width:2; }
+.wide191 { fill:#fbeee8; stroke:#b8431f; stroke-width:2; fill-opacity:0.55; }
+.mean191 { stroke:#14385c; stroke-width:1.8; stroke-dasharray:5 4; }
+.q191 { stroke:#b8431f; stroke-width:1.8; stroke-dasharray:5 4; }
+.lab191 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub191 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.gl191 { font:600 12px sans-serif; fill:#b8431f; text-anchor:middle; }
+</style>
+<text class="lab191" x="410" y="24">Same mean, different decision: order quantile depends on spread</text>
+<line class="axis191" x1="60" y1="265" x2="780" y2="265"/>
+<text class="sub191" x="770" y="285">demand</text>
+<!-- narrow distribution centered at x=400 -->
+<path class="narrow191" d="M330,265 C360,265 375,90 400,90 C425,90 440,265 470,265 Z"/>
+<!-- wide distribution centered at x=400 -->
+<path class="wide191" d="M150,265 C260,265 320,150 400,150 C480,150 540,265 650,265 Z"/>
+<!-- shared mean -->
+<line class="mean191" x1="400" y1="265" x2="400" y2="70"/>
+<text class="lab191" x="400" y="60">shared mean = 412</text>
+<!-- 75th percentile of wide -->
+<line class="q191" x1="540" y1="265" x2="540" y2="135"/>
+<text class="gl191" x="585" y="128">75th pct (wide) = 520</text>
+<text class="lab191" x="400" y="115">narrow</text>
+<text class="gl191" x="250" y="200">wide</text>
+<text class="gl191" x="410" y="305">a point forecast reports only the line; the decision needs the curve</text>
+</svg>
+<figcaption><strong>Figure 19.1.1:</strong> Two predictive distributions over tomorrow's demand with identical means. A point forecast reports 412 for both. The cost-weighted order quantity (here the 75th percentile) is 520 for the wide distribution and far closer to the mean for the narrow one. The decision is a property of the spread, which the point forecast discards entirely.</figcaption>
+</figure>
+<p>It is worth being precise about what "dangerous" means, because the danger is not that the point forecast is biased (it may be perfectly unbiased) but that it is <em>silent about its own reliability</em>. A point forecast of 412 carries no warning that it might be 200 or 600. A decision system that consumes it has no way to distinguish a confident forecast from a near-random one, and so it cannot hedge, cannot size a safety buffer, cannot trigger a human review when the model is unsure. The probabilistic forecast restores exactly this missing channel: it reports not just a value but the model's confidence in that value, and that confidence is what lets a downstream system act differently when the future is uncertain. This is the throughline of the entire chapter.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: A Decision Is an Operation on a Distribution, Not on a Point</div>
+<p>The optimal action under uncertainty is almost never a function of the forecast mean alone. Inventory takes a cost-weighted quantile, risk takes a tail, capacity takes a high percentile, and a probability-of-exceedance alarm takes a CDF evaluation. Each of these is a functional of the full predictive distribution $p(y \mid \mathbf{x})$ that no point summary can supply. So the question "should I forecast a point or a distribution?" is not a matter of sophistication or taste; it is determined by the decision. If the decision is symmetric and linear in the error (rare), the mean suffices. If the decision is asymmetric, threshold-based, or tail-sensitive (the common case), the point forecast is structurally inadequate, and the deficiency is invisible until the moment it costs you.</p>
+</div>
+
+<h2>2. Sources of Uncertainty: Aleatoric vs Epistemic <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>If we are to forecast a distribution, we should understand where its width comes from, because different sources call for different remedies. Predictive uncertainty splits into two qualitatively different parts, and conflating them is one of the most common conceptual errors in applied forecasting.</p>
+<p><strong>Aleatoric uncertainty</strong> is the irreducible randomness in the data-generating process itself: the part of the future that no amount of data or model improvement can pin down, because the world is genuinely stochastic at the resolution we observe it. The roll of a die, the thermal noise on a sensor, the idiosyncratic component of a stock return: these are aleatoric. This is exactly the predictability limit we studied in <a href="../../toc.html">Section 1.5</a>: every series has an intrinsic entropy floor below which no forecaster, however good, can drive its error. Aleatoric uncertainty is a property of the problem, not of your model, and collecting more data does not shrink it. It can, however, depend on the input: heteroscedastic noise, where the spread of $y$ grows with the level of $\mathbf{x}$, is aleatoric uncertainty that varies across the input space.</p>
+<p><strong>Epistemic uncertainty</strong> is the reducible uncertainty in the model itself: uncertainty about which parameters, or which model, is correct, arising because we have only finite data. A model trained on a thousand points is less sure of its parameters than the same model trained on a million; that extra wobble is epistemic. Crucially, epistemic uncertainty <em>shrinks as data grows</em> and is large precisely where data is sparse, namely out-of-distribution inputs, rare regimes, and the far future. It is the uncertainty that more data, a better model, or a wider prior would reduce. The total predictive uncertainty is, loosely, the sum of the two:</p>
+$$\underbrace{p(y \mid \mathbf{x}, \mathcal{D})}_{\text{predictive}} = \int \underbrace{p(y \mid \mathbf{x}, \boldsymbol{\theta})}_{\text{aleatoric: noise given a fixed model}} \; \underbrace{p(\boldsymbol{\theta} \mid \mathcal{D})}_{\text{epistemic: uncertainty over the model}} \, d\boldsymbol{\theta},$$
+<p>where $\boldsymbol{\theta}$ are the model parameters, $\mathcal{D}$ the training data, $p(y \mid \mathbf{x}, \boldsymbol{\theta})$ the noise the model assigns once its parameters are fixed (aleatoric), and $p(\boldsymbol{\theta} \mid \mathcal{D})$ the posterior over parameters (epistemic). A pure point forecaster collapses both integrals: it picks a single $\boldsymbol{\theta}$ (ignoring epistemic uncertainty) and reports the center of $p(y \mid \mathbf{x}, \boldsymbol{\theta})$ (ignoring aleatoric uncertainty). The two together define the predictive distribution this chapter learns to produce.</p>
+<p>The decomposition is not academic: it tells you what to do when a forecast is too uncertain. If the uncertainty is mostly aleatoric, you are at the predictability floor and the only honest move is to report the width and design the decision to tolerate it (more data will not help). If it is mostly epistemic, the uncertainty is a symptom of insufficient or unrepresentative data, and collecting more, especially in the sparse region, will tighten the forecast. A practitioner who cannot tell the two apart will either waste effort gathering data against irreducible noise or, worse, trust a confident-looking forecast in a region where the model has never seen data and its epistemic uncertainty is enormous.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Splitting the Two Sources With a Tiny Ensemble</div>
+<p>Suppose we train five copies of the same model on bootstrap resamples of the data (a small deep ensemble), and at a given input each member $m$ predicts a Gaussian with mean $\mu_m$ and variance $\sigma_m^2$. Say the members report means $\{3.0, 3.4, 2.6, 3.2, 2.8\}$ and each reports the same noise variance $\sigma_m^2 = 0.5$. The <em>aleatoric</em> part is the average of the within-member variances, $\overline{\sigma^2} = 0.5$. The <em>epistemic</em> part is the variance <em>across</em> the member means: the means have sample mean $3.0$ and sample variance $\tfrac{1}{5}\sum (\mu_m - 3.0)^2 = \tfrac{1}{5}(0 + 0.16 + 0.16 + 0.04 + 0.04) = 0.08$. The total predictive variance is the sum, $0.5 + 0.08 = 0.58$, so a forecast standard deviation of $\sqrt{0.58} \approx 0.76$. Here aleatoric noise dominates ($0.5$ of $0.58$), so more data would barely tighten the forecast; if instead the member means had been $\{1, 5, 2, 6, 1\}$ the across-mean variance would dwarf the noise term and the message would be the opposite, namely "the model disagrees with itself, get more data". The one ensemble has separated the irreducible floor from the curable wobble.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Two Ways to Be Wrong</div>
+<p>There is a tidy way to remember the split. Aleatoric uncertainty is the universe refusing to tell you the answer; epistemic uncertainty is you not having studied enough. The first is the dice; the second is forgetting which game you are playing. The reason the distinction has real teeth is that they fail in opposite directions: an overconfident model underestimates aleatoric noise and gets blindsided by ordinary variation, while a model that ignores epistemic uncertainty walks confidently off the edge of its training data and predicts the far future as if it had seen it. The dangerous forecaster is the one sure of itself in a regime it has never observed, which is epistemic uncertainty unaccounted for, wearing the costume of a tight interval.</p>
+</div>
+
+<h2>3. Forms of a Probabilistic Forecast: Density, Quantiles, Samples <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A probabilistic forecast can be represented in three interchangeable ways, and a practitioner moves fluidly between them because each is convenient for a different purpose. All three describe the same object, the predictive distribution $p(y \mid \mathbf{x})$, and any one can be converted into the others.</p>
+<p><strong>Full predictive density (or CDF).</strong> The most complete form: a function $p(y \mid \mathbf{x})$ giving the probability density at every possible value of $y$, or equivalently its cumulative distribution $F(y \mid \mathbf{x}) = \Pr(Y \le y \mid \mathbf{x})$. A Gaussian forecast $\mathcal{N}(\mu(\mathbf{x}), \sigma^2(\mathbf{x}))$ is the canonical parametric example, emitting a mean and a variance per step. The density form supports any downstream functional exactly (any quantile, any tail expectation, any exceedance probability) because it is the whole distribution, but it requires committing to a functional form or a flexible parameterization, the subject of <a href="section-19.4.html">Section 19.4</a>.</p>
+<p><strong>Quantiles and intervals.</strong> Rather than the whole curve, report a few of its quantiles: the value $q_\tau(\mathbf{x})$ such that $\Pr(Y \le q_\tau \mid \mathbf{x}) = \tau$, for a chosen set of levels $\tau$. A central prediction interval is a pair of quantiles, for example $[q_{0.05}, q_{0.95}]$ for a nominal 90% interval. This is the most decision-aligned form, because the newsvendor quantile, the Value-at-Risk quantile, and the service-level quantile of subsection one are read off directly. Quantile regression (<a href="section-19.3.html">Section 19.3</a>) and conformal prediction (<a href="section-19.5.html">Section 19.5</a>) both target this form without ever committing to a density.</p>
+<p><strong>Samples and scenarios.</strong> Emit a set of plausible future trajectories drawn from the predictive distribution, $\{y^{(1)}, \dots, y^{(S)}\} \sim p(y \mid \mathbf{x})$. Any functional is then estimated by a Monte Carlo average over the samples: a quantile is an order statistic of the sample, a tail expectation is the mean of the worst draws, an exceedance probability is the fraction of samples above the threshold. Samples are the natural output of generative temporal models (Part IV) and of autoregressive forecasters rolled out stochastically, and they shine for <em>multi-step</em> forecasts where the joint distribution over a whole horizon matters (correlated scenarios, not marginal-per-step intervals), which is why scenario generation dominates in energy and finance.</p>
+<p>The three forms trade completeness against convenience: the density is exact but needs a parameterization, quantiles are decision-ready but describe only the levels you asked for, samples are flexible and handle joint multi-step structure but introduce Monte Carlo error that shrinks as $1/\sqrt{S}$. Figure 19.1.2 shows the same forecast in all three representations.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Form</th><th>What it emits</th><th>Best for</th><th>Convert to a quantile by</th></tr></thead>
+<tbody>
+<tr><td>full density / CDF</td><td>$p(y \mid \mathbf{x})$ or $F(y \mid \mathbf{x})$, e.g. $(\mu, \sigma)$</td><td>any functional, exactly; parametric tails</td><td>invert the CDF: $q_\tau = F^{-1}(\tau)$</td></tr>
+<tr><td>quantiles / intervals</td><td>$\{q_\tau\}$ for chosen levels $\tau$</td><td>decisions (newsvendor, VaR, service level)</td><td>already a quantile (interpolate between levels)</td></tr>
+<tr><td>samples / scenarios</td><td>$\{y^{(1)}, \dots, y^{(S)}\}$</td><td>joint multi-step structure; arbitrary functionals</td><td>order statistic of the sample</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 19.1.2:</strong> The three interchangeable representations of one probabilistic forecast. Each describes the same $p(y \mid \mathbf{x})$ and converts to the others; the choice is driven by what the downstream decision and the model architecture make convenient, not by any difference in the underlying distribution.</figcaption>
+</figure>
+<p>One distinction must be made sharply because it is the single most common source of confusion in this whole topic: a <em>prediction interval</em> is not a <em>confidence interval</em>. A prediction interval is a statement about a future <em>observation</em>: a 90% prediction interval $[\ell, u]$ claims that the realized future value $y$ will fall in $[\ell, u]$ with probability 0.90. A confidence interval is a statement about a <em>parameter</em>: a 90% confidence interval for the mean claims that the interval, computed from data, covers the true (fixed, unknown) mean with probability 0.90 over repeated samples. The prediction interval includes the irreducible aleatoric noise of the future observation and so is always wider than the confidence interval for the mean, which only accounts for the epistemic uncertainty in estimating that mean. A forecaster reports prediction intervals: it is forecasting an observation, not estimating a parameter. Reporting a confidence interval for the conditional mean and calling it a forecast interval is a textbook error that produces intervals far too narrow, because it omits exactly the aleatoric term of subsection two.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Prediction Interval Covers an Observation, Confidence Interval Covers a Parameter</div>
+<p>A 90% prediction interval should contain 9 of the next 10 realized values; a 90% confidence interval should, over repeated experiments, contain the true parameter 90% of the time. The prediction interval is what a forecaster owes a decision-maker, and it is wider because it must cover the future observation's own noise (aleatoric) on top of the model's uncertainty about where the center is (epistemic). If you build an interval from only the standard error of the mean, you have built a confidence interval and mislabeled it: it will be badly under-covered as a forecast, and subsection five's coverage check will catch it. The width of an honest prediction interval is dominated by aleatoric noise in most well-fit models, which is precisely why "just bootstrap the parameters" is not enough.</p>
+</div>
+
+<h2>4. How Point and Probabilistic Forecasts Relate <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Point and probabilistic forecasts are not rival species: a point forecast is a <em>summary</em> of a probabilistic one, and which summary is optimal is decided entirely by the loss function you score it with. This is the bridge that connects everything you built in Parts II to IV to everything in Part V, and it is worth stating as a theorem-shaped fact. Given a predictive distribution $p(y \mid \mathbf{x})$ and a scoring loss $L(\hat{y}, y)$, the optimal point forecast is the one that minimizes the <em>expected</em> loss under that distribution:</p>
+$$\hat{y}^\star(\mathbf{x}) = \arg\min_{\hat{y}} \; \mathbb{E}_{y \sim p(y \mid \mathbf{x})}\big[\, L(\hat{y}, y) \,\big].$$
+<p>The remarkable part is that the minimizer is a different functional of the distribution for different losses, and the two losses you have used throughout the book pick out the two most familiar summaries:</p>
+<ul>
+<li>Under <strong>squared error</strong> $L(\hat{y}, y) = (\hat{y} - y)^2$, the expected loss is minimized at the <strong>mean</strong>: $\hat{y}^\star = \mathbb{E}[y \mid \mathbf{x}]$. This is why every model trained with MSE (most neural forecasters, OLS, the Kalman filter's update) is, at its optimum, predicting the conditional mean of the predictive distribution.</li>
+<li>Under <strong>absolute error</strong> $L(\hat{y}, y) = |\hat{y} - y|$, the expected loss is minimized at the <strong>median</strong>: $\hat{y}^\star = \mathrm{median}(y \mid \mathbf{x})$. This is the MAE-to-median fact we first met when choosing loss functions; it is why MAE-trained models are robust to skew and outliers, because the median ignores tail mass that the mean chases.</li>
+<li>Under the <strong>pinball (quantile) loss</strong> at level $\tau$, the minimizer is the <strong>$\tau$-quantile</strong>, which is the precise mechanism that lets a single model emit calibrated quantiles in <a href="section-19.3.html">Section 19.3</a>.</li>
+</ul>
+<p>So the loss you train on is not a neutral implementation detail: it silently selects <em>which point</em> of the predictive distribution your "point forecast" reports. Train on MSE and you get the mean; train on MAE and you get the median; if the predictive distribution is skewed (as demand, returns, and durations all are), the mean and median differ, and the "point forecast" you report depends entirely on which loss you happened to choose. This is the deepest reason a point forecast is incomplete: it is one chosen projection of a distribution, and the distribution is the thing that determined the projection in the first place. Reading the relationship in reverse gives the constructive recipe of subsection five: if a point forecast is a summary of a distribution, then to build a probabilistic forecast we put the distribution <em>back</em> around the point, either by modeling the residuals, by predicting distribution parameters directly, or by collecting empirical quantiles of past errors.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: The Same Distribution, Two Different Points</div>
+<p>Take a small skewed predictive distribution over tomorrow's demand: with probabilities $\{0.5, 0.3, 0.2\}$ the demand is $\{300, 500, 1000\}$. The <strong>mean</strong> is $0.5\cdot300 + 0.3\cdot500 + 0.2\cdot1000 = 150 + 150 + 200 = 500$. The <strong>median</strong> is the smallest value whose cumulative probability reaches $0.5$, which is $300$ (since $\Pr(Y \le 300) = 0.5$). So an MSE-trained model reports $500$ and an MAE-trained model reports $300$ for the <em>same</em> underlying distribution, a difference of two hundred units driven purely by the loss. The newsvendor with a 75% target quantile would stock the value where the cumulative probability first reaches $0.75$, namely $500$. Three different "best" numbers, all correct, each answering a different question, all read off the one distribution the point forecasts threw away.</p>
+</div>
+
+<h2>5. Worked Example: Turning One Point Forecaster Into Three Probabilistic Ones <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make the whole section executable. We take a single point forecaster (a simple linear autoregressive model of the kind built in <a href="../../part-2-classical-forecasting/module-05-univariate-forecasting/index.html">Chapter 5</a>) and upgrade it to a probabilistic forecaster three ways from scratch, exactly the three constructions subsection four's reverse reading prescribed: residual-based intervals, a Gaussian distributional head, and empirical quantiles of the errors. We then check the empirical coverage of one interval, and finally collapse the entire thing into a few lines of a modern library. Code 19.1.1 builds the data and the point forecaster and produces residuals on a held-out calibration split.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(0)
+
+# Synthetic AR(1)-with-trend series; the noise is the irreducible aleatoric part.
+T = 600
+eps = rng.normal(0, 2.0, size=T)            # aleatoric noise, sigma = 2.0
+y = np.zeros(T)
+for t in range(1, T):
+    y[t] = 0.6 * y[t-1] + 0.05 * t + eps[t]  # AR(1) + linear trend
+
+# Design matrix for a lag-1 + trend linear forecaster: x_t = [1, y_{t-1}, t].
+X = np.column_stack([np.ones(T-1), y[:-1], np.arange(1, T)])
+target = y[1:]
+
+# Three-way split: train (fit), calibration (residuals), test (evaluate).
+n = len(target)
+i_tr, i_cal = int(0.6*n), int(0.8*n)
+Xtr, ytr = X[:i_tr], target[:i_tr]
+Xcal, ycal = X[i_tr:i_cal], target[i_tr:i_cal]
+Xte, yte = X[i_cal:], target[i_cal:]
+
+# Fit the POINT forecaster by ordinary least squares (predicts the conditional mean).
+beta, *_ = np.linalg.lstsq(Xtr, ytr, rcond=None)
+point = lambda Xq: Xq @ beta               # the single-number forecast
+
+# Calibration residuals: the empirical stand-in for the predictive noise.
+resid = ycal - point(Xcal)
+print("point RMSE (test) = %.3f" % np.sqrt(np.mean((yte - point(Xte))**2)))
+print("calib resid mean = %.3f, std = %.3f" % (resid.mean(), resid.std()))
+</code></pre>
+<div class="code-caption"><strong>Code 19.1.1:</strong> A plain least-squares point forecaster and a held-out calibration split. The OLS fit predicts the conditional mean (the squared-error optimum of subsection four); the calibration residuals <code>resid</code> are the empirical evidence about the predictive noise that all three probabilistic upgrades will reuse.</div>
+<pre><code class="language-text">point RMSE (test) = 2.041
+calib resid mean = -0.027, std = 1.985
+</code></pre>
+<div class="code-caption"><strong>Output 19.1.1:</strong> The point forecaster's test RMSE is close to the true aleatoric noise level $\sigma = 2.0$, confirming the model has captured the signal and what remains is mostly irreducible noise. The calibration residuals are near-zero-mean with standard deviation about 2.0, the raw material for the intervals below.</div>
+<p>Now the three from-scratch probabilistic upgrades. Code 19.1.2 implements all three: (a) <strong>residual-based intervals</strong> add a symmetric band around the point forecast, sized from the residual standard deviation under a Gaussian assumption; (b) a <strong>Gaussian head</strong> emits an explicit $(\mu, \sigma)$ predictive density per point; (c) <strong>empirical quantiles</strong> of the residuals make no distributional assumption and read the interval straight off the residual order statistics. Each turns the one number from Code 19.1.1 into a distribution, exactly the "put the distribution back around the point" recipe of subsection four.</p>
+<pre><code class="language-python">from scipy.stats import norm
+
+mu_te = point(Xte)                          # the shared point forecast (the mean)
+
+# (a) RESIDUAL-BASED Gaussian interval: point +/- z * residual std. 90% -> z = 1.645.
+sigma_hat = resid.std()
+z = norm.ppf(0.95)                          # one-sided 95% -> central 90%
+lo_a, hi_a = mu_te - z*sigma_hat, mu_te + z*sigma_hat
+
+# (b) GAUSSIAN HEAD: emit a full predictive density N(mu, sigma^2) per test point.
+#     Here sigma is homoscedastic (constant); a learned head would predict sigma(x).
+predictive = [norm(loc=m, scale=sigma_hat) for m in mu_te]
+lo_b = np.array([d.ppf(0.05) for d in predictive])   # 5th percentile of each density
+hi_b = np.array([d.ppf(0.95) for d in predictive])   # 95th percentile
+
+# (c) EMPIRICAL QUANTILES: no Gaussian assumption; use residual order statistics.
+q_lo, q_hi = np.quantile(resid, [0.05, 0.95])         # empirical 5% and 95% residuals
+lo_c, hi_c = mu_te + q_lo, mu_te + q_hi               # shift the band onto each forecast
+
+for name, lo, hi in [("residual-Gaussian", lo_a, hi_a),
+                     ("Gaussian head    ", lo_b, hi_b),
+                     ("empirical quantile", lo_c, hi_c)]:
+    width = np.mean(hi - lo)
+    print("%s : mean 90%% width = %.3f" % (name, width))
+</code></pre>
+<div class="code-caption"><strong>Code 19.1.2:</strong> Three from-scratch probabilistic upgrades of the one point forecaster: a residual-sized Gaussian band, an explicit per-point Gaussian density, and assumption-free empirical residual quantiles. All three reuse the calibration residuals of Code 19.1.1; the residual-Gaussian and Gaussian-head bands coincide because both assume Gaussian noise, while the empirical band can be asymmetric if the residuals are skewed.</div>
+<pre><code class="language-text">residual-Gaussian  : mean 90% width = 6.530
+Gaussian head      : mean 90% width = 6.530
+empirical quantile : mean 90% width = 6.479
+</code></pre>
+<div class="code-caption"><strong>Output 19.1.2:</strong> The three 90% intervals have nearly identical width because the residuals here are close to Gaussian by construction; the empirical-quantile band differs slightly because it follows the actual residual order statistics rather than assuming symmetry. On a skewed series the empirical band would visibly diverge from the two Gaussian bands.</div>
+<p>An interval is only useful if its stated coverage is true, so we check it. Code 19.1.3 computes the empirical coverage of the empirical-quantile interval on the test set, the fraction of realized values that actually fell inside the nominal 90% band, and reports the gap from the 0.90 target. This is the calibration check that <a href="section-19.2.html">Section 19.2</a> turns into a formal scoring rule.</p>
+<pre><code class="language-python"># Empirical coverage: fraction of test targets inside the nominal-90% interval.
+inside = (yte >= lo_c) & (yte <= hi_c)
+coverage = inside.mean()
+print("nominal coverage  = 0.900")
+print("empirical coverage = %.3f  (gap %.3f)" % (coverage, abs(coverage - 0.90)))
+print("interval count = %d, covered = %d" % (len(yte), inside.sum()))
+</code></pre>
+<div class="code-caption"><strong>Code 19.1.3:</strong> The coverage diagnostic for the empirical-quantile interval. A well-calibrated 90% interval should contain close to 90% of the realized test values; the gap between empirical and nominal coverage is the first and most basic test of a probabilistic forecast's honesty.</div>
+<pre><code class="language-text">nominal coverage  = 0.900
+empirical coverage = 0.892  (gap 0.008)
+interval count = 120, covered = 107
+</code></pre>
+<div class="code-caption"><strong>Output 19.1.3:</strong> The empirical 90% interval covered 107 of 120 test points, an empirical coverage of 0.892, within one percentage point of the 0.900 target. The interval is well calibrated because the calibration residuals were a faithful sample of the test-time noise, the assumption that conformal prediction in Section 19.5 makes rigorous.</div>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Reading the Coverage Number</div>
+<p>The output reports 107 of 120 test points inside the nominal 90% interval, so empirical coverage is $107/120 = 0.892$. The target was $0.90$, meaning we expected about $0.90 \times 120 = 108$ points inside; we got $107$, an undershoot of one point, a gap of $0.008$. Is that gap real or noise? The standard error of a coverage estimate from $120$ independent points at $p = 0.9$ is $\sqrt{p(1-p)/n} = \sqrt{0.09/120} \approx 0.027$, so $0.892$ is well within one standard error of $0.90$ and the interval is statistically indistinguishable from perfectly calibrated. The lesson: judge coverage against its sampling error, not against an exact match. A 90% interval that covers exactly 90.000% on a finite test set is suspicious, not reassuring.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: From a Point Demand Forecaster to a Stocking Policy</div>
+<p><strong>Who:</strong> A demand-planning team at a mid-size online retailer running a gradient-boosted point forecaster for daily SKU-level demand, the kind of tabular forecaster from <a href="../../part-3-temporal-deep-learning/module-14-deep-forecasting-architectures/index.html">Chapter 14</a>.</p>
+<p><strong>Situation:</strong> The model predicted a single expected demand per SKU per day, and the planners had been stocking exactly that number, then manually padding "high-risk" SKUs by gut feel.</p>
+<p><strong>Problem:</strong> Stockouts on a few fast-moving SKUs were costing far more than the holding cost of overstock, so the symmetric "stock the mean" policy was systematically wrong: the underage cost was roughly four times the overage cost, calling for the 80th percentile of demand, not the mean.</p>
+<p><strong>Dilemma:</strong> Rebuild the whole forecasting stack as a native probabilistic model (months of work), or wrap the existing trusted point model with an uncertainty layer (days). The native model would give sharper, input-dependent intervals; the wrapper would be quick but assume the residual spread was roughly stable.</p>
+<p><strong>Decision:</strong> They wrapped the existing point forecaster with the empirical-quantile construction of Code 19.1.2, computing per-SKU residual quantiles on a rolling calibration window, then set each order to the cost-weighted 80th-percentile quantile from subsection one rather than the mean.</p>
+<p><strong>How:</strong> A nightly job scored the point model, collected the trailing residuals per SKU, formed the empirical $0.80$ residual quantile, added it to the point forecast, and emitted that as the order quantity, exactly the three-line shift-the-band logic of the empirical-quantile branch.</p>
+<p><strong>Result:</strong> Stockouts on the targeted SKUs dropped sharply at a modest increase in average inventory, and the planners stopped padding by hand because the quantile encoded the asymmetry explicitly. The point model never changed; only the layer that turned its number into a distribution and then into a decision.</p>
+<p><strong>Lesson:</strong> You often do not need to retrain to get probabilistic forecasts. Wrapping a trusted point model with calibration residuals and reading the decision-relevant quantile is a fast, auditable upgrade, and it makes the cost asymmetry an explicit knob instead of a gut feeling.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: A Probabilistic Forecaster in a Handful of Lines</div>
+<p>The three from-scratch constructions of Code 19.1.2 plus the manual split and residual bookkeeping of Code 19.1.1 ran about 35 lines. A modern forecasting library produces a fully probabilistic forecaster, with quantiles and a sampling interface, in roughly five lines: the model fits the conditional quantiles directly (pinball loss internally), handles the lag features, and exposes the interval and the predictive samples through one API. The library internalizes the loss-to-quantile correspondence of subsection four, the calibration split, and the quantile bookkeeping.</p>
+<pre><code class="language-python">from statsforecast import StatsForecast
+from statsforecast.models import AutoARIMA
+import pandas as pd
+
+# Long-format frame the API expects: unique_id, ds (time), y (value).
+df = pd.DataFrame({"unique_id": "series_1",
+                   "ds": pd.date_range("2020-01-01", periods=len(y)),
+                   "y": y})
+
+sf = StatsForecast(models=[AutoARIMA()], freq="D")
+sf.fit(df)
+# level=[90] returns the 90% PREDICTION interval columns alongside the point forecast.
+fc = sf.predict(h=14, level=[90])           # point + lo-90 + hi-90, in one call
+print(fc[["AutoARIMA", "AutoARIMA-lo-90", "AutoARIMA-hi-90"]].head())
+</code></pre>
+<div class="code-caption"><strong>Code 19.1.4:</strong> The library equivalent. A single <code>level=[90]</code> argument turns a point forecaster into a probabilistic one: <code>statsforecast</code> fits the model and returns the point forecast together with the 90% prediction-interval bounds in the same call, collapsing the roughly 35 lines of manual residual handling and interval construction in Code 19.1.1 to 19.1.3 down to about five lines. The library handles the lag features, the noise estimation, and the interval bookkeeping internally.</div>
+<p>Step back and read what the four code blocks establish together. Code 19.1.1 built one ordinary point forecaster. Code 19.1.2 turned it into a probabilistic forecaster three independent ways, each a concrete instance of "put the distribution back around the point" from subsection four. Code 19.1.3 verified that one of those intervals actually covers what it claims. Code 19.1.4 showed that a library does the whole pipeline in a few lines. The throughline is the chapter's thesis made operational: a point forecast is a collapsed distribution, and with a held-out residual split you can un-collapse it, recovering the uncertainty the decision needs, whether you build it by hand or call one library argument.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Probabilistic Forecasting in 2024 to 2026</div>
+<p>Probabilistic forecasting is where the most active forecasting research now concentrates. The temporal foundation models of <a href="../../part-3-temporal-deep-learning/module-15-temporal-foundation-models/index.html">Chapter 15</a> are increasingly probabilistic by default: Chronos (Ansari et al., 2024) tokenizes a series and produces a predictive distribution by sampling its language-model head, so a single pretrained model emits calibrated quantiles zero-shot; Moirai (Woo et al., 2024) and Lag-Llama (Rasul et al., 2023) likewise output full predictive distributions rather than points, and TimesFM has added probabilistic heads. On the calibration side, conformal prediction (the subject of <a href="section-19.5.html">Section 19.5</a>) has become the default distribution-free wrapper for turning any point or interval forecaster into one with finite-sample coverage guarantees, with conformal PID control (Angelopoulos et al., 2024) extending it to the online, drifting setting of <a href="../../toc.html">Chapter 20</a>. A parallel thread questions the very metrics: the field is converging on proper scoring rules (CRPS, log-score, the subject of <a href="section-19.2.html">Section 19.2</a>) over coverage-only checks, because a forecaster can be perfectly calibrated and still useless if its intervals are needlessly wide. The 2026 practitioner's stance: a forecast that does not report its own uncertainty is increasingly considered incomplete, and the tooling to add that uncertainty has become nearly free.</p>
+</div>
+
+<h2>6. Exercises</h2>
+<p>Work these before continuing to <a href="section-19.2.html">Section 19.2</a>; they convert the reading into the reflexes the rest of Part V assumes.</p>
+<div class="callout exercise">
+<div class="callout-title">Exercise 19.1.1 (Conceptual): Which Summary Does the Decision Need?</div>
+<p>For each decision, state whether the optimal action depends on the mean, the median, a specific quantile, or a tail expectation of the predictive distribution, and justify in one sentence: (a) stocking a perishable good where unsold units spoil and lost sales cost twice as much as spoilage; (b) setting a bank's regulatory capital to survive the worst 1% of trading days; (c) choosing the single forecast number to minimize long-run mean squared error in a public leaderboard; (d) deciding whether to trigger a human review when the forecast is "too uncertain". Then explain why a single point forecast is adequate for exactly one of these four and inadequate for the other three.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 19.1.2 (Implementation): A Skewed Series Breaks the Gaussian Band</div>
+<p>Modify Code 19.1.1 so the noise is drawn from a right-skewed distribution (for example <code>rng.lognormal</code> centered to mean zero) instead of Gaussian. Rerun all three probabilistic constructions of Code 19.1.2 and the coverage check of Code 19.1.3. Report (i) how the empirical-quantile interval's width and asymmetry now differ from the two Gaussian bands, and (ii) which of the three intervals retains coverage closest to 0.90 on the test set. Explain in two sentences why the empirical-quantile construction wins on skewed residuals, connecting your answer to the aleatoric-uncertainty discussion of subsection two.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 19.1.3 (Open-ended): Separating the Two Uncertainties</div>
+<p>The constructions in subsection five capture only aleatoric uncertainty (they assume the fitted parameters are correct). Design and implement an extension that also captures epistemic uncertainty: fit an ensemble of point forecasters on bootstrap resamples of the training data, then combine the across-member spread (epistemic) with the within-member residual spread (aleatoric) using the decomposition formula of subsection two. Investigate how the epistemic term behaves as you (a) shrink the training set and (b) forecast further into the future beyond the training range. Discuss which of your test points have predictive intervals dominated by epistemic versus aleatoric uncertainty, and what a decision-maker should do differently in each case.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="nav-prev" href="index.html">&#8592; Contents</a>
+<a class="nav-up" href="index.html">Chapter 19 Index</a>
+<a class="nav-next" href="section-19.2.html">Proper Scoring Rules and Calibration &#8594;</a>
+</nav>
+</main>
+<footer class="book-footer">
+<p class="edition-line">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="copyright-line">&copy; 2026 Alexander Apartsin &middot; <a href="../../toc.html">Contents</a></p>
+<p class="last-updated"><script>document.write("Last updated: " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

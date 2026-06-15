@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 20.3: Online and Incremental Models. Models that update one observation at a time under drift: sliding-window and forgetting-factor estimators, exponential forgetting in RLS and EWMA, adaptive learning rates, streaming ensembles that add and drop members on drift, blind versus informed adaptation, recurring-drift model pools, online deep learning with replay, and a from-scratch forgetting-factor forecaster plus drift-resetting ensemble matched against river." name="description"/>
+<title>Section 20.3: Online and Incremental Models | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Uncertainty, Online, and Adaptive Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 20: Online and Continual Learning</a></div>
+<h1>Online and Incremental Models</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I was built to forget. Every observation I admit, I discount the last; every regime that ends, I let fade. The trouble started when the world stopped changing for a while, and I kept forgetting anyway, dropping perfectly good evidence out of sheer habit. Now I sit here, half my memory gone, refusing to forget how to forget, because the one thing I was never taught is when to stop."</p>
+<cite>An Incremental Model Refusing to Forget How to Forget</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A batch model is trained once on a fixed dataset and frozen; an online model is never finished. It consumes the stream one observation at a time, updates its parameters in place, and must somehow stay accurate while the data-generating process underneath it drifts. The single design question that organizes this entire section is the question of memory: how much of the past should a streaming model trust, and how fast should it let the past fade?</strong> Every technique here is an answer to that one question. Sliding windows answer it with a hard cutoff (remember the last $w$ points exactly, forget everything older). Forgetting factors answer it with a soft exponential decay (weight each past point by $\lambda^{\text{age}}$, so influence fades smoothly). Adaptive learning rates answer it by changing how big a step each new point is allowed to take. Streaming ensembles answer it at the level of whole models, adding fresh learners and retiring stale ones as <a href="section-20.2.html">Section 20.2</a>'s drift detectors fire. This section builds the forgetting-factor recursive least squares and EWMA estimators that recur throughout classical forecasting, derives the effective memory length a forgetting factor buys you, constructs a streaming ensemble that resets a member on a drift alarm, contrasts blind adaptation (always forget a little) with informed adaptation (retrain on detection), and handles recurring regimes with a pool of frozen models. You implement a forgetting-factor forecaster and a drift-resetting ensemble from scratch, then reproduce both in a few lines of <code>river</code>, and watch each one recover after an injected drift. You leave able to choose, tune, and reason about the memory of a model that must learn forever.</p>
+</div>
+<p>In <a href="section-20.2.html">Section 20.2</a> we built detectors that watch a stream and raise an alarm when the data-generating process has changed: ADWIN, the Page-Hinkley test, DDM and its kin. A detector that fires is only half a system. The other half, the half this section supplies, is the model that does something useful with the alarm, and more fundamentally the model that keeps learning between alarms so that it tracks slow drift the detector never trips on. We are moving from <em>noticing</em> drift to <em>surviving</em> it. The classical estimators we lean on were first met in <a href="../../part-2-classical-forecasting/module-05-univariate-forecasting/index.html">Chapter 5</a>, where exponential smoothing and recursive updates appeared as forecasting tools; here they return wearing a different hat, as the simplest possible online learners, and we read them through the lens of memory and adaptation rather than point prediction. We use the unified notation of <a href="../../toc.html">Appendix A</a>: $\mathbf{x}_t$ the features at time $t$, $y_t$ the target, $\boldsymbol{\theta}_t$ the parameter vector after seeing $t$ observations, $\hat{y}_t$ the prediction, $\lambda$ the forgetting factor.</p>
+<p>Why does online learning deserve its own treatment rather than "just retrain the batch model on new data now and then"? Because periodic retraining is a coarse, expensive, and laggy approximation of what a true online learner does continuously and cheaply. Retraining nightly means the model is up to a day stale; retraining is wasteful when the world barely moved; and retraining throws away the elegant fact that many models admit an exact constant-time, constant-memory update per observation. The four competencies this section installs are these: to build incremental estimators whose memory you control with a window or a forgetting factor, and to compute the effective memory length that factor implies; to assemble a streaming ensemble that adds, weights, and drops members in response to drift; to choose deliberately between blind and informed adaptation and to handle recurring regimes with a model pool; and to understand the stability-plasticity tension that online deep learning inherits, the tension that <a href="section-20.4.html">Section 20.4</a> on continual and lifelong learning is devoted to resolving. These are the load-bearing skills of any temporal system that must run in production while the world refuses to hold still.</p>
+
+<h2>1. Incremental Updates Under Drift: Windows, Forgetting Factors, Adaptive Rates <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>An incremental model maintains a current parameter $\boldsymbol{\theta}_t$ and, on receiving a new pair $(\mathbf{x}_t, y_t)$, produces $\boldsymbol{\theta}_{t+1}$ from $\boldsymbol{\theta}_t$ and the new pair alone, without revisiting the past. The whole craft of online learning under drift is the craft of deciding how much the past should count, and there are three classical instruments for tuning that, each a different shape of memory.</p>
+<p>The first is the <strong>sliding window</strong>. Keep an explicit buffer of the most recent $w$ observations, fit the model on exactly those, and let the oldest point fall out as each new one arrives. The window is a hard, rectangular memory: a point that is $w$ steps old counts fully, and a point that is $w+1$ steps old counts not at all. The window length $w$ is a direct knob on the stability-plasticity trade. A short window adapts fast to drift but is noisy and overreacts to outliers; a long window is smooth and statistically efficient but lags behind real change. The window's virtue is its honesty (you can point to exactly which data the model is using) and its vice is its abruptness (a single old point dominates until the instant it is evicted, then vanishes entirely).</p>
+<p>The second, and the workhorse of this section, is the <strong>forgetting factor</strong>. Rather than a hard cutoff, weight each past observation by a geometric decay: at the current time, an observation of age $a$ contributes with weight $\lambda^{a}$ for some $\lambda \in (0, 1)$ close to one. The objective minimized at time $t$ is the exponentially weighted sum of squared errors,</p>
+$$\mathcal{J}_t(\boldsymbol{\theta}) = \sum_{i=1}^{t} \lambda^{\,t-i}\,\big(y_i - \boldsymbol{\theta}^{\top}\mathbf{x}_i\big)^2,$$
+<p>so the most recent point ($i = t$) gets weight one, the previous gets $\lambda$, the one before $\lambda^2$, and so on into a smoothly fading tail. This is a soft, exponential memory: nothing is ever fully forgotten, but old evidence decays geometrically. The forgetting factor is the continuous cousin of the window, and (as subsection five derives) a given $\lambda$ corresponds to an <em>effective</em> window of about $1/(1-\lambda)$ points. The exponentially weighted moving average (EWMA) we met in <a href="../../part-2-classical-forecasting/module-05-univariate-forecasting/index.html">Chapter 5.5</a> as exponential smoothing is the degenerate one-parameter case of this objective, $\hat{y}_{t+1} = \alpha y_t + (1-\alpha)\hat{y}_t$ with $\alpha = 1 - \lambda$, and recursive least squares (RLS) with forgetting is its full multivariate generalization.</p>
+<div class="callout looking-back">
+<div class="callout-title">Looking Back: Exponential Smoothing Returns as an Online Learner</div>
+<p>The EWMA recursion $\hat{y}_{t+1} = \alpha y_t + (1-\alpha)\hat{y}_t$ first appeared in <a href="../../part-2-classical-forecasting/module-05-univariate-forecasting/index.html">Chapter 5.5</a> as exponential smoothing, a forecasting method. Read it again now and it is something more general: an online learner with a forgetting factor $\lambda = 1 - \alpha$, updating its single parameter (the level) in constant time per observation, discounting the past geometrically. The same recursion, two readings: a forecaster in Part II, an adaptive estimator under drift in Part V. This is the temporal thread in miniature: a classical tool returns, unchanged in arithmetic, recast in the language of online adaptation. RLS with forgetting (subsection five) is the matrix-valued version of the same idea, tracking a full weight vector instead of a scalar level.</p>
+</div>
+<p>The third instrument is the <strong>adaptive learning rate</strong>. For models updated by stochastic gradient descent, $\boldsymbol{\theta}_{t+1} = \boldsymbol{\theta}_t - \eta_t\,\nabla_{\boldsymbol{\theta}}\ell_t$, the step size $\eta_t$ plays the role of forgetting: a large $\eta_t$ lets a new point move the parameters far (high plasticity, fast forgetting of the old fit), a small $\eta_t$ moves them little (high stability). In a stationary stream the textbook prescription is a decaying schedule $\eta_t \propto 1/t$ so the estimate converges; under drift that prescription is exactly wrong, because a vanishing learning rate freezes the model just when it most needs to keep moving. Online learning under drift therefore keeps the learning rate bounded away from zero, or adapts it upward when error rises, so the model never loses the plasticity to track change. This is the same vanishing-step pathology, in a different guise, that <a href="../../toc.html">Chapter 9</a> raised for recurrent training, and the same instinct (never let the update fully die) recurs in the continual-learning methods of <a href="section-20.4.html">Section 20.4</a>.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Window, Forgetting Factor, and Learning Rate Are One Knob in Three Costumes</div>
+<p>A sliding window of length $w$, a forgetting factor $\lambda$, and an SGD learning rate $\eta$ are three implementations of a single underlying decision: how fast should the influence of an observation fade? They are interconvertible at the level of effective memory. A window of $w$ points behaves like a forgetting factor $\lambda \approx 1 - 1/w$, which behaves like a constant learning rate of roughly $1/w$ for a stationary linear model. Picking any one of the three is picking the same point on the stability-plasticity curve: short window, small $\lambda$, large $\eta$ all mean fast-forgetting and high plasticity; their opposites all mean slow-forgetting and high stability. There is no universally correct setting, only a setting matched to how fast your world drifts, which is why <a href="../../part-5-uncertainty-online-adaptive/module-21-adaptive-systems/index.html">Chapter 21</a> makes the memory itself adaptive.</p>
+</div>
+
+<h2>2. Ensemble Methods for Streams: Weighting, Adding, and Dropping Members <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A single incremental model with one memory setting is a blunt instrument: its forgetting factor is a compromise that is too fast for stable periods and too slow for abrupt change. Streaming ensembles relax that compromise by maintaining several learners at once and letting a meta-policy decide, observation by observation, which to trust, which to refresh, and which to discard. Three ensemble families dominate online practice.</p>
+<p>The first is <strong>Dynamic Weighted Majority</strong> (DWM, Kolter and Maloof, 2007). Maintain a set of experts, each casting a weighted vote; on every observation, multiply the weight of any expert that predicted wrongly by a penalty $\beta \in (0,1)$; periodically remove experts whose weight has fallen below a threshold and add a fresh expert when the ensemble as a whole errs. DWM adapts without any explicit drift detector: the weighting silently demotes models that have gone stale and the add-on-error rule injects fresh capacity exactly when accuracy slips. It is blind adaptation (subsection three) realized as a weighting scheme.</p>
+<p>The second is the <strong>Adaptive Random Forest</strong> (ARF, Gomes et al., 2017), the streaming counterpart of the batch random forest and one of the strongest off-the-shelf online learners. Each tree is grown incrementally on a different bootstrap of the stream; critically, each tree carries its own <a href="section-20.2.html">Section 20.2</a> drift detector (typically ADWIN) running on its own error stream. When a tree's detector signals a warning, the forest starts growing a background replacement tree on new data; when the detector confirms drift, the background tree takes over and the stale tree is dropped. ARF is the cleanest illustration of the informed-adaptation pattern (subsection three): detect, prepare a replacement in the background, swap on confirmation.</p>
+<p>The third family is <strong>online bagging and boosting</strong> (Oza and Russell, 2001). Batch bagging resamples the dataset; you cannot resample a stream you have not fully seen, so online bagging instead presents each arriving point to each base learner $k \sim \text{Poisson}(1)$ times, the Poisson being the streaming limit of the binomial resample. Online boosting reweights similarly, increasing a point's Poisson rate for learners that got it wrong. These give the variance reduction of bagging and the bias reduction of boosting in a pure one-pass setting.</p>
+<p>Across all three families, the operations that matter under drift are the same triad, summarized in Figure 20.3.1: <strong>weight</strong> members by recent accuracy so stale models fade from the vote; <strong>add</strong> fresh members (or background replacements) when accuracy drops or a detector warns; and <strong>drop</strong> members that have decayed or been superseded. The add-and-drop is where the ensemble couples to the drift detectors of <a href="section-20.2.html">Section 20.2</a>: a confirmed alarm is the cue to retire a stale member and seat a fresh one, which is exactly the reset mechanism the worked ensemble of subsection five implements.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Method</th><th>Member type</th><th>Weighting</th><th>Add / drop trigger</th><th>Drift handling</th></tr></thead>
+<tbody>
+<tr><td>Dynamic Weighted Majority</td><td>any online classifier</td><td>multiplicative penalty $\beta$ on error</td><td>add on ensemble error; drop on low weight</td><td>blind (weighting only)</td></tr>
+<tr><td>Adaptive Random Forest</td><td>incremental Hoeffding trees</td><td>accuracy-weighted vote</td><td>per-tree ADWIN warning grows a background tree; confirm swaps it in</td><td>informed (per-member detector)</td></tr>
+<tr><td>Online bagging / boosting</td><td>any online learner</td><td>uniform (bagging) / error-driven (boosting)</td><td>fixed pool; reweight via Poisson rate</td><td>blind (resampling), or pair with a detector</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 20.3.1:</strong> Three streaming-ensemble families and how each realizes the weight-add-drop triad. The decisive design axis is whether members are refreshed blindly (DWM, online bagging weight continuously) or on an explicit drift signal (ARF grows and swaps a background member when its per-tree detector fires), the blind-versus-informed distinction of subsection three.</figcaption>
+</figure>
+
+<h2>3. Drift-Aware Strategies: Blind Versus Informed, and Recurring Regimes <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Step up from individual mechanisms to the overall adaptation strategy, and online systems split into two philosophies. <strong>Blind adaptation</strong> never explicitly detects drift: it simply forgets a little on every observation, via a forgetting factor, a bounded learning rate, or continuous reweighting, so that the model is always gently tracking. <strong>Informed adaptation</strong> runs a drift detector (<a href="section-20.2.html">Section 20.2</a>) and reacts only on an alarm, by resetting, retraining, or swapping in a fresh model. Each buys something and pays for it.</p>
+<p>Blind adaptation is robust to slow, gradual drift that no detector would ever trip on, and it has no detection-lag, the model is already adapting before any alarm could fire. Its weakness is that it pays a constant price in stationarity: even when the world is perfectly stable, a blind learner keeps discounting good data, so its estimates are noisier than a model that knew to stop forgetting. Informed adaptation is the mirror image. It is statistically efficient in stable periods (it stops forgetting and lets data accumulate) and it reacts decisively to abrupt change (a clean reset throws out the now-irrelevant past in one move). Its weaknesses are detection lag (it does nothing until the alarm fires, so it is briefly wrong after a sudden shift) and a vulnerability to slow drift that creeps in below the detector's sensitivity. The practical synthesis, and the design most production systems converge on, is to do both: a blind forgetting factor to track gradual drift continuously, plus an informed detector to trigger a hard reset on the abrupt shifts the slow forgetting cannot keep up with. The worked ensemble of subsection five is exactly this synthesis: forgetting members that also reset on an alarm.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Blind Forgets Always, Informed Forgets on Cue, Mature Systems Do Both</div>
+<p>Blind adaptation is a low, constant rate of forgetting applied unconditionally; it tracks slow drift for free but wastes data in stable periods. Informed adaptation is a large, discrete act of forgetting (a reset) triggered by a detector; it is efficient in stable periods and decisive on abrupt change but is briefly wrong during detection lag and blind to sub-threshold drift. The two failure modes are complementary, so the mature design layers them: a gentle forgetting factor handles the gradual, an explicit detector handles the abrupt. The detector is not a replacement for forgetting and forgetting is not a replacement for the detector; each covers the other's blind spot, which is why the streaming systems of <a href="../../toc.html">Chapter 34</a> ship both.</p>
+</div>
+<p>One drift pattern defeats both simple strategies on its own: <strong>recurring drift</strong>, where regimes that appeared before come back. Demand reverts to a holiday pattern every December; a market re-enters a volatility regime it has visited before; a sensor returns to a previously-seen operating mode. A model that resets on every drift discards a regime it will need again next month, then has to relearn it from scratch, paying the detection-lag and relearning cost over and over. The remedy is a <strong>model pool</strong>: instead of discarding a model when drift is detected, freeze it and store it in a pool keyed by a signature of the regime it was trained on. When drift is next detected, before training a fresh model, check whether any pooled model already matches the new regime (by recent error on the incoming window) and, if so, reactivate it instead of relearning. The pool converts recurring drift from a repeated full relearning cost into a near-instant model switch, and it is the streaming analogue of the recurring-state idea that the regime-switching models of <a href="../../part-2-classical-forecasting/module-06-multivariate-econometric/index.html">Chapter 6</a> handled in batch. Recurring-regime pools are also a stepping stone to the lifelong learners of <a href="section-20.4.html">Section 20.4</a>, which must retain many past skills rather than two or three regimes.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Hoarder and the Minimalist</div>
+<p>Two online learners walk into a drifting stream. The minimalist resets on every alarm: spotless, decisive, and doomed to relearn December every single December, greeting each returning holiday season as a baffling novelty. The hoarder keeps every model it has ever trained in an ever-growing pool, certain that some regime from three years ago will surely return, until its pool of stale specialists no longer fits in memory and it spends more time searching its hoard than predicting. The well-adjusted system, as usual, lives in between: it keeps a small pool of genuinely recurring regimes, evicts the ones that never come back, and is neither surprised by December nor buried under its own past.</p>
+</div>
+
+<h2>4. Online Deep Learning: Replay, Plasticity, and the Stability Tension <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The estimators of subsection one update in closed form; a deep network has no such luxury, and online deep learning is where the memory question turns genuinely hard. The naive recipe, keep applying SGD to each new minibatch as it streams in, is <strong>continual finetuning</strong>, and on a drifting stream it fails in a characteristic way. A neural network trained only on recent data suffers <strong>catastrophic forgetting</strong>: the gradient steps that fit the new regime overwrite the weights that encoded the old one, so a model that adapts to December's pattern silently destroys its ability to handle June's. The very plasticity that lets the network track drift is what erases its earlier competence, and a pure forgetting factor at the weight level (which is what an unconstrained learning rate amounts to) makes the problem worse, not better.</p>
+<p>The standard mitigation is a <strong>replay buffer</strong>. Maintain a bounded memory of past examples (a reservoir sample of the stream, or a class-balanced or regime-balanced selection), and at each update step mix a batch of fresh observations with a batch sampled from the buffer. The replayed examples re-inject gradient signal from older regimes, so the update that fits the new data is restrained from destroying the old; the network interleaves new and old as if it were training on a stationary mixture. Replay is the simplest and most reliable defense against catastrophic forgetting, and the size and sampling policy of the buffer are the knob that trades adaptation speed against retention.</p>
+<p>Underneath every choice here sits the <strong>stability-plasticity dilemma</strong>: a learner must be plastic enough to acquire new patterns yet stable enough to retain old ones, and these pull in opposite directions. Too plastic and it forgets catastrophically; too stable and it cannot adapt to drift at all. A second, subtler failure has drawn recent attention, <strong>loss of plasticity</strong>: networks trained continually for long enough gradually lose the <em>ability</em> to learn new things at all, as units saturate and effective capacity shrinks, so the network becomes not just forgetful but unteachable. Online deep learning is the art of navigating between these two cliffs, and it is hard enough that <a href="section-20.4.html">Section 20.4</a> on continual and lifelong learning is devoted entirely to the regularization, replay, and architectural strategies that manage it. Here we simply name the tension and note that the classical forgetting-factor estimators of subsection one sidestep it precisely because their convexity guarantees a unique fit that no amount of forgetting can corrupt into uselessness, a luxury the non-convex network does not enjoy.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Online and Continual Learning Under Drift (2024 to 2026)</div>
+<p>Three lines are especially active. First, <em>loss of plasticity</em> moved from folklore to a measured phenomenon: Dohare et al. (Nature, 2024) showed that standard deep networks lose the ability to learn in continual settings and proposed continual backpropagation, which selectively reinitializes dormant units to keep the network teachable, a direct answer to the second cliff of subsection four. Second, <em>test-time adaptation</em> for forecasting matured: methods that adapt a frozen foundation model's outputs online (for example the conformal-PID and online-calibration ideas of <a href="../module-19-probabilistic-uncertainty/index.html">Chapter 19</a>, and lightweight per-series finetuning of TimesFM and Moirai) let large pretrained temporal models track drift without full retraining. Third, the streaming-ML ecosystem consolidated around <code>river</code> and its companion <code>deep-river</code>, bringing incremental neural models, ARF, and ADWIN-coupled ensembles under one online API, while online conformal methods (Gibbs and Cand&egrave;s, 2021 onward) gave drift-robust prediction intervals that recalibrate every step. The practitioner's 2026 takeaway: for tabular streams, incremental trees and ARF in <code>river</code> remain the strong default; for deep models, replay plus a plasticity-preserving step is the emerging recipe; and adapting a frozen foundation model online is the fastest-moving frontier.</p>
+</div>
+
+<h2>5. Worked Example: A Forgetting-Factor Forecaster and a Drift-Resetting Ensemble <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make the section executable on the sensor-and-IoT stream that threads through Part V. The plan has three movements. First, build a forgetting-factor recursive least squares forecaster from scratch and watch it recover after an injected drift, the blind-adaptation half of subsection three. Second, build a tiny streaming ensemble whose members carry a forgetting factor and reset one member on a drift alarm, the blind-plus-informed synthesis. Third, reproduce both with a few lines of <code>river</code>, the production online-learning library, and state the line-count reduction. We start by generating a stream with an abrupt drift at the midpoint, then implement RLS with forgetting. Code 20.3.1 is the from-scratch incremental estimator.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(0)
+T, d = 600, 3                               # stream length, feature dimension
+drift_at = 300                              # an abrupt coefficient change at t=300
+
+# A linear stream y = theta . x + noise, with theta jumping at the drift point.
+X = rng.normal(0, 1.0, size=(T, d))
+theta_a = np.array([2.0, -1.0,  0.5])       # regime A coefficients
+theta_b = np.array([-1.0, 2.0, -0.5])       # regime B coefficients (post-drift)
+theta_true = np.where(np.arange(T)[:, None] &lt; drift_at, theta_a, theta_b)
+y = np.einsum("td,td-&gt;t", X, theta_true) + rng.normal(0, 0.3, size=T)
+
+class ForgettingRLS:
+    """Recursive least squares with exponential forgetting factor lam in (0,1]."""
+    def __init__(self, d, lam=0.98, delta=100.0):
+        self.lam = lam
+        self.theta = np.zeros(d)            # current weight estimate theta_t
+        self.P = delta * np.eye(d)          # inverse correlation matrix (large = unsure)
+
+    def predict(self, x):
+        return self.theta @ x               # y_hat = theta . x
+
+    def update(self, x, y):
+        Px = self.P @ x
+        denom = self.lam + x @ Px           # scalar gain denominator
+        k = Px / denom                      # Kalman-like gain vector
+        err = y - self.theta @ x            # prediction error (innovation)
+        self.theta = self.theta + k * err   # move theta toward the new point
+        self.P = (self.P - np.outer(k, Px)) / self.lam  # forgetting inflates P
+
+# Run two forgetting factors over the stream and record absolute error.
+errs = {}
+for lam in (0.999, 0.95):                   # long memory vs short memory
+    m = ForgettingRLS(d, lam=lam)
+    e = np.empty(T)
+    for t in range(T):
+        e[t] = abs(m.predict(X[t]) - y[t])  # test-then-train (prequential)
+        m.update(X[t], y[t])
+    errs[lam] = e
+
+print("lam=0.999  mean |err| pre-drift  = %.3f" % errs[0.999][:drift_at].mean())
+print("lam=0.999  mean |err| 50 steps after drift = %.3f" % errs[0.999][drift_at:drift_at+50].mean())
+print("lam=0.95   mean |err| 50 steps after drift = %.3f" % errs[0.95][drift_at:drift_at+50].mean())
+</code></pre>
+<div class="code-caption"><strong>Code 20.3.1:</strong> Forgetting-factor recursive least squares from scratch. The forgetting factor <code>lam</code> divides the covariance update, so old evidence decays geometrically and the estimator keeps tracking; <code>lam=0.95</code> forgets faster than <code>lam=0.999</code> and so recovers more quickly after the coefficient jump at <code>t=300</code>. The loop is prequential (test-then-train): we score each point before learning from it.</div>
+<pre><code class="language-text">lam=0.999  mean |err| pre-drift  = 0.279
+lam=0.999  mean |err| 50 steps after drift = 2.913
+lam=0.95   mean |err| 50 steps after drift = 1.146
+</code></pre>
+<div class="code-caption"><strong>Output 20.3.1:</strong> The long-memory estimator (lam=0.999) is accurate before the drift but recovers slowly after it, while the short-memory estimator (lam=0.95) absorbs the new regime in a fraction of the steps. This is the stability-plasticity trade of subsection one made numerical: faster forgetting buys faster recovery at the cost of noisier stationary estimates.</div>
+<p>The single forgetting factor is a fixed compromise. Code 20.3.2 builds the blind-plus-informed synthesis of subsection three: a small ensemble of forgetting-RLS members, weighted by recent accuracy, with a lightweight drift alarm (a jump in the running error) that <em>resets</em> the worst member so the ensemble injects fresh plasticity exactly when the stream shifts. This is the add-and-drop triad of subsection two realized in a few lines.</p>
+<pre><code class="language-python">class DriftResettingEnsemble:
+    """Forgetting-RLS members, accuracy-weighted, resetting a member on a drift alarm."""
+    def __init__(self, d, lams=(0.999, 0.99, 0.95), window=30, alarm_mult=2.5):
+        self.members = [ForgettingRLS(d, lam=l) for l in lams]
+        self.w = np.ones(len(self.members))      # ensemble vote weights
+        self.window = window
+        self.alarm_mult = alarm_mult
+        self.recent = []                         # rolling ensemble errors for the alarm
+        self.baseline = None                     # learned "normal" error level
+
+    def predict(self, x):
+        preds = np.array([m.predict(x) for m in self.members])
+        return (self.w @ preds) / self.w.sum()   # weighted-average prediction
+
+    def update(self, x, y):
+        for j, m in enumerate(self.members):
+            e = abs(m.predict(x) - y)
+            self.w[j] *= np.exp(-e)              # demote members that erred (DWM-style)
+            m.update(x, y)
+        self.w /= self.w.sum()                   # renormalize the vote weights
+        ens_err = abs(self.predict(x) - y)
+        self.recent.append(ens_err)
+        if len(self.recent) &gt; self.window:
+            self.recent.pop(0)
+            cur = np.mean(self.recent)
+            if self.baseline is None:
+                self.baseline = cur
+            elif cur &gt; self.alarm_mult * self.baseline:   # DRIFT ALARM fired
+                worst = int(np.argmin(self.w))            # reset the least-trusted member
+                self.members[worst] = ForgettingRLS(x.shape[0], lam=0.95)
+                self.w[worst] = self.w.mean()             # give the fresh member a fair vote
+                self.baseline = cur                       # accept the new error regime
+            else:
+                self.baseline = 0.99 * self.baseline + 0.01 * cur  # slow baseline drift
+
+ens = DriftResettingEnsemble(d)
+ens_err = np.empty(T)
+for t in range(T):
+    ens_err[t] = abs(ens.predict(X[t]) - y[t])
+    ens.update(X[t], y[t])
+
+print("ensemble mean |err| 50 steps after drift = %.3f" % ens_err[drift_at:drift_at+50].mean())
+print("ensemble mean |err| pre-drift             = %.3f" % ens_err[:drift_at].mean())
+</code></pre>
+<div class="code-caption"><strong>Code 20.3.2:</strong> A drift-resetting streaming ensemble from scratch. Members are weighted multiplicatively by recent accuracy (the Dynamic Weighted Majority idea of subsection two); a rising rolling error trips a drift alarm that resets the least-trusted member to a fresh fast-forgetting learner, combining blind forgetting with informed reset, the synthesis of subsection three.</div>
+<pre><code class="language-text">ensemble mean |err| 50 steps after drift = 0.831
+ensemble mean |err| pre-drift             = 0.291
+</code></pre>
+<div class="code-caption"><strong>Output 20.3.2:</strong> The ensemble recovers faster after drift (0.831) than either single forgetting factor in Output 20.3.1, while staying nearly as accurate as the long-memory member before drift. Weighting toward whichever member currently fits, plus resetting a stale member on the alarm, gives the ensemble the best of both memories.</div>
+<p>Finally the library pair. Code 20.3.3 solves the same prequential streaming-regression task with <code>river</code>, the standard online-learning library, whose objects expose exactly the <code>learn_one</code> / <code>predict_one</code> incremental interface and ship ADWIN-coupled adaptive ensembles internally. The from-scratch RLS and ensemble above ran roughly 60 lines of state management; the <code>river</code> version is about 8.</p>
+<pre><code class="language-python">from river import linear_model, optim, ensemble, tree, metrics
+
+# An online linear regressor whose learning rate IS the forgetting knob.
+model = linear_model.LinearRegression(optimizer=optim.SGD(lr=0.05))
+
+# Or a drift-adaptive ensemble: bagging over Hoeffding trees with ADWIN per member.
+# model = ensemble.ADWINBaggingRegressor(model=tree.HoeffdingTreeRegressor(), n_models=3)
+
+mae = metrics.MAE()
+for t in range(T):
+    xi = {f"f{j}": X[t, j] for j in range(d)}   # river uses dict feature vectors
+    y_pred = model.predict_one(xi)              # test ...
+    mae.update(y[t], y_pred)
+    model.learn_one(xi, y[t])                   # ... then train (prequential)
+
+print("river streaming MAE over full drifting stream =", round(mae.get(), 3))
+</code></pre>
+<div class="code-caption"><strong>Code 20.3.3:</strong> The same prequential streaming regression in <code>river</code>. The roughly 60 lines of hand-rolled forgetting-RLS and drift-resetting ensemble state (Code 20.3.1 and 20.3.2) collapse to about 8: <code>river</code> manages the incremental update, the metric accumulation, and (in the commented <code>ADWINBaggingRegressor</code>) the per-member ADWIN drift detection and member replacement of subsection two internally.</div>
+<pre><code class="language-text">river streaming MAE over full drifting stream = 0.642
+</code></pre>
+<div class="code-caption"><strong>Output 20.3.3:</strong> The library learner tracks the full drifting stream with a single prequential MAE, matching the spirit of the hand-built estimators while hiding all of their state management. Swapping the commented adaptive ensemble in lifts robustness to abrupt drift further, with no change to the training loop.</div>
+<p>Read the three blocks together. Code 20.3.1 showed a single forgetting factor trading stationary accuracy against recovery speed; Code 20.3.2 escaped that single compromise with a weighted ensemble that resets a member on a drift alarm; Code 20.3.3 reproduced the whole streaming pattern in a few lines of <code>river</code>. The pedagogical payoff is that online learning under drift is not a black box: the memory is a knob you can write down ($\lambda$, a window, a learning rate), the ensemble logic is a short weight-add-drop loop, and a production library packages exactly these mechanics behind a two-method incremental API.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: The Effective Memory Length of a Forgetting Factor</div>
+<p>A forgetting factor $\lambda$ weights an observation of age $a$ by $\lambda^{a}$. How many recent points is the estimator effectively averaging over? The total weight is the geometric series $\sum_{a=0}^{\infty} \lambda^{a} = 1/(1-\lambda)$, so the <em>effective sample size</em>, the number of equally-weighted points that would carry the same total weight, is exactly</p>
+$$N_{\text{eff}} = \frac{1}{1-\lambda}.$$
+<p>Plug in the section's values. The long-memory estimator $\lambda = 0.999$ has $N_{\text{eff}} = 1/0.001 = 1000$ points: it averages over roughly the last thousand observations, which is why it is smooth before the drift and sluggish after it. The short-memory estimator $\lambda = 0.95$ has $N_{\text{eff}} = 1/0.05 = 20$ points: it effectively forgets everything older than about twenty steps, recovering from the drift in tens of observations exactly as Output 20.3.1 shows. A useful companion number is the <em>half-life</em>, the age at which an observation's weight has fallen to one half: $a_{1/2} = \ln(0.5)/\ln(\lambda)$, which for $\lambda = 0.95$ is $\ln 0.5 / \ln 0.95 \approx 13.5$ steps and for $\lambda = 0.999$ is about $693$ steps. The single rule to carry away: a forgetting factor $\lambda$ remembers about $1/(1-\lambda)$ points, so choose $\lambda$ by deciding how many recent observations should count, then set $\lambda = 1 - 1/N_{\text{eff}}$.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: An Online Anomaly Threshold on a Drifting Sensor Fleet</div>
+<p><strong>Who:</strong> A reliability team at a wind-turbine operator maintaining an online vibration-anomaly monitor across a fleet of turbines, the sensor-and-IoT series threaded through <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8</a> and <a href="../../toc.html">Chapter 34</a>.</p>
+<p><strong>Situation:</strong> Each turbine streams a vibration feature whose normal level drifts slowly with season, blade wear, and lubricant aging, and jumps abruptly after a maintenance visit re-seats a component.</p>
+<p><strong>Problem:</strong> A fixed anomaly threshold fitted once went stale within weeks: seasonal drift pushed the normal level past the old threshold and the monitor cried wolf on every cold morning, while a genuinely anomalous turbine drifted under a threshold that had crept up with it.</p>
+<p><strong>Dilemma:</strong> A short forgetting factor tracked the seasonal drift but also quietly absorbed slow real degradation into "normal", masking the very faults the monitor existed to catch. A long forgetting factor kept the fault visible but lagged the seasonal baseline and false-alarmed. A pure reset on the post-maintenance jump discarded the seasonal baseline it had spent months learning.</p>
+<p><strong>Decision:</strong> They ran the blind-plus-informed synthesis of subsection three: a forgetting factor with $N_{\text{eff}} \approx 500$ (about $\lambda = 0.998$) to track seasonal drift gently, plus a Page-Hinkley detector from <a href="section-20.2.html">Section 20.2</a> to catch the abrupt post-maintenance jumps and reset the baseline cleanly, and a small per-turbine model pool so a turbine returning to a known operating mode reused its stored baseline instead of relearning.</p>
+<p><strong>How:</strong> The monitor updated an EWMA mean and variance per turbine each minute (the constant-time forgetting update of subsection one), recomputed the threshold from them, reset the EWMA on a confirmed Page-Hinkley alarm, and on each reset checked the model pool of subsection three for a matching stored regime before starting fresh.</p>
+<p><strong>Result:</strong> Cold-morning false alarms fell sharply because the threshold now tracked the seasonal baseline, post-maintenance jumps no longer triggered a week of false positives because the detector reset the baseline in one step, and turbines cycling between known modes reused pooled baselines instead of relearning each time.</p>
+<p><strong>Lesson:</strong> Drift is rarely all-gradual or all-abrupt, so a single memory setting cannot win. Pair a gentle forgetting factor for the gradual with an explicit detector for the abrupt, and keep a small pool for the regimes that recur. The forgetting factor sets the baseline's everyday memory; the detector handles the days it must forget hard.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: The Streaming Stack in a Handful of Lines</div>
+<p>The from-scratch forgetting-RLS and drift-resetting ensemble of Code 20.3.1 and 20.3.2 ran about 60 lines of explicit state management (the covariance update, the vote weights, the rolling-error alarm, the member reset). The <code>river</code> library collapses the entire streaming pattern to roughly 8 lines, and its adaptive ensembles fold in the <a href="section-20.2.html">Section 20.2</a> drift detectors automatically.</p>
+<pre><code class="language-python">from river import ensemble, tree, drift, metrics
+
+# An adaptive ensemble: each Hoeffding tree carries its own ADWIN detector and is
+# replaced on confirmed drift, exactly the add-and-drop triad of subsection 2.
+model = ensemble.ADWINBaggingRegressor(
+    model=tree.HoeffdingTreeRegressor(),
+    n_models=5,
+    drift_detector=drift.ADWIN(),
+)
+mae = metrics.MAE()
+for t in range(T):
+    xi = {f"f{j}": X[t, j] for j in range(d)}
+    mae.update(y[t], model.predict_one(xi))   # prequential test-then-train
+    model.learn_one(xi, y[t])
+</code></pre>
+<p>What <code>river</code> handles internally that the from-scratch code did by hand: the per-member incremental fit, the accuracy-based vote weighting, the per-member ADWIN drift detection, the background-tree growth and swap on confirmed drift, and the prequential metric accumulation. The line-count reduction is roughly 60 to 8, and the result is more robust because the detection is per-member rather than a single ensemble-level alarm.</p>
+</div>
+
+<h2>Exercises</h2>
+<div class="callout exercise">
+<div class="callout-title">Exercise 20.1 (Conceptual): Three Costumes, One Knob</div>
+<p>Argue, using the effective-memory-length result $N_{\text{eff}} = 1/(1-\lambda)$ from the numeric-example callout, why a sliding window of length $w$, a forgetting factor $\lambda$, and a constant SGD learning rate $\eta$ are three encodings of the same stability-plasticity choice. Give the approximate conversions among $w$, $\lambda$, and $\eta$ for a stationary scalar mean estimator, and explain precisely what differs between the window's rectangular memory and the forgetting factor's exponential memory when a single large outlier enters and later ages out.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 20.2 (Implementation): A Recurring-Regime Model Pool</div>
+<p>Extend the <code>DriftResettingEnsemble</code> of Code 20.3.2 with the model pool of subsection three. On a confirmed drift alarm, instead of always resetting the worst member to a fresh learner, first freeze the outgoing member into a pool keyed by its recent feature statistics, then before training fresh, score every pooled model on the most recent window and reactivate the best-matching one if its error beats a fresh start. Construct a stream that alternates between regime A and regime B three times, and show empirically that the pooled ensemble recovers faster on the second and third returns to each regime than the reset-only ensemble, because it reuses a stored model rather than relearning.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 20.3 (Open-ended): Online Deep Forecaster With Replay</div>
+<p>Take a small recurrent or temporal-convolutional forecaster from <a href="../../part-3-temporal-deep-learning/module-10-recurrent-neural-networks/index.html">Chapter 10</a> or <a href="../../part-3-temporal-deep-learning/module-11-temporal-convolutional-networks/index.html">Chapter 11</a> and train it online on a stream with two recurring regimes, using continual finetuning with no replay. Demonstrate catastrophic forgetting: after the model adapts to regime B, measure its error back on regime A and show it has degraded. Now add a reservoir-sampling replay buffer that mixes a fraction $\rho$ of buffered past examples into each update batch, and study how retention on regime A and adaptation speed to regime B both depend on $\rho$ and on the buffer size. Relate your findings to the stability-plasticity dilemma of subsection four and preview which of the continual-learning strategies of <a href="section-20.4.html">Section 20.4</a> you would reach for to push the trade-off further.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="nav-prev" href="section-20.2.html">&#8592; Previous: 20.2 Drift Detection</a>
+<a class="nav-up" href="index.html">&#8593; Chapter 20 Contents</a>
+<a class="nav-next" href="section-20.4.html">Next: 20.4 Continual and Lifelong Learning &#8594;</a>
+</nav>
+</main>
+<footer class="book-footer">
+<p class="footer-edition">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="footer-copy">&#169; 2026 Alexander Apartsin &middot; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated"><script>document.write("Last updated: " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

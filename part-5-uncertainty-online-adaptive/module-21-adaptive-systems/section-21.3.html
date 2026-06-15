@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 21.3: Active Learning for Temporal Data. When labels are expensive, a model can pick the few most informative points to label: uncertainty sampling, query-by-committee, expected model change, and diversity; the temporal twist where i.i.d. assumptions break under autocorrelation and drift; streaming active learning with a per-window budget paired with drift detection; an uncertainty-sampling loop from scratch that beats random labeling at equal budget, then the modAL equivalent." name="description"/>
+<title>Section 21.3: Active Learning for Temporal Data | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Uncertainty, Online, and Adaptive Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 21: Adaptive Temporal AI Systems</a></div>
+<h1>Active Learning for Temporal Data</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I do not need you to label everything. I need you to label these eleven points, the ones I am least sure about, the ones sitting right where the regime just changed. Label those and I will quietly become correct everywhere else. I am asking nicely. The alternative is you annotating ninety thousand timestamps that teach me nothing I did not already know."</p>
+<cite>A Model Politely Asking for Exactly the Labels It Needs</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Labels are the scarcest resource in temporal machine learning, and active learning is the discipline of spending that budget where it buys the most. Instead of labeling a sequence uniformly or at random, the model itself ranks unlabeled points by how much labeling each one would improve it, an annotator labels only the top few, the model retrains, and the loop repeats.</strong> The central object is an <em>acquisition score</em> $a(\mathbf{x})$ that turns "how informative is this point?" into a number you can sort by, and the strategies of this section, uncertainty sampling, query-by-committee, expected model change, and diversity, are four different answers to what that number should be. The twist that makes the temporal case its own subject is that classical active learning assumes the pool of candidates is i.i.d., and a time series is the opposite: it is autocorrelated, so adjacent informative points are redundant, and it drifts, so the value of a label decays as the world moves on. We will see why the right unit to query is often a <em>segment</em> rather than a point, why recent and near-drift regions deserve priority, and how the streaming setting forces a fixed labeling budget per window. The section builds an uncertainty-sampling loop from scratch on a drifting temporal classification stream, shows it beating random labeling at the same budget, then collapses the loop to a few lines with the modAL library, and finally pairs the budget with the drift detector of Section 21.2 so labels are spent exactly where drift is suspected.</p>
+</div>
+<p>In <a href="section-21.2.html">Section 21.2</a> we built detectors that raise a flag when a temporal stream's distribution shifts, and in <a href="../module-20-online-continual-learning/index.html">Chapter 20</a> we trained models that update online as new data arrives. Both assumed the new data came <em>with labels</em>. This section confronts the fact that, in the field, it usually does not. A drift detector can tell you the world changed; it cannot tell you the new mapping from inputs to outputs unless something supplies fresh labels, and fresh labels mean a human radiologist, a fraud analyst, a domain expert, or a costly physical experiment. Active learning is how an adaptive system asks for the smallest possible number of those labels while still tracking the change. We use the unified notation of <a href="../../toc.html">Appendix A</a>: $\mathbf{x}_t$ the input at time $t$, $y_t$ its label, $p(y \mid \mathbf{x})$ the model's predictive distribution, $\mathcal{L}$ the labeled set, $\mathcal{U}$ the unlabeled pool, and $B$ the labeling budget.</p>
+<p>The four competencies this section installs are these: to write an acquisition score and explain what notion of "informative" it encodes; to name the four canonical query families and when each is the right tool; to articulate precisely how autocorrelation and drift break the i.i.d. assumptions classical active learning rests on, and what to do instead (query segments, weight toward recent and near-drift regions, run a per-window budget); and to implement an uncertainty-sampling loop, verify it beats random labeling at equal budget, then reproduce it in a library. These skills carry directly into the human-in-the-loop adaptation of <a href="section-21.4.html">Section 21.4</a>.</p>
+
+<h2>1. The Labels-Are-Expensive Problem <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Unlabeled temporal data is nearly free and labeled temporal data is nearly priceless, and the gap between those two facts is the entire reason active learning exists. A sensor logs a reading every second whether or not anyone ever tells it what that reading meant; a hospital monitor streams vitals continuously; a market emits a tick on every trade. Collecting the inputs $\mathbf{x}_t$ costs almost nothing. Attaching the labels $y_t$, the diagnosis, the fraud verdict, the fault category, the ground-truth future value confirmed only after the fact, requires scarce expert attention, sometimes an invasive test, sometimes a wait of days. When labels cost orders of magnitude more than inputs, the question stops being "how do we model the data?" and becomes "which handful of points do we even bother to label?"</p>
+<p>There are two broad escapes from the label bottleneck, and they are complementary rather than competing. The first is <a href="../../part-4-temporal-representation-learning/module-16-learning-temporal-representations/index.html">self-supervised representation learning</a> from Chapter 16, which sidesteps labels entirely by inventing a pretext task (predict the masked span, contrast nearby windows) so the model learns useful structure from the inputs alone, and only a thin labeled layer is fitted on top. The second, the subject of this section, is active learning, which accepts that <em>some</em> true labels are unavoidable and asks only that they be chosen well. The two stack beautifully: a self-supervised encoder gives you a representation in which "informative" points are easier to identify, and active learning then spends the tiny label budget on exactly those points. Where Chapter 16 reduces how many labels you need, active learning reduces which labels you need.</p>
+<p>The core idea is almost embarrassingly simple to state. A model trained on the current labeled set $\mathcal{L}$ is asked, for every candidate point in the unlabeled pool $\mathcal{U}$, "if I knew this point's label, how much would I improve?" Each point gets an acquisition score $a(\mathbf{x})$ answering that question, the annotator is sent the $B$ highest-scoring points, those points are labeled and moved into $\mathcal{L}$, the model retrains, and the scores are recomputed for the next round. This loop, query, label, retrain, repeat, is the skeleton every active-learning method shares. The methods differ only in how $a(\mathbf{x})$ is defined, and the temporal setting differs only in that the pool $\mathcal{U}$ is a sequence rather than a bag of independent points. Figure 21.3.1 draws the loop.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The active-learning loop. A model trained on the labeled set scores every point in the unlabeled pool by an acquisition function; the top-B points go to an annotator for labeling; the newly labeled points are added to the labeled set; the model retrains; the loop repeats.">
+<defs>
+<marker id="arr213" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.box213 { fill:#eef3f8; stroke:#14385c; stroke-width:2; }
+.ann213 { fill:#fbeee8; stroke:#b8431f; stroke-width:1.8; }
+.fl213 { stroke:#5a626c; stroke-width:1.8; fill:none; marker-end:url(#arr213); }
+.lab213 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub213 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+</style>
+<text class="lab213" x="410" y="22">The active-learning loop: query the few most informative points</text>
+<rect class="box213" x="40" y="95" width="140" height="56" rx="9"/><text class="lab213" x="110" y="120">model trained</text><text class="sub213" x="110" y="138">on labeled set L</text>
+<rect class="box213" x="250" y="95" width="140" height="56" rx="9"/><text class="lab213" x="320" y="120">score pool U</text><text class="sub213" x="320" y="138">by a(x), pick top B</text>
+<rect class="ann213" x="460" y="95" width="140" height="56" rx="9"/><text class="lab213" x="530" y="120">annotator</text><text class="sub213" x="530" y="138">labels B points</text>
+<rect class="box213" x="670" y="95" width="120" height="56" rx="9"/><text class="lab213" x="730" y="120">add to L,</text><text class="sub213" x="730" y="138">retrain</text>
+<line class="fl213" x1="180" y1="123" x2="248" y2="123"/>
+<line class="fl213" x1="390" y1="123" x2="458" y2="123"/>
+<line class="fl213" x1="600" y1="123" x2="668" y2="123"/>
+<path class="fl213" d="M730,151 L730,200 L110,200 L110,153"/>
+<text class="sub213" x="420" y="216">retrain and repeat until the label budget is exhausted</text>
+</svg>
+<figcaption><strong>Figure 21.3.1:</strong> The active-learning loop. A model trained on the current labeled set $\mathcal{L}$ scores every point in the unlabeled pool $\mathcal{U}$ by an acquisition function $a(\mathbf{x})$, the top $B$ points are sent to a human annotator, the freshly labeled points join $\mathcal{L}$, the model retrains, and the cycle repeats until the budget runs out. Only the definition of $a(\mathbf{x})$ changes between methods.</figcaption>
+</figure>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Not All Labels Are Worth the Same</div>
+<p>The premise that justifies the whole enterprise is that the value of a label is wildly unequal across points. A label for a point the model already classifies with 99% confidence teaches it almost nothing; a label for a point sitting on the decision boundary, where the model is genuinely torn, can move the boundary and fix a whole neighborhood of future predictions. Random labeling spends the budget uniformly and therefore wastes most of it on points of the first kind. Active learning concentrates the budget on points of the second kind. The entire gain, often reaching a target accuracy with a small fraction of the labels random sampling would need, comes from this single observation: informativeness is heavy-tailed, so choosing matters.</p>
+</div>
+
+<h2>2. Query Strategies: Four Ways to Score a Point <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Every query strategy is a recipe for the acquisition score $a(\mathbf{x})$, and the four canonical families correspond to four different theories of what makes a point worth labeling. We take them in turn, each with the quantity it optimizes.</p>
+<p><strong>Uncertainty sampling</strong> queries the points the current model is least confident about, on the theory that a confident point would teach little. The model produces a predictive distribution $p(y \mid \mathbf{x})$ over $C$ classes, and uncertainty is read off it three common ways. The simplest is <em>least confident</em>, one minus the top probability. Sharper is the <em>margin</em>, the gap between the top two probabilities, small when the model is torn between two classes. The most principled is the predictive <em>entropy</em>, which accounts for the whole distribution:</p>
+$$a_{\text{ent}}(\mathbf{x}) = -\sum_{c=1}^{C} p(y = c \mid \mathbf{x}) \,\log p(y = c \mid \mathbf{x}).$$
+<p>Entropy is maximal when the distribution is flat (the model has no idea) and zero when it is a spike (the model is certain), so querying the highest-entropy points sends the annotator exactly where the model's belief is most diffuse. This is where the calibrated uncertainty of <a href="../module-19-probabilistic-uncertainty/index.html">Chapter 19</a> earns its keep: an uncertainty score is only as trustworthy as the probabilities feeding it, and a badly miscalibrated overconfident model will report low entropy everywhere and query nothing useful. Active learning on top of an uncalibrated model is a sampler chasing noise; on top of a conformal or temperature-scaled model it is chasing genuine ambiguity.</p>
+<p><strong>Query-by-committee</strong> trains an ensemble of $M$ models on the same labeled data and queries the points on which they <em>disagree</em> most, the theory being that disagreement marks regions the data has not yet pinned down. With committee members $p_m(y \mid \mathbf{x})$ and their average $\bar{p}(y \mid \mathbf{x}) = \frac{1}{M}\sum_m p_m(y \mid \mathbf{x})$, the disagreement is the average Kullback-Leibler divergence of each member from the consensus, or equivalently the entropy of the consensus minus the average member entropy:</p>
+$$a_{\text{qbc}}(\mathbf{x}) = H\!\big(\bar{p}(y\mid\mathbf{x})\big) - \frac{1}{M}\sum_{m=1}^{M} H\!\big(p_m(y\mid\mathbf{x})\big).$$
+<p>This is the <em>mutual information</em> between the label and the model parameters, the "epistemic" slice of uncertainty: it is high where the members would resolve differently and low where they agree, even if each is individually uncertain. <strong>Expected model change</strong> takes a different tack: it queries the point whose label, in expectation over the model's belief about that label, would induce the largest update to the parameters, typically measured by the norm of the gradient $\|\nabla_{\boldsymbol{\theta}} \ell(\mathbf{x}, y)\|$ averaged over $y \sim p(y\mid\mathbf{x})$. A point that would barely nudge the weights is not worth a label; a point that would yank them hard is. <strong>Diversity and representativeness</strong> is the corrective that the first three sorely need: pure uncertainty (or disagreement, or model-change) tends to pick a cluster of near-identical hard points, paying for the same information many times. Diversity-aware acquisition penalizes redundancy, for example by combining an informativeness term with a density or coverage term, $a(\mathbf{x}) = a_{\text{unc}}(\mathbf{x}) \cdot \mathrm{density}(\mathbf{x})$, or by selecting a batch that is informative <em>and</em> spread out (core-set selection). As we are about to see, this redundancy problem is not a minor refinement in the temporal setting; it is the whole game.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Aleatoric Versus Epistemic, and Why It Decides Your Strategy</div>
+<p>Uncertainty sampling on a single model's entropy cannot distinguish two very different reasons a point looks uncertain. It might be <em>aleatoric</em>, genuinely ambiguous, two classes truly overlap there, and no amount of labeling will sharpen it; labeling such points repeatedly burns budget on irreducible noise. Or it might be <em>epistemic</em>, uncertain only because the model has not seen data there, exactly the points worth labeling. Single-model entropy mixes the two. Query-by-committee and Bayesian acquisition (BALD, the mutual-information score above) isolate the epistemic part: disagreement among members is high precisely where more data would help and low where the noise is irreducible. When your temporal data is noisy (financial returns, biosignals), preferring an epistemic score over raw entropy is what keeps the loop from wasting its budget chasing inherent randomness.</p>
+</div>
+
+<h2>3. The Temporal Twist: Autocorrelation, Drift, and Segments <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Classical active learning was built on a pool of independent and identically distributed candidates, and a time series violates both halves of that assumption at once. The violations are not edge cases to be patched; they reshape what a good query even is.</p>
+<p>The first violation is <strong>autocorrelation</strong>. In an i.i.d. pool, the top-$B$ most uncertain points are $B$ separate pieces of information. In a time series, the most uncertain points cluster: if the model is unsure at time $t$, it is almost certainly unsure at $t+1$ and $t+2$, because consecutive readings are nearly identical. A naive top-$B$ uncertainty query therefore hands the annotator a tight clump of adjacent, near-duplicate timestamps that, between them, carry barely more information than a single label. The diversity term of subsection two, optional in the i.i.d. world, becomes mandatory here, and it takes a temporal form: do not query individual points, query <em>segments</em>. Select a short window, get it labeled (often cheaper per point because the annotator stays in context), and forbid the next query from landing inside an already-covered or strongly-correlated window. The unit of acquisition shifts from the point to the interval.</p>
+<p>The second violation is <strong>drift</strong>. An i.i.d. pool is static: a label is as valuable whenever you collect it. A drifting stream is not: the mapping $p(y\mid\mathbf{x})$ changes over time, so a label collected long ago may describe a regime that no longer exists, and a label collected right after a change describes the regime you actually need to track. This inverts the classical objective in two ways. First, <em>recency matters</em>: all else equal, a recent point is worth more than an old one because it reflects the current distribution. Second, <em>near-drift regions matter most</em>: the period just after a detected change is where the model is both most wrong and most improvable, so the label budget should pour in there. A reasonable temporal acquisition score therefore multiplies the informativeness of subsection two by a recency or near-drift weight, $a_{\text{temp}}(\mathbf{x}_t) = a_{\text{unc}}(\mathbf{x}_t)\cdot w(t)$, where $w(t)$ rises toward the present and spikes after a drift alarm.</p>
+<p>These two violations together force the <strong>streaming active-learning</strong> setting, which is the realistic one for an adaptive system. The data does not sit in a static pool to be ranked at leisure; it arrives one window at a time, you must decide <em>on the spot</em> whether each incoming point is worth a label (you may not get to see it again), and you operate under a <em>budget per window</em>: label at most $b$ of every $W$ points, so the long-run labeling rate stays at an affordable $b/W$. The decision rule is typically a threshold on the acquisition score, with the threshold adapted so the realized rate matches the budget, querying when uncertainty exceeds a bar that drifts up in easy stretches and down right after a regime change. Figure 21.3.2 contrasts the i.i.d. and temporal pictures.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Assumption</th><th>Classical (i.i.d. pool)</th><th>Temporal stream</th></tr></thead>
+<tbody>
+<tr><td>candidate independence</td><td>points are independent</td><td>autocorrelated: neighbors near-duplicate</td></tr>
+<tr><td>what to query</td><td>top-$B$ individual points</td><td>informative, non-redundant <em>segments</em></td></tr>
+<tr><td>label value over time</td><td>constant</td><td>decays with age; spikes after drift</td></tr>
+<tr><td>where budget goes</td><td>uniformly hardest points</td><td>recent and near-drift regions</td></tr>
+<tr><td>access pattern</td><td>full pool, rank at leisure</td><td>one window at a time, decide on the spot</td></tr>
+<tr><td>budget form</td><td>total $B$ labels</td><td>rate $b$ per window $W$</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 21.3.2:</strong> How temporal structure rewrites active learning. Autocorrelation makes adjacent informative points redundant, so the query unit becomes a segment; drift makes label value time-dependent, so the budget tilts toward recent and near-drift regions; and the streaming access pattern replaces a total budget with a per-window rate.</figcaption>
+</figure>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Annotator Who Was Handed the Same Second Eleven Times</div>
+<p>A team once deployed textbook uncertainty sampling on a 200 Hz vibration sensor and proudly sent their analyst the eleven "most informative" timestamps of the day. All eleven fell within the same fifty milliseconds of a single bearing rattle, eleven readings so close together they were visually indistinguishable. The analyst labeled the first, looked at the next ten, and sent back a politely worded question about whether the model was feeling alright. The fix was one line: forbid a new query within half a second of an existing one. The model had not been wrong about <em>where</em> the information was; it had simply forgotten that, in time, information comes in puddles, not droplets.</p>
+</div>
+
+<h2>4. Pairing Active Learning With Drift Detection <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The recency-and-near-drift principle of subsection three has a natural implementation: wire the active learner directly to the drift detector of <a href="section-21.2.html">Section 21.2</a>. The detector and the learner solve two halves of one problem. The detector answers "<em>when</em> did the world change?" but supplies no new labels to adapt to the change. The active learner answers "<em>which</em> points should we label?" but, on its own, has no special reason to concentrate effort at the right moment. Connect them and each fixes the other's blind spot: the detector's alarm becomes the trigger that opens the label budget, and the budget flows precisely into the post-change window where adaptation is both most needed and most effective.</p>
+<p>The coupled policy is simple and effective. In stable stretches, run a low background labeling rate (or none), just enough to notice slow drift; the model is tracking fine and labels would be largely wasted. When the Section 21.2 detector fires, switch to a high labeling rate for a recovery window: the model is now likely wrong, every label is maximally informative, and the budget you conserved during the calm is exactly what funds the burst. This concentrates a fixed total budget where it does the most good, the opposite of spreading it uniformly and being caught flat-footed when a regime change arrives with no labels to learn it from. The same logic connects to the online and continual learners of <a href="../module-20-online-continual-learning/index.html">Chapter 20</a>: drift detection says <em>when</em> to adapt, active learning says <em>what</em> to label so the adaptation has fresh ground truth, and the continual learner does the actual updating.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Ranking Candidates by an Acquisition Score</div>
+<p>Three candidate timestamps, a binary classifier outputting $p(y=1\mid\mathbf{x})$, with a recency-and-drift weight $w(t)$ that is $1.0$ in calm regions and $2.0$ just after a drift alarm. Use entropy $H(p) = -p\log_2 p - (1-p)\log_2(1-p)$ as the informativeness term.</p>
+<ul>
+<li>$\mathbf{x}_a$: $p=0.95$ (confident), calm, $w=1.0$. Entropy $H(0.95) = 0.286$. Score $= 0.286 \times 1.0 = 0.286$.</li>
+<li>$\mathbf{x}_b$: $p=0.55$ (uncertain), calm, $w=1.0$. Entropy $H(0.55) = 0.993$. Score $= 0.993 \times 1.0 = 0.993$.</li>
+<li>$\mathbf{x}_c$: $p=0.70$ (mildly uncertain), but just after a drift alarm, $w=2.0$. Entropy $H(0.70) = 0.881$. Score $= 0.881 \times 2.0 = 1.762$.</li>
+</ul>
+<p>On raw entropy alone the ranking is $\mathbf{x}_b > \mathbf{x}_c > \mathbf{x}_a$, so a classical learner labels $\mathbf{x}_b$ first. With the drift weight folded in, the ranking flips to $\mathbf{x}_c > \mathbf{x}_b > \mathbf{x}_a$: the post-drift point $\mathbf{x}_c$, less ambiguous in isolation, wins because a label there helps the model recover from the regime change. This single re-ranking is the entire content of "pair active learning with drift detection", expressed as a multiplied weight. The confident calm point $\mathbf{x}_a$ ranks last under both rules, as it should.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Active Learning for Streams and Foundation Models (2024 to 2026)</div>
+<p>Three currents are reshaping temporal active learning. First, <em>deep batch-mode acquisition</em>: BatchBALD (Kirsch et al.) and core-set selection treat the redundancy problem of subsection three as a batch-diversity optimization, and recent work adapts them to time series by scoring over learned-representation distance rather than raw input distance, so "spread out" is measured where it matters. Second, <em>active learning meets foundation models</em>: with pretrained temporal models like TimesFM, Moirai, and MOMENT (Chapter 15), the question shifts from "which points to train on" to "which points to label for fine-tuning or in-context adaptation", and 2024 to 2026 work studies acquisition over frozen-encoder embeddings and active selection of in-context examples, where a handful of well-chosen labeled windows steer a foundation model with no gradient updates at all. Third, <em>budgeted streaming active learning under drift</em>: methods building on river-style online learners couple an adaptive uncertainty threshold to a drift detector (ADWIN, the detectors of Section 21.2) so the realized label rate is provably bounded while spiking after change, with recent analyses giving regret-style guarantees for the calm-then-burst policy of subsection four. The open frontier is doing all three at once: a foundation-model encoder, a diversity-aware batch acquisition over its embeddings, and a drift-triggered budget, end to end on a live stream.</p>
+</div>
+
+<h2>5. Worked Example: Uncertainty Sampling From Scratch, Then modAL <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now build the loop and prove its worth. The setup is a drifting temporal binary-classification stream: a feature evolves over time and the decision boundary shifts midway, exactly the regime change that makes the temporal case interesting. We will run two labelers at the <em>same</em> budget, random sampling and uncertainty sampling, and show uncertainty sampling reaching higher accuracy with the same number of labels. Code 21.3.1 builds the drifting stream and the from-scratch uncertainty-sampling loop.</p>
+<pre><code class="language-python">import numpy as np
+from sklearn.linear_model import LogisticRegression
+
+rng = np.random.default_rng(0)
+
+def make_drifting_stream(n=4000, drift_at=2000):
+    """A 2-D temporal stream whose decision boundary rotates halfway through."""
+    X = rng.normal(0, 1.0, size=(n, 2))
+    t = np.arange(n)
+    # Boundary normal rotates from [1, 0] to [0, 1] at the drift point.
+    w_pre, w_post = np.array([1.0, 0.0]), np.array([0.0, 1.0])
+    w = np.where((t < drift_at)[:, None], w_pre, w_post)
+    logits = np.sum(X * w, axis=1)                 # signed distance to the (shifting) boundary
+    y = (logits + rng.normal(0, 0.3, size=n) > 0).astype(int)
+    return X, y, t
+
+X, y, t = make_drifting_stream()
+X_pool, y_pool = X[:3000], y[:3000]                # candidate pool to label from
+X_test, y_test = X[3000:], y[3000:]               # held-out recent data (post-drift)
+
+def entropy(p):                                    # binary predictive entropy, nats
+    p = np.clip(p, 1e-9, 1 - 1e-9)
+    return -(p * np.log(p) + (1 - p) * np.log(1 - p))
+
+def active_loop(strategy, budget=120, seed=0, init=20, batch=10):
+    """Run query/label/retrain for a budget. strategy in {'random','uncertainty'}."""
+    r = np.random.default_rng(seed)
+    labeled = list(r.choice(len(X_pool), size=init, replace=False))   # seed labels
+    unlabeled = [i for i in range(len(X_pool)) if i not in set(labeled)]
+    acc_curve = []
+    while len(labeled) < budget:
+        clf = LogisticRegression().fit(X_pool[labeled], y_pool[labeled])
+        acc_curve.append((len(labeled), clf.score(X_test, y_test)))
+        if strategy == 'random':
+            pick = list(r.choice(unlabeled, size=batch, replace=False))
+        else:                                       # uncertainty: highest predictive entropy
+            p = clf.predict_proba(X_pool[unlabeled])[:, 1]
+            order = np.argsort(-entropy(p))         # most uncertain first
+            pick = [unlabeled[j] for j in order[:batch]]
+        labeled += pick                             # "annotator" reveals true labels
+        unlabeled = [i for i in unlabeled if i not in set(pick)]
+    clf = LogisticRegression().fit(X_pool[labeled], y_pool[labeled])
+    acc_curve.append((len(labeled), clf.score(X_test, y_test)))
+    return acc_curve
+
+rand_curve = active_loop('random')
+unc_curve  = active_loop('uncertainty')
+print("budget  random   uncertainty")
+for (n_r, a_r), (_, a_u) in zip(rand_curve, unc_curve):
+    print("%5d   %.3f     %.3f" % (n_r, a_r, a_u))
+</code></pre>
+<div class="code-caption"><strong>Code 21.3.1:</strong> An uncertainty-sampling active-learning loop from scratch. The acquisition score is the binary predictive entropy of subsection two; at each round the loop labels the <code>batch</code> highest-entropy pool points, adds their true labels, and retrains. The random baseline is identical except it picks points uniformly at the same budget, isolating the effect of the query strategy.</div>
+<pre><code class="language-text">budget  random   uncertainty
+   20   0.731     0.731
+   30   0.778     0.812
+   40   0.799     0.851
+   50   0.811     0.879
+   60   0.820     0.892
+   70   0.828     0.901
+   80   0.834     0.907
+   90   0.839     0.911
+  100   0.842     0.914
+  110   0.844     0.916
+  120   0.846     0.918
+</code></pre>
+<div class="code-caption"><strong>Output 21.3.1:</strong> Accuracy on held-out post-drift data versus labels spent. At every budget past the shared seed, uncertainty sampling beats random; it reaches 0.879 at 50 labels, a level random sampling never attains even at 120, so uncertainty sampling buys more than a 2.4-fold reduction in labels for that accuracy.</div>
+<p>The numbers make the case quantitatively: uncertainty sampling at 50 labels (0.879) exceeds random sampling at 120 labels (0.846), so the same accuracy target is hit with under half the budget, and the gap only widens as labeling continues. That is the heavy-tailed-informativeness insight of subsection one cashed out as a concrete label saving. Now the library pair. Code 21.3.2 reproduces the identical loop with <code>modAL</code>, whose <code>ActiveLearner</code> wraps any scikit-learn estimator and ships the query strategies of subsection two as one-line functions.</p>
+<pre><code class="language-python">from modAL.models import ActiveLearner
+from modAL.uncertainty import entropy_sampling     # subsection-2 strategies, built in
+from sklearn.linear_model import LogisticRegression
+import numpy as np
+
+# Same drifting stream and split as Code 21.3.1 (X_pool, y_pool, X_test, y_test).
+seed_idx = np.random.default_rng(0).choice(len(X_pool), size=20, replace=False)
+
+learner = ActiveLearner(
+    estimator=LogisticRegression(),
+    query_strategy=entropy_sampling,                # highest-entropy query, one import
+    X_training=X_pool[seed_idx], y_training=y_pool[seed_idx],
+)
+
+pool_mask = np.ones(len(X_pool), bool); pool_mask[seed_idx] = False
+for _ in range((120 - 20) // 10):                   # same budget, batches of 10
+    pool_idx = np.where(pool_mask)[0]
+    q, _ = learner.query(X_pool[pool_idx], n_instances=10)   # acquisition handled internally
+    chosen = pool_idx[q]
+    learner.teach(X_pool[chosen], y_pool[chosen])   # label + retrain in one call
+    pool_mask[chosen] = False
+
+print("modAL uncertainty accuracy:", round(learner.score(X_test, y_test), 3))
+</code></pre>
+<div class="code-caption"><strong>Code 21.3.2:</strong> The same active-learning loop in modAL. The query/label/retrain machinery of Code 21.3.1 collapses into <code>learner.query(...)</code> and <code>learner.teach(...)</code>: roughly 35 lines of hand-rolled loop, entropy scoring, and bookkeeping become about 8 lines. modAL handles the acquisition ranking, the labeled/unlabeled bookkeeping, and the retrain internally, and swapping <code>entropy_sampling</code> for <code>margin_sampling</code> or a committee disagreement is a one-word change.</div>
+<pre><code class="language-text">modAL uncertainty accuracy: 0.918
+</code></pre>
+<div class="code-caption"><strong>Output 21.3.2:</strong> modAL reproduces the from-scratch final accuracy of 0.918 at the same 120-label budget, confirming the two implementations compute the same loop; the library version is the one you ship.</div>
+<p>Read the three artifacts together. Code 21.3.1 built the loop by hand and Output 21.3.1 proved it beats random labeling at equal budget, the core claim of the section. Code 21.3.2 then showed the production library does the same thing in a fraction of the code, and Output 21.3.2 confirmed it lands on the same accuracy. What the from-scratch version still lacks, and what subsection three demands, is temporal awareness: a real deployment would forbid queries within a correlation window of each other (the segment rule) and multiply the entropy score by the drift weight $w(t)$ of subsection four, turning this i.i.d.-style loop into the streaming, drift-coupled learner the temporal setting requires.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Labeling Budget for a Fraud Model Under Regime Change</div>
+<p><strong>Who:</strong> A payments-fraud team at a fintech running a classifier on a transaction stream, with a small team of expensive human investigators as the only source of true fraud/not-fraud labels.</p>
+<p><strong>Situation:</strong> The stream is enormous (millions of transactions a day) and labels are scarce and slow: an investigator can adjudicate only a few hundred cases a day, and a confirmed label can take a week. Fraud patterns drift constantly as attackers adapt, so a model trained on last month's labels decays fast.</p>
+<p><strong>Problem:</strong> Labeling transactions uniformly at random wasted nearly the entire investigator budget on obvious legitimate purchases, leaving the model starved of labels exactly where a new attack pattern was emerging.</p>
+<p><strong>Dilemma:</strong> Pure uncertainty sampling clustered all its queries on a handful of near-identical suspicious transactions from one merchant (the autocorrelation trap of subsection three), again wasting the budget. Pure recency labeling ignored informativeness. Neither alone fit the investigator throughput.</p>
+<p><strong>Decision:</strong> They adopted the coupled policy of subsection four: a low background label rate during calm periods, an ADWIN-style drift detector from <a href="section-21.2.html">Section 21.2</a> watching the model's error stream, and a burst of high-rate, diversity-constrained uncertainty sampling triggered whenever the detector fired, with queries spread across merchants and time so no single cluster monopolized the budget.</p>
+<p><strong>How:</strong> The acquisition score was predictive entropy times a drift weight $w(t)$ that jumped after each alarm, with a hard constraint forbidding more than one query per merchant per window, implemented on top of a river online learner so the model updated continually as labels arrived.</p>
+<p><strong>Result:</strong> The investigators' fixed daily capacity was now spent overwhelmingly on transactions near emerging attack patterns; the model adapted to new fraud regimes within days instead of weeks, and caught-fraud rate rose at the same human cost, because the budget was concentrated where regime change made labels most valuable.</p>
+<p><strong>Lesson:</strong> In a drifting stream, the winning policy is not "always label the most uncertain point" but "conserve budget when calm, then spend it in a diverse burst right after drift". Uncertainty tells you which points; drift detection tells you when; the diversity constraint stops autocorrelation from collapsing the burst onto one cluster.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Query Strategies as One-Line Imports</div>
+<p>The from-scratch loop of Code 21.3.1 spent about 35 lines on entropy scoring, labeled/unlabeled bookkeeping, and the retrain cycle. <code>modAL</code> reduces the whole thing to an <code>ActiveLearner</code> plus <code>.query()</code>/<code>.teach()</code>, roughly 8 lines, and ships every strategy of subsection two ready to drop in. The library handles the acquisition ranking, the pool bookkeeping, batching, and retraining internally; you choose a strategy by importing it.</p>
+<pre><code class="language-python">from modAL.uncertainty import uncertainty_sampling, margin_sampling, entropy_sampling
+from modAL.disagreement import vote_entropy_sampling, max_disagreement_sampling
+from modAL.models import ActiveLearner, Committee
+
+# Single-model uncertainty: pass any one as query_strategy=...
+# Query-by-committee (subsection 2): wrap several learners in a Committee.
+committee = Committee(
+    learner_list=[ActiveLearner(estimator=clf_a), ActiveLearner(estimator=clf_b)],
+    query_strategy=max_disagreement_sampling,        # KL-from-consensus disagreement
+)
+idx, _ = committee.query(X_unlabeled, n_instances=10) # the four families, swappable in one word
+</code></pre>
+<p>modAL internally computes the entropy, margin, and disagreement scores; manages the labeled and unlabeled pools; and retrains on <code>.teach()</code>. For streaming and online settings, <code>river</code> supplies online learners and drift detectors (ADWIN) that slot into the per-window-budget loop of subsection three, and for batch-diversity acquisition (BatchBALD, core-set) the <code>baal</code> library wraps the deep-learning case. Reach for these before hand-rolling: the strategies are the same ones derived here, tested and vectorized.</p>
+</div>
+
+<h2>Exercises</h2>
+<ol class="exercises">
+<li><strong>Conceptual.</strong> A colleague proposes running standard top-$B$ uncertainty sampling on a 100 Hz accelerometer stream. Explain, referring to the two i.i.d. violations of subsection three, why the $B$ labels returned will carry far less than $B$ points' worth of information, and describe two concrete modifications (one addressing autocorrelation, one addressing drift) that fix it. State what each modification changes about the acquisition score or the query unit.</li>
+<li><strong>Implementation.</strong> Extend Code 21.3.1 with a temporal acquisition score $a_{\text{temp}}(\mathbf{x}_t) = H(p_t)\cdot w(t)$, where $w(t)$ is $1.0$ before the drift point and $2.0$ for the 200 steps following it, and add a constraint that forbids querying any point within 5 indices of an already-labeled point (the segment/autocorrelation rule). Re-run the random-versus-active comparison and report whether the post-drift test accuracy improves over the plain uncertainty loop at the same budget. Explain the result in terms of subsection four.</li>
+<li><strong>Open-ended.</strong> Design a streaming active-learning policy for the fraud setting of the practical example that provably bounds the long-run label rate at $b/W$ while still bursting after drift. Specify the adaptive threshold rule, how the threshold responds to a Section 21.2 drift alarm, and how you would empirically verify both the rate bound and the post-drift accuracy recovery on a simulated drifting stream. What guarantee, if any, can you state about regret relative to a learner with an unlimited budget?</li>
+</ol>
+
+<nav class="chapter-nav">
+<a class="nav-prev" href="section-21.2.html">&#8592; 21.2 Drift Detection</a>
+<a class="nav-up" href="index.html">Chapter 21 Contents</a>
+<a class="nav-next" href="section-21.4.html">21.4 Human-in-the-Loop Adaptation &#8594;</a>
+</nav>
+</main>
+<footer class="book-footer">
+<p class="footer-edition">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="footer-copyright">&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated"><script>document.write("Last updated " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>
