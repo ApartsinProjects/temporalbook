@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 7.5: Hidden Markov Models. The discrete-state cousin of the Kalman filter: latent states with transition probabilities and emission distributions, the forward algorithm, Viterbi decoding, Baum-Welch learning, Gaussian and categorical emissions, Markov-switching regimes, and a from-scratch then hmmlearn worked example on a regime-switching finance series." name="description"/>
+<title>Section 7.5: Hidden Markov Models | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Forecasting and Time Series Analysis</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 7: State-Space Models and Filtering</a></div>
+<h1>Hidden Markov Models</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"You think you know which mood I am in, but you only ever see what I emit, never what I am. By the time your forward pass is sure I was calm, I have already, quietly and with full probability, switched to panic."</p>
+<cite>A Hidden Markov Model Switching Regimes When You Least Expect</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A Hidden Markov Model is the Kalman filter with the continuous latent state replaced by a discrete one: instead of a real-valued vector drifting through space, an unobserved label hops among a finite set of regimes, each regime emitting observations from its own distribution. The recursive predict-update logic is identical; only the bookkeeping changes, sums over states standing in for integrals over space.</strong> Once you see that one substitution, three classical questions fall out and each has a clean dynamic-programming answer: how likely is this data (the forward algorithm), which hidden path most likely produced it (Viterbi), and what parameters best explain it (Baum-Welch). This section builds all three from scratch, fits the same model in a few lines with <code>hmmlearn</code>, and turns the machinery loose on a finance series that secretly switches between a calm regime and a turbulent one.</p>
+</div>
+<p>In <a href="section-7.2.html">Section 7.2</a> the Kalman filter tracked a continuous hidden state $\mathbf{x}_t \in \mathbb{R}^d$ through a linear-Gaussian world, alternating a prediction step (push the belief forward through the dynamics) with an update step (correct the belief using the new measurement). Everything in that section assumed the latent variable lived on a continuum and that all distributions stayed Gaussian, which is what made the integrals collapse into the tidy matrix algebra of the Kalman gain. The Hidden Markov Model keeps the recursive skeleton and throws away the continuum. The hidden variable $z_t$ now takes one of $K$ discrete values, the prediction step becomes a matrix-vector product against a transition table, and the update step becomes an elementwise multiply by emission likelihoods followed by renormalization. The same belief, propagated the same way, over a different kind of state. This section makes that correspondence precise and then exploits it.</p>
+
+<h2>1. The Discrete-State Cousin of the Kalman Filter <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>An HMM is defined by three pieces. There is a hidden state sequence $z_1, z_2, \dots, z_T$ where each $z_t \in \{1, \dots, K\}$, and an observed sequence $x_1, \dots, x_T$. The hidden states form a first-order Markov chain: the next state depends only on the current one, never on the longer past. That assumption is the entire model compressed into one line, the symbol $z_t$ joining the unified notation table of <a href="../../toc.html">Appendix A</a> on first use:</p>
+$$p(z_t \mid z_{1:t-1}) = p(z_t \mid z_{t-1}).$$
+<p>The three parameter blocks are the initial distribution $\pi_k = p(z_1 = k)$, the transition matrix $A_{jk} = p(z_t = k \mid z_{t-1} = j)$ (a $K \times K$ stochastic matrix whose rows sum to one), and the emission distribution $b_k(x) = p(x_t = x \mid z_t = k)$, which says how each regime generates observations. Write the bundle $\lambda = (\pi, A, B)$. The joint probability of a full hidden path and its observations factorizes along the chain,</p>
+$$p(z_{1:T}, x_{1:T}) = \pi_{z_1} \, b_{z_1}(x_1) \prod_{t=2}^{T} A_{z_{t-1} z_t} \, b_{z_t}(x_t),$$
+<p>which is exactly the discrete analogue of the linear-Gaussian factorization that drove the Kalman recursion. The structural parallel is worth stating as a table in prose: the Kalman state-transition matrix $\mathbf{F}$ becomes the transition table $A$, the Gaussian process noise becomes the stochasticity already baked into $A$, the observation matrix $\mathbf{H}$ and measurement noise become the emission distribution $b_k$, and the integral that marginalizes a continuous state becomes a sum over $K$ discrete states.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Same Recursion, Sums Instead of Integrals</div>
+<p>The Kalman filter and the HMM forward pass are the same algorithm viewed through two lenses. Both maintain a belief over the hidden state, both predict it forward through the dynamics, and both update it with the new observation. The Kalman filter does this with Gaussians, so prediction and update stay Gaussian and reduce to mean-and-covariance updates. The HMM does it with categorical distributions over $K$ states, so prediction is a multiply by the transition matrix and update is a multiply by the emission likelihood vector. Where Kalman integrates over a continuum, the HMM sums over a finite set. Master one and you have, structurally, already met the other. This is the first concrete instance of the filtering-as-recurrent-inference theme that <a href="section-7.6.html">Section 7.6</a> will make explicit.</p>
+</div>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Scoring One Hidden Path by Hand</div>
+<p>Take a tiny categorical HMM with two states, calm (1) and turbulent (2), emitting one of two symbols, $\text{down}$ and $\text{up}$. Let $\pi = (0.8, 0.2)$, $A = \begin{pmatrix} 0.9 &amp; 0.1 \\ 0.4 &amp; 0.6 \end{pmatrix}$, and emissions $b_1(\text{up}) = 0.6, b_1(\text{down}) = 0.4$ for calm and $b_2(\text{up}) = 0.5, b_2(\text{down}) = 0.5$ for turbulent. Consider the observed sequence $(\text{up}, \text{down}, \text{down})$ and the candidate hidden path $(1, 1, 2)$. The joint factorization of this subsection multiplies the start, the emissions, and the transitions: $p(z,x) = \pi_1 \cdot b_1(\text{up}) \cdot A_{11} \cdot b_1(\text{down}) \cdot A_{12} \cdot b_2(\text{down})$, which is $0.8 \times 0.6 \times 0.9 \times 0.4 \times 0.1 \times 0.5 = 0.008640$. The all-calm path $(1,1,1)$ instead scores $0.8 \times 0.6 \times 0.9 \times 0.4 \times 0.9 \times 0.4 = 0.062208$, over seven times larger, because staying calm is far likelier than switching given the sticky transition matrix. The forward algorithm sums probabilities like these over all $2^3 = 8$ paths to get the total likelihood; Viterbi keeps only the largest. Already with three steps, enumerating paths is something you would rather not do by hand, which is exactly why the dynamic programs exist.</p>
+</div>
+<p>Where do discrete hidden states actually arise? Three canonical domains recur throughout this book. In finance, a market alternates between a calm low-volatility regime and a turbulent high-volatility one, and the regime label is never printed on the tape; you infer it from returns, which is the running example of subsection five. In speech, the hidden state is the phoneme being uttered and the observation is the acoustic frame, the application that made HMMs the backbone of recognition systems for two decades. In computational biology, the hidden state labels a region of a DNA sequence (coding versus non-coding, for instance) and the observation is the nucleotide, so that decoding the hidden path annotates the genome. In every case the regime is latent, the emission is observed, and the Markov assumption on the regime is the modeling bet.</p>
+
+<h2>2. The Three Classic Problems <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Rabiner's canonical treatment organizes everything you do with an HMM into three problems, and each is solved by a dynamic program that reuses subresults rather than enumerating the exponentially many hidden paths.</p>
+<p><strong>Problem 1, evaluation.</strong> Given parameters $\lambda$ and observations $x_{1:T}$, compute the likelihood $p(x_{1:T} \mid \lambda)$. The naive route sums the joint over all $K^T$ hidden paths, which is hopeless. The forward algorithm collapses that sum by caching the forward variable $\alpha_t(k) = p(x_{1:t}, z_t = k)$, the joint probability of the observations seen so far and being in state $k$ now. It obeys a one-line recursion that mirrors Kalman predict-then-update exactly:</p>
+$$\alpha_1(k) = \pi_k \, b_k(x_1), \qquad \alpha_t(k) = \underbrace{\left[ \sum_{j=1}^{K} \alpha_{t-1}(j) \, A_{jk} \right]}_{\text{predict: sum over states}} \; \underbrace{b_k(x_t)}_{\text{update: emission}}.$$
+<p>The bracketed sum is the prediction step (propagate last step's belief through the transition matrix), and multiplying by $b_k(x_t)$ is the update step (weight by how well state $k$ explains the new observation). The total likelihood is the final column summed, $p(x_{1:T} \mid \lambda) = \sum_k \alpha_T(k)$. Cost is $O(K^2 T)$, not $O(K^T)$.</p>
+<p><strong>Problem 2, decoding.</strong> Find the single most likely hidden path $z_{1:T}^\star = \arg\max_{z_{1:T}} p(z_{1:T} \mid x_{1:T})$. Replacing the sum in the forward recursion with a maximum gives the Viterbi algorithm, whose variable $\delta_t(k)$ is the probability of the best path ending in state $k$ at time $t$:</p>
+$$\delta_t(k) = \left[ \max_{j} \, \delta_{t-1}(j) \, A_{jk} \right] b_k(x_t), \qquad \psi_t(k) = \arg\max_{j} \, \delta_{t-1}(j) \, A_{jk}.$$
+<p>The backpointer table $\psi$ remembers which predecessor won, and a backward pass from $\arg\max_k \delta_T(k)$ traces out the optimal path. Viterbi is to the HMM what the most-probable trajectory is to a state-space model; the swap of $\sum$ for $\max$ is the only difference between scoring all paths and finding the best one.</p>
+<p><strong>Problem 3, learning.</strong> Given only observations, estimate $\lambda$. There is no labeled hidden path, so we cannot just count transitions. The Baum-Welch algorithm, an instance of Expectation-Maximization, alternates an E-step that computes the expected number of times each transition and each emission occurred (using the forward variables above and matching backward variables $\beta_t(k) = p(x_{t+1:T} \mid z_t = k)$) with an M-step that re-estimates $\pi$, $A$, and $B$ from those expected counts. Each iteration provably never decreases the likelihood, climbing to a local optimum.</p>
+<p>The E-step needs two posteriors. The first is the smoothed state posterior, the probability of being in state $k$ at time $t$ given the entire sequence, which combines the forward and backward variables:</p>
+$$\gamma_t(k) = p(z_t = k \mid x_{1:T}) = \frac{\alpha_t(k)\,\beta_t(k)}{\sum_{j} \alpha_t(j)\,\beta_t(j)}.$$
+<p>This $\gamma_t$ is the discrete cousin of the Kalman smoother of <a href="section-7.2.html">Section 7.2</a>: it uses future observations as well as past ones to refine the belief, which is why it beats the forward-only $\alpha_t$ for offline analysis. The second is the smoothed transition posterior, the probability of being in state $j$ at time $t$ and $k$ at time $t+1$:</p>
+$$\xi_t(j,k) = p(z_t = j, z_{t+1} = k \mid x_{1:T}) = \frac{\alpha_t(j)\,A_{jk}\,b_k(x_{t+1})\,\beta_{t+1}(k)}{p(x_{1:T})}.$$
+<p>The M-step then re-estimates each parameter as an expected-count ratio. The new initial distribution is just the smoothed posterior at $t=1$, $\hat{\pi}_k = \gamma_1(k)$. The new transition matrix is expected transitions $j \to k$ over expected visits to $j$, and the new Gaussian emission parameters are posterior-weighted moments of the data:</p>
+$$\hat{A}_{jk} = \frac{\sum_{t=1}^{T-1} \xi_t(j,k)}{\sum_{t=1}^{T-1} \gamma_t(j)}, \qquad \hat{\mu}_k = \frac{\sum_{t} \gamma_t(k)\, x_t}{\sum_{t} \gamma_t(k)}, \qquad \hat{\sigma}_k^2 = \frac{\sum_{t} \gamma_t(k)\,(x_t - \hat{\mu}_k)^2}{\sum_{t} \gamma_t(k)}.$$
+<p>Read those formulas as soft counting: if every $\gamma_t(k)$ were a hard zero or one, they would reduce to the ordinary maximum-likelihood estimates you would write down from a labeled path, dividing observed transitions by observed visits and averaging the data in each state. Baum-Welch simply replaces the missing labels with their expected values under the current parameters and iterates, which is exactly what EM does for any latent-variable model.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact: The Same Algorithm Under Four Names</div>
+<p>Andrew Viterbi published his algorithm in 1967 to decode convolutional error-correcting codes for noisy communication channels, with no time series in sight. The identical max-product dynamic program is the forward pass that named GPS and modem decoders, the inference step inside conditional random fields for part-of-speech tagging, and the spell-checker that picks the most likely intended word. One recursion, conceived for satellite links, now quietly runs every time your phone autocorrects. The HMM did not invent it; it just gave it a probabilistic home.</p>
+</div>
+
+<h2>3. Emissions: Categorical, Gaussian, and the Mixture Connection <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The transition machinery is fixed, but the emission distribution $b_k$ is a modeling choice that adapts the HMM to the data type. Two cases dominate. When observations are discrete symbols (nucleotides, quantized words, weather categories), each state carries a categorical emission, a length-$M$ probability vector $b_k(x = m) = B_{km}$ over the $M$ possible symbols. This is the classic discrete HMM, and Baum-Welch re-estimates $B$ by counting expected symbol emissions per state. When observations are continuous (financial returns, acoustic features, sensor readings), the natural choice is a Gaussian emission, $b_k(x) = \mathcal{N}(x \mid \mu_k, \Sigma_k)$, giving the Gaussian HMM in which each regime is a Gaussian cloud and learning re-estimates each $(\mu_k, \Sigma_k)$ as the posterior-weighted mean and covariance of the data.</p>
+<p>A single Gaussian per state is sometimes too rigid: a phoneme's acoustic frames or a market regime's returns may be multimodal. The fix is to let each state emit from a mixture of Gaussians, $b_k(x) = \sum_{m=1}^{M} c_{km} \, \mathcal{N}(x \mid \mu_{km}, \Sigma_{km})$, the GMM-HMM that powered speech recognition before deep learning. This exposes a clean conceptual link. A plain Gaussian mixture model is exactly an HMM with $T = 1$, or equivalently an HMM whose transition matrix has identical rows so the state at each step is drawn independently, forgetting the past entirely. Turn that independence into a Markov chain and the mixture model grows a memory: the GMM clusters points, the HMM clusters points and models how the cluster assignment evolves over time. The HMM is a mixture model that remembers which component it was in last.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: An HMM Is a Mixture Model With Memory</div>
+<p>If you delete the transition structure (make every row of $A$ identical, or set $T=1$), an HMM collapses to a Gaussian mixture model that assigns each observation to a latent cluster with no regard for order. The transition matrix is precisely the memory that a mixture model lacks: it says the next cluster assignment depends on the current one. This is why the same EM machinery fits both, why a GMM is a sensible way to initialize a Gaussian HMM's emissions, and why an HMM applied to shuffled data degrades toward a plain mixture. Temporal structure lives entirely in $A$.</p>
+</div>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: One Forward Step by Hand</div>
+<p>Take a two-state Gaussian HMM with calm state 1 and turbulent state 2. Let $\pi = (0.8, 0.2)$, transition matrix $A = \begin{pmatrix} 0.95 &amp; 0.05 \\ 0.10 &amp; 0.90 \end{pmatrix}$, and emissions $\mathcal{N}(0, 1^2)$ for calm and $\mathcal{N}(0, 3^2)$ for turbulent. Suppose the first observation is $x_1 = 0.5$. The emission likelihoods are $b_1(0.5) = \frac{1}{\sqrt{2\pi}\cdot 1}e^{-0.5^2/2} \approx 0.3521$ and $b_2(0.5) = \frac{1}{\sqrt{2\pi}\cdot 3}e^{-0.5^2/18} \approx 0.1314$. So $\alpha_1(1) = 0.8 \times 0.3521 = 0.2817$ and $\alpha_1(2) = 0.2 \times 0.1314 = 0.0263$. Now a second observation $x_2 = 4.0$ arrives, a value far likelier under the wide turbulent Gaussian. The prediction step gives $\sum_j \alpha_1(j) A_{j2} = 0.2817 \times 0.05 + 0.0263 \times 0.90 = 0.0377$ for landing in state 2, versus $0.2817 \times 0.95 + 0.0263 \times 0.10 = 0.2702$ for state 1. Multiplying by emissions $b_1(4.0) \approx 0.0001$ and $b_2(4.0) \approx 0.0547$ yields $\alpha_2(1) \approx 0.0000$ and $\alpha_2(2) \approx 0.00206$. The single extreme observation has flipped the belief decisively toward the turbulent regime, which is precisely the regime-detection behavior we want.</p>
+</div>
+
+<h2>4. Regime-Switching Models, Limits, and What Comes After <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Bolt an HMM on top of a forecasting model and you get a regime-switching model. The Markov-switching autoregression of Hamilton (1989) is the canonical case: the observation follows an AR process whose coefficients (and noise variance) depend on the current hidden regime,</p>
+$$x_t = c_{z_t} + \sum_{i=1}^{p} \phi_{i, z_t} \, x_{t-i} + \varepsilon_t, \qquad \varepsilon_t \sim \mathcal{N}(0, \sigma_{z_t}^2),$$
+<p>so a single series can have, say, a slow mean-reverting calm regime and a violent high-variance crisis regime, with the hidden chain governing when each set of AR dynamics applies. This is the ARIMA family of <a href="../module-05-univariate-forecasting/index.html">Chapter 5</a> made regime-aware, and it is the workhorse of empirical macroeconomics and quantitative finance for exactly the calm-versus-crisis structure of subsection five.</p>
+<p>The limitations are real and worth naming, because they are precisely what the rest of the book learns to relax. The number of states $K$ is fixed in advance and must be chosen by hand or by an information criterion; the model cannot grow a new regime it has never budgeted for. The first-order Markov assumption forces the state duration to be geometrically distributed, which often mismatches reality (a market crisis rarely ends with constant per-day probability). The emissions are simple parametric families, so the HMM cannot capture rich, high-dimensional observations such as raw audio or images without a great deal of feature engineering. And the discrete state is a severe information bottleneck: $K$ regimes carry only $\log_2 K$ bits of memory about the past.</p>
+<p>Two of these limitations have classical patches worth knowing, because they show where the model bends before it breaks. The geometric-duration problem is fixed by the hidden semi-Markov model (HSMM), which augments each state with an explicit duration distribution so a regime can be made to last, on average, a realistic number of steps rather than decaying geometrically; the price is a heavier inference recursion that tracks how long the chain has dwelt in the current state. The other patch abandons the generative story entirely: a conditional random field models $p(z_{1:T} \mid x_{1:T})$ directly with the same Viterbi-style decoding but arbitrary, overlapping features of the observations, trading the HMM's ability to generate data for far richer emission conditioning. Both patches keep the dynamic-programming backbone; both were eventually subsumed, for high-dimensional data, by the neural sequence models of Part III. Knowing them sharpens your sense of which assumption to relax first when a plain HMM disappoints: duration, emission richness, or the Markov order itself.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: HMM to Neural Latent-Variable Model to Belief-State Agent</div>
+<p>The book's central claim is that every classical idea returns in learned form, and the HMM's return is a three-stage arc. Stage one is the HMM itself: a discrete latent state, a hand-specified transition table, and parametric emissions. Stage two replaces every rigid piece with a learned one. The sequential variational autoencoders of <a href="../../toc.html">Chapter 17</a> keep the latent-state-emits-observation skeleton but make the latent state a continuous high-dimensional vector, the transition a neural network, and the emission a deep decoder, fitting the whole thing by amortized variational inference rather than Baum-Welch. The discrete bottleneck and fixed $K$ dissolve; the recursive inference survives. Stage three puts that learned latent state to work for action. In the partially observed decision problems of <a href="../../toc.html">Chapter 23</a>, an agent that cannot see the world's true state maintains a belief over hidden states and acts on it; that belief is exactly the HMM's posterior $\gamma_t$, now the input to a policy. The HMM's forward pass becomes the belief-update of a POMDP agent. One filtering recursion, three increasingly capable homes: model, generator, decision-maker.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Discrete Latent States in the Deep Era (2024 to 2026)</div>
+<p>Far from retiring, the HMM's discrete-latent idea is enjoying a revival inside modern architectures. Structured state-space models such as Mamba (Gu and Dao, 2023) and the work surveyed in <a href="../../toc.html">Chapter 13</a> share the HMM's recursive linear state update, and the 2024 to 2026 literature on selective and input-dependent state transitions is, in effect, learning the transition matrix $A$ as a function of the input rather than fixing it. In reinforcement learning, the Dreamer V3 world model (Hafner et al., 2023) and its successors learn a recurrent state-space model with a categorical latent, a deliberately discrete bottleneck that is the HMM's hidden state grown into a learned generative model of the environment, which agents plan inside. Discrete-latent sequence models are also resurgent in tokenized generative modeling, where a learned codebook plays the role of the emission alphabet. The recurring 2024-onward finding is that a discrete or near-discrete latent state, the HMM's defining commitment, remains a powerful inductive bias for interpretable, controllable temporal models, so the regime-switching intuition you build here transfers directly to the frontier.</p>
+</div>
+
+<h2>5. Worked Example: Recovering Hidden Regimes in a Finance Series <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now build the whole pipeline on the running finance dataset of Part II: a returns series that secretly switches between a calm regime and a turbulent one. First we synthesize data from a known two-state Gaussian HMM so we have ground-truth regimes to grade against. Code 7.5.1 draws the hidden chain and its emissions.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(7)
+
+# Ground-truth two-regime model: calm (low vol) and turbulent (high vol).
+pi_true = np.array([0.8, 0.2])                 # start mostly calm
+A_true = np.array([[0.97, 0.03],              # calm is sticky
+                   [0.10, 0.90]])             # turbulent is sticky too
+mu_true = np.array([0.0005, -0.0010])          # daily mean return per regime
+sigma_true = np.array([0.006, 0.022])          # daily volatility per regime
+
+def sample_hmm(T):
+    """Draw a hidden Markov chain and its Gaussian (return) emissions."""
+    z = np.empty(T, dtype=int)
+    x = np.empty(T)
+    z[0] = rng.choice(2, p=pi_true)
+    for t in range(1, T):
+        z[t] = rng.choice(2, p=A_true[z[t - 1]])   # Markov transition
+    x = rng.normal(mu_true[z], sigma_true[z])       # regime-dependent emission
+    return z, x
+
+T = 1500
+z_true, returns = sample_hmm(T)
+print("days turbulent (true):", int(z_true.sum()), "of", T)
+print("first 8 returns:", np.round(returns[:8], 4))
+</code></pre>
+<div class="code-caption"><strong>Code 7.5.1:</strong> Synthesizing a regime-switching returns series from a known two-state Gaussian HMM. The sticky transition matrix produces long calm stretches punctuated by turbulent episodes, the calm-versus-crisis structure that motivated Markov-switching models in subsection four.</div>
+<pre><code class="language-text">days turbulent (true): 271 of 1500
+first 8 returns: [ 0.0049  0.0009 -0.0007  0.0083  0.0026 -0.0011  0.0046  0.0024]
+</code></pre>
+<div class="code-caption"><strong>Output 7.5.1:</strong> Roughly 18 percent of days fall in the turbulent regime, and the opening run is visibly low-amplitude, the calm regime the chain started in. From the raw returns alone the regime label is invisible, which is the inference problem the next blocks solve.</div>
+<p>Now the from-scratch core. Code 7.5.2 implements the forward algorithm (likelihood) and Viterbi decoding (most likely regime path) for a Gaussian HMM, working in log space to avoid the underflow that destroys a naive product of $T$ tiny probabilities. These are the recursions of subsection two written literally.</p>
+<pre><code class="language-python">from scipy.stats import norm
+from scipy.special import logsumexp
+
+def gaussian_log_b(x, mu, sigma):
+    """T x K matrix of log emission likelihoods log b_k(x_t)."""
+    return np.stack([norm.logpdf(x, mu[k], sigma[k]) for k in range(len(mu))],
+                    axis=1)
+
+def forward_loglik(x, pi, A, mu, sigma):
+    """Forward algorithm in log space; returns total log-likelihood."""
+    logB = gaussian_log_b(x, mu, sigma)
+    logA = np.log(A)
+    log_alpha = np.log(pi) + logB[0]                       # alpha_1
+    for t in range(1, len(x)):
+        # predict (logsumexp over previous states) then update (+ emission)
+        log_alpha = logsumexp(log_alpha[:, None] + logA, axis=0) + logB[t]
+    return logsumexp(log_alpha)                            # sum over final states
+
+def viterbi(x, pi, A, mu, sigma):
+    """Most likely hidden state path (max-product dynamic program)."""
+    logB = gaussian_log_b(x, mu, sigma)
+    logA = np.log(A)
+    T, K = logB.shape
+    delta = np.log(pi) + logB[0]
+    psi = np.zeros((T, K), dtype=int)
+    for t in range(1, T):
+        scores = delta[:, None] + logA          # K(prev) x K(next)
+        psi[t] = np.argmax(scores, axis=0)       # backpointer
+        delta = scores.max(axis=0) + logB[t]
+    path = np.empty(T, dtype=int)
+    path[-1] = int(np.argmax(delta))
+    for t in range(T - 2, -1, -1):               # trace backpointers
+        path[t] = psi[t + 1, path[t + 1]]
+    return path
+
+ll = forward_loglik(returns, pi_true, A_true, mu_true, sigma_true)
+path_oracle = viterbi(returns, pi_true, A_true, mu_true, sigma_true)
+acc = (path_oracle == z_true).mean()
+print(f"log-likelihood at true params: {ll:.1f}")
+print(f"Viterbi regime accuracy (true params): {acc:.3f}")
+</code></pre>
+<div class="code-caption"><strong>Code 7.5.2:</strong> From-scratch forward algorithm and Viterbi decoder for a Gaussian HMM, in log space. The forward pass returns the sequence log-likelihood (Problem 1); Viterbi returns the single most likely regime path (Problem 2). Given the true parameters, Viterbi recovers the hidden regime on most days.</div>
+<pre><code class="language-text">log-likelihood at true params: 5413.7
+Viterbi regime accuracy (true params): 0.946
+</code></pre>
+<div class="code-caption"><strong>Output 7.5.2:</strong> With oracle parameters, the from-scratch Viterbi path matches the true regime about 95 percent of the time; the misses cluster at regime boundaries, where one or two ordinary-looking returns leave the switch genuinely ambiguous. This is the ceiling that learned parameters will approach in the next block.</div>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Why Log Space Is Not Optional</div>
+<p>Each daily emission likelihood for this data is on the order of $b_k(x_t) \approx 20$ to $60$ (a narrow Gaussian density can exceed one). Over $T = 1500$ steps a naive forward pass multiplies $1500$ such factors together with transition probabilities below one mixed in, and the running $\alpha$ either overflows past the largest representable double (about $10^{308}$) or, with the sub-one transitions dominating, underflows to exactly $0.0$ within a few hundred steps, at which point the likelihood is silently lost. Working with $\log \alpha$ and combining via <code>logsumexp</code> keeps every quantity in a comfortable range (here the total log-likelihood is about $5414$, meaning a likelihood of $e^{5414}$ that no float could ever hold directly). The lesson generalizes to every long-sequence probabilistic model in this book: sum logs, never multiply probabilities.</p>
+</div>
+<p>So far we supplied the true parameters. The learning problem (Problem 3) is to recover them from the returns alone. Code 7.5.3 implements one Baum-Welch iteration from scratch, the E-step and M-step formulas of subsection two written literally in log space, so you can watch EM climb the likelihood. The backward variable reuses the same log-space pattern as the forward pass.</p>
+<pre><code class="language-python">def backward_loglik(logB, logA):
+    """Backward variable beta in log space: log p(x_{t+1:T} | z_t = k)."""
+    T, K = logB.shape
+    log_beta = np.zeros((T, K))                 # beta_T(k) = 1 -> log 0
+    for t in range(T - 2, -1, -1):
+        log_beta[t] = logsumexp(logA + logB[t + 1] + log_beta[t + 1], axis=1)
+    return log_beta
+
+def baum_welch(x, pi, A, mu, sigma, n_iter=30):
+    """Fit a Gaussian HMM from scratch by EM (Baum-Welch), log space."""
+    pi, A, mu, sigma = map(np.array, (pi, A, mu, sigma))
+    for _ in range(n_iter):
+        logB = gaussian_log_b(x, mu, sigma)
+        logA = np.log(A)
+        T, K = logB.shape
+        # E-step: forward, backward, then gamma and xi posteriors.
+        log_alpha = np.empty((T, K)); log_alpha[0] = np.log(pi) + logB[0]
+        for t in range(1, T):
+            log_alpha[t] = logsumexp(log_alpha[t-1][:, None] + logA, 0) + logB[t]
+        log_beta = backward_loglik(logB, logA)
+        ll = logsumexp(log_alpha[-1])
+        log_gamma = log_alpha + log_beta - ll
+        gamma = np.exp(log_gamma)                              # T x K
+        log_xi = (log_alpha[:-1, :, None] + logA[None]
+                  + (logB[1:] + log_beta[1:])[:, None, :] - ll)
+        xi = np.exp(log_xi).sum(0)                             # K x K expected
+        # M-step: re-estimate pi, A, and per-state mean/variance.
+        pi = gamma[0]
+        A = xi / xi.sum(1, keepdims=True)
+        w = gamma / gamma.sum(0, keepdims=True)
+        mu = (w * x[:, None]).sum(0)
+        sigma = np.sqrt((w * (x[:, None] - mu) ** 2).sum(0))
+    return pi, A, mu, sigma, ll
+
+# Start from deliberately wrong parameters and let EM find the regimes.
+pi0, A0 = np.array([0.5, 0.5]), np.array([[0.5, 0.5], [0.5, 0.5]])
+mu0, sigma0 = np.array([-0.01, 0.01]), np.array([0.01, 0.03])
+pi_f, A_f, mu_f, sigma_f, ll_f = baum_welch(returns, pi0, A0, mu0, sigma0)
+print("learned volatilities:", np.round(np.sort(sigma_f), 4))
+print("learned transition diag:", np.round(np.diag(A_f), 3))
+print(f"final log-likelihood: {ll_f:.1f}")
+</code></pre>
+<div class="code-caption"><strong>Code 7.5.3:</strong> From-scratch Baum-Welch (EM) for a Gaussian HMM. The E-step builds $\gamma$ and $\xi$ from the forward and backward variables; the M-step re-estimates $\pi$, $A$, and the per-regime mean and volatility as the posterior-weighted counts and moments of subsection two. Starting from uniform, deliberately wrong parameters, thirty iterations recover the two regimes.</div>
+<pre><code class="language-text">learned volatilities: [0.0059 0.0215]
+learned transition diag: [0.969 0.901]
+final log-likelihood: 5418.3
+</code></pre>
+<div class="code-caption"><strong>Output 7.5.3:</strong> From a uniform initialization that knew nothing of the two regimes, EM recovers both volatilities (true 0.006 and 0.022) and the sticky diagonal of the transition matrix (true 0.97 and 0.90) to within rounding, and reaches essentially the oracle log-likelihood. The hand-written E-step and M-step have rediscovered the hidden structure with no labels.</div>
+<p>That from-scratch EM is instructive but verbose. In practice we reach for the library that implements the same algorithm, and state the line-count reduction explicitly. Code 7.5.4 fits and decodes with <code>hmmlearn</code>.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Baum-Welch and Viterbi in a Dozen Lines With hmmlearn</div>
+<p>The from-scratch forward and Viterbi routines of Code 7.5.2 plus the Baum-Welch loop of Code 7.5.3 run about ninety lines together, with log-space arithmetic, a backward pass, and $\gamma$ and $\xi$ accumulation all written by hand. The <code>hmmlearn</code> library collapses all of it: <code>GaussianHMM.fit</code> runs Baum-Welch internally, <code>.predict</code> runs Viterbi, and <code>.score</code> runs the forward algorithm, turning roughly ninety lines into a dozen. The library handles the log-space arithmetic, the backward pass, the covariance re-estimation with regularization, the multiple random restarts, and the convergence monitoring that our from-scratch code left implicit.</p>
+<pre><code class="language-python"># pip install hmmlearn
+from hmmlearn.hmm import GaussianHMM
+
+model = GaussianHMM(n_components=2, covariance_type="diag",
+                    n_iter=100, random_state=0)
+model.fit(returns.reshape(-1, 1))            # Baum-Welch (EM) under the hood
+
+learned_path = model.predict(returns.reshape(-1, 1))   # Viterbi decoding
+learned_ll = model.score(returns.reshape(-1, 1))       # forward algorithm
+
+# Label-switching is arbitrary in EM: name the wider-variance state "turbulent".
+turbulent = int(np.argmax(model.covars_.ravel()))
+pred_turbulent = (learned_path == turbulent).astype(int)
+acc = (pred_turbulent == z_true).mean()
+print(f"learned log-likelihood: {learned_ll:.1f}")
+print(f"recovered volatilities: {np.sqrt(model.covars_.ravel())}")
+print(f"regime accuracy vs ground truth: {acc:.3f}")
+</code></pre>
+<div class="code-caption"><strong>Code 7.5.4:</strong> The library pair for Codes 7.5.2 and 7.5.3. <code>GaussianHMM.fit</code> learns $\pi$, $A$, and the per-regime $(\mu, \Sigma)$ by Baum-Welch from the returns alone; <code>.predict</code> reruns Viterbi with the learned parameters. The only manual step is resolving label-switching by naming the higher-variance state turbulent.</div>
+</div>
+<pre><code class="language-text">learned log-likelihood: 5418.2
+recovered volatilities: [0.00592 0.02147]
+regime accuracy vs ground truth: 0.939
+</code></pre>
+<div class="code-caption"><strong>Output 7.5.4:</strong> The library Baum-Welch recovers the two volatilities (true values 0.006 and 0.022) to three decimals from unlabeled returns, matching the from-scratch result of Output 7.5.3, and the learned Viterbi path matches the true regime about 94 percent of the time, within a point of the oracle ceiling of Output 7.5.2. EM has rediscovered the hidden calm-and-crisis structure with no labels at all.</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact: The Algorithm That Was Classified</div>
+<p>Leonard Baum and Lloyd Welch developed the forward-backward re-estimation procedure in the 1960s at the Institute for Defense Analyses, and much of the early HMM work grew out of cryptanalysis and signal intelligence, where inferring a hidden state from a stream of noisy emissions is the literal job description. The technique only became famous a decade later when Jim Baker and the team at IBM and CMU turned it loose on speech, and Lawrence Rabiner's 1989 tutorial finally explained it to everyone else. So the EM loop you just ran on stock returns has a lineage that runs from code-breaking through dictation software to, today, the discrete-latent world models of <a href="../../toc.html">Chapter 29</a>. Few algorithms have changed careers so often while staying exactly the same recursion.</p>
+</div>
+<p>The payoff is interpretive. The learned model hands back not just a regime label per day but the smoothed posterior $\gamma_t = p(z_t = \text{turbulent} \mid x_{1:T})$, a soft probability of turbulence on each day, available through <code>model.predict_proba</code>. Figure 7.5.1 sketches what that posterior looks like over a regime switch: calm returns hug zero with the posterior near zero, then a burst of large-magnitude returns drives the posterior sharply toward one, exactly the belief flip the numeric example of subsection three computed by hand.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Top panel shows a returns series, small near zero on the left then large swings on the right; bottom panel shows the posterior probability of the turbulent regime rising from near zero to near one as the returns become volatile">
+<defs>
+<marker id="arr75" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.ax75 { stroke:#5a626c; stroke-width:1.5; marker-end:url(#arr75); }
+.ret75 { fill:none; stroke:#14385c; stroke-width:1.6; }
+.post75 { fill:none; stroke:#b8431f; stroke-width:2.4; }
+.zero75 { stroke:#9aa3b2; stroke-width:1; stroke-dasharray:4 4; }
+.t75 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s75 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.band75 { fill:#b8431f; opacity:0.08; }
+</style>
+<!-- turbulent band -->
+<rect class="band75" x="500" y="20" width="320" height="280"/>
+<text class="s75" x="660" y="34">turbulent regime</text>
+<text class="s75" x="250" y="34">calm regime</text>
+<!-- Top: returns -->
+<text class="t75" x="430" y="16">Observed returns $x_t$</text>
+<line class="ax75" x1="50" y1="90" x2="830" y2="90"/>
+<line class="zero75" x1="50" y1="90" x2="820" y2="90"/>
+<text class="s75" x="38" y="60" transform="rotate(-90 38 60)">return</text>
+<path class="ret75" d="M 55 88 L 75 92 L 95 87 L 115 93 L 135 89 L 155 91 L 175 88 L 195 92 L 215 89 L 235 90 L 255 88 L 275 92 L 295 89 L 315 91 L 335 88 L 355 92 L 375 90 L 395 89 L 415 91 L 435 88 L 455 91 L 475 89 L 495 90 L 515 62 L 535 120 L 555 55 L 575 128 L 595 70 L 615 118 L 635 58 L 655 125 L 675 72 L 695 115 L 715 60 L 735 122 L 755 68 L 775 110 L 795 75 L 815 105"/>
+<!-- Bottom: posterior -->
+<text class="t75" x="430" y="170">Posterior $\gamma_t = p(z_t=\text{turbulent}\mid x_{1:T})$</text>
+<line class="ax75" x1="50" y1="290" x2="830" y2="290"/>
+<line class="ax75" x1="50" y1="290" x2="50" y2="185"/>
+<text class="s75" x="38" y="240" transform="rotate(-90 38 240)">prob</text>
+<text class="s75" x="40" y="195">1</text>
+<text class="s75" x="40" y="288">0</text>
+<path class="post75" d="M 55 287 L 255 287 L 460 285 L 495 280 L 510 250 L 525 215 L 545 200 L 700 197 L 820 196"/>
+<text class="s75" x="440" y="312">time (one regime switch shown)</text>
+</svg>
+<figcaption><strong>Figure 7.5.1:</strong> The smoothed posterior probability of the turbulent regime. While returns stay small (left, calm), the posterior $\gamma_t$ sits near zero; once large-magnitude returns appear (right, shaded turbulent), the posterior climbs toward one. This soft belief, not just the hard Viterbi label, is the HMM's most useful output and the exact quantity a belief-state agent of <a href="../../toc.html">Chapter 23</a> would act upon.</figcaption>
+</figure>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Risk Desk That Stopped Trusting a Single Volatility Number</div>
+<p><strong>Who:</strong> A quantitative risk analyst at a mid-size asset manager, responsible for daily value-at-risk on a multi-strategy equity book.</p>
+<p><strong>Situation:</strong> The desk sized positions using a single rolling volatility estimate over a trailing window, the same number feeding both risk limits and a volatility-targeting overlay that scaled exposure inversely to recent volatility.</p>
+<p><strong>Problem:</strong> The trailing estimate was always late. It stayed low going into stress, so the overlay kept exposure high right as a turbulent regime began, then stayed high for weeks after calm returned, throttling exposure during the recovery. Both errors cost money, and a post-mortem blamed the implicit assumption that volatility was one slowly drifting quantity rather than two distinct states.</p>
+<p><strong>Dilemma:</strong> Three paths competed. Shorten the rolling window to react faster, which made the estimate noisy and triggered whipsaw trading. Move to a GARCH model from <a href="../module-05-univariate-forecasting/index.html">Chapter 5</a>, which captured volatility clustering but still produced one continuously varying number with no notion of a discrete regime. Or fit a two-state Gaussian HMM to returns and act on the regime posterior directly.</p>
+<p><strong>Decision:</strong> The analyst fit a two-state <code>GaussianHMM</code> on daily returns, exactly the model of Code 7.5.3, and replaced the single volatility input with the posterior probability of the turbulent regime, $\gamma_t$ from <code>predict_proba</code>.</p>
+<p><strong>How:</strong> A nightly job refit the HMM on a trailing two-year window, decoded the current regime posterior, and exposed it as a single risk-on probability. The overlay scaled exposure by one minus that probability, so a sharp rise in turbulence probability cut exposure within a day or two rather than weeks. The discrete regime also gave the risk committee a far more legible signal than a wiggling GARCH line: a single sentence, "the model puts an 80 percent probability on the turbulent regime today."</p>
+<p><strong>Result:</strong> In backtests across two stress episodes the regime-aware overlay reduced peak drawdown materially versus the trailing-window version while re-engaging exposure faster in the recovery, because the posterior collapsed back toward calm within days of returns normalizing. The desk kept GARCH for the magnitude of risk but used the HMM for the question of which regime they were in.</p>
+<p><strong>Lesson:</strong> When the world genuinely has discrete regimes, modeling them as one continuous quantity throws away the most decision-relevant fact. An HMM's regime posterior is both a sharper signal and a more communicable one, and it is the same $\gamma_t$ that a sequential decision-making agent later in the book would condition its policy on.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.5.1: Sum Versus Max <span class="exercise-type conceptual">Conceptual</span></div>
+<p>The forward algorithm and Viterbi share a recursion that differs in one operator: forward uses a sum over previous states, Viterbi a maximum. Explain in words what each quantity computes ($\alpha_T(k)$ summed versus the Viterbi path probability), and give a short two-state example sequence where the single most likely path passes through a state that is not the most likely state at every individual time step. Why does this mean Viterbi decoding and per-step marginal (posterior) decoding can disagree?</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.5.2: Viterbi Versus Posterior Decoding <span class="exercise-type coding">Coding</span></div>
+<p>The Baum-Welch loop of Code 7.5.3 computes the smoothed posterior $\gamma_t(k) \propto \alpha_t(k)\beta_t(k)$ internally but discards it. Modify <code>baum_welch</code> to also return the final $\gamma$, then build a posterior-decoded regime path by thresholding $\gamma_t(\text{turbulent})$ at 0.5. Compare this per-step posterior decoding against the Viterbi path of Code 7.5.2 on the data from Code 7.5.1: report both accuracies against the ground truth, count the days on which they disagree, and pick one such day to explain why the globally most likely path (Viterbi) and the locally most likely state (posterior) can differ. Tie your explanation back to the sum-versus-max distinction of subsection two.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.5.3: How Many States? <span class="exercise-type analysis">Analysis</span></div>
+<p>Subsection four noted that $K$ is fixed in advance. Fit <code>GaussianHMM</code> with <code>n_components</code> in $\{1, 2, 3, 4\}$ to the returns of Code 7.5.1 and, for each, record the log-likelihood and compute the Bayesian Information Criterion $\text{BIC} = -2\log L + p\log T$, where $p$ is the number of free parameters (count $\pi$, $A$, and the per-state means and variances). Which $K$ does BIC select, and does it recover the true two regimes? Discuss why raw log-likelihood alone cannot choose $K$ and how this connects to the fixed-state-count limitation.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.5.4: From Regimes to a Switching Forecaster <span class="exercise-type open-ended">Open-ended</span></div>
+<p>Extend the Gaussian HMM into the Markov-switching autoregression of subsection four: let each regime carry its own AR(1) coefficient and noise variance. Fit it (statsmodels' <code>MarkovAutoregression</code> implements this, or extend Code 7.5.3 by hand) to a real equity-index return series, and compare its out-of-sample forecast and regime-dated turbulence calls against a single global AR(1) model, using the time-aware evaluation of <a href="../../part-1-foundations/module-02-temporal-data-engineering/section-2.6.html">Section 2.6</a>. Does letting the dynamics switch with the regime improve forecasts, or only the volatility narrative? Reflect on which downstream decision (risk sizing versus point forecasting) benefits more.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-7.4.html"><span class="nav-label">Previous</span><span class="nav-num">Section 7.4</span><span class="nav-title">Nonlinear and Non-Gaussian Filtering</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 7</span><span class="nav-num">Contents</span><span class="nav-title">State-Space Models and Filtering</span></a>
+<a class="next" href="section-7.6.html"><span class="nav-label">Next</span><span class="nav-num">Section 7.6</span><span class="nav-title">Bridge: Filtering as Recurrent Inference</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

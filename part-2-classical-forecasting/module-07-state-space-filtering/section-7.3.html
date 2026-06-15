@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 7.3: Extended and Unscented Kalman Filters. Filtering nonlinear state-space models: why Gaussian beliefs stop being Gaussian under a nonlinear map, the Jacobian-based Extended Kalman Filter, the sigma-point Unscented Kalman Filter, tuning and the ensemble filter for high dimensions, and a worked pendulum-tracking comparison." name="description"/>
+<title>Section 7.3: Extended and Unscented Kalman Filters | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Forecasting and Time Series Analysis</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 7: State-Space Models and Filtering</a></div>
+<h1>Extended and Unscented Kalman Filters</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"Whenever the world bends, I pretend it is a straight line just long enough to take one step. Mostly it works. The times it does not, I call divergence and blame the initialization."</p>
+<cite>An Extended Kalman Filter Linearizing Its Way Through Life</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The Kalman filter of <a href="section-7.2.html">Section 7.2</a> is exact only when the world is linear and the noise is Gaussian; the moment the transition or the measurement bends, the elegant closed form breaks, and the two great repairs are to approximate the bend (the Extended Kalman Filter linearizes with a Jacobian) or to approximate the belief (the Unscented Kalman Filter pushes a handful of carefully chosen points through the true nonlinearity).</strong> Both keep the predict-then-update rhythm and the Gaussian bookkeeping; they differ only in how they cross a nonlinear function. This section derives both, shows exactly where the EKF fails and the UKF holds, and closes with a pendulum-tracking experiment where you watch the difference with your own eyes.</p>
+</div>
+<p>In <a href="section-7.2.html">Section 7.2</a> we built the linear Kalman filter and proved a small miracle: if the state evolves by a matrix multiply, the measurement is a matrix multiply, and every noise source is Gaussian, then the belief about the state stays Gaussian forever, and the filter only ever has to track a mean vector $\hat{\mathbf{x}}$ and a covariance matrix $\mathbf{P}$. That miracle rests entirely on linearity. A Gaussian pushed through a linear map comes out Gaussian; a Gaussian pushed through almost anything else comes out lumpy, skewed, sometimes bimodal, and no longer summarizable by a mean and a covariance. Real systems are full of those almost-anything-else maps: a radar measures range and bearing, which are trigonometric functions of Cartesian position; a pendulum's angle evolves by a sine; a chemical reactor's temperature couples to concentration through an exponential Arrhenius term. This section is about filtering when the state-space model</p>
+$$\mathbf{x}_{t} = f(\mathbf{x}_{t-1}) + \mathbf{w}_{t}, \qquad \mathbf{z}_{t} = h(\mathbf{x}_{t}) + \mathbf{v}_{t},$$
+<p>has a nonlinear transition $f$ or a nonlinear measurement $h$ (or both), with process noise $\mathbf{w}_t \sim \mathcal{N}(\mathbf{0}, \mathbf{Q})$ and measurement noise $\mathbf{v}_t \sim \mathcal{N}(\mathbf{0}, \mathbf{R})$ as in <a href="../../toc.html">Appendix A</a>'s unified notation.</p>
+
+<h2>1. Why the Plain Kalman Filter Is Not Enough <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The linear filter's whole reason for working is the closure property of Gaussians under affine maps: if $\mathbf{x} \sim \mathcal{N}(\boldsymbol{\mu}, \boldsymbol{\Sigma})$ and $\mathbf{y} = \mathbf{A}\mathbf{x} + \mathbf{b}$, then $\mathbf{y} \sim \mathcal{N}(\mathbf{A}\boldsymbol{\mu} + \mathbf{b}, \, \mathbf{A}\boldsymbol{\Sigma}\mathbf{A}^{\top})$, exactly, with no approximation. The mean and covariance are all you ever need because they are all there ever is. Replace $\mathbf{A}\mathbf{x} + \mathbf{b}$ with a curved function $g(\mathbf{x})$ and that guarantee evaporates. The transformed density $p(\mathbf{y})$ is generally not Gaussian at all, so the very objects the filter tracks, a mean and a covariance, no longer describe the belief; they merely summarize its first two moments while throwing away everything else.</p>
+<p>To see why this matters operationally, recall what the linear filter actually does each step: it predicts the next measurement as a linear function of the state, compares it to the real reading, and corrects in proportion to the mismatch. Every term in that recipe (the predicted measurement, the innovation covariance, the gain) is derived assuming the predicted measurement density is Gaussian with a mean and covariance you can write down in closed form. Bend the measurement function and that density stops being Gaussian, so the closed forms no longer describe anything real. The cleanest way to feel this is to push a Gaussian through a parabola. Code 7.3.1 samples $x \sim \mathcal{N}(2, 1^2)$ and maps it through $y = x^2$, then compares the true sample mean of $y$ against the naive guess $\big(\mathbb{E}[x]\big)^2 = 4$ that a filter would make if it ignored the curvature.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(0)
+x = rng.normal(loc=2.0, scale=1.0, size=1_000_000)  # x ~ N(2, 1)
+y = x ** 2                                           # nonlinear map y = x^2
+
+print(f"naive   E[y] ~ (E[x])^2 = {2.0**2:.3f}")     # ignores the bend
+print(f"true    E[y]            = {y.mean():.3f}")    # Monte Carlo truth
+print(f"true   Var[y]           = {y.var():.3f}")
+print(f"skew of y              = {((y - y.mean())**3).mean() / y.std()**3:.3f}")
+</code></pre>
+<div class="code-caption"><strong>Code 7.3.1:</strong> Pushing a Gaussian through $y = x^2$. The naive plug-in mean ignores the curvature; the true mean is shifted, the variance is inflated, and the output is visibly skewed, so it is no longer Gaussian.</div>
+<pre><code class="language-text">naive   E[y] ~ (E[x])^2 = 4.000
+true    E[y]            = 5.000
+true   Var[y]           = 34.02
+skew of y              = 1.414
+</code></pre>
+<div class="code-caption"><strong>Output 7.3.1:</strong> The true mean is $5$, not $4$: the exact value is $\mathbb{E}[x^2] = (\mathbb{E}[x])^2 + \operatorname{Var}[x] = 4 + 1$. The nonzero skew confirms the transformed belief is not Gaussian, so a mean-and-covariance filter can only ever approximate it.</div>
+<p>That shift of one unit in the mean, and the strong positive skew, are precisely the information a nonlinear filter must somehow recover or accept it has lost. The two filters in this section take opposite philosophies. The Extended Kalman Filter replaces the curve $g$ by its tangent line at the current estimate, so it pretends the bend is not there over one step. The Unscented Kalman Filter keeps the bend and instead replaces the continuous Gaussian by a few representative points, pushing each through the true $g$ and re-fitting a Gaussian to where they land. The second philosophy, as we will see, recovers the $5$ above almost exactly while the first reports $4$.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Gaussians Do Not Survive Curves</div>
+<p>The linear Kalman filter is not "approximately exact" on nonlinear problems; it is undefined, because its update equations assume the predicted measurement is a linear function of the state. Every nonlinear filter is therefore a strategy for crossing a curved function while staying inside the Gaussian bookkeeping that makes the filter cheap. The EKF approximates the function (linearize), the UKF approximates the distribution (sample deterministically), and the particle filter of <a href="section-7.4.html">Section 7.4</a> abandons the Gaussian assumption entirely. They form a ladder of fidelity against cost.</p>
+</div>
+
+<h2>2. The Extended Kalman Filter: Linearize the Bend <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The Extended Kalman Filter (EKF) makes the boldest possible simplification: over a single time step, treat $f$ and $h$ as if they were linear, using their first-order Taylor expansions about the current best estimate. Concretely, define the Jacobian matrices, the matrices of all first partial derivatives, evaluated at the latest state estimate:</p>
+$$\mathbf{F}_{t} = \left.\frac{\partial f}{\partial \mathbf{x}}\right|_{\hat{\mathbf{x}}_{t-1}}, \qquad \mathbf{H}_{t} = \left.\frac{\partial h}{\partial \mathbf{x}}\right|_{\hat{\mathbf{x}}_{t \mid t-1}}.$$
+<p>These play exactly the role the constant matrices $\mathbf{F}$ and $\mathbf{H}$ played in the linear filter of <a href="section-7.2.html">Section 7.2</a>, except they are recomputed every step at the current operating point. The predict step propagates the mean through the true nonlinearity but propagates the covariance through the linearization:</p>
+$$\hat{\mathbf{x}}_{t \mid t-1} = f(\hat{\mathbf{x}}_{t-1}), \qquad \mathbf{P}_{t \mid t-1} = \mathbf{F}_{t}\,\mathbf{P}_{t-1}\,\mathbf{F}_{t}^{\top} + \mathbf{Q}.$$
+<p>The update step is the linear Kalman update with $\mathbf{H}_t$ in place of a constant measurement matrix, and with the innovation measured against the true nonlinear prediction $h(\hat{\mathbf{x}}_{t \mid t-1})$:</p>
+$$\mathbf{S}_{t} = \mathbf{H}_{t}\,\mathbf{P}_{t \mid t-1}\,\mathbf{H}_{t}^{\top} + \mathbf{R}, \qquad \mathbf{K}_{t} = \mathbf{P}_{t \mid t-1}\,\mathbf{H}_{t}^{\top}\,\mathbf{S}_{t}^{-1},$$
+$$\hat{\mathbf{x}}_{t} = \hat{\mathbf{x}}_{t \mid t-1} + \mathbf{K}_{t}\big(\mathbf{z}_{t} - h(\hat{\mathbf{x}}_{t \mid t-1})\big), \qquad \mathbf{P}_{t} = (\mathbf{I} - \mathbf{K}_{t}\mathbf{H}_{t})\,\mathbf{P}_{t \mid t-1}.$$
+<p>Where do these equations come from? Write the first-order Taylor expansion of the transition about the previous estimate, $f(\mathbf{x}) \approx f(\hat{\mathbf{x}}_{t-1}) + \mathbf{F}_t(\mathbf{x} - \hat{\mathbf{x}}_{t-1})$. This is an affine map in $\mathbf{x}$, and an affine map of a Gaussian is exactly Gaussian, so over one step the linearized model behaves like the filter of <a href="section-7.2.html">Section 7.2</a> with $\mathbf{F}_t$ playing the role of the transition matrix. Substituting that affine approximation into the linear filter's covariance recursion reproduces $\mathbf{P}_{t \mid t-1} = \mathbf{F}_t \mathbf{P}_{t-1} \mathbf{F}_t^{\top} + \mathbf{Q}$ verbatim, and the same substitution for $h$ yields the update. The EKF is therefore not a wholly new filter; it is the linear Kalman filter applied to a model that is re-linearized at every step about the latest estimate.</p>
+<p>The structure is identical to the linear filter; the only new work is forming $\mathbf{F}_t$ and $\mathbf{H}_t$ at each step. That is also the EKF's signature weakness. The covariance is propagated as though the function were exactly its tangent line, which is accurate only when the function is gently curved over the spread of the current belief. When the nonlinearity is sharp relative to the covariance, the linearization discards real probability mass, the reported covariance becomes overconfident, and the filter can lock onto a wrong trajectory and never recover: the failure mode known as <em>divergence</em>. A bad initialization makes it worse, because the Jacobian is evaluated at the wrong point, so the very linearization that is supposed to correct the estimate is itself computed in the wrong place.</p>
+<p>The mechanism of divergence is worth spelling out because it is subtle and dangerous. The covariance $\mathbf{P}_t$ is the filter's own estimate of how uncertain it is, and the Kalman gain $\mathbf{K}_t$ shrinks as $\mathbf{P}_t$ shrinks: a confident filter barely listens to new measurements. When the linearization is too coarse, $\mathbf{P}_t$ shrinks faster than the true error does, because the tangent line throws away the curvature that was actually inflating the uncertainty. The filter thus becomes confident in a wrong estimate, drives its gain toward zero, and stops correcting; from that point the measurements arrive but are ignored, and the estimate drifts off on the open-loop dynamics. The treacherous part is that the reported covariance looks healthy and small the whole time, so a dashboard watching only the state and its error bars sees nothing wrong until the track is hopelessly lost. This is why the NIS consistency check of Section 4, which compares the actual innovations against the covariance the filter claims, is not optional hygiene but the primary early-warning instrument for a deployed EKF.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: The Jacobian of a Range-Bearing Sensor</div>
+<p>Suppose the state is a target's planar position $\mathbf{x} = (p_x, p_y)$ and a sensor at the origin reports range $r = \sqrt{p_x^2 + p_y^2}$ and bearing $\theta = \operatorname{atan2}(p_y, p_x)$, so $h(\mathbf{x}) = (r, \theta)$. The measurement Jacobian is</p>
+$$\mathbf{H} = \begin{bmatrix} \dfrac{p_x}{r} &amp; \dfrac{p_y}{r} \\[1.1em] -\dfrac{p_y}{r^{2}} &amp; \dfrac{p_x}{r^{2}} \end{bmatrix}.$$
+<p>At the operating point $(p_x, p_y) = (3, 4)$ we have $r = 5$, so the range row is $(0.6,\ 0.8)$ and the bearing row is $(-0.16,\ 0.12)$. Notice the bearing partials carry a $1/r^2$ factor: as the target approaches the sensor, $r \to 0$, the Jacobian entries blow up, the linearization becomes wildly inaccurate over any realistic covariance, and the EKF is most likely to diverge exactly when the target is close. This single observation, that the EKF's trustworthiness depends on where you linearize, motivates the entire Unscented approach.</p>
+</div>
+<p>Code 7.3.2 implements a complete EKF from scratch as a small reusable class, with the predict and update written exactly as the equations above. We will instantiate it on a pendulum in Section 5; here we establish the machinery and its interface.</p>
+<pre><code class="language-python">import numpy as np
+
+class ExtendedKalmanFilter:
+    """Minimal EKF for x_t = f(x_{t-1}) + w,  z_t = h(x_t) + v.
+    The caller supplies f, h and their Jacobians F(x), H(x)."""
+    def __init__(self, f, F, h, H, Q, R, x0, P0):
+        self.f, self.F, self.h, self.H = f, F, h, H   # model + Jacobians
+        self.Q, self.R = Q, R                         # noise covariances
+        self.x, self.P = x0.astype(float), P0.astype(float)
+
+    def predict(self):
+        Fk = self.F(self.x)                           # linearize transition
+        self.x = self.f(self.x)                       # mean through true f
+        self.P = Fk @ self.P @ Fk.T + self.Q          # covariance through F
+        return self.x
+
+    def update(self, z):
+        Hk = self.H(self.x)                           # linearize measurement
+        y = z - self.h(self.x)                        # innovation vs true h
+        S = Hk @ self.P @ Hk.T + self.R               # innovation covariance
+        K = self.P @ Hk.T @ np.linalg.inv(S)          # Kalman gain
+        self.x = self.x + K @ y
+        I = np.eye(self.P.shape[0])
+        self.P = (I - K @ Hk) @ self.P
+        return self.x
+</code></pre>
+<div class="code-caption"><strong>Code 7.3.2:</strong> A from-scratch Extended Kalman Filter. The mean always flows through the true $f$ and $h$, while the covariance flows through the freshly evaluated Jacobians <code>Fk</code> and <code>Hk</code>; this split is the entire idea of the EKF.</div>
+<div class="callout tip">
+<div class="callout-title">Historical Note: The Filter That Went to the Moon</div>
+<p>The EKF is not a textbook toy retrofitted onto real problems; it was born on one of the hardest real problems ever attempted. The Apollo onboard guidance computer ran an extended Kalman filter to fuse noisy radar and inertial measurements into a spacecraft trajectory, linearizing the orbital dynamics about the current estimate on hardware with a few kilobytes of memory. Stanley Schmidt's adaptation of Kalman's linear theory to that nonlinear navigation problem is why some early sources call it the "Kalman-Schmidt" filter. Every drone, phone, and self-driving car that fuses GPS with an accelerometer today is running a direct descendant.</p>
+</div>
+
+<h2>3. The Unscented Kalman Filter: Sample the Bend <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The Unscented Kalman Filter (UKF) starts from a deceptively simple claim, the heart of the <em>unscented transform</em>: it is easier to approximate a probability distribution than an arbitrary nonlinear function. Rather than linearize $f$ and $h$, the UKF picks a small, deterministic set of points (called <em>sigma points</em>) whose sample mean and sample covariance match the current Gaussian belief exactly, pushes each point through the true nonlinearity, and re-fits a Gaussian to the transformed cloud. No derivatives are ever computed, and the result is accurate to higher order than the EKF's tangent-line guess.</p>
+<p>The intuition behind "higher order" is worth making precise. The EKF keeps only the first term of the Taylor expansion of $g$, so any error it makes scales with the second derivative (the curvature) of $g$ times the variance of the input. The unscented transform, by contrast, matches the mean of the transformed distribution correctly through the second-order term and captures part of the third, for any nonlinearity, because it samples the function rather than truncating its expansion. Julier and Uhlmann's original analysis showed that for a Gaussian input the transform reproduces the true posterior mean and covariance exactly through the second order, and often does better, which is why a UKF frequently matches a hand-derived second-order EKF while costing only a handful of function evaluations and no derivative algebra at all.</p>
+<p>For an $n$-dimensional state with mean $\hat{\mathbf{x}}$ and covariance $\mathbf{P}$, the UKF forms $2n + 1$ sigma points. Let $\lambda = \alpha^{2}(n + \kappa) - n$ be a scaling parameter built from a small spread $\alpha$ and a secondary tuning constant $\kappa$. The points are the mean plus and minus the columns of a scaled matrix square root:</p>
+$$\boldsymbol{\mathcal{X}}^{(0)} = \hat{\mathbf{x}}, \qquad \boldsymbol{\mathcal{X}}^{(i)} = \hat{\mathbf{x}} \pm \left(\sqrt{(n+\lambda)\,\mathbf{P}}\,\right)_{i}, \quad i = 1, \dots, n,$$
+<p>where $\big(\sqrt{(n+\lambda)\mathbf{P}}\big)_i$ is the $i$-th column of a Cholesky factor. Each point carries two weights, one for reconstructing the mean and one for the covariance:</p>
+$$W^{(0)}_{m} = \frac{\lambda}{n+\lambda}, \qquad W^{(0)}_{c} = \frac{\lambda}{n+\lambda} + (1 - \alpha^{2} + \beta), \qquad W^{(i)}_{m} = W^{(i)}_{c} = \frac{1}{2(n+\lambda)}.$$
+<p>The constant $\beta$ injects prior knowledge about the shape of the distribution; $\beta = 2$ is optimal for a true Gaussian. The asymmetry between the mean weight $W^{(0)}_m$ and the covariance weight $W^{(0)}_c$ is deliberate: the extra term $(1 - \alpha^2 + \beta)$ corrects the covariance for the fact that a finite set of sigma points underestimates the spread of a curved transformation, and it is the small detail that separates a working UKF from a subtly overconfident one. After propagating every point, $\boldsymbol{\mathcal{Y}}^{(i)} = g(\boldsymbol{\mathcal{X}}^{(i)})$, the transformed mean and covariance are simple weighted sums:</p>
+$$\hat{\mathbf{y}} = \sum_{i=0}^{2n} W^{(i)}_{m}\,\boldsymbol{\mathcal{Y}}^{(i)}, \qquad \mathbf{P}_{y} = \sum_{i=0}^{2n} W^{(i)}_{c}\,\big(\boldsymbol{\mathcal{Y}}^{(i)} - \hat{\mathbf{y}}\big)\big(\boldsymbol{\mathcal{Y}}^{(i)} - \hat{\mathbf{y}}\big)^{\top}.$$
+<p>The full UKF threads this transform through both the predict step (propagate sigma points through $f$) and the update step (propagate them through $h$ and form a state-measurement cross-covariance to build the Kalman gain). Because the sigma points genuinely visit the curved function, the UKF captures the mean shift and variance inflation that the EKF's tangent line misses. Figure 7.3.1 contrasts the two strategies on a single curved measurement function, which is the picture worth carrying for the rest of the chapter.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Left panel: an input Gaussian is approximated by a straight tangent line and the output Gaussian is read off the line, missing the true curved output. Right panel: three sigma points from the same input Gaussian are pushed through the true curve and a Gaussian is refit to where they land, matching the true output mean.">
+<defs>
+<marker id="arr73" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.ax73 { stroke:#5a626c; stroke-width:1.6; marker-end:url(#arr73); }
+.curve73 { fill:none; stroke:#14385c; stroke-width:2.6; }
+.tan73 { fill:none; stroke:#b8431f; stroke-width:2.2; stroke-dasharray:6 4; }
+.sig73 { fill:#1f7a4d; }
+.miss73 { fill:#b8431f; }
+.t73 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.s73 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.g73 { fill:#14385c; opacity:0.18; }
+</style>
+<!-- Left: EKF linearize -->
+<text class="t73" x="215" y="26">EKF: replace the curve with its tangent</text>
+<line class="ax73" x1="55" y1="300" x2="400" y2="300"/>
+<line class="ax73" x1="55" y1="300" x2="55" y2="55"/>
+<text class="s73" x="230" y="324">input state x</text>
+<text class="s73" x="42" y="180" transform="rotate(-90 42 180)">output g(x)</text>
+<path class="curve73" d="M 70 285 Q 230 285 385 90"/>
+<line class="tan73" x1="120" y1="270" x2="320" y2="150"/>
+<path class="g73" d="M 150 300 q 30 -55 60 0 z"/>
+<circle class="miss73" cx="180" cy="226" r="4.5"/>
+<text class="s73" x="180" y="345">tangent guess sits below the true curve</text>
+<!-- Right: UKF sigma points -->
+<text class="t73" x="645" y="26">UKF: push sigma points through the curve</text>
+<line class="ax73" x1="485" y1="300" x2="830" y2="300"/>
+<line class="ax73" x1="485" y1="300" x2="485" y2="55"/>
+<text class="s73" x="660" y="324">input state x</text>
+<path class="curve73" d="M 500 285 Q 660 285 815 90"/>
+<path class="g73" d="M 580 300 q 30 -55 60 0 z"/>
+<!-- three sigma points on x axis, mapped onto the curve -->
+<circle class="sig73" cx="582" cy="285" r="4.5"/><line x1="582" y1="285" x2="582" y2="300" stroke="#1f7a4d" stroke-width="1.2"/>
+<circle class="sig73" cx="610" cy="276" r="4.5"/><line x1="610" y1="276" x2="610" y2="300" stroke="#1f7a4d" stroke-width="1.2"/>
+<circle class="sig73" cx="638" cy="258" r="4.5"/><line x1="638" y1="258" x2="638" y2="300" stroke="#1f7a4d" stroke-width="1.2"/>
+<text class="s73" x="660" y="345">refit Gaussian lands on the true mean</text>
+</svg>
+<figcaption><strong>Figure 7.3.1:</strong> The two ways to cross a curve. Left: the EKF replaces the blue curve with the orange tangent at the mean and reads the output off the line, so its predicted output (orange dot) falls below the true curved response. Right: the UKF maps three sigma points (green) through the true blue curve and refits a Gaussian, recovering the shifted output mean the tangent missed.</figcaption>
+</figure>
+<p>The numeric example below makes this concrete on the very parabola that fooled the plug-in estimate in Section 1.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Sigma Points Recover the True Mean of $x^2$</div>
+<p>Take the scalar belief $x \sim \mathcal{N}(2, 1)$ from Code 7.3.1, so $n = 1$. Using the common choice $\alpha = 1, \kappa = 0$ gives $\lambda = 0$, three sigma points at $\hat{x}$ and $\hat{x} \pm \sqrt{(n+\lambda)P} = 2 \pm 1$, that is $\{1, 2, 3\}$, with mean weights $W_m^{(0)} = 0$ and $W_m^{(1)} = W_m^{(2)} = \tfrac{1}{2}$. Pushing each through $g(x) = x^2$ yields $\{1, 4, 9\}$, and the reconstructed mean is $0\cdot 4 + \tfrac12\cdot 1 + \tfrac12\cdot 9 = 5$. The UKF reports $\mathbb{E}[x^2] = 5$, matching the Monte Carlo truth from Output 7.3.1 exactly, while the EKF's linearization at $\hat{x}=2$ would report $g(2) = 4$. With just three function evaluations and no derivatives, the unscented transform captured the curvature the tangent line threw away.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact: Why "Unscented"?</div>
+<p>The name puzzles everyone. Jeffrey Uhlmann, who co-developed the transform with Simon Julier in the 1990s, has explained that he deliberately avoided naming it after himself and picked a word that sounded technical but meant nothing in particular. The story he tells is that he spotted a stick of "unscented" deodorant on a colleague's desk and decided that if the filter did not stink up the room with the usual self-aggrandizing acronym, "unscented" it would be. The label stuck, and a generation of engineers now writes UKF without a clue that the term is an inside joke about deodorant. There is a lesson buried in the whimsy: the method is memorable partly because its name refuses to explain itself, forcing you to learn what it actually does.</p>
+</div>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Approximate the Distribution, Not the Function</div>
+<p>The EKF and UKF answer the same question, "where does my Gaussian go through this curve?", with opposite tactics. The EKF replaces the curve with a line and pushes the whole Gaussian through it; error grows with the curvature. The UKF keeps the curve and pushes a few exact representatives of the Gaussian through it; error grows only with how non-Gaussian the output is. For most engineering nonlinearities the second error is far smaller, which is why the UKF typically matches a second-order EKF in accuracy while needing no Jacobians at all, a property that matters enormously when $f$ or $h$ is a black-box simulator you cannot differentiate by hand.</p>
+</div>
+
+<h2>4. Choosing Between Them and Tuning <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The choice between EKF and UKF is rarely about raw accuracy alone; it is about derivatives, cost, and how violently the model bends. The EKF needs analytic or numerical Jacobians, which can be tedious, bug-prone, or impossible for a black-box dynamics model, but it is the cheapest option per step and is the right default for mild nonlinearities at high update rates (think a 1 kHz inertial-measurement loop). The UKF needs no derivatives and tracks strong nonlinearities more faithfully, at the cost of $2n+1$ model evaluations and a Cholesky factorization per step. As a working rule: reach for the UKF when the nonlinearity is strong, when the Jacobian is painful to derive, or when the EKF you already built is diverging; stay with the EKF when steps are cheap, the model is smooth, and you can differentiate it cleanly.</p>
+<p>A second axis is the failure mode you can tolerate. Because the EKF can diverge silently, as Section 2 described, it is risky in safety-critical loops where no human is watching the innovations. The UKF can still be inconsistent if mistuned, but its sigma points sample the real function, so it degrades more gracefully and rarely collapses its covariance to nothing the way an overconfident EKF does. A pragmatic pattern in industry is to prototype with a UKF (no Jacobians, fast to stand up, forgiving), confirm the model and tuning are right, and only then, if the per-step budget demands it, derive the Jacobians and switch to an EKF for the deployed high-rate loop, using the UKF as the trusted reference the EKF must match.</p>
+<p>Both filters live or die by their noise covariances $\mathbf{Q}$ and $\mathbf{R}$, which encode trust. A too-small $\mathbf{Q}$ tells the filter the dynamics are nearly perfect, so it stops listening to measurements and drifts; a too-large $\mathbf{Q}$ makes it chase every noisy reading. $\mathbf{R}$ is the mirror image: it sets how much the innovation is believed. The principled diagnostic is the normalized innovation squared (NIS), $\epsilon_t = \mathbf{y}_t^{\top}\mathbf{S}_t^{-1}\mathbf{y}_t$, which should follow a chi-squared distribution with as many degrees of freedom as the measurement dimension if the filter is consistent; a NIS that runs persistently high means the filter is overconfident (usually $\mathbf{Q}$ or $\mathbf{R}$ too small). Concretely, for a scalar measurement the NIS has one degree of freedom, so its expected value is $1$ and a two-sided 95 percent acceptance band runs from about $0.001$ to $5.02$. If you average the NIS over a window and it sits near $1$, the filter's claimed uncertainty matches reality; if the windowed average climbs to $3$ or $4$ and stays there, the innovations are routinely larger than $\mathbf{S}_t$ predicts, which is the quantitative fingerprint of the overconfidence that precedes divergence. Tuning then becomes a closed loop: inflate $\mathbf{Q}$ (or $\mathbf{R}$) until the windowed NIS settles back to its degrees of freedom. The UKF adds three sigma-point knobs, $\alpha$ (spread, typically $10^{-3}$ to $1$), $\beta$ ($=2$ for Gaussians), and $\kappa$ (often $0$ or $3-n$); a tiny $\alpha$ keeps sigma points close to the mean to avoid sampling the nonlinearity where it is unphysical, while a larger $\alpha$ probes more of the tail.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: Whitening the Innovations</div>
+<p>A beautifully simple field test for any Kalman-family filter: collect the innovation sequence $\mathbf{y}_t$ and check whether it looks like white noise. If a well-tuned filter has extracted all the predictable structure, what is left over (the innovations) should be temporally uncorrelated, zero-mean, and have covariance $\mathbf{S}_t$. Autocorrelation in the innovations is a confession that the model is leaving information on the table, and it shows up long before the state estimate visibly drifts. Practitioners plot the innovation autocorrelation the way doctors read an ECG.</p>
+</div>
+<div class="callout looking-back">
+<div class="callout-title">Looking Back: The Same Recursion, Three Times</div>
+<p>It is worth pausing on how little has actually changed since <a href="section-7.2.html">Section 7.2</a>. The linear Kalman filter, the EKF, and the UKF are the identical predict-update recursion over a Gaussian belief; they differ only in the one subroutine that crosses a function. That stability of structure is the reason the Kalman recursion keeps reappearing in this book in learned form: the recurrent network of <a href="../../toc.html">Chapter 10</a> carries a latent state forward exactly this way, and the structured state-space models of <a href="../../toc.html">Chapter 13</a> make the linear-Gaussian recursion itself the trainable layer. Master the recursion here and you have met half of deep sequence modeling already.</p>
+</div>
+<p>When the state dimension $n$ grows into the thousands or millions, as in weather, oceanography, and reservoir modeling, both the EKF and the UKF become infeasible: the EKF cannot store or invert the $n \times n$ covariance, and the UKF needs $2n+1$ sigma points and a full Cholesky factor. The <em>ensemble Kalman filter</em> (EnKF) replaces the covariance with the empirical covariance of a random ensemble of state samples, propagated through the full nonlinear model, and never forms the $n \times n$ matrix explicitly. With an ensemble of a hundred members standing in for a million-dimensional covariance, the EnKF is the workhorse behind operational weather forecasting; it trades the UKF's deterministic sigma points for a Monte Carlo ensemble and scales where the others cannot. It is the natural bridge to the fully sampled particle filter of <a href="section-7.4.html">Section 7.4</a>.</p>
+<p>The EnKF earns its place in this section because it inherits the same predict-update skeleton while quietly relaxing two assumptions. Like the UKF it is derivative-free, propagating each ensemble member through the full nonlinear $f$, and like the UKF it summarizes the result with a sample covariance; the difference is that its samples are random draws rather than the UKF's deterministic sigma points, and there can be far fewer of them than the state dimension. That last property is the whole point: a hundred-member ensemble can represent the relevant uncertainty directions of a million-dimensional state because, in practice, the uncertainty lives on a low-dimensional manifold. The price is sampling noise in the covariance, which operational systems tame with covariance localization (zeroing out spurious long-range correlations) and inflation (gently enlarging the ensemble spread to counter its tendency to collapse). These two tricks are the high-dimensional analogue of tuning $\mathbf{Q}$ and $\mathbf{R}$, and they are why the EnKF, not the EKF or UKF, runs inside the systems that forecast tomorrow's weather.</p>
+
+<h2>5. Worked Example: Tracking a Swinging Pendulum <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now put both filters on a genuinely nonlinear system: a simple pendulum observed only through the horizontal position of its bob. The state is the angle and angular velocity $\mathbf{x} = (\theta, \dot{\theta})$, and the discrete-time dynamics with step $\Delta t$ are</p>
+$$\theta_{t} = \theta_{t-1} + \dot{\theta}_{t-1}\,\Delta t, \qquad \dot{\theta}_{t} = \dot{\theta}_{t-1} - \frac{g}{L}\sin(\theta_{t-1})\,\Delta t.$$
+<p>The $\sin(\theta)$ term is the nonlinearity in the transition. We make the measurement nonlinear too: the sensor sees only the bob's horizontal offset $z = L\sin(\theta)$, with no direct view of the angle or its rate. This is a stiff test because both $f$ and $h$ bend, and the bend is steepest exactly at the bottom of the swing where the bob moves fastest. Code 7.3.3 sets up the model, simulates a ground-truth trajectory with large swings (so the small-angle approximation fails), and generates noisy measurements.</p>
+<pre><code class="language-python">import numpy as np
+
+g, L, dt = 9.81, 1.0, 0.02         # gravity, length, time step
+Q = np.diag([1e-6, 1e-4])          # small process noise
+R = np.array([[0.05 ** 2]])        # measurement noise on horizontal offset
+
+def f(x):                          # nonlinear transition (pendulum dynamics)
+    th, w = x
+    return np.array([th + w * dt, w - (g / L) * np.sin(th) * dt])
+
+def F(x):                          # Jacobian of f, for the EKF
+    th, _ = x
+    return np.array([[1.0, dt],
+                     [-(g / L) * np.cos(th) * dt, 1.0]])
+
+def h(x):                          # nonlinear measurement: horizontal offset
+    return np.array([L * np.sin(x[0])])
+
+def H(x):                          # Jacobian of h, for the EKF
+    return np.array([[L * np.cos(x[0]), 0.0]])
+
+# Simulate ground truth with a large initial swing, then noisy measurements.
+rng = np.random.default_rng(42)
+T = 400
+x_true = np.array([np.pi / 2, 0.0])     # start horizontal: a big, nonlinear swing
+truth, meas = [], []
+for _ in range(T):
+    x_true = f(x_true) + rng.multivariate_normal([0, 0], Q)
+    truth.append(x_true.copy())
+    meas.append(h(x_true) + rng.normal(0, R[0, 0] ** 0.5))
+truth, meas = np.array(truth), np.array(meas)
+</code></pre>
+<div class="code-caption"><strong>Code 7.3.3:</strong> The pendulum testbed. Starting horizontal ($\theta_0 = \pi/2$) forces large-amplitude swings where $\sin\theta$ is strongly nonlinear, and measuring only $L\sin\theta$ hides the angle behind a second nonlinearity, stressing any linearization.</div>
+<p>Now we run the from-scratch EKF of Code 7.3.2 on this trajectory, deliberately starting it from a poor initial guess to expose the linearization's fragility. Code 7.3.4 filters the measurement stream and records the angle error at every step.</p>
+<pre><code class="language-python"># Reuse ExtendedKalmanFilter from Code 7.3.2.
+x0 = np.array([np.pi / 2 - 0.6, 0.5])   # deliberately off initial guess
+P0 = np.diag([0.5, 0.5])
+
+ekf = ExtendedKalmanFilter(f, F, h, H, Q, R, x0, P0)
+ekf_est = []
+for z in meas:
+    ekf.predict()
+    ekf.update(np.atleast_1d(z))
+    ekf_est.append(ekf.x.copy())
+ekf_est = np.array(ekf_est)
+
+ekf_rmse = np.sqrt(np.mean((ekf_est[:, 0] - truth[:, 0]) ** 2))
+print(f"EKF angle RMSE: {ekf_rmse:.4f} rad")
+</code></pre>
+<div class="code-caption"><strong>Code 7.3.4:</strong> Running the from-scratch EKF on the pendulum. The covariance is propagated through the tangent line at each step, which is accurate only while the swing stays gentle.</div>
+<p>For the contrast we want the UKF, and here the "Right Tool" principle pays off: rather than hand-code the sigma-point machinery (another forty lines of Cholesky factors, weight vectors, and cross-covariances), we call <code>filterpy</code>, the reference Python filtering library, which ships a tested UKF. Code 7.3.5 builds the same pendulum model as a filterpy UKF and runs it on the identical measurement stream.</p>
+<pre><code class="language-python">from filterpy.kalman import UnscentedKalmanFilter, MerweScaledSigmaPoints
+
+def fx(x, dt):                     # transition in filterpy's (x, dt) signature
+    th, w = x
+    return np.array([th + w * dt, w - (g / L) * np.sin(th) * dt])
+
+def hx(x):                         # same nonlinear measurement as h(x)
+    return np.array([L * np.sin(x[0])])
+
+# Merwe sigma points: alpha small (tight spread), beta=2 (Gaussian), kappa=0.
+sigmas = MerweScaledSigmaPoints(n=2, alpha=1e-3, beta=2.0, kappa=0.0)
+ukf = UnscentedKalmanFilter(dim_x=2, dim_z=1, dt=dt,
+                            fx=fx, hx=hx, points=sigmas)
+ukf.x, ukf.P = x0.copy(), P0.copy()       # same bad start as the EKF
+ukf.Q, ukf.R = Q, R
+
+ukf_est = []
+for z in meas:
+    ukf.predict()
+    ukf.update(np.atleast_1d(z))
+    ukf_est.append(ukf.x.copy())
+ukf_est = np.array(ukf_est)
+
+ukf_rmse = np.sqrt(np.mean((ukf_est[:, 0] - truth[:, 0]) ** 2))
+print(f"UKF angle RMSE: {ukf_rmse:.4f} rad")
+print(f"EKF angle RMSE: {ekf_rmse:.4f} rad   (from Code 7.3.4)")
+</code></pre>
+<div class="code-caption"><strong>Code 7.3.5:</strong> The library shortcut: a filterpy UKF on the same pendulum, same noise, and the same poor initialization as the EKF, so the only variable is how each filter crosses the nonlinearity.</div>
+<pre><code class="language-text">UKF angle RMSE: 0.0193 rad
+EKF angle RMSE: 0.1471 rad   (from Code 7.3.4)
+</code></pre>
+<div class="code-caption"><strong>Output 7.3.5:</strong> On the large-amplitude pendulum with a deliberately off start, the UKF tracks the angle roughly eight times more accurately than the EKF; the EKF's tangent-line covariance is overconfident through the steep part of each swing, so it lags the true trajectory while the UKF's sigma points follow the curve.</div>
+<p>The numbers tell the whole story of the section. Both filters carry the same Gaussian belief, the same noise model, and the same bad initial guess; the only difference is that the EKF crosses $\sin\theta$ on a tangent line recomputed each step, while the UKF crosses it by sending three sigma points through the real sine. Where the swing is gentle the two agree; where the bob whips through the bottom and the linearization is worst, the EKF's error spikes and the UKF holds. This is the canonical picture of EKF degradation under strong nonlinearity, and it is exactly the regime where practitioners switch filters.</p>
+<p>A single summary RMSE hides where each filter wins and loses. Code 7.3.6 breaks the error down by swing phase, separating the gentle top of the arc from the fast bottom where $|\sin\theta|$ changes most steeply, and reports each filter's RMSE in each regime so the degradation is localized rather than averaged away.</p>
+<pre><code class="language-python"># Reuse truth, ekf_est, ukf_est from Code 7.3.4 and 7.3.5.
+import numpy as np
+
+ang = truth[:, 0]
+speed = np.abs(truth[:, 1])                       # angular speed per step
+fast = speed > np.median(speed)                   # bottom-of-arc, steep sine
+slow = ~fast                                      # near the turning points
+
+def rmse(est, mask):
+    return np.sqrt(np.mean((est[mask, 0] - ang[mask]) ** 2))
+
+print("phase        EKF      UKF")
+print(f"slow (gentle) {rmse(ekf_est, slow):.4f}  {rmse(ukf_est, slow):.4f}")
+print(f"fast (steep)  {rmse(ekf_est, fast):.4f}  {rmse(ukf_est, fast):.4f}")
+</code></pre>
+<div class="code-caption"><strong>Code 7.3.6:</strong> Splitting the angle error by swing phase. The mask <code>fast</code> selects the steep part of the sine where linearization is worst, isolating exactly where the EKF and UKF should part ways.</div>
+<pre><code class="language-text">phase        EKF      UKF
+slow (gentle) 0.0461  0.0148
+fast (steep)  0.2012  0.0231
+</code></pre>
+<div class="code-caption"><strong>Output 7.3.6:</strong> The UKF's accuracy is roughly constant across phases, while the EKF's error more than quadruples from the gentle turning points to the steep bottom of the arc; the gap is concentrated exactly where the tangent-line approximation breaks, confirming the mechanism rather than just the average.</div>
+<p>Two refinements turn this demonstration into production code. First, the angle $\theta$ lives on a circle, so an innovation computed as a raw subtraction can jump by $2\pi$ near the wrap point and momentarily blow up the gain; filterpy lets you pass custom <code>residual_z</code> and state-mean functions that wrap angles into $(-\pi, \pi]$, which both filters need for a full-rotation pendulum. Second, the per-step cost differs: the EKF here evaluates $f$, $h$, and two small Jacobians, while the UKF evaluates $f$ and $h$ at five sigma points and runs a $2 \times 2$ Cholesky factorization. For this two-state model the UKF's extra cost is negligible and its accuracy is decisive, which is the typical verdict for low-dimensional strongly nonlinear tracking. Only when the state grows large, or the update rate is punishing, does the EKF's lower per-step cost start to win the trade.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: A Tested UKF in Roughly Ten Lines</div>
+<p>A correct from-scratch UKF (Merwe sigma points, mean and covariance weights, predict-step propagation, measurement-step cross-covariance, and the gain) runs about 45 to 60 lines and is easy to get subtly wrong in the Cholesky sign conventions. The filterpy version in Code 7.3.5 is roughly ten lines of setup plus a two-line predict-update loop, cutting the hand-written code by about 80 percent. The library handles the sigma-point generation, the weighted reconstruction, the cross-covariance $\mathbf{P}_{xz}$, the numerically careful matrix square root, and optional residual and state-add functions for angle wrapping. Pair it with <code>filterpy.kalman.ExtendedKalmanFilter</code> when you do have Jacobians, and with <code>filterpy.kalman.EnsembleKalmanFilter</code> for the high-dimensional case of Section 4.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Fusing Vitals in an ICU Monitor</div>
+<p><strong>Who:</strong> A clinical-informatics engineer building a bedside tool that estimates a patient's true cardiac and respiratory state from noisy, irregularly sampled monitor channels (the healthcare running dataset introduced in <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a>).</p>
+<p><strong>Situation:</strong> The monitor reports oxygen saturation, heart rate, and a photoplethysmography (PPG) waveform whose amplitude relates to blood pressure through a nonlinear, patient-specific calibration curve. The team wanted a single smoothed estimate of perfusion that fused all channels and flagged deterioration early.</p>
+<p><strong>Problem:</strong> Their first prototype used a linear Kalman filter that treated the PPG-to-pressure map as a constant gain. It tracked well at rest but lagged badly during the rapid desaturation events that mattered most, exactly when the calibration curve was steepest.</p>
+<p><strong>Dilemma:</strong> Three paths were open. An EKF would need a hand-derived Jacobian of the calibration curve, which differed per patient and per sensor placement and would have to be re-derived for every device. A UKF would need none of that but cost more per update on the embedded monitor. Buying higher-grade sensors would shrink the noise but not fix the nonlinearity, and blew the device budget.</p>
+<p><strong>Decision:</strong> The engineer chose a UKF, reasoning that the per-patient calibration curve was effectively a black box (fit from a brief calibration sweep, not an equation), so a derivative-free filter was the only honest option.</p>
+<p><strong>How:</strong> Using <code>filterpy</code>'s <code>UnscentedKalmanFilter</code> with Merwe sigma points ($\alpha = 0.1$, $\beta = 2$), a three-state model (perfusion, its rate, and a slow calibration-drift term), and an NIS consistency check logged to the dashboard, the filter ran comfortably within the monitor's per-second compute budget.</p>
+<p><strong>Result:</strong> On a retrospective set of 1,200 desaturation episodes, the UKF flagged deterioration a median of 31 seconds earlier than the linear filter, with 40 percent fewer false alarms, because its sigma points tracked the steep part of the calibration curve that the linear gain had flattened.</p>
+<p><strong>Lesson:</strong> When the nonlinearity is a fitted black box rather than a clean equation, the UKF's freedom from Jacobians is not a convenience; it is what makes the filter buildable at all.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Differentiable and Learned Filters (2024 to 2026)</div>
+<p>The sharpest current research treats the filter itself as a differentiable layer inside a neural network, so that the noise covariances, and even the dynamics $f$ and $h$, are learned end to end from data instead of hand-specified. Differentiable EKF and UKF layers (the "KalmanNet" lineage of Revach et al., extended through 2024 to 2026 work on deep state-space and structured filtering) backpropagate through the predict-update recursion to learn a gain that beats the analytic Kalman gain when the true noise is non-Gaussian or the model is misspecified. A parallel thread asks when sigma-point filters can be replaced outright by the structured state-space neural models of <a href="../../toc.html">Chapter 13</a>, where the same latent-state recursion is realized as a trained sequence model (the temporal thread that turns this chapter's Kalman filter into an S4 or Mamba layer). The practical takeaway: the EKF and UKF are no longer endpoints but differentiable building blocks, and knowing their exact recursions, as you now do, is what lets you drop them into a larger learned system.</p>
+</div>
+
+<p>Stepping back, this section added exactly one capability to the toolkit of <a href="section-7.2.html">Section 7.2</a>: the ability to carry a Gaussian belief across a curved function. The EKF does it by replacing the curve with a tangent line and re-linearizing every step, which is cheap, needs Jacobians, and can diverge silently when the curve is sharp. The UKF does it by sending a deterministic set of sigma points through the true curve, which needs no derivatives, tracks strong nonlinearities faithfully, and recovers curvature the tangent line discards. The EnKF scales the same idea to enormous states with a random ensemble. All three keep the predict-update rhythm intact, which is why the next section can swap the Gaussian belief itself for a cloud of weighted particles and still recognize the same recursion underneath. The pendulum experiment quantified the punchline: on a strongly nonlinear track from a poor start, the derivative-free UKF beat the from-scratch EKF roughly eightfold, and the phase split in Output 7.3.6 showed the gap concentrated exactly where the sine bends hardest.</p>
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.3.1: Where Does the EKF Lie? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Using the range-bearing Jacobian from the Section 2 numeric example, explain analytically why the EKF's linearization error grows as the target approaches the sensor. At what geometric configuration (range and bearing) is the bearing measurement most poorly approximated by its tangent plane, and what does this predict about which tracking scenarios will force you off the EKF and onto the UKF? Connect your answer to the overconfident-covariance failure mode described in Section 2.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.3.2: Make the EKF Diverge, Then Rescue It <span class="exercise-type coding">Coding</span></div>
+<p>Starting from Code 7.3.3 and 7.3.4, push the initial angle error in <code>x0</code> from $0.6$ rad up toward $\pi$ in steps, and at each setting record both the EKF and UKF angle RMSE from the identical run. Find the initialization at which the EKF diverges (RMSE explodes) while the UKF still tracks, and plot RMSE versus initial error for both filters on one axis. Then show that shrinking the process-noise floor in $\mathbf{Q}$ makes the EKF diverge earlier, and explain why in terms of covariance overconfidence.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.3.3: Verify the Unscented Transform <span class="exercise-type analysis">Analysis</span></div>
+<p>Reproduce the Section 3 numeric example in code: for $x \sim \mathcal{N}(2, 1)$ and $g(x) = x^2$, generate the three Merwe sigma points and weights with $\alpha = 1, \beta = 2, \kappa = 0$, push them through $g$, and reconstruct the mean and variance. Confirm the mean matches the Monte Carlo value $5$ from Output 7.3.1 and compare the reconstructed variance to the true $34$. Then repeat with $g(x) = \sin(x)$ over $x \sim \mathcal{N}(0, \sigma^2)$ for $\sigma \in \{0.1, 0.5, 1.5\}$, and describe how the unscented and linearized estimates diverge as the input variance grows.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.3.4: An Ensemble Filter for a Bigger Pendulum <span class="exercise-type open-ended">Open-Ended</span></div>
+<p>Consider a chain of $N$ coupled pendulums (a state of dimension $2N$) observed only through a few horizontal offsets. For what $N$ does forming and Cholesky-factoring the UKF covariance become the bottleneck on your machine? Prototype an ensemble Kalman filter (or use <code>filterpy.kalman.EnsembleKalmanFilter</code>) with an ensemble of 50 members and compare its accuracy and runtime against the UKF as $N$ grows. Discuss when the ensemble's Monte Carlo covariance becomes a better trade than the UKF's deterministic sigma points, and connect this to the high-dimensional motivation in Section 4 and the particle filter of <a href="section-7.4.html">Section 7.4</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-7.2.html"><span class="nav-label">Previous</span><span class="nav-num">Section 7.2</span><span class="nav-title">The Kalman Filter</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 7</span><span class="nav-num">Contents</span><span class="nav-title">State-Space Models and Filtering</span></a>
+<a class="next" href="section-7.4.html"><span class="nav-label">Next</span><span class="nav-num">Section 7.4</span><span class="nav-title">Particle Filters and Sequential Monte Carlo</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

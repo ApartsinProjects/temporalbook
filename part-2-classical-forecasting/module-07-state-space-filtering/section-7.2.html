@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 7.2: The Kalman Filter. The recursive Bayesian view of linear-Gaussian filtering, the predict and update steps, the Kalman gain as a trust trade-off between model and measurement, minimum-variance optimality, the steady-state filter, the prediction-error log-likelihood, the RTS smoother, and a complete from-scratch Kalman filter compared against filterpy and statsmodels on a local-level tracking problem." name="description"/>
+<title>Section 7.2: The Kalman Filter | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Forecasting and Time Series Analysis</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 7: State-Space Models and Filtering</a></div>
+<h1>The Kalman Filter</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"Every instant I am handed two stories: the one my model tells about where I should be, and the one the sensor swears it just measured. I do not pick a winner. I weigh each by how much I trust it, and the weight has a name."</p>
+<cite>A Kalman Gain Balancing Faith in Model and Measurement</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The Kalman filter is the exact, recursive answer to one of the most common questions in temporal AI: given a noisy stream of measurements of a system that is itself only approximately predictable, what is the best running estimate of the hidden state, and how sure are we of it?</strong> It carries a Gaussian belief over the latent state forward in time, and at every tick it does two things. It <em>predicts</em>, pushing the belief through the system's dynamics and letting uncertainty grow because the model is imperfect. Then it <em>updates</em>, pulling the belief toward a fresh measurement by an amount governed by a single matrix, the Kalman gain, that encodes precisely how much to trust the sensor versus the model. Because the linear-Gaussian assumptions keep every belief Gaussian, the entire infinite-dimensional problem of tracking a probability distribution collapses to propagating just a mean and a covariance, two finite objects updated by a handful of matrix operations per step. This section derives both steps from the recursive Bayesian idea, interprets the gain as the trust trade-off the epigraph describes, establishes the filter's minimum-variance optimality and its steady-state behavior, shows how its by-product log-likelihood drives parameter estimation, sketches the RTS smoother that refines the past with the future, and finally implements the whole filter from scratch on a tracking problem before collapsing it to a few lines of <code>filterpy</code> and <code>statsmodels</code>.</p>
+</div>
+<p>The previous section, <a href="section-7.1.html">Section 7.1</a>, introduced the linear-Gaussian state-space model: a hidden state $\mathbf{z}_t$ that evolves by a linear transition $\mathbf{z}_t = F\mathbf{z}_{t-1} + \mathbf{w}_t$ with process noise $\mathbf{w}_t \sim \mathcal{N}(\mathbf{0}, Q)$, observed only through a linear measurement $\mathbf{y}_t = H\mathbf{z}_t + \mathbf{v}_t$ with measurement noise $\mathbf{v}_t \sim \mathcal{N}(\mathbf{0}, R)$. That section posed the filtering question but did not solve it. The Kalman filter is the solution, and it is the algorithmic heart of Chapter 7. We assume the reader is comfortable with the multivariate Gaussian, with conditional expectation, and with the companion-form linear recursion that <a href="../module-06-multivariate-econometric/section-6.1.html">Section 6.1</a> built for the vector autoregression, because the VAR's observed state recursion $\mathbf{z}_t = F\mathbf{z}_{t-1} + \tilde{\boldsymbol{\varepsilon}}_t$ is exactly the transition the Kalman filter now handles when the state is only partially observed. Throughout we use the state-space symbols of the unified notation table in <a href="../../toc.html">Appendix A</a>: $\mathbf{z}_t$ for the latent state, $\mathbf{y}_t$ for the observation, $F, H, Q, R$ for the four system matrices, and $P_t$ for the state-estimate covariance.</p>
+
+<h2>1. The Filtering Problem and the Recursive Bayesian Idea <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Filtering is the task of computing the posterior distribution of the current hidden state given every measurement received up to now, $p(\mathbf{z}_t \mid \mathbf{y}_{1:t})$. The word "filtering" is deliberate: we want the best estimate at the present moment using the present and the past, as opposed to <em>smoothing</em> (estimating a past state using future measurements too, subsection five) or <em>prediction</em> (estimating a future state before its measurement arrives). The naive approach, recomputing the posterior from scratch over the whole history at every new measurement, is hopeless online because the cost grows without bound as the series lengthens. The escape is recursion: maintain a compact summary of everything seen so far and update it incrementally as each measurement lands.</p>
+<p>The recursive Bayesian filter makes this precise in two alternating moves that hold for any state-space model, linear or not. Suppose we have the posterior from the previous step, $p(\mathbf{z}_{t-1} \mid \mathbf{y}_{1:t-1})$. The <em>predict</em> step pushes it through the dynamics using the Chapman-Kolmogorov equation, marginalizing out the previous state to obtain the prior for the current state before seeing the new measurement,</p>
+$$p(\mathbf{z}_t \mid \mathbf{y}_{1:t-1}) = \int p(\mathbf{z}_t \mid \mathbf{z}_{t-1})\, p(\mathbf{z}_{t-1} \mid \mathbf{y}_{1:t-1})\, d\mathbf{z}_{t-1}.$$
+<p>The <em>update</em> step then folds in the new measurement $\mathbf{y}_t$ by Bayes' rule, multiplying the predicted prior by the measurement likelihood and renormalizing,</p>
+$$p(\mathbf{z}_t \mid \mathbf{y}_{1:t}) = \frac{p(\mathbf{y}_t \mid \mathbf{z}_t)\, p(\mathbf{z}_t \mid \mathbf{y}_{1:t-1})}{p(\mathbf{y}_t \mid \mathbf{y}_{1:t-1})}.$$
+<p>This predict-update cycle is the universal skeleton of recursive estimation. For a general nonlinear or non-Gaussian model the integral and the normalization have no closed form, which is why the particle filters and nonlinear variants of <a href="section-7.3.html">Section 7.3</a> exist. The miracle of the linear-Gaussian case is that both operations preserve Gaussianity, so the entire belief is forever summarized by a mean and a covariance.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Conjugacy Is Why a Mean and a Covariance Suffice</div>
+<p>A Gaussian pushed through a linear map plus independent Gaussian noise is again Gaussian, and a Gaussian prior multiplied by a Gaussian likelihood is again a Gaussian posterior. These two closure properties, the heart of the linear-Gaussian model, mean that if the belief starts Gaussian it stays Gaussian at every predict and every update forever. A Gaussian is fully described by its mean and covariance, so the infinite-dimensional task of tracking a probability density over states collapses to propagating just two finite objects: $\hat{\mathbf{z}}_t$ (where we think the state is) and $P_t$ (how uncertain we are, as a full covariance matrix capturing correlations between state components). The Kalman filter is nothing more than the exact bookkeeping for those two objects. Every equation in the rest of this section is the consequence of pushing a Gaussian through a linear operation and reading off the new mean and covariance.</p>
+</div>
+<p>We adopt the standard double-subscript notation that keeps predict and update legible. Write $\hat{\mathbf{z}}_{t \mid t-1}$ and $P_{t \mid t-1}$ for the mean and covariance of the <em>predicted</em> (prior) belief, conditioned on measurements through time $t-1$, and write $\hat{\mathbf{z}}_{t \mid t}$ and $P_{t \mid t}$ for the <em>updated</em> (posterior) belief, conditioned on measurements through time $t$. The filter is then a loop: from the previous posterior $(\hat{\mathbf{z}}_{t-1 \mid t-1}, P_{t-1 \mid t-1})$, predict to get $(\hat{\mathbf{z}}_{t \mid t-1}, P_{t \mid t-1})$, then update with $\mathbf{y}_t$ to get $(\hat{\mathbf{z}}_{t \mid t}, P_{t \mid t})$, and repeat. Figure 7.2.1 shows the cycle.</p>
+<figure class="diagram">
+<svg viewBox="0 0 720 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A cycle diagram showing the previous posterior belief flowing into a predict step that increases uncertainty, then into an update step that pulls toward the measurement and decreases uncertainty, then looping back as the next step's input.">
+<style>
+  .kbox{fill:var(--surface-color,#f4f6f8);stroke:var(--accent-color,#3b6ea5);stroke-width:2;}
+  .kt{font-family:var(--font-sans,sans-serif);font-size:13px;font-weight:700;fill:var(--text-color,#222);text-anchor:middle;}
+  .ks{font-family:var(--font-sans,sans-serif);font-size:11px;fill:var(--text-muted,#666);text-anchor:middle;}
+  .kar{stroke:var(--accent-color,#3b6ea5);stroke-width:2;fill:none;marker-end:url(#kah);}
+  .kmeas{stroke:var(--warning-color,#d98b2b);stroke-width:2;fill:none;marker-end:url(#kahm);stroke-dasharray:5 3;}
+</style>
+<defs>
+  <marker id="kah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--accent-color,#3b6ea5)"/></marker>
+  <marker id="kahm" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--warning-color,#d98b2b)"/></marker>
+</defs>
+<rect class="kbox" x="40" y="95" width="150" height="60" rx="8"/>
+<text class="kt" x="115" y="120">Posterior at t-1</text>
+<text class="ks" x="115" y="138">z(t-1|t-1), P(t-1|t-1)</text>
+<rect class="kbox" x="285" y="95" width="150" height="60" rx="8"/>
+<text class="kt" x="360" y="115">PREDICT</text>
+<text class="ks" x="360" y="131">z(t|t-1)=F z(t-1|t-1)</text>
+<text class="ks" x="360" y="146">P up: add Q</text>
+<rect class="kbox" x="530" y="95" width="150" height="60" rx="8"/>
+<text class="kt" x="605" y="115">UPDATE</text>
+<text class="ks" x="605" y="131">gain K pulls to y(t)</text>
+<text class="ks" x="605" y="146">P down: shrink</text>
+<path class="kar" d="M 190 125 L 281 125"/>
+<path class="kar" d="M 435 125 L 526 125"/>
+<path class="kmeas" d="M 605 60 L 605 91"/>
+<text class="ks" x="605" y="50" fill="var(--warning-color,#d98b2b)">measurement y(t)</text>
+<path class="kar" d="M 605 159 L 605 200 L 115 200 L 115 159"/>
+<text class="ks" x="360" y="216">loop: posterior at t becomes input at t+1</text>
+</svg>
+<figcaption><strong>Figure 7.2.1:</strong> One turn of the Kalman cycle. The previous posterior is pushed through the dynamics in the predict step, which grows the covariance by adding process noise $Q$. The update step then incorporates the new measurement $\mathbf{y}_t$ (dashed orange input), pulling the mean toward the data by the Kalman gain and shrinking the covariance. The resulting posterior loops back as the next step's input, which is what makes the filter recursive and online.</figcaption>
+</figure>
+
+<h2>2. The Predict Step: Propagating the Prior <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Start from the previous posterior, a Gaussian with mean $\hat{\mathbf{z}}_{t-1 \mid t-1}$ and covariance $P_{t-1 \mid t-1}$. The dynamics say $\mathbf{z}_t = F\mathbf{z}_{t-1} + \mathbf{w}_t$ with $\mathbf{w}_t \sim \mathcal{N}(\mathbf{0}, Q)$ independent of the state. We push the Gaussian through this linear-plus-noise map and read off the new mean and covariance. The mean of a linear transform is the linear transform of the mean, and the additive noise has mean zero, so the predicted state mean is simply the deterministic part of the dynamics evaluated at the previous estimate,</p>
+$$\hat{\mathbf{z}}_{t \mid t-1} = F\,\hat{\mathbf{z}}_{t-1 \mid t-1}.$$
+<p>(If the model carries a control input $\mathbf{u}_t$ entering as $B\mathbf{u}_t$, it is added here; we suppress it for clarity, since the autonomous case carries every idea.) The covariance requires the standard transformation rule: a linear map $F$ acting on a random vector with covariance $P$ produces a vector with covariance $FPF^\top$, and because the process noise is independent of the previous state its covariance $Q$ adds on. Hence the predicted covariance is</p>
+$$P_{t \mid t-1} = F\,P_{t-1 \mid t-1}\,F^\top + Q.$$
+<p>Read this equation as the precise statement that prediction <em>increases</em> uncertainty. The term $FP_{t-1\mid t-1}F^\top$ propagates the old uncertainty through the dynamics (it may grow or shrink depending on whether $F$ stretches or contracts), and then $Q$ adds the irreducible new uncertainty injected because the model is an imperfect description of reality. With no measurement to anchor it, a pure predict loop would let $P$ grow until the estimate is worthless, which is exactly the situation in dead reckoning between GPS fixes: a vehicle that integrates its wheel-speed and heading without external correction watches its position covariance balloon until a fresh fix collapses it again. The update step is what supplies that collapse.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact: A Filter That Flew to the Moon</div>
+<p>Rudolf E. Kalman published the filter in 1960, and within a few years it was airborne in the most demanding setting imaginable. NASA's Ames Research Center adapted it for the Apollo program's onboard navigation, fusing the spacecraft's inertial measurements with periodic star sightings to estimate position and velocity well enough to fly to the Moon and back on a computer with a few kilobytes of memory. The square-root and information forms developed for that mission, designed to keep the covariance numerically positive-definite on limited hardware, are still the recommended implementations today. A piece of 1960 linear algebra that fit in the Apollo Guidance Computer now runs in every smartphone's sensor-fusion stack, every self-driving car, and the orbit determination of essentially every satellite.</p>
+</div>
+
+<h2>3. The Update Step: Innovation, Gain, and the Trust Trade-off <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Now the measurement $\mathbf{y}_t$ arrives, and we fold it in by Bayes' rule. Because both the predicted prior and the measurement likelihood are Gaussian, the posterior is Gaussian and its mean and covariance follow in closed form. The derivation organizes around three quantities. First, what did the model expect to measure, and how wrong was it? The predicted measurement is $H\hat{\mathbf{z}}_{t \mid t-1}$, and the <em>innovation</em> (or measurement residual) is the surprise, the gap between what arrived and what was expected,</p>
+$$\tilde{\mathbf{y}}_t = \mathbf{y}_t - H\,\hat{\mathbf{z}}_{t \mid t-1}.$$
+<p>Second, how surprised should we have been? The innovation has its own covariance, called the <em>innovation covariance</em>, which combines the predicted state uncertainty mapped into measurement space with the measurement noise,</p>
+$$S_t = H\,P_{t \mid t-1}\,H^\top + R.$$
+<p>The two pieces of $S_t$ have clean meanings: $HP_{t\mid t-1}H^\top$ is how uncertain the model is about what it should measure (state uncertainty seen through $H$), and $R$ is how noisy the sensor itself is. Third, and centrally, the <em>Kalman gain</em> $K_t$ converts a measurement-space surprise into a state-space correction,</p>
+$$K_t = P_{t \mid t-1}\,H^\top\,S_t^{-1}.$$
+<p>With these three objects the update writes itself. The posterior mean is the prior mean nudged along the gain in proportion to the innovation, and the posterior covariance is the prior covariance reduced by the information the measurement supplied,</p>
+$$\hat{\mathbf{z}}_{t \mid t} = \hat{\mathbf{z}}_{t \mid t-1} + K_t\,\tilde{\mathbf{y}}_t, \qquad P_{t \mid t} = (I - K_t H)\,P_{t \mid t-1}.$$
+<p>These three update lines are not assumed; they fall out of completing the square in the product of the two Gaussians, or equivalently from the standard formula for the conditional distribution of one jointly-Gaussian block given another. The joint distribution of the state and the next measurement, both before $\mathbf{y}_t$ is seen, is Gaussian with cross-covariance $\operatorname{Cov}(\mathbf{z}_t, \mathbf{y}_t) = P_{t\mid t-1}H^\top$ and measurement marginal covariance $S_t = HP_{t\mid t-1}H^\top + R$. The Gaussian conditioning formula then states that the mean of $\mathbf{z}_t$ given $\mathbf{y}_t$ is the prior mean plus (cross-covariance)(marginal-covariance)$^{-1}$ times the residual, which is exactly $\hat{\mathbf{z}}_{t\mid t-1} + P_{t\mid t-1}H^\top S_t^{-1}\tilde{\mathbf{y}}_t$, and the conditional covariance shrinks by the same factor, giving $P_{t\mid t-1} - P_{t\mid t-1}H^\top S_t^{-1}H P_{t\mid t-1} = (I - K_t H)P_{t\mid t-1}$. So the Kalman gain $K_t = P_{t\mid t-1}H^\top S_t^{-1}$ is precisely the regression coefficient of the hidden state on the measurement residual; the update is a single step of Gaussian conditioning, no more and no less.</p>
+<p>The structure of the gain is the entire epigraph rendered as algebra. Read $K_t = P_{t\mid t-1}H^\top S_t^{-1}$ as a ratio: the numerator $P_{t\mid t-1}H^\top$ is the model's uncertainty (mapped into measurement space), and the denominator $S_t$ is the total uncertainty (model plus measurement). When the model is very uncertain relative to the sensor, the gain is large and the update leans hard on the measurement, snapping the estimate toward $\mathbf{y}_t$. When the sensor is very noisy relative to the model, the gain is small and the update barely moves, keeping faith with the prediction. The gain is the formal, optimal answer to "how much should I trust this new measurement?", and it is recomputed every step from the current balance of uncertainties. This is why the persona of the epigraph refuses to pick a winner: the correct weight is never zero or one but a precise blend that the gain delivers.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Gain Is a Precision-Weighted Average</div>
+<p>In the scalar case the update is transparently a weighted average of two estimates. Let the prior have variance $p^-$ and the measurement have variance $r$ (taking $H = 1$). Then the gain is $k = p^- / (p^- + r)$, a number strictly between zero and one, and the posterior mean is $\hat z = (1-k)\,\hat z^- + k\,y$. The posterior is literally a convex combination of the prediction and the measurement, weighted by their <em>relative precisions</em>: the more precise source (smaller variance) gets the larger weight. The posterior variance $p^+ = (1-k)\,p^- = p^- r / (p^- + r)$ is smaller than either input variance, the harmonic-mean-like shrinkage that quantifies how combining two noisy estimates beats both. The full matrix Kalman gain is exactly this idea generalized to vectors, with $S_t^{-1}$ playing the role of dividing by the total variance and $H^\top$ mapping between measurement space and state space. Every Kalman update is a precision-weighted fusion of model and data.</p>
+</div>
+<p>A worked single cycle makes the abstraction concrete. The numeric example below walks one full predict-update on a scalar local-level model, the simplest non-trivial state-space model, where the state is an unobserved level that drifts and the measurement is that level plus noise.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: One Predict-Update Cycle by Hand</div>
+<p>Take a scalar local-level model with $F = 1$ (the level persists), $H = 1$ (we measure the level directly), process-noise variance $Q = 0.01$, and measurement-noise variance $R = 0.25$. Suppose after step $t-1$ the posterior is $\hat z_{t-1\mid t-1} = 2.00$ with variance $P_{t-1\mid t-1} = 0.10$, and the new measurement is $y_t = 2.60$.</p>
+<p><strong>Predict.</strong> The mean is unchanged because $F = 1$: $\hat z_{t\mid t-1} = 1 \cdot 2.00 = 2.00$. The variance grows by $Q$: $P_{t\mid t-1} = 1 \cdot 0.10 \cdot 1 + 0.01 = 0.11$.</p>
+<p><strong>Update.</strong> The innovation is the surprise $\tilde y_t = 2.60 - 1\cdot 2.00 = 0.60$. The innovation variance is $S_t = 1\cdot 0.11 \cdot 1 + 0.25 = 0.36$. The gain is $K_t = 0.11 / 0.36 = 0.3056$, telling us to move about thirty percent of the way toward the measurement (the sensor noise $R = 0.25$ dwarfs the prior variance $0.11$, so we trust the model more than the sensor). The posterior mean is $\hat z_{t\mid t} = 2.00 + 0.3056 \cdot 0.60 = 2.183$, and the posterior variance is $P_{t\mid t} = (1 - 0.3056)\cdot 0.11 = 0.0764$.</p>
+<p>Notice the arithmetic of trust. The estimate moved from $2.00$ only to $2.183$, not all the way to the measured $2.60$, precisely because the measurement was the noisier of the two sources. And the variance fell from $0.11$ to $0.0764$: even a noisy measurement carries information, so seeing it always sharpens the belief. Run this same cycle with $R = 0.01$ instead (a precise sensor) and the gain jumps to $0.11/0.12 = 0.917$, the estimate snaps to $2.55$, and the variance collapses to $0.0092$. The single knob $R/P$ slides the filter continuously between "ignore the sensor" and "ignore the model."</p>
+</div>
+<div class="callout looking-back">
+<div class="callout-title">Looking Back: The Same Fusion You Met in Recursive Least Squares</div>
+<p>The update $\hat{\mathbf{z}}_{t\mid t} = \hat{\mathbf{z}}_{t\mid t-1} + K_t\tilde{\mathbf{y}}_t$ is the same incremental correction structure as the recursive least-squares estimator that refines a regression coefficient as each new data point arrives, and as the online-learning updates that will reappear in <a href="../../toc.html">Chapter 20</a>. In all three, an estimate is corrected by a gain times a residual, and the gain shrinks as accumulated information grows. The Kalman filter generalizes recursive least squares by letting the underlying quantity <em>move</em> between observations (the predict step with its $Q$), which is exactly why a filter, not a fixed estimator, is the right tool for a state that evolves. When $Q = 0$ and $F = I$, the Kalman filter on a constant state reduces precisely to recursive least squares, a reduction worth verifying as Exercise 7.2.4.</p>
+</div>
+
+<h2>4. Optimality, the Steady-State Filter, and the Log-Likelihood <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The Kalman filter is not merely <em>a</em> reasonable estimator; for the linear-Gaussian model it is <em>the</em> optimal one, in a strong and precise sense. Among all estimators, linear or nonlinear, that use the measurements $\mathbf{y}_{1:t}$, the Kalman filter's posterior mean $\hat{\mathbf{z}}_{t\mid t}$ is the minimum-mean-squared-error estimate of the state, because it is exactly the conditional expectation $\mathbb{E}[\mathbf{z}_t \mid \mathbf{y}_{1:t}]$ and the conditional expectation is the MMSE estimator for any distribution. It is also unbiased, $\mathbb{E}[\hat{\mathbf{z}}_{t\mid t} - \mathbf{z}_t] = \mathbf{0}$, and $P_{t\mid t}$ is its true error covariance. If we drop the Gaussian assumption but keep the means and covariances, a second, weaker optimality survives: the Kalman filter is still the best <em>linear</em> unbiased estimator (the minimum-variance estimator among all linear functions of the data), so it remains the right answer even when the noise is merely white with known covariance rather than truly Gaussian. This dual guarantee, exactly optimal under Gaussianity and best-linear otherwise, is why the filter is the default estimator across engineering and statistics.</p>
+<p>A striking practical fact is that for a time-invariant model (constant $F, H, Q, R$) the covariance recursion forgets its starting point. The covariance update $P_{t\mid t}$ does not depend on the measurements at all, only on the system matrices, so it can be run offline. Iterating predict-then-update on the covariance alone, $P^- = FPF^\top + Q$ followed by $P = (I - KH)P^-$, drives $P$ to a fixed point $P_\infty$ that satisfies the discrete-time algebraic Riccati equation. At that fixed point the gain is constant, $K_\infty = P_\infty^- H^\top S_\infty^{-1}$, and the filter becomes a fixed linear recursion $\hat{\mathbf{z}}_{t\mid t} = (I - K_\infty H)F\hat{\mathbf{z}}_{t-1\mid t-1} + K_\infty\mathbf{y}_t$ with no per-step matrix inverse. This <em>steady-state Kalman filter</em> is what many embedded systems ship: precompute $K_\infty$ once, then run a cheap constant-gain update forever. The convergence of $P$ to $P_\infty$ is what the worked example will display as "the gain settling."</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Watching the Covariance Converge to Its Riccati Fixed Point</div>
+<p>Stay with the scalar local-level model ($F = H = 1$, $Q = 0.01$, $R = 0.25$) and iterate only the covariance recursion, with no measurements at all, starting from a deliberately ignorant $P_0 = 10$. Each iteration does predict ($P^- = P + Q$) then update ($P = (1 - K)P^-$ with $K = P^-/(P^- + R)$). Step one: $P^- = 10.01$, $K = 10.01/10.26 = 0.9756$, $P = 0.2438$. Step two: $P^- = 0.2538$, $K = 0.2538/0.5038 = 0.5038$, $P = 0.1259$. Step three: $P^- = 0.1359$, $K = 0.3522$, $P = 0.0880$. Step four: $P^- = 0.0980$, $K = 0.2817$, $P = 0.0704$. The iterates $0.244, 0.126, 0.088, 0.070, \dots$ march steadily downward and settle near $P_\infty \approx 0.0566$, where the recursion is a fixed point: plugging $P_\infty$ in gives $P^- = 0.0666$, $K_\infty = 0.2104$, and $P$ back at $0.0566$. The fixed-point equation $P = (1 - \tfrac{P+Q}{P+Q+R})(P+Q)$ is the scalar discrete algebraic Riccati equation, and its positive root is $P_\infty$. The crucial observation is that not a single measurement value entered this calculation: the steady-state gain $K_\infty \approx 0.21$ is fully determined by $Q$ and $R$ alone, which is exactly why an embedded filter can bake it in at compile time.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact: The Filter, the Smoother, and the Two Other People in the Name</div>
+<p>Three names ride along with the basic algorithm, and each marks a real contribution. The forward filter is Kalman's (1960), with the continuous-time version co-credited to Richard Bucy (the Kalman-Bucy filter). The backward smoother of subsection five is Rauch, Tung, and Striebel's (1965), three aerospace engineers at Lockheed who needed to reconstruct a missile's full trajectory after the flight, when every measurement was already in hand. And the whole approach has a deep statistical ancestor: the prediction-error decomposition that turns the filter into a likelihood machine is essentially the innovations representation studied by Norman Levinson and, earlier still, traces to the linear-prediction theory of Norbert Wiener and Andrey Kolmogorov in the 1940s. The Kalman filter's genius was not inventing fusion from nothing but recasting Wiener's frequency-domain optimal filter as a recursive, finite-state, computer-friendly update, which is precisely what let it fit in a spacecraft.</p>
+</div>
+<p>The filter quietly hands us a second prize that turns it into an estimation engine, not just a tracker. Running the filter produces, at each step, the innovation $\tilde{\mathbf{y}}_t$ and its covariance $S_t$, and under the model the innovations are independent zero-mean Gaussians with covariance $S_t$. The log-likelihood of the entire observed series therefore factors into a sum of one-step innovation terms, the <em>prediction-error decomposition</em>,</p>
+$$\log p(\mathbf{y}_{1:T} \mid \boldsymbol{\theta}) = -\frac{1}{2}\sum_{t=1}^{T}\Bigl( d\log 2\pi + \log|S_t| + \tilde{\mathbf{y}}_t^\top S_t^{-1}\tilde{\mathbf{y}}_t \Bigr),$$
+<p>where $d$ is the measurement dimension and $\boldsymbol{\theta}$ collects the unknown entries of $F, H, Q, R$. This is the key that unlocks parameter estimation: to fit the unknown system matrices (most commonly the noise variances $Q$ and $R$), run the filter to get the innovations, evaluate this log-likelihood, and maximize it numerically. The same information criteria of <a href="../module-05-univariate-forecasting/section-5.7.html">Section 5.7</a> then apply directly to compare competing state-space specifications: AIC and BIC built on this exact log-likelihood let us choose, for instance, between a local-level and a local-linear-trend model, just as they chose ARIMA orders. The filter is thus both the inference algorithm and the likelihood evaluator, which is why a single state-space fit yields tracking, forecasting, and model selection in one pass.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Temporal Thread: The Kalman Filter Returns as the RNN and the SSM</div>
+<p>The recursion $\hat{\mathbf{z}}_{t\mid t} = (I - K_\infty H)F\,\hat{\mathbf{z}}_{t-1\mid t-1} + K_\infty\mathbf{y}_t$ is, structurally, a recurrent update: a hidden state carried forward by a linear map and corrected by the current input. That is precisely the skeleton of the recurrent neural network of <a href="../../toc.html">Chapter 10</a>, with the fixed, derived gain replaced by learned weights and a nonlinearity wrapped around the update. The eigenvalue stability story is shared too: just as a VAR is stationary when the companion matrix has spectral radius below one (<a href="../module-06-multivariate-econometric/section-6.1.html">Section 6.1</a>), a linear recurrent state stays bounded under the same condition, and the structured state-space models of <a href="../../toc.html">Chapter 13</a> (the S4 and Mamba lineage) parameterize their transition matrix precisely to control that spectrum while keeping the linear-recursion efficiency the Kalman filter enjoys. When you understand why the steady-state Kalman gain is constant and why the covariance converges, you already understand why a well-conditioned linear RNN can carry information across long horizons. The classical filter returns in learned form, twice.</p>
+</div>
+
+<h2>5. Smoothing: Refining the Past with the Future <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The filter estimates $\mathbf{z}_t$ using measurements up to time $t$ only. Often we are analyzing a recorded series after the fact and want the best estimate of every past state given the <em>entire</em> dataset, $p(\mathbf{z}_t \mid \mathbf{y}_{1:T})$ with $T > t$, which is the <em>smoothing</em> problem. The Rauch-Tung-Striebel (RTS) smoother solves it with an elegant backward pass that reuses the filter's stored quantities. Run the forward Kalman filter once, storing every filtered $(\hat{\mathbf{z}}_{t\mid t}, P_{t\mid t})$ and predicted $(\hat{\mathbf{z}}_{t+1\mid t}, P_{t+1\mid t})$, then sweep backward from $t = T-1$ to $1$, correcting each filtered estimate using the already-smoothed future state through a smoother gain $C_t = P_{t\mid t}F^\top P_{t+1\mid t}^{-1}$ and the recursion $\hat{\mathbf{z}}_{t\mid T} = \hat{\mathbf{z}}_{t\mid t} + C_t(\hat{\mathbf{z}}_{t+1\mid T} - \hat{\mathbf{z}}_{t+1\mid t})$, with a matching covariance update that always satisfies $P_{t\mid T} \preceq P_{t\mid t}$. Intuitively, future measurements carry information about where the state was, so the smoothed estimate is never less certain than the filtered one and usually much sharper, especially at the start of the series where the filter had little history. Smoothing is the right tool for offline analysis, for the expectation step when fitting state-space parameters by EM, and for imputing the irregularly-sampled clinical series that thread through this book's healthcare examples (<a href="section-7.1.html">Section 7.1</a>); for real-time tracking, where the future is not yet available, the filter is all we have.</p>
+
+<h2>6. Worked Example: A Kalman Filter From Scratch, Then the Library Pair <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now build the entire filter from scratch and run it on a concrete tracking problem, then reproduce it in a few lines with <code>filterpy</code> and <code>statsmodels</code>. The system is a one-dimensional constant-velocity tracker, the classic introductory Kalman target: an object moves along a line at a roughly constant velocity that drifts slowly (a small random acceleration is the process noise), and a sensor reports its noisy position once per time step. The hidden state is two-dimensional, position and velocity, $\mathbf{z}_t = (p_t, v_t)^\top$, even though we measure only position, so the filter must <em>infer</em> the unobserved velocity from the position stream alone, which is the entire point of having a latent state. Code 7.2.1 sets up the model matrices and simulates the ground truth and the noisy measurements.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(7)
+
+# State z = (position, velocity). Constant-velocity dynamics with dt = 1.
+dt = 1.0
+F = np.array([[1.0, dt],      # position += velocity * dt
+              [0.0, 1.0]])    # velocity persists
+H = np.array([[1.0, 0.0]])    # we measure position only, not velocity
+
+# Process noise: a small random acceleration perturbs the velocity (and,
+# through it, the position). q scales the continuous-acceleration variance.
+q = 0.004
+Q = q * np.array([[dt**3 / 3, dt**2 / 2],
+                  [dt**2 / 2, dt]])
+R = np.array([[0.25]])        # sensor position-noise variance (std = 0.5)
+
+# Simulate T steps of ground truth and noisy position measurements.
+T = 80
+z_true = np.zeros((T, 2)); z_true[0] = [0.0, 1.0]   # start at origin, speed 1
+y = np.zeros((T, 1))
+chol_Q = np.linalg.cholesky(Q)
+for t in range(1, T):
+    z_true[t] = F @ z_true[t-1] + chol_Q @ rng.standard_normal(2)
+y[:, 0] = z_true[:, 0] + np.sqrt(R[0, 0]) * rng.standard_normal(T)
+print("true final state (pos, vel):", z_true[-1].round(3))
+print("first 4 noisy measurements :", y[:4, 0].round(3))
+</code></pre>
+<div class="code-caption"><strong>Code 7.2.1:</strong> The constant-velocity tracking model and its simulation. The state holds position and velocity, but $H$ exposes only position, so velocity is latent. The process-noise matrix $Q$ is the standard continuous-acceleration discretization, which correctly couples the position and velocity uncertainties rather than treating them as independent.</div>
+<pre><code class="language-text">true final state (pos, vel): [79.642  0.94 ]
+first 4 noisy measurements : [ 0.371  1.245  2.4    2.879]
+</code></pre>
+<div class="code-caption"><strong>Output 7.2.1:</strong> The object has drifted to position about $79.6$ with velocity near $0.94$ after eighty steps, and the early measurements are visibly jittered around the true positions $0, 1, 2, 3$ by the half-unit sensor noise. The filter must recover both the clean position and the never-measured velocity from this noisy stream.</div>
+<p>Code 7.2.2 implements the filter itself: a direct transcription of the predict equations of subsection two and the update equations of subsection three, looping over the measurement stream and recording the gain at each step so we can watch it settle toward the steady-state value of subsection four.</p>
+<pre><code class="language-python">def kalman_filter(y, F, H, Q, R, z0, P0):
+    """Run a linear-Gaussian Kalman filter over a (T, d_y) measurement array.
+    Returns filtered state means, covariances, and the per-step Kalman gain."""
+    T = y.shape[0]
+    n = F.shape[0]
+    z = z0.copy(); P = P0.copy()
+    I = np.eye(n)
+    z_filt = np.zeros((T, n))
+    P_filt = np.zeros((T, n, n))
+    gains  = np.zeros((T, n, H.shape[0]))
+    for t in range(T):
+        # --- Predict: push the belief through the dynamics, grow uncertainty.
+        z_pred = F @ z                       # z_{t|t-1} = F z_{t-1|t-1}
+        P_pred = F @ P @ F.T + Q             # P_{t|t-1} = F P F^T + Q
+        # --- Update: fold in the measurement, shrink uncertainty.
+        innov = y[t] - H @ z_pred            # innovation (the surprise)
+        S = H @ P_pred @ H.T + R             # innovation covariance
+        K = P_pred @ H.T @ np.linalg.inv(S)  # Kalman gain = trust weight
+        z = z_pred + K @ innov               # posterior mean
+        P = (I - K @ H) @ P_pred             # posterior covariance
+        z_filt[t] = z; P_filt[t] = P; gains[t] = K
+    return z_filt, P_filt, gains
+
+z0 = np.array([0.0, 0.0])          # ignorant prior: guess zero position/velocity
+P0 = np.eye(2) * 10.0              # large prior variance: "I really don't know"
+z_filt, P_filt, gains = kalman_filter(y, F, H, Q, R, z0, P0)
+
+pos_rmse_raw  = np.sqrt(np.mean((y[:, 0]      - z_true[:, 0])**2))
+pos_rmse_filt = np.sqrt(np.mean((z_filt[:, 0] - z_true[:, 0])**2))
+print(f"position RMSE, raw measurements : {pos_rmse_raw:.3f}")
+print(f"position RMSE, Kalman-filtered  : {pos_rmse_filt:.3f}")
+print("recovered final velocity (never measured):", round(z_filt[-1, 1], 3))
+print("position-gain at steps 0, 5, 40 :",
+      gains[[0, 5, 40], 0, 0].round(3))
+</code></pre>
+<div class="code-caption"><strong>Code 7.2.2:</strong> The complete from-scratch Kalman filter, predict and update transcribed line for line from the section's equations. The loop records the gain so its convergence is observable, and the position gain is pulled out specifically because it is the scalar that most directly shows the trust trade-off settling.</div>
+<pre><code class="language-text">position RMSE, raw measurements : 0.503
+position RMSE, Kalman-filtered  : 0.235
+recovered final velocity (never measured): 0.967
+position-gain at steps 0, 5, 40 : [0.989 0.46  0.356]</code></pre>
+<div class="code-caption"><strong>Output 7.2.2:</strong> The filter more than halves the position error (RMSE $0.503 \to 0.235$) and recovers the latent velocity ($0.967$ versus the true $0.94$) despite never measuring it. The position gain starts near one (the ignorant prior trusts the first measurement almost completely), then settles toward its steady-state value around $0.35$ as the covariance converges, exactly the gain-settling the steady-state analysis predicted.</div>
+<p>The numbers tell the story but a picture makes it vivid. Figure 7.2.2 plots, on simulated-style coordinates, the noisy measurements scattering around the true trajectory and the filtered estimate threading smoothly between them, alongside the position gain decaying from one to its steady-state value.</p>
+<figure class="diagram">
+<svg viewBox="0 0 720 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Left panel: noisy measurement dots scatter around a straight true-trajectory line while a smooth filtered curve threads between them. Right panel: the Kalman gain starts near one and decays to a flat steady-state value.">
+<style>
+  .axk{stroke:var(--text-muted,#888);stroke-width:1.4;}
+  .lblk{font-family:var(--font-sans,sans-serif);font-size:11px;fill:var(--text-muted,#666);text-anchor:middle;}
+  .ttl{font-family:var(--font-sans,sans-serif);font-size:12px;font-weight:700;fill:var(--text-color,#222);text-anchor:middle;}
+  .truth{fill:none;stroke:var(--text-muted,#999);stroke-width:1.6;stroke-dasharray:5 3;}
+  .filt{fill:none;stroke:var(--accent-color,#3b6ea5);stroke-width:2.4;}
+  .gain{fill:none;stroke:var(--warning-color,#d98b2b);stroke-width:2.4;}
+  .meas{fill:var(--warning-color,#d98b2b);opacity:0.55;}
+</style>
+<text class="ttl" x="190" y="20">Tracking: measurements, truth, filtered estimate</text>
+<line class="axk" x1="55" y1="250" x2="345" y2="250"/>
+<line class="axk" x1="55" y1="250" x2="55" y2="45"/>
+<text class="lblk" x="200" y="272">time</text>
+<text class="lblk" x="30" y="150" transform="rotate(-90 30 150)">position</text>
+<line class="truth" x1="55" y1="235" x2="335" y2="60"/>
+<circle class="meas" cx="75" cy="232" r="3.5"/><circle class="meas" cx="95" cy="214" r="3.5"/>
+<circle class="meas" cx="115" cy="225" r="3.5"/><circle class="meas" cx="135" cy="196" r="3.5"/>
+<circle class="meas" cx="155" cy="205" r="3.5"/><circle class="meas" cx="175" cy="178" r="3.5"/>
+<circle class="meas" cx="195" cy="188" r="3.5"/><circle class="meas" cx="215" cy="158" r="3.5"/>
+<circle class="meas" cx="235" cy="170" r="3.5"/><circle class="meas" cx="255" cy="138" r="3.5"/>
+<circle class="meas" cx="275" cy="128" r="3.5"/><circle class="meas" cx="295" cy="104" r="3.5"/>
+<circle class="meas" cx="315" cy="92" r="3.5"/><circle class="meas" cx="335" cy="66" r="3.5"/>
+<path class="filt" d="M 75 230 Q 130 205, 175 184 T 275 122 T 335 64"/>
+<text class="lblk" x="250" y="248" fill="var(--warning-color,#d98b2b)">dots: noisy measurements</text>
+<text class="lblk" x="120" y="60" fill="var(--accent-color,#3b6ea5)">filtered</text>
+<text class="ttl" x="545" y="20">Kalman gain settling to steady state</text>
+<line class="axk" x1="410" y1="250" x2="690" y2="250"/>
+<line class="axk" x1="410" y1="250" x2="410" y2="45"/>
+<text class="lblk" x="550" y="272">time step</text>
+<text class="lblk" x="388" y="150" transform="rotate(-90 388 150)">gain</text>
+<path class="gain" d="M 410 60 C 440 120, 470 180, 510 198 C 560 212, 620 214, 690 214"/>
+<line class="axk" x1="410" y1="214" x2="690" y2="214" stroke-dasharray="4 4"/>
+<text class="lblk" x="640" y="208" fill="var(--warning-color,#d98b2b)">steady state ~0.35</text>
+<text class="lblk" x="430" y="56">starts near 1</text>
+</svg>
+<figcaption><strong>Figure 7.2.2:</strong> Left: the noisy position measurements (orange dots) scatter around the true straight-line trajectory (dashed gray), and the Kalman estimate (blue) threads a smooth path through them, visibly closer to the truth than any single measurement. Right: the position gain begins near one, where the ignorant prior trusts the first measurement almost completely, and decays to its steady-state value near $0.35$ as the covariance converges to the Riccati fixed point, the gain-settling reported numerically in Output 7.2.2.</figcaption>
+</figure>
+<p>That was the transparent machinery, every matrix operation visible. In production you would not hand-roll the predict-update loop, the covariance bookkeeping, and the numerical-stability safeguards; mature libraries package all of it. Code 7.2.3 is the library pair, the identical filter through <code>filterpy</code> and, for the state-space-model framing with built-in maximum-likelihood parameter estimation, <code>statsmodels</code>.</p>
+<pre><code class="language-python"># --- Shortcut A: filterpy, a direct object wrapper of the same recursion ---
+from filterpy.kalman import KalmanFilter
+
+kf = KalmanFilter(dim_x=2, dim_z=1)
+kf.F, kf.H, kf.Q, kf.R = F, H, Q, R          # same matrices as Code 7.2.1
+kf.x = np.array([0.0, 0.0]); kf.P = np.eye(2) * 10.0
+xs = []
+for t in range(T):
+    kf.predict()                              # one call = our predict block
+    kf.update(y[t])                           # one call = our update block
+    xs.append(kf.x.copy())
+xs = np.array(xs)
+print("filterpy final state:", xs[-1].round(3))   # matches z_filt[-1]
+
+# --- Shortcut B: statsmodels, which ALSO estimates Q and R by MLE ---
+import statsmodels.api as sm
+# UnobservedComponents fits a local-linear-trend (position + velocity) model
+# and maximizes the prediction-error log-likelihood of subsection 4 for us.
+mod = sm.tsa.UnobservedComponents(y[:, 0], level="local linear trend")
+res = mod.fit(disp=False)                      # MLE of the noise variances
+print("statsmodels smoothed final level:", round(res.states.smoothed[-1, 0], 3))
+print("log-likelihood (prediction-error decomposition):", round(res.llf, 2))
+</code></pre>
+<div class="code-caption"><strong>Code 7.2.3:</strong> The same filter through two libraries. <code>filterpy</code> mirrors our loop exactly with <code>predict</code> and <code>update</code> calls, while <code>statsmodels.UnobservedComponents</code> goes further: it treats the noise variances as unknown and fits them by maximizing the prediction-error log-likelihood of subsection four, returning a smoothed state and the log-likelihood for model selection.</div>
+<pre><code class="language-text">filterpy final state: [79.51  0.967]
+statsmodels smoothed final level: 79.583
+log-likelihood (prediction-error decomposition): -71.34</code></pre>
+<div class="code-caption"><strong>Output 7.2.3:</strong> Both libraries reproduce the from-scratch result. <code>filterpy</code> returns the identical final state because it runs the identical recursion, and <code>statsmodels</code> recovers essentially the same level while additionally fitting the noise variances by maximum likelihood and reporting the log-likelihood that drives the AIC and BIC model selection of <a href="../module-05-univariate-forecasting/section-5.7.html">Section 5.7</a>.</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: From Twenty Lines of Linear Algebra to Three</div>
+<p>The from-scratch <code>kalman_filter</code> of Code 7.2.2 is about twenty lines of explicit predict-update linear algebra, plus the covariance and gain bookkeeping. With <code>filterpy</code> the per-step logic collapses to two calls, <code>kf.predict()</code> and <code>kf.update(y)</code>, roughly a sevenfold reduction in the core loop, and the library adds numerically stable forms (Joseph-form covariance update, square-root filters) that our naive $(I - KH)P$ update omits. With <code>statsmodels.UnobservedComponents</code> the reduction is larger still: three lines build, fit, and smooth a complete state-space model, and the library internally constructs the $F, H, Q, R$ matrices for standard structural specifications, runs the filter and the RTS smoother, evaluates the prediction-error log-likelihood, and <em>estimates the unknown noise variances by maximum likelihood</em>, the one thing our hand-rolled filter could not do because we fixed $Q$ and $R$ by hand. For nonlinear or large-scale problems, <code>filterpy</code> also ships the extended and unscented variants of <a href="section-7.3.html">Section 7.3</a>, and PyTorch-based differentiable Kalman filters (used inside deep state-space models) bring the same recursion into a learnable, gradient-trained setting. The library does not change the math; it makes the math robust and lets you estimate the parameters you previously had to assume.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Bedside Monitor That Stopped Crying Wolf</div>
+<p><strong>Who:</strong> A clinical-informatics team at a hospital, building a real-time alerting system on continuous vital-sign streams (heart rate, blood pressure, oxygen saturation) in an intensive-care unit.</p>
+<p><strong>Situation:</strong> Bedside sensors report vitals at high frequency but with heavy, transient noise: a patient moving an arm, a probe slipping, electrical interference. The existing alert logic thresholded the raw sensor values directly.</p>
+<p><strong>Problem:</strong> The raw-threshold alerts were drowning the staff in false alarms. A momentary noise spike on the oxygen probe would trip a critical-desaturation alert even when the patient was stable, and the resulting alarm fatigue meant nurses began ignoring the monitor, the worst possible outcome for a safety system.</p>
+<p><strong>Dilemma:</strong> Two tempting fixes were both wrong. Raising the thresholds cut false alarms but delayed or missed real deteriorations. A simple moving-average smoother cut the noise but lagged badly, so a genuine rapid desaturation would be flattened and detected too late. They needed noise suppression that did not sacrifice responsiveness, and an explicit, trustworthy uncertainty on the estimate.</p>
+<p><strong>Decision:</strong> The team modeled each vital sign as a local-linear-trend state-space model (a hidden level and slope) and ran a Kalman filter per signal, alerting on the <em>filtered</em> estimate and its covariance rather than the raw reading, and treating an unusually large innovation as a separate "sensor artifact" flag rather than a clinical event.</p>
+<p><strong>How:</strong> They used <code>statsmodels.UnobservedComponents</code> to fit the process and measurement noise variances per patient cohort by maximum likelihood (the prediction-error log-likelihood of subsection four), then deployed the lightweight steady-state filter on the ward. The Kalman gain automatically down-weighted the noisy probe and tracked the trend, and the innovation magnitude separated true physiological change (a sustained, model-consistent shift) from artifact (a single large surprise the next measurement contradicted).</p>
+<p><strong>Result:</strong> False-alarm volume on the pilot ward fell substantially while time-to-detection of genuine deteriorations held steady or improved, because the trend state caught sustained slopes the raw threshold missed. The filtered uncertainty band also gave clinicians an honest "how confident is the monitor" signal, which the raw value never provided.</p>
+<p><strong>Lesson:</strong> When a stream is noisy but the underlying quantity is smooth, do not threshold the measurement; threshold the filtered state, and use the innovation to tell signal from artifact. The Kalman gain gives you exactly the responsiveness-versus-smoothness trade-off a fixed moving average cannot, and the covariance gives you the uncertainty a raw reading never will.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Differentiable, Neural, and Robust Kalman Filtering (2024 to 2026)</div>
+<p>A sixty-year-old filter is unusually present in current research. Three threads stand out. First, <em>differentiable and learned Kalman filters</em>: KalmanNet (Revach et al.) and its 2024 to 2026 successors keep the predict-update recursion as a fixed computational backbone but replace the gain (or the noise statistics) with a small recurrent network trained end to end, so the filter learns to handle model mismatch and partially unknown dynamics while retaining the interpretable structure and the uncertainty propagation this section derived. Second, the <em>deep state-space lineage</em>: the structured state-space models S4, S5, and Mamba (2023 to 2024) that now rival Transformers on long-sequence tasks are, at their core, linear state recursions $\mathbf{z}_t = F\mathbf{z}_{t-1} + \dots$ with learned, carefully parameterized transition matrices, the same recursion the Kalman filter runs, and the connection is explicit in works that cast SSM training as Kalman-style inference (developed further in <a href="../../toc.html">Chapter 13</a>). Third, <em>robust and heavy-tailed filtering</em>: because the classical filter's optimality assumes Gaussian noise and breaks under outliers, recent variational and Student-t Kalman filters, and the broader ensemble Kalman filter used in 2024 to 2025 operational weather and climate data assimilation at enormous scale, extend the recursion to non-Gaussian and very high-dimensional regimes. The single idea of carrying a Gaussian belief through predict and update, recompute the gain, keeps reappearing wherever a system must fuse a dynamics model with a measurement stream.</p>
+</div>
+<p>Step back and see what the section assembled. We started from the recursive Bayesian filter, the universal predict-update skeleton, and used the linear-Gaussian conjugacy to collapse it to the propagation of a mean and a covariance. The predict step pushed the belief through the dynamics and grew its uncertainty by $Q$; the update step folded in the measurement through the Kalman gain, the precise precision-weighted blend of model and measurement that the epigraph's persona embodies. We established the filter's minimum-variance optimality, the steady-state constant-gain regime, and the prediction-error log-likelihood that turns the filter into a parameter-estimation and model-selection engine, then sketched the RTS smoother that sharpens the past with the future. The from-scratch implementation tracked a moving target through noise, recovered a velocity it never measured, and watched its gain settle, before <code>filterpy</code> and <code>statsmodels</code> reproduced it in a handful of lines and added the maximum-likelihood parameter fitting we had assumed away. The filter's one structural limitation is its linearity assumption: the predict and update steps both required linear $F$ and $H$ so that Gaussians stay Gaussian. The next section, <a href="section-7.3.html">Section 7.3</a>, removes that assumption, building the extended and unscented Kalman filters that handle nonlinear dynamics and measurements while preserving the predict-update structure we have just made second nature.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.2.1: Reading the Gain <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Consider a scalar local-level filter ($F = H = 1$) with prior variance $P^- = 0.4$ and measurement-noise variance $R$. (a) Write the gain $k$ as a function of $R$ and compute it for $R = 0.04$, $R = 0.4$, and $R = 4.0$. (b) For each, state how far the posterior mean moves toward a measurement that is $1.0$ above the prediction. (c) Explain in words why $k \to 1$ as $R \to 0$ and $k \to 0$ as $R \to \infty$, and tie each limit to the epigraph's "faith in model versus measurement." (d) Show that the posterior variance $(1-k)P^-$ is always strictly less than $P^-$, and interpret why even a poor measurement helps.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.2.2: Build It and Watch It Settle <span class="exercise-type coding">Coding</span></div>
+<p>Using the from-scratch <code>kalman_filter</code> of Code 7.2.2, run the constant-velocity tracker of Code 7.2.1 for $T = 200$ steps. (a) Plot the position component of the Kalman gain across all steps and confirm it converges to a steady-state value; estimate that value numerically from the last twenty steps. (b) Independently compute the steady-state covariance by iterating only the covariance recursion ($P^- = FPF^\top + Q$, then $P = (I-KH)P^-$) from any starting $P$ until it stops changing, and verify the resulting gain matches part (a). (c) Replace the per-step gain with this single precomputed constant gain (the steady-state filter) and confirm the filtered RMSE is essentially unchanged. (d) Explain why the covariance can be computed offline without any measurements.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.2.3: Tuning Q Against R <span class="exercise-type analysis">Analysis</span></div>
+<p>The ratio between process noise $Q$ and measurement noise $R$ governs the filter's character. (a) On the tracker of Code 7.2.1, sweep the process-noise scale $q$ across several orders of magnitude with $R$ fixed, and for each compute the filtered position RMSE against the ground truth. (b) Plot RMSE versus $q$ and locate the minimum; explain why both very small $q$ (the filter trusts a possibly-wrong model too much and lags real motion) and very large $q$ (the filter trusts the noisy sensor too much and barely smooths) degrade performance. (c) Now use <code>statsmodels.UnobservedComponents</code> to estimate $q$ and $R$ by maximum likelihood on the same data and compare the fitted ratio to the RMSE-optimal one from part (b). (d) Comment on when likelihood-optimal and RMSE-optimal tuning agree and when they need not.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.2.4: The Filter That Became Recursive Least Squares <span class="exercise-type open">Open-Ended</span></div>
+<p>Subsection three's Looking Back claimed that with $F = I$ and $Q = 0$ the Kalman filter on a constant state reduces to recursive least squares. (a) Set up a scalar Kalman filter estimating a single unknown constant from noisy measurements of it, with $F = 1$, $H = 1$, $Q = 0$, and measurement variance $R$. (b) Derive a closed form for the posterior variance $P_t$ after $t$ measurements and show it equals $R/t$, the variance of the sample mean. (c) Show the posterior mean after $t$ steps is exactly the running average of the measurements. (d) Discuss what re-introducing a small $Q > 0$ does (it lets the "constant" drift) and connect this to the exponentially-weighted moving average and to the online-learning-under-drift setting of <a href="../../toc.html">Chapter 20</a>. There is no single right answer for the discussion; argue from the variance recursion and the effective memory length $Q$ induces.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-7.1.html"><span class="nav-label">Previous</span><span class="nav-num">Section 7.1</span><span class="nav-title">Linear-Gaussian State-Space Models</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 7</span><span class="nav-num">Contents</span><span class="nav-title">State-Space Models and Filtering</span></a>
+<a class="next" href="section-7.3.html"><span class="nav-label">Next</span><span class="nav-num">Section 7.3</span><span class="nav-title">Extended and Unscented Kalman Filters</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

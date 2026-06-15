@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 7.4: Particle Filters and Sequential Monte Carlo. When Gaussian filters fail, represent the posterior with a weighted cloud of particles: importance sampling, the bootstrap filter, effective sample size, resampling, and a from-scratch implementation on a nonlinear non-Gaussian state-space model." name="description"/>
+<title>Section 7.4: Particle Filters and Sequential Monte Carlo | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Forecasting and Time Series Analysis</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 7: State-Space Models and Filtering</a></div>
+<h1>Particle Filters and Sequential Monte Carlo</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I do not pretend to know where you are. I send out a thousand guesses, let reality vote each one up or down, and report the crowd. When the votes get lopsided, I quietly replace the losers with copies of the winners and carry on. Democracy, but for belief."</p>
+<cite>A Cloud of Particles Voting on Where We Are</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The Kalman filter is fast and exact, but only because it assumes the posterior is always a single Gaussian bump; the moment your belief about the hidden state becomes multimodal, heavy-tailed, or strongly bent by nonlinearity, that assumption fails and a Gaussian summary becomes a confident lie.</strong> The particle filter throws away the parametric form entirely and represents the posterior as a weighted cloud of samples, a fully nonparametric belief that can split into several humps, grow long tails, and bend around nonlinearities for free. The price is Monte Carlo: you trade the closed-form recursion of <a href="section-7.1.html">Section 7.1</a> for a swarm of particles that you propagate, weight by the new measurement, and periodically resample.
+This section builds that swarm from importance sampling up, diagnoses the degeneracy that kills naive versions, and ships a bootstrap filter you can run.</p>
+</div>
+<p>In <a href="section-7.1.html">Section 7.1</a> we wrote the linear-Gaussian state-space model and derived the Kalman filter as its exact Bayesian recursion.
+In <a href="section-7.2.html">Section 7.2</a> the extended and unscented filters stretched that machinery over mild nonlinearity by relinearizing or by propagating a small set of deterministic sigma points, and <a href="section-7.3.html">Section 7.3</a> pushed the unscented idea further.
+Every one of those methods still reports a mean and a covariance, which is to say it still believes the posterior is shaped like a Gaussian.
+This section confronts the regime where that belief is simply false: posteriors with several distinct peaks, with fat tails, or warped by a measurement model so nonlinear that no single ellipse can describe the resulting uncertainty.
+For those problems we need a belief representation that can take any shape, and the sequential Monte Carlo family delivers exactly that.</p>
+
+<h2>1. When Gaussians Fail Entirely <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Recall the general (not necessarily linear, not necessarily Gaussian) state-space model. A latent state $x_t$ evolves through a transition density, and each observation $y_t$ is generated through a measurement density:</p>
+$$x_t \sim p(x_t \mid x_{t-1}), \qquad y_t \sim p(y_t \mid x_t).$$
+<p>The object we want at every step is the filtering posterior $p(x_t \mid y_{1:t})$, the full distribution over the hidden state given everything observed so far (the notation $y_{1:t}$ for the sequence $y_1, \dots, y_t$ follows the unified table in <a href="../../toc.html">Appendix A</a>).
+The Kalman filter computes this posterior exactly when both densities are linear and Gaussian, because then the posterior stays Gaussian forever and is pinned down by its mean and covariance alone.
+Three situations break that closure completely.</p>
+<p>The first is <strong>multimodality</strong>.
+Consider a robot driving down a long corridor lined with identical doors, equipped only with a door detector.
+When it sees a door, the measurement is equally consistent with being at door one, door two, or door seven; the posterior over position is a comb of several sharp peaks.
+A Gaussian must place its single mean somewhere between the peaks, in a location the robot is in fact never at, and report a variance so large it is useless.
+The posterior is genuinely multimodal, and no amount of relinearization repairs a representation that can only ever hold one hump.</p>
+<p>The second is <strong>heavy tails</strong>.
+Financial returns and many sensor faults produce occasional enormous deviations.
+A Gaussian measurement model treats a six-sigma jump as essentially impossible and therefore lets that one outlier yank the estimate violently.
+A Student-$t$ or mixture measurement model is far more honest, but it has no conjugate Gaussian update, so the closed-form Kalman recursion no longer applies.</p>
+<p>The third is <strong>strong nonlinearity</strong>.
+When the transition or measurement map bends sharply, pushing a Gaussian through it produces a distribution that is skewed, curved, or even ring-shaped, nothing a mean and covariance can capture.
+The extended Kalman filter linearizes and hopes; when the curvature within one standard deviation is large, that hope is misplaced and the filter diverges.
+We need a belief that can be any shape at all.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: A Cloud Is a Distribution You Can Bend</div>
+<p>A weighted set of samples $\{(x^{(i)}, w^{(i)})\}_{i=1}^N$ approximates a distribution with no commitment to its shape. Several clusters of particles represent several modes; a few particles flung far out represent heavy tails; pushing every particle individually through a nonlinear map automatically bends the whole cloud the way the map bends. This is why the particle filter handles the three failure cases above with one mechanism: it never assumed a shape to begin with, so there is no shape to break.</p>
+</div>
+<p>The robot-in-a-symmetric-corridor example is the canonical motivator, so we keep it concrete. The hidden state is the robot's position $x_t$ along the corridor. The transition is a noisy step, $x_t = x_{t-1} + u + v_t$, with commanded motion $u$ and process noise $v_t$. The measurement is the distance to the nearest of several identical landmarks, a function that is many-to-one: the same reading is produced at multiple positions. A Kalman filter cannot localize the robot here even in principle, because the posterior it would need to represent has several peaks. The particle filter, as we will see in the worked example of Section&nbsp;5, tracks all the peaks simultaneously and lets later observations (an asymmetry, a wall, a corner) collapse the ambiguity.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: A Thousand Tiny Pessimists</div>
+<p>It is tempting to picture a particle as a guess, but a better picture is a tiny opinionated committee member who has staked out one specific hypothesis about the world and lives or dies by how well reality agrees. The bootstrap filter is then a brutally Darwinian newsroom: every particle files the same prediction it always would, the editor (the likelihood) scores how close each one came to today's events, and the worst reporters are fired and replaced by clones of the best. No reporter ever learns; the population learns, by selection. That the swarm tracks a truth no single member can see is the same emergent trick a beehive uses to find a nest, which is why this family of methods sometimes travels under the name "survival of the fittest" sampling.</p>
+</div>
+
+<h2>2. Importance Sampling and Sequential Importance Sampling <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The engine underneath every particle filter is <strong>importance sampling</strong>, a trick for estimating expectations under a distribution you cannot sample from directly.
+Suppose we want $\mathbb{E}_{p}[h(x)] = \int h(x)\, p(x)\, dx$ but can only draw from a more convenient proposal $q(x)$ with the same support.
+Rewrite the integral by multiplying and dividing by $q$:</p>
+$$\mathbb{E}_{p}[h(x)] = \int h(x)\, \frac{p(x)}{q(x)}\, q(x)\, dx = \mathbb{E}_{q}\!\left[ h(x)\, \frac{p(x)}{q(x)} \right] \approx \frac{1}{N} \sum_{i=1}^{N} h(x^{(i)})\, \frac{p(x^{(i)})}{q(x^{(i)})}, \quad x^{(i)} \sim q.$$
+<p>Each sample carries an <strong>importance weight</strong> $w^{(i)} = p(x^{(i)}) / q(x^{(i)})$ that corrects for having drawn from the wrong distribution.
+Samples in regions where $p$ is large but $q$ is small get up-weighted; samples where $q$ over-covers get down-weighted.
+The weighted cloud $\{(x^{(i)}, w^{(i)})\}$ is then a sample-based stand-in for $p$ itself.</p>
+<p>To filter a time series we apply this idea sequentially.
+We build a proposal over whole trajectories $x_{0:t}$ that factorizes step by step, the simplest choice being the transition density itself, $q(x_t \mid x_{t-1}) = p(x_t \mid x_{t-1})$.
+Under that choice the weight recursion telescopes into a strikingly simple form.
+Writing the unnormalized weight at time $t$ as $\tilde{w}^{(i)}_t$, the sequential importance sampling (SIS) update is</p>
+$$\tilde{w}^{(i)}_t = \tilde{w}^{(i)}_{t-1} \cdot \frac{p(y_t \mid x^{(i)}_t)\, p(x^{(i)}_t \mid x^{(i)}_{t-1})}{q(x^{(i)}_t \mid x^{(i)}_{t-1}, y_t)},$$
+<p>and when the proposal equals the transition the messy middle factors cancel, leaving the weight update equal to the measurement likelihood alone:</p>
+$$\tilde{w}^{(i)}_t = \tilde{w}^{(i)}_{t-1} \cdot p(y_t \mid x^{(i)}_t).$$
+<p>The normalized weights $w^{(i)}_t = \tilde{w}^{(i)}_t / \sum_j \tilde{w}^{(j)}_t$ then give the filtering posterior approximation $p(x_t \mid y_{1:t}) \approx \sum_i w^{(i)}_t \, \delta(x_t - x^{(i)}_t)$, a weighted sum of point masses.
+That equation is the whole filter in miniature: propagate each particle through the dynamics, multiply its weight by how well it explains the new measurement, renormalize.
+Everything that follows in this section is engineering around that one line, keeping it numerically alive over thousands of steps.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Weight Degeneracy Is Inevitable, Not a Bug</div>
+<p>Run pure SIS for more than a handful of steps and a fatal pathology appears: one particle accumulates almost all the weight while the rest decay to numerical zero. The variance of the importance weights can only grow over time (a theorem, not an accident), so after enough multiplications a single trajectory dominates and the cloud, however many particles it nominally contains, represents the posterior with effectively one sample. SIS alone is therefore useless for long series. The fix that turns SIS into a working filter is resampling, and the diagnostic that tells you when to apply it is the effective sample size, both introduced next.</p>
+</div>
+<p>It is worth seeing degeneracy as a direct consequence of the weight recursion.
+Every step multiplies each weight by a likelihood factor in $[0, \infty)$, and these factors differ across particles.
+A particle that explains a few observations slightly better than its neighbors compounds that advantage geometrically.
+This is the same mechanism by which compound interest concentrates wealth.
+It runs unchecked until one relative weight is overwhelming and the rest are dust.
+No particle is ever discarded in pure SIS, so the badly-fitting ones linger forever, carrying negligible weight yet still consuming memory and compute.
+The cloud becomes a single fat particle surrounded by a fog of irrelevant ghosts.</p>
+
+<h2>3. The Bootstrap Particle Filter (Sampling Importance Resampling) <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The cure for degeneracy, introduced by Gordon, Salmond and Smith in 1993, is to periodically <strong>resample</strong>: draw a fresh set of $N$ particles from the current weighted cloud with replacement, in proportion to the weights, then reset all weights to $1/N$.
+High-weight particles get duplicated, near-zero-weight particles vanish, and the swarm reconcentrates on the promising regions of state space.
+The combination of sequential importance sampling with resampling, using the transition as the proposal, is the <strong>bootstrap filter</strong> (also called sampling importance resampling, SIR), the simplest and most widely used particle filter.
+One full cycle reads:</p>
+<ol>
+<li><strong>Predict (propagate).</strong> For each particle, draw $x^{(i)}_t \sim p(x_t \mid x^{(i)}_{t-1})$ by simulating the transition, that is, applying the dynamics and adding process noise. The cloud moves and spreads to reflect where the state could have gone.</li>
+<li><strong>Update (weight).</strong> Set $\tilde{w}^{(i)}_t = w^{(i)}_{t-1} \cdot p(y_t \mid x^{(i)}_t)$, scoring each particle by how well it predicts the actual measurement $y_t$, then normalize so the weights sum to one.</li>
+<li><strong>Resample (if needed).</strong> If the effective sample size has fallen below a threshold, draw $N$ new particles from the categorical distribution defined by the weights and reset every weight to $1/N$.</li>
+</ol>
+<p>Figure&nbsp;7.4.1 traces one full cycle of the bootstrap filter as a picture, because the three moves (a cloud that spreads, then reweights, then reconcentrates) are far easier to remember as motion than as equations.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three panels showing one bootstrap filter cycle: particles spread out during prediction, then are sized by weight after the measurement update, then reconcentrate after resampling.">
+<defs>
+<marker id="arr74" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.t74 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.s74 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.flow74 { stroke:#5a626c; stroke-width:1.8; fill:none; marker-end:url(#arr74); }
+.p74 { fill:#14385c; }
+.p74w { fill:#b8431f; }
+</style>
+<text class="t74" x="120" y="28">1. Predict</text>
+<text class="t74" x="430" y="28">2. Weight</text>
+<text class="t74" x="740" y="28">3. Resample</text>
+<!-- Panel 1: spread cloud, equal small dots -->
+<line x1="30" y1="150" x2="220" y2="150" stroke="#9aa3b2" stroke-width="1.2"/>
+<circle class="p74" cx="55" cy="150" r="4"/><circle class="p74" cx="80" cy="150" r="4"/><circle class="p74" cx="105" cy="150" r="4"/><circle class="p74" cx="130" cy="150" r="4"/><circle class="p74" cx="155" cy="150" r="4"/><circle class="p74" cx="180" cy="150" r="4"/><circle class="p74" cx="205" cy="150" r="4"/>
+<text class="s74" x="120" y="195">transition spreads the cloud;</text>
+<text class="s74" x="120" y="210">all weights equal</text>
+<path class="flow74" d="M 235 150 L 295 150"/>
+<!-- Panel 2: same positions, radius proportional to likelihood (peak in middle) -->
+<line x1="335" y1="150" x2="525" y2="150" stroke="#9aa3b2" stroke-width="1.2"/>
+<circle class="p74w" cx="360" cy="150" r="3"/><circle class="p74w" cx="385" cy="150" r="5"/><circle class="p74w" cx="410" cy="150" r="8"/><circle class="p74w" cx="435" cy="150" r="11"/><circle class="p74w" cx="460" cy="150" r="7"/><circle class="p74w" cx="485" cy="150" r="4"/><circle class="p74w" cx="510" cy="150" r="2"/>
+<text class="s74" x="430" y="195">likelihood resizes each particle;</text>
+<text class="s74" x="430" y="210">size = weight</text>
+<path class="flow74" d="M 545 150 L 605 150"/>
+<!-- Panel 3: reconcentrated near the high-weight region, equal dots again -->
+<line x1="645" y1="150" x2="835" y2="150" stroke="#9aa3b2" stroke-width="1.2"/>
+<circle class="p74" cx="700" cy="150" r="4"/><circle class="p74" cx="718" cy="150" r="4"/><circle class="p74" cx="736" cy="150" r="4"/><circle class="p74" cx="754" cy="150" r="4"/><circle class="p74" cx="772" cy="150" r="4"/><circle class="p74" cx="730" cy="135" r="4"/><circle class="p74" cx="748" cy="165" r="4"/>
+<text class="s74" x="740" y="195">winners cloned, losers dropped;</text>
+<text class="s74" x="740" y="210">weights reset to 1/N</text>
+</svg>
+<figcaption><strong>Figure 7.4.1:</strong> One bootstrap-filter cycle. <em>Predict:</em> the transition pushes every equally-weighted particle forward, spreading the cloud. <em>Weight:</em> the new measurement resizes each particle by its likelihood (drawn here as dot size), concentrating belief without moving any particle. <em>Resample:</em> high-weight particles are duplicated and low-weight ones discarded, so the swarm reconcentrates and every weight resets to $1/N$, ready for the next step.</figcaption>
+</figure>
+<p>To decide <em>when</em> to resample we need a number that quantifies how degenerate the weights have become. The standard diagnostic is the <strong>effective sample size</strong>, an estimate of how many equally-weighted particles the current weighted cloud is worth:</p>
+$$\widehat{N}_{\text{eff}} = \frac{1}{\sum_{i=1}^{N} \big(w^{(i)}_t\big)^2}.$$
+<p>When all weights are equal at $1/N$, the sum of squares is $N \cdot (1/N)^2 = 1/N$ and $\widehat{N}_{\text{eff}} = N$: the cloud is as healthy as it can be.
+When one weight is one and the rest are zero, the sum of squares is one and $\widehat{N}_{\text{eff}} = 1$: total degeneracy.
+The standard policy is adaptive resampling: trigger step three only when $\widehat{N}_{\text{eff}} < N/2$.
+Resampling injects its own Monte Carlo noise, so doing it only when necessary, rather than at every step, keeps the estimate smoother.
+The threshold $N/2$ is a convention, not a theorem; some implementations use $N/3$ or tune it, but halving the count is a robust default that fires neither too eagerly nor too late.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Reading the Effective Sample Size</div>
+<p>Take four particles. Suppose after a weight update the normalized weights are $w = (0.25, 0.25, 0.25, 0.25)$, a perfectly balanced cloud. Then $\sum_i w_i^2 = 4 \times 0.0625 = 0.25$ and $\widehat{N}_{\text{eff}} = 1/0.25 = 4$, the full count, so no resampling is needed. Now suppose a sharp measurement concentrates the weights to $w = (0.97, 0.01, 0.01, 0.01)$. Then $\sum_i w_i^2 = 0.9409 + 3(0.0001) = 0.9412$ and $\widehat{N}_{\text{eff}} = 1/0.9412 \approx 1.06$. The cloud of four particles is now worth barely one; with the threshold $N/2 = 2$ we resample, duplicating the dominant particle and discarding the three near-dead ones. An intermediate case, $w = (0.5, 0.3, 0.15, 0.05)$, gives $\sum_i w_i^2 = 0.25 + 0.09 + 0.0225 + 0.0025 = 0.365$ and $\widehat{N}_{\text{eff}} \approx 2.74$, again below the threshold of two? No: $2.74 > 2$, so we hold off. The diagnostic cleanly separates the healthy and the collapsed regimes.</p>
+</div>
+<p>Resampling itself admits several schemes, and the choice matters for variance.
+<strong>Multinomial</strong> resampling simply draws $N$ independent indices from the categorical weight distribution; it is correct but noisiest.
+<strong>Systematic</strong> resampling lays down a single random offset and then $N$ evenly spaced pointers along the cumulative weight axis, which guarantees that a particle with weight $w^{(i)}$ is selected either $\lfloor N w^{(i)} \rfloor$ or $\lceil N w^{(i)} \rceil$ times and adds the least extra variance.
+We use systematic resampling in the implementation below because it is both faster (one sort-free pass) and lower-variance than the multinomial default.</p>
+
+<h2>4. Practical Issues: Impoverishment, Proposals, and Dimensionality <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Resampling cures weight degeneracy but introduces a twin problem, <strong>sample impoverishment</strong>.
+Because resampling duplicates high-weight particles, a single ancestor can come to occupy many slots, and if the process noise is small those duplicates barely separate afterward.
+Over many steps the diversity of the cloud collapses: you may have a thousand particles but only a handful of distinct values among them, so the posterior is poorly represented even though $\widehat{N}_{\text{eff}}$ looks healthy.
+The classic remedies are to add a small jitter (regularized particle filter), to resample less aggressively, or to use a resample-move step that applies a Markov kernel after resampling to spread duplicates apart.</p>
+<p>The <strong>choice of proposal</strong> is the deepest lever.
+The bootstrap filter proposes from the transition, which is convenient but blind: it pushes particles forward without ever looking at the measurement $y_t$ it is about to be scored against.
+When the measurement is very informative (a low-noise sensor), most blindly-proposed particles land in low-likelihood regions and die at the weighting step, wasting the swarm.
+The <strong>optimal proposal</strong> $p(x_t \mid x_{t-1}, y_t)$ folds the measurement into the prediction and minimizes the variance of the weights, but it is rarely available in closed form.
+The auxiliary particle filter and proposals built from an unscented or extended Kalman approximation around each particle are practical middle grounds that peek at $y_t$ without needing the exact optimal density.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Filter That Found a Lost Submarine</div>
+<p>Sequential Monte Carlo is not a toy. In 1968 the US submarine Scorpion was lost in the Atlantic, and the search team built what was, in effect, a particle representation of the wreck's location: thousands of weighted hypotheses scattered over the sea floor, reweighted as each sonar pass came back empty. The same Bayesian bookkeeping later guided the 2011 discovery of Air France 447's flight recorders after two years of failed searches, when a fresh posterior over the debris field pointed the submersibles at a patch everyone had previously written off. A cloud of weighted guesses, reweighted by evidence, is a very old and very practical idea.</p>
+</div>
+<p>The hardest practical wall is the <strong>curse of dimensionality</strong>.
+The number of particles needed to keep the weight variance bounded grows roughly exponentially with the dimension of the state, because in high dimensions almost every blindly-proposed particle lands far from the thin shell where the measurement likelihood is appreciable.
+In one or a few dimensions a few thousand particles is plentiful; in tens of dimensions the bootstrap filter collapses, and one turns to high-dimensional cousins such as the ensemble Kalman filter (which reimposes a Gaussian approximation to survive) or to careful proposal design.
+This is precisely why particle filters dominate low-dimensional nonlinear problems (target tracking, robot localization, a scalar stochastic-volatility state) but are rarely the first tool for a hundred-dimensional latent space.</p>
+<p>The <strong>number of particles</strong> is the filter's main accuracy knob, and its statistics are reassuring in low dimensions. The Monte Carlo error of any posterior expectation falls as $1/\sqrt{N}$, independent of the state dimension on its face.
+To halve the standard error you therefore quadruple the particle count. Cost is linear in $N$: every particle is propagated and weighted once per step.
+A thousand particles therefore cost a thousand transition draws and a thousand likelihood evaluations per observation. In one dimension a few thousand particles drives the Monte Carlo noise far below the irreducible filtering uncertainty.
+That is why our worked example used two thousand and reported a stable estimate. The catch hidden inside that clean $1/\sqrt{N}$ is the constant in front, which is the weight variance, and it is the weight variance that explodes with dimension.
+The rate stays $1/\sqrt{N}$ but you need exponentially more particles to keep the constant manageable.
+That is the precise sense in which the curse of dimensionality bites.</p>
+<div class="callout warning">
+<div class="callout-title">Common Misconception: More Particles Cures Everything</div>
+<p>Because the Monte Carlo error falls as $1/\sqrt{N}$, it is tempting to treat the particle count as a universal quality dial: if the filter is bad, add particles. This fails in two distinct ways. First, against the curse of dimensionality the required $N$ grows exponentially with the state dimension, so in a twenty-dimensional state no affordable particle count rescues a bootstrap proposal; the fix is a better proposal, not a bigger swarm. Second, against sample impoverishment after aggressive resampling, the problem is too few <em>distinct</em> particles, not too few particles total; cloning a million copies of one ancestor still represents the posterior with one value. Diagnose which pathology you have (watch $\widehat{N}_{\text{eff}}$ and the count of unique particle values) before reaching for more samples, because for two of the three classic failure modes more particles is the wrong medicine.</p>
+</div>
+<div class="callout tip">
+<div class="callout-title">Try This: Watch Degeneracy Happen</div>
+<p>Take Code 7.4.2 and comment out the entire resampling block, turning the bootstrap filter back into pure sequential importance sampling. Add one line inside the loop to record the number of particles carrying more than $0.1\%$ of the total weight, then run on the 300-step series. You will watch that count fall from the full two thousand to a single digit within roughly twenty to forty steps, and the filtered estimate will visibly lock onto whatever path the surviving particle happens to trace, drifting away from the truth thereafter. Restoring the three-line resampling block fixes it instantly. Seeing the collapse with your own eyes is the fastest way to understand why resampling is not optional.</p>
+</div>
+<div class="callout looking-back">
+<div class="callout-title">Looking Back: The Stochastic-Volatility State of Section 6.5</div>
+<p>The stochastic-volatility model of <a href="../module-06-multivariate-econometric/section-6.5.html">Section 6.5</a> is the textbook nonlinear, non-Gaussian state-space problem and a perfect particle-filter target. There the log-variance $h_t$ follows a linear-Gaussian autoregression, $h_t = \mu + \phi(h_{t-1} - \mu) + \sigma_\eta \eta_t$, but it enters the observation through an exponential, $y_t = \exp(h_t / 2)\,\varepsilon_t$, so the measurement density $p(y_t \mid h_t)$ is non-Gaussian in $h_t$ and the Kalman filter does not apply. The single hidden volatility state is one-dimensional, exactly where particle filters shine. The worked example below uses precisely this model, closing the loop: the GARCH-style volatility you estimated by maximum likelihood in Section&nbsp;6.5 you can now filter online, one observation at a time, with a few hundred particles.</p>
+</div>
+
+<h2>5. Worked Example: A Bootstrap Filter from Scratch <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now build a bootstrap particle filter in plain NumPy and run it on the stochastic-volatility state-space model from <a href="../module-06-multivariate-econometric/section-6.5.html">Section 6.5</a>.
+The hidden state is the latent log-variance $h_t$; we observe a return $y_t$ whose scale is set by $h_t$.
+Code&nbsp;7.4.1 generates a synthetic series so we know the ground-truth volatility path and can judge the filter against it.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(7)
+
+# Stochastic-volatility model (the Section 6.5 state-space form):
+#   h_t = mu + phi * (h_{t-1} - mu) + sigma_eta * eta_t    (latent log-variance)
+#   y_t = exp(h_t / 2) * eps_t                             (observed return)
+mu, phi, sigma_eta = -0.5, 0.97, 0.20   # persistence phi near 1: clustered vol
+T = 300
+
+h = np.empty(T)
+y = np.empty(T)
+h[0] = mu
+for t in range(1, T):
+    h[t] = mu + phi * (h[t - 1] - mu) + sigma_eta * rng.standard_normal()
+for t in range(T):
+    y[t] = np.exp(h[t] / 2.0) * rng.standard_normal()   # heavy-tailed-looking returns
+
+print(f"true log-var range: [{h.min():.2f}, {h.max():.2f}]")
+print(f"observed |return| max: {np.abs(y).max():.3f}")
+</code></pre>
+<div class="code-caption"><strong>Code 7.4.1:</strong> Simulating the stochastic-volatility series. The persistence <code>phi = 0.97</code> produces the volatility clustering seen in real returns: calm stretches and bursts. We keep the true path <code>h</code> only to score the filter; the filter itself sees only <code>y</code>.</div>
+<pre><code class="language-text">true log-var range: [-1.43, 0.86]
+observed |return| max: 2.741
+</code></pre>
+<div class="code-caption"><strong>Output 7.4.1:</strong> The latent log-variance wanders over a roughly two-unit range, and the observed returns occasionally spike well past two in magnitude during high-volatility stretches, exactly the kind of non-Gaussian observation that defeats a linear filter.</div>
+<p>The filter needs three model pieces: a way to sample the initial state, a way to propagate a particle one step through the transition, and a measurement log-likelihood $\log p(y_t \mid h_t)$.
+For this model the observation $y_t \mid h_t$ is Gaussian with mean zero and variance $\exp(h_t)$, so its log-density is $-\tfrac{1}{2}\big(\log 2\pi + h_t + y_t^2 e^{-h_t}\big)$.
+Code&nbsp;7.4.2 is the complete bootstrap filter, including systematic resampling and the effective-sample-size diagnostic.</p>
+<pre><code class="language-python">def transition(h_prev, rng):
+    """Sample h_t given h_{t-1} from the AR(1) log-variance dynamics."""
+    return mu + phi * (h_prev - mu) + sigma_eta * rng.standard_normal(h_prev.shape)
+
+def log_likelihood(y_t, h):
+    """log p(y_t | h_t): y_t ~ Normal(0, exp(h_t))."""
+    return -0.5 * (np.log(2 * np.pi) + h + (y_t ** 2) * np.exp(-h))
+
+def systematic_resample(weights, rng):
+    """Low-variance resampling: one random offset, N evenly spaced pointers."""
+    N = len(weights)
+    positions = (rng.random() + np.arange(N)) / N
+    cumulative = np.cumsum(weights)
+    cumulative[-1] = 1.0                      # guard against rounding drift
+    return np.searchsorted(cumulative, positions)
+
+def bootstrap_filter(y, N=2000, seed=0):
+    rng = np.random.default_rng(seed)
+    T = len(y)
+    particles = mu + (sigma_eta / np.sqrt(1 - phi ** 2)) * rng.standard_normal(N)  # stationary prior
+    weights = np.full(N, 1.0 / N)
+    mean_est = np.empty(T)
+    n_eff_hist = np.empty(T)
+    for t in range(T):
+        particles = transition(particles, rng)                 # 1. predict
+        logw = np.log(weights) + log_likelihood(y[t], particles)
+        logw -= logw.max()                                     # 2. weight (stable)
+        weights = np.exp(logw)
+        weights /= weights.sum()
+        mean_est[t] = np.sum(weights * particles)              # posterior mean of h_t
+        n_eff = 1.0 / np.sum(weights ** 2)                     # effective sample size
+        n_eff_hist[t] = n_eff
+        if n_eff < N / 2:                                      # 3. resample if degenerate
+            idx = systematic_resample(weights, rng)
+            particles = particles[idx]
+            weights = np.full(N, 1.0 / N)
+    return mean_est, n_eff_hist
+
+h_hat, n_eff = bootstrap_filter(y, N=2000)
+rmse = np.sqrt(np.mean((h_hat - h) ** 2))
+print(f"filtered log-var RMSE: {rmse:.3f}")
+print(f"median N_eff: {np.median(n_eff):.0f} of 2000 "
+      f"(resampled on {(n_eff < 1000).mean() * 100:.0f}% of steps)")
+</code></pre>
+<div class="code-caption"><strong>Code 7.4.2:</strong> A complete bootstrap particle filter from scratch: predict by sampling the transition, weight in the log domain for numerical stability, track $\widehat{N}_{\text{eff}}$, and resample systematically only when the cloud degenerates below $N/2$. The returned <code>h_hat</code> is the online posterior-mean estimate of the latent log-variance.</div>
+<pre><code class="language-text">filtered log-var RMSE: 0.244
+median N_eff: 1240 of 2000 (resampled on 38% of steps)
+</code></pre>
+<div class="code-caption"><strong>Output 7.4.2:</strong> Roughly 250 particles' worth of error: the filter recovers the hidden volatility path it was never shown, to within a quarter of a log-variance unit. The median effective sample size sits well above the threshold, and adaptive resampling fires on about a third of steps, exactly when a surprising return briefly concentrates the weights.</div>
+<p>The estimate <code>h_hat</code> tracks the true latent log-variance closely despite the filter never seeing it, which is the whole point.
+From a stream of scalar returns the particle cloud reconstructs the hidden volatility regime online, one observation at a time, with no batch refitting.
+One subtlety deserves a word.
+What we computed is the <em>filtering</em> estimate $\mathbb{E}[h_t \mid y_{1:t}]$, the posterior mean of the state given data up to the present.
+If you are willing to wait and reprocess the whole batch, the <em>smoothing</em> estimate $\mathbb{E}[h_t \mid y_{1:T}]$, which conditions on future observations too, is strictly more accurate.
+Particle smoothers (forward-filtering backward-sampling, or the fixed-lag smoother) extend the cloud to compute it.
+Filtering is the online quantity, the one a risk desk or a robot needs in real time.
+Smoothing is the retrospective quantity for after-the-fact analysis, when the whole record is already in hand.
+Note the one defensive line <code>logw -= logw.max()</code> inside the loop.
+Subtracting the maximum log-weight before exponentiating prevents underflow when every particle's raw likelihood is tiny, a routine but essential trick that keeps the normalization from dividing zero by zero.
+To make the multimodal-tracking ability vivid, Code&nbsp;7.4.3 visualizes the particle cloud at a single time step on the symmetric-corridor localization problem of Section&nbsp;1, where the posterior genuinely has several peaks.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(1)
+
+# Symmetric corridor: landmarks at 2, 5, 8; sensor reports distance to NEAREST.
+landmarks = np.array([2.0, 5.0, 8.0])
+def nearest_dist(x):
+    return np.min(np.abs(x[:, None] - landmarks[None, :]), axis=1)
+
+N = 5000
+particles = rng.uniform(0, 10, N)          # flat prior over the whole corridor
+weights = np.full(N, 1.0 / N)
+
+y_obs = 0.0                                 # robot sees a landmark right at its position
+sigma_meas = 0.15
+logw = -0.5 * ((nearest_dist(particles) - y_obs) / sigma_meas) ** 2
+logw -= logw.max()
+weights = np.exp(logw); weights /= weights.sum()
+
+# Where did the posterior mass land? Bucket particles by corridor third.
+for lo, hi, name in [(0, 3.5, "near landmark 2"),
+                     (3.5, 6.5, "near landmark 5"),
+                     (6.5, 10, "near landmark 8")]:
+    mass = weights[(particles >= lo) & (particles < hi)].sum()
+    print(f"{name:>18}: posterior mass {mass:.2f}")
+</code></pre>
+<div class="code-caption"><strong>Code 7.4.3:</strong> A one-step localization snapshot in a symmetric corridor. Seeing a landmark at distance zero is consistent with standing at <em>any</em> of the three identical landmarks, so the weighted particle cloud splits into three peaks of nearly equal mass, a posterior no single Gaussian could represent.</div>
+<pre><code class="language-text">   near landmark 2: posterior mass 0.34
+   near landmark 5: posterior mass 0.33
+   near landmark 8: posterior mass 0.33
+</code></pre>
+<div class="code-caption"><strong>Output 7.4.3:</strong> The posterior mass divides almost evenly across the three landmark neighborhoods. A Kalman filter would report a mean near the corridor center (position 5) with huge variance, a location and uncertainty that describe the truth nowhere; the particle cloud instead holds all three hypotheses alive until a later, disambiguating measurement arrives.</div>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: One Resampling Step by Hand</div>
+<p>Take five particles at log-variances $h = (-0.8, -0.3, 0.0, 0.4, 1.1)$ with equal prior weights $0.2$, and observe a large return $y_t = 1.9$. The log-likelihood $-\tfrac12(h + y_t^2 e^{-h})$ with $y_t^2 = 3.61$ strongly prefers <em>high</em> variance: the particle at $h = 1.1$ gets log-likelihood $\approx -0.5(1.1 + 3.61 \cdot 0.333) = -1.15$, while $h = -0.8$ gets $-0.5(-0.8 + 3.61 \cdot 2.23) = -3.62$. Exponentiating and normalizing yields weights of roughly $(0.02, 0.05, 0.09, 0.23, 0.61)$. The effective sample size is $1/\sum w_i^2 = 1/(0.0004 + 0.0025 + 0.0081 + 0.0529 + 0.3721) \approx 2.3$, below $N/2 = 2.5$, so we resample. Systematic resampling with these weights duplicates the $h = 1.1$ particle about three times and the $h = 0.4$ particle once, and almost surely drops the two lowest, exactly steering the cloud toward the high-volatility explanation the large return demands.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: The Same Filter in a Dozen Lines with FilterPy</div>
+<p>The from-scratch filter of Code 7.4.2 is about 35 lines once you count the transition, likelihood, systematic resampling, and the main loop. The <code>filterpy</code> library ships those primitives, so the same bootstrap filter collapses to roughly a dozen lines, a reduction of nearly two thirds, with the resampling scheme and the effective-sample-size test handled internally:</p>
+<pre><code class="language-python"># pip install filterpy
+import numpy as np
+from filterpy.monte_carlo import systematic_resample
+from filterpy.monte_carlo import neff   # 1 / sum(w**2), the effective sample size
+
+N = 2000
+rng = np.random.default_rng(0)
+particles = mu + (sigma_eta / np.sqrt(1 - phi**2)) * rng.standard_normal(N)
+weights = np.full(N, 1.0 / N)
+h_hat = np.empty(len(y))
+
+for t in range(len(y)):
+    particles = mu + phi * (particles - mu) + sigma_eta * rng.standard_normal(N)  # predict
+    weights *= np.exp(-0.5 * (particles + y[t]**2 * np.exp(-particles)))          # weight
+    weights += 1e-300                                                             # avoid all-zero
+    weights /= weights.sum()
+    h_hat[t] = np.average(particles, weights=weights)
+    if neff(weights) < N / 2:                                                     # library diagnostic
+        idx = systematic_resample(weights)                                        # library resample
+        particles, weights = particles[idx], np.full(N, 1.0 / N)
+</code></pre>
+<div class="code-caption"><strong>Code 7.4.4:</strong> The bootstrap filter via <code>filterpy</code>. The library's <code>systematic_resample</code> and <code>neff</code> replace the two helper functions we wrote by hand; the dedicated <code>particles</code> library offers an even higher-level <code>SMC</code> object that wires the whole loop for you. The arithmetic is identical to Code 7.4.2, only the bookkeeping is borrowed.</div>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Filtering Volatility for a Risk Desk</div>
+<p><strong>Who:</strong> A quantitative analyst on the market-risk team of a mid-sized asset manager, responsible for a daily value-at-risk number on an equity portfolio.</p>
+<p><strong>Situation:</strong> The desk needed an online estimate of each asset's instantaneous volatility to size positions intraday, updated as every new return printed, not refit overnight in a batch.</p>
+<p><strong>Problem:</strong> Their incumbent GARCH model, refit each evening by maximum likelihood (the Section 6.5 workflow), gave a single point estimate of volatility but no honest intraday uncertainty, and it reacted sluggishly to regime shifts because it could not update within the day.</p>
+<p><strong>Dilemma:</strong> Three paths were debated. Refitting GARCH every few minutes was computationally wasteful and numerically fragile. An extended Kalman filter on the log-variance state was fast but assumed a Gaussian posterior that the exponential measurement link badly violated, understating tail risk precisely when it mattered. A bootstrap particle filter gave a full posterior over volatility but cost more compute and introduced Monte Carlo noise into a regulated risk number.</p>
+<p><strong>Decision:</strong> They deployed a 1,000-particle bootstrap filter on the stochastic-volatility state, accepting the modest compute cost in exchange for a full, non-Gaussian posterior over current volatility and adaptive resampling tuned to fire only on surprising returns.</p>
+<p><strong>How:</strong> The filter ran exactly as in Code 7.4.2, one update per incoming tick, with systematic resampling at the $N/2$ threshold and a fixed random seed per trading day for auditability. The posterior's upper quantiles fed directly into the value-at-risk calculation.</p>
+<p><strong>Result:</strong> During the next volatility spike the particle filter's volatility estimate rose a full session ahead of the overnight-refit GARCH number, and its posterior tail correctly widened, flagging elevated risk that the Gaussian filter had smoothed away. The desk kept the particle filter for its tail-honest uncertainty, not merely its point estimate.</p>
+<p><strong>Lesson:</strong> When the quantity you report is a tail (value-at-risk is a quantile, not a mean), a filter that represents the whole posterior shape beats a faster filter that only tracks the center. The particle cloud's tails were the deliverable.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Differentiable and Neural Particle Filters (2024 to 2026)</div>
+<p>The resampling step is not differentiable (drawing discrete indices has no gradient), which long blocked particle filters from being trained end to end inside a deep network. The frontier is fixing exactly that. Differentiable particle filters replace hard resampling with soft, optimal-transport or Gumbel-softmax relaxations so that gradients flow through the whole filter.
+This lets you learn the transition, the measurement model, and the proposal jointly from data; recent surveys (Chen and Li, 2024) consolidate this fast-moving line. Particle-filter recurrent neural networks and the broader class of <em>neural</em> SMC methods embed a learned proposal network that peeks at the observation.
+This directly attacks the curse of dimensionality that cripples the bootstrap filter in high dimensions. On the inference side, particle MCMC and the SMC-sampler family (the <code>particles</code> and BlackJAX libraries) push sequential Monte Carlo well beyond filtering.
+These methods reach into full Bayesian parameter estimation, jointly inferring states and the model parameters that govern them. One thread runs through all of it.
+The 1993 bootstrap filter you implemented above is now a differentiable layer, and the proposal it lacked is something a network can learn. This same latent-state-with-learned-dynamics idea returns in force when the structured state-space models of <a href="../../toc.html">Chapter 13</a> reinterpret filtering as a trainable sequence layer.</p>
+</div>
+
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: From Filter to Learned Belief State</div>
+<p>The particle cloud is a belief state: a representation of everything the system knows about a hidden variable given its observations so far. That idea is the spine of the rest of the book. The same belief state becomes the hidden state of a recurrent network in <a href="../../toc.html">Chapter 10</a>.
+There the network learns its own update rule instead of being handed the transition and measurement densities, replacing the modeler's equations with parameters fit from data. It becomes the latent variable of a deep generative sequence model in <a href="../../toc.html">Chapter 17</a>, and the agent's belief over an unobserved world state in the POMDP framework of <a href="../../toc.html">Chapter 23</a>, where acting well requires reasoning about a posterior you can never observe directly.
+The particle filter even resurfaces inside reinforcement learning as a way to maintain a belief state for planning, the bridge that <a href="../../toc.html">Chapter 23</a> makes explicit.
+The particle filter is the first place in this book where belief becomes an explicit, manipulable object; it will not be the last.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.4.1: Why the Weight Update Simplifies <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Starting from the general sequential importance sampling weight recursion $\tilde{w}^{(i)}_t = \tilde{w}^{(i)}_{t-1} \cdot \dfrac{p(y_t \mid x^{(i)}_t)\, p(x^{(i)}_t \mid x^{(i)}_{t-1})}{q(x^{(i)}_t \mid x^{(i)}_{t-1}, y_t)}$, show algebraically that choosing the transition density as the proposal, $q = p(x_t \mid x_{t-1})$, reduces the update to multiplication by the measurement likelihood alone. Then explain in one or two sentences the practical cost of this convenient choice: what information does the bootstrap proposal ignore, and in what measurement regime does that omission hurt most?</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.4.2: Resample Never, Always, or Adaptively <span class="exercise-type coding">Coding</span></div>
+<p>Modify Code 7.4.2 to support three resampling policies: never resample (pure SIS), resample at every step, and the adaptive $N_{\text{eff}} < N/2$ rule already implemented. Run each on the stochastic-volatility series and record both the filtered log-variance RMSE and the median effective sample size over time. Show numerically that pure SIS collapses to $\widehat{N}_{\text{eff}} \approx 1$ within a few dozen steps, that resampling every step is stable but noisier than adaptive, and that the adaptive rule gives the best RMSE. Plot $\widehat{N}_{\text{eff}}$ versus time for all three.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.4.3: A Gaussian Filter on a Multimodal Posterior <span class="exercise-type analysis">Analysis</span></div>
+<p>Take the symmetric-corridor setup of Code 7.4.3. Implement (or reason carefully about) an extended Kalman filter for the same problem and explain precisely why it fails to localize the robot, identifying which step of the Gaussian recursion cannot represent the three-peaked posterior. Then describe a sequence of later measurements (for example, the robot reaching a wall at one end) that would collapse the particle filter's posterior to a single mode, and explain why the same evidence does not rescue the Gaussian filter.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.4.4: Designing a Smarter Proposal <span class="exercise-type open-ended">Open-Ended</span></div>
+<p>The bootstrap filter proposes blindly from the transition. Design a proposal for the stochastic-volatility model that peeks at the current return $y_t$ before placing particles, for instance by shifting the proposal mean toward log-variances that better explain a large $|y_t|$. Derive the corresponding corrected weight update (it will no longer be the likelihood alone), implement it, and measure whether the smarter proposal raises the median effective sample size and lowers RMSE at a fixed particle count. Discuss when the extra complexity is worth it.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-7.3.html"><span class="nav-label">Previous</span><span class="nav-num">Section 7.3</span><span class="nav-title">The Unscented Kalman Filter</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 7</span><span class="nav-num">Contents</span><span class="nav-title">State-Space Models and Filtering</span></a>
+<a class="next" href="section-7.5.html"><span class="nav-label">Next</span><span class="nav-num">Section 7.5</span><span class="nav-title">Hidden Markov Models</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>
