@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 9.2: Sequence Learning Concepts and Tasks. The taxonomy of sequence tasks (one-to-one, one-to-many, many-to-one, aligned and unaligned many-to-many), the inputs and outputs of variable-length sequences with padding and masking, losses and targets for temporal learning, conditioning on static and covariate features, the encoder-decoder bottleneck that motivates attention, and a runnable PyTorch pipeline with from-scratch and library masking." name="description"/>
+<title>Section 9.2: Sequence Learning Concepts and Tasks | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Temporal Deep Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 9: Neural Sequence Modeling Fundamentals</a></div>
+<h1>Sequence Learning Concepts and Tasks</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They hand me a sequence and a loss and expect me to know what I am. Am I collapsing the whole history into one number, or am I supposed to speak back a sequence of my own? Tell me my output shape and I will tell you who I am."</p>
+<cite>A Sequence Model Unsure if It Is Many-to-One or Many-to-Many</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Before you choose an architecture, you must name the task, and almost every temporal learning problem falls into one of five shapes defined purely by how the length of the output relates to the length of the input: one input to one output, one input to a sequence, a sequence to one output, a sequence to an equally long aligned sequence, and a sequence to a differently long unaligned sequence.</strong> Forecasting, anomaly labeling, activity recognition, and transduction are not four unrelated problems; they are four cells of this single table. Once you fix the shape you have fixed the output head, the loss family, the way variable lengths are padded and masked, and whether the model generates one step at a time (autoregressively) or emits the whole horizon at once. This section builds that taxonomy, then nails down the mechanics that every shape shares: how variable-length sequences are batched with padding and masking, which losses match which targets, how teacher forcing trains an autoregressive model and why it leaks, how static and covariate features enter, and why squeezing a whole input into one fixed context vector is the bottleneck that attention was invented to break. We close with a runnable PyTorch pipeline that builds both a many-to-one and a many-to-many head over the same padded, masked batch.</p>
+</div>
+<p>In <a href="section-9.1.html">Section 9.1</a> we argued that a sequence model is any function that maps an ordered collection of observations to a prediction, and we met the carried-state recurrence that <a href="../../toc.html">Section 7.6</a> showed underlies every classical filter. That section answered "what is the machine?". This section answers the prior question every practitioner must settle first: "what is the task?". The architecture follows from the task, not the other way around, and a startling number of modeling mistakes are really task-misclassification mistakes, for example training a many-to-one classifier when the problem actually demands a per-step aligned label. We will use the notation of the unified table in <a href="../../toc.html">Appendix A</a>: an input sequence $\mathbf{x}_{1:T} = (\mathbf{x}_1, \dots, \mathbf{x}_T)$ of length $T$, a target $\mathbf{y}$ that is either a single value, a vector, or its own sequence $\mathbf{y}_{1:T'}$ of length $T'$, and a model $f_\theta$ with parameters $\theta$.</p>
+<p>By the end of this section you should be able to do four concrete things. Place any temporal problem you meet into the five-cell taxonomy and read off its output head from that placement. Pad and mask a ragged batch of sequences correctly, so that the loss never counts a padding position. Pick a loss that matches the target type, including the quantile loss that returns later when we forecast distributions. And explain why a fixed context vector limits an encoder-decoder, which is the motivation the attention chapter builds on. These four skills are the grammar of Part III; every later architecture is a different way of speaking this same grammar.</p>
+
+<h2>1. The Taxonomy of Sequence Tasks <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The most useful first cut in all of sequence modeling sorts tasks by the relationship between input length and output length. There are exactly five shapes worth naming, and the discipline of naming the shape before reaching for a model is what keeps you from, say, building a generator when you needed a classifier. The five shapes are one-to-one, one-to-many, many-to-one, aligned many-to-many, and unaligned many-to-many. We take them in turn, each with its canonical temporal example.</p>
+<p>A <strong>one-to-one</strong> task maps a single input to a single output with no temporal extent at all; it is the degenerate case, ordinary tabular regression or classification, and we list it only to mark the boundary of the family. A <strong>one-to-many</strong> task takes a single input and emits a sequence: a single conditioning vector seeds an entire generated trajectory, as when a static patient descriptor seeds a simulated vital-sign path, or a class label seeds a generated waveform. A <strong>many-to-one</strong> task consumes a whole sequence and returns one prediction; this splits by target type into classification (the sequence belongs to one of $C$ classes, for example recognizing an activity from an accelerometer window) and regression (the sequence maps to a real number, for example predicting next-quarter demand from a sales history).</p>
+<p>The two many-to-many shapes are where most temporal subtlety lives, and the distinction between them is the single most important idea in this subsection. An <strong>aligned many-to-many</strong> task emits one output per input step, with the $t$-th output paired to the $t$-th input: sequence labeling, also called sequence tagging. Anomaly detection that flags each timestamp as normal or anomalous is aligned many-to-many, and so is per-step segmentation of a sensor stream into operating regimes. The lengths are equal, $T' = T$, and the alignment is given. An <strong>unaligned many-to-many</strong> task maps an input sequence to an output sequence of possibly different length with no given per-step correspondence: this is sequence-to-sequence, or transduction. Translating one language to another is the textbook case; in temporal AI, mapping an irregular event log to a regular forecast horizon, or transcribing a variable-length sensor burst into a variable-length symptom code sequence, are unaligned because $T' \ne T$ in general and nothing tells you which input step produced which output step. Figure 9.2.1 draws all five shapes at once.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Five small diagrams of input and output boxes. One-to-one: one input box maps to one output box. One-to-many: one input box maps to three output boxes. Many-to-one: three input boxes map to one output box. Aligned many-to-many: three input boxes each map to one of three output boxes directly above. Unaligned many-to-many: three input boxes feed an encoder that feeds a decoder emitting two output boxes.">
+<defs>
+<marker id="arr92" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.inb92 { fill:#eef3f8; stroke:#14385c; stroke-width:1.6; }
+.outb92 { fill:#fbeee8; stroke:#b8431f; stroke-width:1.6; }
+.fl92 { stroke:#5a626c; stroke-width:1.5; fill:none; marker-end:url(#arr92); }
+.cap92 { font:600 12px sans-serif; fill:#14385c; text-anchor:middle; }
+.sm92 { font:10.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+</style>
+<!-- one-to-one -->
+<text class="cap92" x="80" y="22">one-to-one</text>
+<rect class="inb92" x="62" y="180" width="36" height="26"/>
+<rect class="outb92" x="62" y="120" width="36" height="26"/>
+<line class="fl92" x1="80" y1="178" x2="80" y2="148"/>
+<text class="sm92" x="80" y="232">regression</text>
+<!-- one-to-many -->
+<text class="cap92" x="230" y="22">one-to-many</text>
+<rect class="inb92" x="212" y="180" width="36" height="26"/>
+<rect class="outb92" x="178" y="120" width="30" height="26"/>
+<rect class="outb92" x="215" y="120" width="30" height="26"/>
+<rect class="outb92" x="252" y="120" width="30" height="26"/>
+<line class="fl92" x1="230" y1="178" x2="200" y2="148"/>
+<line class="fl92" x1="230" y1="178" x2="230" y2="148"/>
+<line class="fl92" x1="230" y1="178" x2="260" y2="148"/>
+<text class="sm92" x="230" y="232">generation</text>
+<!-- many-to-one -->
+<text class="cap92" x="410" y="22">many-to-one</text>
+<rect class="inb92" x="358" y="180" width="30" height="26"/>
+<rect class="inb92" x="395" y="180" width="30" height="26"/>
+<rect class="inb92" x="432" y="180" width="30" height="26"/>
+<rect class="outb92" x="392" y="120" width="36" height="26"/>
+<line class="fl92" x1="373" y1="178" x2="405" y2="148"/>
+<line class="fl92" x1="410" y1="178" x2="410" y2="148"/>
+<line class="fl92" x1="447" y1="178" x2="415" y2="148"/>
+<text class="sm92" x="410" y="232">classify / regress</text>
+<!-- aligned many-to-many -->
+<text class="cap92" x="590" y="22">aligned m-to-m</text>
+<rect class="inb92" x="538" y="180" width="30" height="26"/>
+<rect class="inb92" x="575" y="180" width="30" height="26"/>
+<rect class="inb92" x="612" y="180" width="30" height="26"/>
+<rect class="outb92" x="538" y="120" width="30" height="26"/>
+<rect class="outb92" x="575" y="120" width="30" height="26"/>
+<rect class="outb92" x="612" y="120" width="30" height="26"/>
+<line class="fl92" x1="553" y1="178" x2="553" y2="148"/>
+<line class="fl92" x1="590" y1="178" x2="590" y2="148"/>
+<line class="fl92" x1="627" y1="178" x2="627" y2="148"/>
+<text class="sm92" x="590" y="232">per-step labeling</text>
+<!-- unaligned many-to-many -->
+<text class="cap92" x="775" y="22">unaligned m-to-m</text>
+<rect class="inb92" x="720" y="180" width="26" height="26"/>
+<rect class="inb92" x="750" y="180" width="26" height="26"/>
+<rect class="inb92" x="780" y="180" width="26" height="26"/>
+<rect class="outb92" x="735" y="120" width="26" height="26"/>
+<rect class="outb92" x="775" y="120" width="26" height="26"/>
+<line class="fl92" x1="733" y1="178" x2="755" y2="160"/>
+<line class="fl92" x1="763" y1="178" x2="760" y2="160"/>
+<line class="fl92" x1="793" y1="178" x2="767" y2="160"/>
+<text class="sm92" x="763" y="166">enc</text>
+<line class="fl92" x1="763" y1="158" x2="755" y2="148"/>
+<line class="fl92" x1="763" y1="158" x2="788" y2="148"/>
+<text class="sm92" x="763" y="232">seq2seq</text>
+</svg>
+<figcaption><strong>Figure 9.2.1:</strong> The five shapes of sequence learning, sorted by how output length relates to input length. Blue boxes are inputs, orange boxes are outputs. Reading left to right: a degenerate tabular case, a generator seeded by one vector, a sequence collapsed to one prediction, a per-step aligned labeler, and an encoder-decoder transducer whose output length need not equal its input length.</figcaption>
+</figure>
+<p>The reason this taxonomy earns its place at the front of the chapter is that the output shape dictates the engineering. A many-to-one head pools the sequence into one vector and attaches a single classifier or regressor; an aligned many-to-many head attaches a small head at every step and computes the loss per step; an unaligned head needs an encoder that summarizes the input and a decoder that generates the output, the architecture of subsection five. Table 9.2.1 maps each shape to its temporal example, its output head, and its natural loss, so that classifying the task immediately yields the first three design decisions.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Shape</th><th>Temporal example</th><th>Output head</th><th>Natural loss</th></tr></thead>
+<tbody>
+<tr><td>one-to-one</td><td>map one feature vector to one value (tabular baseline)</td><td>single linear / softmax</td><td>MSE or cross-entropy</td></tr>
+<tr><td>one-to-many</td><td>generate a synthetic vital-sign trajectory from a patient descriptor</td><td>autoregressive decoder</td><td>per-step likelihood</td></tr>
+<tr><td>many-to-one (classification)</td><td>activity recognition from an accelerometer window</td><td>pool then softmax over $C$ classes</td><td>cross-entropy</td></tr>
+<tr><td>many-to-one (regression)</td><td>forecast next-step demand from a sales history</td><td>pool then linear</td><td>MSE / MAE / pinball</td></tr>
+<tr><td>aligned many-to-many</td><td>flag each timestamp as anomalous or normal</td><td>per-step head, $T'=T$</td><td>masked per-step cross-entropy</td></tr>
+<tr><td>unaligned many-to-many</td><td>transduce an irregular event log to a regular horizon</td><td>encoder-decoder, $T' \ne T$</td><td>per-step likelihood with masking</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Table 9.2.1:</strong> The task taxonomy mapped to canonical temporal examples, the output head each shape requires, and the loss family each invites. Settling the leftmost column settles the other three, which is why naming the task is the first modeling act.</figcaption>
+</figure>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Output Shape Is the Task</div>
+<p>A model's identity is determined less by its internal cell (RNN, convolution, or attention, the subjects of <a href="../../toc.html">Chapter 10</a> through <a href="../../toc.html">Chapter 12</a>) than by the shape of what it must emit. The same recurrent backbone becomes a classifier when you pool its states into one prediction, a labeler when you read out every state, and a generator when you feed its output back as its next input. Architecture is the verb; the task shape is the sentence it must complete. When a temporal project stalls, the first diagnostic question is almost never "is my cell powerful enough?" and almost always "did I match the output shape to the task?", because the two many-to-many shapes in particular are routinely confused, and an aligned labeler trained as a many-to-one classifier silently discards exactly the per-step signal the problem was about.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Famous Five-Boxes Diagram</div>
+<p>The five-shapes picture in Figure 9.2.1 is so canonical that a generation of practitioners learned it from one blog post, Andrej Karpathy's 2015 "The Unreasonable Effectiveness of Recurrent Neural Networks", which drew the boxes in red, green, and blue and made "one-to-many, many-to-one, many-to-many" part of the field's spoken vocabulary. The diagram predates the Transformer entirely, which is a quiet testament to its level of abstraction: it classifies tasks, not architectures, so it survived the architecture that replaced the RNN it was drawn to explain. You will meet the same five boxes wearing convolutional and attention costumes for the rest of Part III.</p>
+</div>
+
+<h2>2. Inputs, Outputs, and the Shape of a Batch <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Real temporal data is ragged. One patient stay is forty hours, another is four hundred; one customer has a two-year purchase history, another signed up last week. A neural network, however, wants rectangular tensors, so the first mechanical task in every sequence pipeline is turning a list of variable-length sequences into one padded tensor plus a mask that records which entries are real. Padding appends a filler value (commonly zero) to every sequence until all reach the batch's maximum length $T_{\max}$; the mask is a Boolean tensor of the same shape that is true at real positions and false at padding. Every downstream computation, the loss above all, must consult the mask so that padded positions contribute nothing, a discipline subsection six makes concrete in code.</p>
+<p>The batch tensor for a single-feature series therefore has shape $(B, T_{\max})$, or $(B, T_{\max}, F)$ once each step carries $F$ features; PyTorch's convention with <code>batch_first=True</code> puts batch first, which we adopt throughout. Two further efficiencies matter in practice. <strong>Batching by length</strong>, sometimes called bucketing, groups sequences of similar length into the same batch so that $T_{\max}$ is not dominated by one outlier, which would otherwise waste computation on padding for every other sequence. And the packed-sequence representation, which we use in subsection six, lets the recurrent layers of <a href="../../toc.html">Chapter 10</a> skip padded steps entirely rather than process and then discard them.</p>
+<p>On the output side, a deeper fork appears whenever the task is to predict multiple future steps, the multi-horizon forecasting that recurs throughout <a href="../../toc.html">Chapter 14</a>. There are two ways to produce a horizon of length $H$, and the choice has consequences that ripple through training and inference. <strong>Autoregressive generation</strong> predicts one step, feeds that prediction back as input, and predicts the next, repeating $H$ times; the model only ever has a one-step head, but errors compound because each prediction conditions on the model's own possibly wrong earlier predictions. <strong>Direct multi-horizon output</strong> emits all $H$ values in a single forward pass from one head of width $H$; there is no error feedback loop, but the model cannot exploit its own intermediate predictions and must learn each horizon offset somewhat independently. This is the same windowing fork we set up in <a href="../../toc.html">Chapter 2</a> when we slid input and output windows over a series; the input window became $\mathbf{x}_{1:T}$ and the output window became either one step generated $H$ times or $H$ steps emitted at once.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Padding Three Ragged Sequences</div>
+<p>Suppose a batch holds three univariate series of lengths $5$, $3$, and $4$. Then $T_{\max} = 5$, and the padded tensor has shape $(B, T_{\max}) = (3, 5)$. Writing $p$ for the padding value, the padded batch and its mask are</p>
+$$\mathbf{X} = \begin{bmatrix} x^{(1)}_1 &amp; x^{(1)}_2 &amp; x^{(1)}_3 &amp; x^{(1)}_4 &amp; x^{(1)}_5 \\ x^{(2)}_1 &amp; x^{(2)}_2 &amp; x^{(2)}_3 &amp; p &amp; p \\ x^{(3)}_1 &amp; x^{(3)}_2 &amp; x^{(3)}_3 &amp; x^{(3)}_4 &amp; p \end{bmatrix}, \qquad \mathbf{M} = \begin{bmatrix} 1 &amp; 1 &amp; 1 &amp; 1 &amp; 1 \\ 1 &amp; 1 &amp; 1 &amp; 0 &amp; 0 \\ 1 &amp; 1 &amp; 1 &amp; 1 &amp; 0 \end{bmatrix}.$$
+<p>The mask has $5 + 3 + 4 = 12$ true entries out of $15$, so a correctly masked per-step loss averages over $12$ positions, not $15$. If you forgot the mask and averaged over all $15$, the three padding zeros would pull a mean-squared error toward zero by a factor of $12/15 = 0.8$, silently reporting a loss $20\%$ lower than the truth. That single factor is the most common quiet bug in sequence pipelines.</p>
+</div>
+
+<h2>3. Losses and Targets for Temporal Tasks <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>With the task shape fixed and the batch padded, the loss is the next decision, and it follows almost mechanically from the target type. For a <strong>real-valued regression target</strong> the workhorses are mean-squared error $\frac{1}{N}\sum (y_i - \hat{y}_i)^2$, which penalizes large errors quadratically and corresponds to a Gaussian likelihood, and mean-absolute error $\frac{1}{N}\sum |y_i - \hat{y}_i|$, which is robust to outliers and corresponds to a Laplace likelihood. When the target is a <strong>category</strong>, whether the single label of a many-to-one classifier or the per-step label of an aligned tagger, the loss is cross-entropy, $-\sum_c y_c \log \hat{p}_c$, the negative log-likelihood of the correct class under the model's softmax.</p>
+<p>Temporal forecasting adds a loss the tabular world rarely needs: the <strong>quantile, or pinball, loss</strong>, which trains a model to predict a specific quantile of the predictive distribution rather than its mean. For target quantile level $\tau \in (0, 1)$ and error $u = y - \hat{y}$, the pinball loss is</p>
+$$\rho_\tau(u) = \max\big(\tau\, u,\; (\tau - 1)\, u\big) = \begin{cases} \tau\, u &amp; u \ge 0 \\ (\tau - 1)\, u &amp; u < 0. \end{cases}$$
+<p>It is an asymmetric absolute error: under-prediction (positive $u$) is weighted by $\tau$ and over-prediction by $1 - \tau$. Minimizing $\rho_\tau$ over the data drives $\hat{y}$ toward the conditional $\tau$-quantile, so fitting several $\tau$ values at once (say $0.1, 0.5, 0.9$) yields a predictive interval directly, which is why the pinball loss is the bread-and-butter objective of the probabilistic forecasting we develop fully in <a href="../../toc.html">Chapter 19</a>. We meet it again there as the bridge to conformal calibration; here it is enough to recognize it as the loss that turns a point forecaster into an interval forecaster.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Pinball Loss Is Asymmetric on Purpose</div>
+<p>Take the upper-tail quantile $\tau = 0.9$ and a true value $y = 100$. If the model under-predicts with $\hat{y} = 90$, then $u = y - \hat{y} = 10 \ge 0$, so $\rho_{0.9} = 0.9 \times 10 = 9.0$. If instead it over-predicts by the same magnitude, $\hat{y} = 110$, then $u = -10 < 0$, so $\rho_{0.9} = (0.9 - 1)\times(-10) = 0.1 \times 10 = 1.0$. The same ten-unit miss costs nine times as much when the model falls short as when it overshoots, which is exactly what you want from a $0.9$ quantile: it should sit high enough that the truth rarely exceeds it, so the optimizer is taught to fear under-prediction. Set $\tau = 0.5$ and both directions cost $0.5 \times 10 = 5.0$, recovering symmetric (half) absolute error and confirming that the median pinball loss is just scaled MAE.</p>
+</div>
+<p>The final loss-side topic is specific to autoregressive (one-to-many and unaligned many-to-many) models: how to train a model that, at inference, consumes its own previous outputs. The standard answer is <strong>teacher forcing</strong>: during training, feed the model the ground-truth previous token rather than its own prediction, so that step $t$ always conditions on the correct $\mathbf{y}_{t-1}$ from the data. This makes training stable and fully parallelizable over steps, because every step's input is known in advance. It also creates a discrepancy known as <strong>exposure bias</strong>: the model is only ever exposed to correct histories during training, but at inference it must consume its own imperfect generations, so a single early mistake leads it into a region of history it never saw in training, and errors compound. Figure 9.2.2 contrasts the two regimes.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 230" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Top row, training with teacher forcing: each decoder step receives the ground-truth previous token from the data as input. Bottom row, inference: each decoder step receives its own previous prediction as input, so an early error propagates forward.">
+<defs>
+<marker id="arrT92" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.dc92 { fill:#eef3f8; stroke:#14385c; stroke-width:1.6; }
+.gt92 { fill:#e7f3ec; stroke:#1f7a4d; stroke-width:1.6; }
+.pr92 { fill:#fbeee8; stroke:#b8431f; stroke-width:1.6; }
+.f92 { stroke:#5a626c; stroke-width:1.5; fill:none; marker-end:url(#arrT92); }
+.t92 { font:600 12px sans-serif; fill:#14385c; text-anchor:middle; }
+.s92 { font:10.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+</style>
+<text class="t92" x="80" y="28">Training: teacher forcing</text>
+<rect class="dc92" x="120" y="40" width="44" height="30"/><text class="s92" x="142" y="60">dec</text>
+<rect class="dc92" x="320" y="40" width="44" height="30"/><text class="s92" x="342" y="60">dec</text>
+<rect class="dc92" x="520" y="40" width="44" height="30"/><text class="s92" x="542" y="60">dec</text>
+<rect class="gt92" x="110" y="92" width="64" height="26"/><text class="s92" x="142" y="109">truth y&#8320;</text>
+<rect class="gt92" x="310" y="92" width="64" height="26"/><text class="s92" x="342" y="109">truth y&#8321;</text>
+<rect class="gt92" x="510" y="92" width="64" height="26"/><text class="s92" x="542" y="109">truth y&#8322;</text>
+<line class="f92" x1="142" y1="90" x2="142" y2="72"/>
+<line class="f92" x1="342" y1="90" x2="342" y2="72"/>
+<line class="f92" x1="542" y1="90" x2="542" y2="72"/>
+<line class="f92" x1="164" y1="55" x2="318" y2="55"/>
+<line class="f92" x1="364" y1="55" x2="518" y2="55"/>
+<text class="s92" x="690" y="60">ground truth feeds in</text>
+<text class="t92" x="80" y="160">Inference: own predictions</text>
+<rect class="dc92" x="120" y="172" width="44" height="30"/><text class="s92" x="142" y="192">dec</text>
+<rect class="dc92" x="320" y="172" width="44" height="30"/><text class="s92" x="342" y="192">dec</text>
+<rect class="dc92" x="520" y="172" width="44" height="30"/><text class="s92" x="542" y="192">dec</text>
+<rect class="pr92" x="112" y="146" width="60" height="22"/><text class="s92" x="142" y="161">pred &#375;&#8320;</text>
+<rect class="pr92" x="312" y="146" width="60" height="22"/><text class="s92" x="342" y="161">pred &#375;&#8321;</text>
+<line class="f92" x1="142" y1="170" x2="142" y2="170"/>
+<line class="f92" x1="164" y1="187" x2="318" y2="187"/>
+<line class="f92" x1="364" y1="187" x2="518" y2="187"/>
+<text class="s92" x="700" y="192">own output feeds in</text>
+</svg>
+<figcaption><strong>Figure 9.2.2:</strong> Teacher forcing versus free-running inference. In training (top) every decoder step is fed the ground-truth previous value (green), making the steps independent and parallel. At inference (bottom) each step is fed the model's own previous prediction (orange), so the model traverses histories it never saw in training. That mismatch is exposure bias.</figcaption>
+</figure>
+<p>Several remedies for exposure bias appear later in the book and are worth flagging now so the term is familiar: scheduled sampling mixes ground-truth and predicted inputs on a curriculum, and sequence-level objectives optimize the generated sequence as a whole rather than step by step. The non-autoregressive direct-output head of subsection two sidesteps exposure bias entirely by never feeding outputs back, which is one reason direct multi-horizon heads are popular in <a href="../../toc.html">Chapter 14</a>.</p>
+
+<h2>4. Conditioning and Covariates <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A sequence model rarely sees only the target series. Real forecasting problems come with side information of three distinct temporal kinds, and keeping them straight is essential because they enter the model at different points and respecting their availability prevents the leakage we warned about in <a href="../../toc.html">Chapter 2</a>. <strong>Static features</strong> do not vary with time: the store's region, the patient's baseline diagnosis, the product category. <strong>Known-future covariates</strong> are time-varying but known in advance for the entire forecast horizon: calendar effects (day of week, month), scheduled holidays, planned promotions, known price changes. <strong>Past covariates</strong> (also called observed covariates) are time-varying and known only up to the present: a related sensor reading, realized weather, an exogenous market index whose future values you do not have.</p>
+<p>The availability distinction is not pedantic. A known-future covariate may legitimately inform the prediction at horizon step $h$, because you genuinely know next Tuesday is a holiday when you forecast it. A past covariate may not, because using its future value at training time would leak information the model will not have at deployment, manufacturing an optimistic backtest that collapses in production. Mechanically, static features are typically broadcast across all time steps and concatenated to every step's input, or used to initialize the recurrent state; known-future covariates are concatenated to the decoder inputs over the horizon; past covariates are concatenated only to the encoder inputs over the observed window. This three-way routing is the organizing principle of the Temporal Fusion Transformer we build in <a href="../../toc.html">Chapter 14</a>, which devotes separate processing paths to exactly these three covariate types and even learns per-feature importance weights, so the categories you are learning here are the literal inputs of that architecture.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Availability, Not Just Relevance, Decides Where a Feature Enters</div>
+<p>The temptation is to throw every available column at the model and let it sort out what matters. For temporal data this is a trap, because the question is not only "is this feature predictive?" but "will its value be known at the moment of prediction?". A feature that is informative in the training table but unavailable at inference for the horizon you are predicting is a leakage hazard, not a help: the model learns to lean on a value it will never receive in deployment. The discipline of sorting every covariate into static, known-future, or past-only, and routing each to the part of the model where its information is legitimately available, is what separates a backtest that holds up in production from one that does not. This is the deployment-facing twin of the leakage discussion in <a href="../../toc.html">Chapter 2</a>, now expressed in the vocabulary of sequence models.</p>
+</div>
+
+<h2>5. Encoder-Decoder and the Bottleneck of a Fixed Context <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The unaligned many-to-many shape demands a structure that the other four do not: a way to read a whole input sequence of length $T$ and then write a whole output sequence of length $T' \ne T$ with no given alignment between them. The classical answer is the <strong>encoder-decoder</strong>. An encoder, typically a recurrence of the kind <a href="../../toc.html">Section 7.6</a> derived, consumes $\mathbf{x}_{1:T}$ and compresses it into a single fixed-width <strong>context vector</strong> $\mathbf{c}$, usually its final hidden state. A decoder, another recurrence, is initialized from $\mathbf{c}$ and generates the output sequence one step at a time, autoregressively, until it emits an end-of-sequence marker or reaches the target length. Formally,</p>
+$$\mathbf{c} = \text{Encoder}(\mathbf{x}_{1:T}), \qquad \mathbf{y}_t = \text{Decoder}(\mathbf{y}_{t-1}, \mathbf{s}_{t-1}, \mathbf{c}), \quad t = 1, \dots, T',$$
+<p>where $\mathbf{s}_{t-1}$ is the decoder's own carried state. This factorization is elegant and was the dominant sequence-to-sequence design for years, but it hides a structural flaw that becomes acute as $T$ grows. <strong>Every detail the decoder will ever need about the input must pass through the single fixed-width vector $\mathbf{c}$.</strong> A vector of, say, 512 numbers is asked to summarize an input that might be hundreds of steps long, and it cannot grow with $T$. The earliest inputs, in particular, must survive the entire encoder recurrence without being overwritten, the precise compression limit that <a href="../../toc.html">Section 7.6</a> named when it contrasted a recurrence (which compresses into a bounded state) with attention (which keeps everything). This is the <strong>information bottleneck</strong> of the fixed context vector.</p>
+<p>The bottleneck has a memorable empirical signature: encoder-decoder translation quality degrades sharply as input length increases past what the context vector can hold, while a model that lets the decoder look back at all encoder states does not degrade the same way. That observation, made by Bahdanau, Cho, and Bengio in 2014, is precisely what motivated <strong>attention</strong>: rather than force the decoder to rely on one summary vector, give it a mechanism to attend to all the encoder's per-step states and form a fresh, query-dependent context at every output step. The fixed $\mathbf{c}$ becomes a time-varying $\mathbf{c}_t$ computed by a weighted look back over the whole input. We develop attention in full in <a href="../../toc.html">Chapter 12</a>; for now the load-bearing idea is that the bottleneck of this subsection is the problem statement that the next-but-one chapter answers. The encoder-decoder is not wrong; it is the structure whose one weakness defined the agenda of modern sequence modeling.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="An encoder of four cells consumes four inputs and funnels into a single narrow context vector box labeled c, which then fans out to initialize a decoder of three cells that each emit an output, with the narrowness of c drawn as a pinch point.">
+<defs>
+<marker id="arrE92" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.en92 { fill:#eef3f8; stroke:#14385c; stroke-width:1.6; }
+.de92 { fill:#fbeee8; stroke:#b8431f; stroke-width:1.6; }
+.cx92 { fill:#fff6d6; stroke:#9a7a16; stroke-width:2; }
+.l92 { stroke:#5a626c; stroke-width:1.5; fill:none; marker-end:url(#arrE92); }
+.tt92 { font:600 12px sans-serif; fill:#14385c; text-anchor:middle; }
+.ss92 { font:10.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+</style>
+<text class="tt92" x="150" y="26">Encoder</text>
+<text class="tt92" x="650" y="26">Decoder</text>
+<rect class="en92" x="40" y="100" width="40" height="34"/>
+<rect class="en92" x="110" y="100" width="40" height="34"/>
+<rect class="en92" x="180" y="100" width="40" height="34"/>
+<rect class="en92" x="250" y="100" width="40" height="34"/>
+<line class="l92" x1="80" y1="117" x2="108" y2="117"/>
+<line class="l92" x1="150" y1="117" x2="178" y2="117"/>
+<line class="l92" x1="220" y1="117" x2="248" y2="117"/>
+<line class="l92" x1="290" y1="117" x2="378" y2="117"/>
+<rect class="cx92" x="380" y="104" width="50" height="26"/>
+<text class="ss92" x="405" y="121">c</text>
+<text class="ss92" x="405" y="150">fixed width</text>
+<text class="ss92" x="405" y="166">bottleneck</text>
+<line class="l92" x1="430" y1="117" x2="518" y2="117"/>
+<rect class="de92" x="520" y="100" width="40" height="34"/>
+<rect class="de92" x="590" y="100" width="40" height="34"/>
+<rect class="de92" x="660" y="100" width="40" height="34"/>
+<line class="l92" x1="560" y1="117" x2="588" y2="117"/>
+<line class="l92" x1="630" y1="117" x2="658" y2="117"/>
+<line class="l92" x1="540" y1="98" x2="540" y2="64"/>
+<line class="l92" x1="610" y1="98" x2="610" y2="64"/>
+<line class="l92" x1="680" y1="98" x2="680" y2="64"/>
+<text class="ss92" x="540" y="56">&#375;&#8321;</text>
+<text class="ss92" x="610" y="56">&#375;&#8322;</text>
+<text class="ss92" x="680" y="56">&#375;&#8323;</text>
+<text class="ss92" x="150" y="160">x&#8321; .. x&#8324;</text>
+</svg>
+<figcaption><strong>Figure 9.2.3:</strong> The encoder-decoder and its pinch point. Four input steps are compressed into one fixed-width context vector $\mathbf{c}$ (yellow), which alone initializes the decoder. As the input grows, $\mathbf{c}$ cannot, so the earliest inputs must survive the whole encoder without being overwritten. Attention (<a href="../../toc.html">Chapter 12</a>) removes the pinch by letting the decoder read all encoder states.</figcaption>
+</figure>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: The Five Shapes in the Foundation-Model Era (2024 to 2026)</div>
+<p>The task taxonomy of this section is not a historical artifact; it is the schema that the 2024 to 2026 temporal foundation models are built to span. Moirai (Salesforce, 2024) is explicitly a many-input, multi-horizon forecaster with a unified head that handles arbitrary numbers of variates, and TimesFM (Google, 2024) is a decoder-only autoregressive forecaster, the one-to-many and many-to-one cells of this table scaled to a pretrained model. Chronos (Amazon, 2024) reframes forecasting as unaligned sequence-to-sequence by tokenizing the series and reusing a language-model decoder, a direct application of the seq2seq shape of subsection five, and MOMENT (2024) targets the aligned many-to-many cell for per-step tasks like anomaly detection and imputation. The selective state-space models Mamba and Mamba-2 (Gu and Dao, 2023 to 2024) and the linear-attention revival are, in the framing of <a href="../../toc.html">Section 7.6</a>, attempts to keep the recurrence's bounded state while recovering attention's freedom from the fixed-context bottleneck this subsection diagnosed. The practitioner's takeaway: the first decision when prompting or fine-tuning any 2026 temporal foundation model is still "which of the five shapes is my task?", because that determines which model family and which head you reach for.</p>
+</div>
+
+<h2>6. Worked Example: A Padded, Masked seq2seq Pipeline in PyTorch <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The cleanest way to make the previous five subsections concrete is to build the data plumbing once and then hang two different heads, a many-to-one and an aligned many-to-many, on the same padded, masked batch. We will assemble a tiny variable-length dataset, write a collate function that pads and builds a mask <em>from scratch</em>, run a recurrent encoder, and show that the many-to-one head pools to one prediction while the many-to-many head reads out every step. Then we replace the hand-written masking with PyTorch's <code>nn.utils.rnn</code> pack and pad utilities, the library pair, and demonstrate a teacher-forcing decoder step. Throughout, watch the tensor shapes; they are the running proof that the abstractions of this section are real objects. Code 9.2.1 starts with the dataset and the from-scratch collate.</p>
+<pre><code class="language-python">import torch
+from torch.utils.data import Dataset, DataLoader
+
+class RaggedSeqDataset(Dataset):
+    """Variable-length univariate sequences with a per-sequence class label
+    (for many-to-one) and a per-step target (for aligned many-to-many)."""
+    def __init__(self, sequences, labels):
+        self.sequences = sequences        # list of 1D float tensors, ragged
+        self.labels = labels              # list of int class labels
+    def __len__(self):
+        return len(self.sequences)
+    def __getitem__(self, i):
+        x = self.sequences[i]             # shape (T_i,)  variable length
+        return x, self.labels[i]
+
+def collate_pad(batch):
+    """FROM SCRATCH: pad a ragged batch to T_max and build a boolean mask.
+    Returns padded inputs (B, T_max), a mask (B, T_max), labels (B,),
+    and the true lengths (B,)."""
+    seqs, labels = zip(*batch)
+    lengths = torch.tensor([len(s) for s in seqs])      # true length per seq
+    T_max = int(lengths.max())
+    B = len(seqs)
+    padded = torch.zeros(B, T_max)                      # pad value = 0.0
+    mask = torch.zeros(B, T_max, dtype=torch.bool)      # False everywhere
+    for i, s in enumerate(seqs):
+        padded[i, :len(s)] = s                          # copy real values
+        mask[i, :len(s)] = True                         # mark real positions
+    return padded, mask, torch.tensor(labels), lengths
+
+# three ragged sequences of lengths 5, 3, 4 (the numeric example above)
+seqs = [torch.arange(1., 6.), torch.arange(1., 4.), torch.arange(1., 5.)]
+ds = RaggedSeqDataset(seqs, labels=[0, 1, 0])
+loader = DataLoader(ds, batch_size=3, collate_fn=collate_pad)
+padded, mask, labels, lengths = next(iter(loader))
+print("padded shape:", tuple(padded.shape), " mask true count:", int(mask.sum()))
+print(padded)
+print(mask)
+</code></pre>
+<div class="code-caption"><strong>Code 9.2.1:</strong> The from-scratch data pipeline. <code>collate_pad</code> turns a ragged batch into a rectangular <code>(B, T_max)</code> tensor and builds the boolean mask by hand, the explicit version of the padding shown in the subsection-two numeric example.</div>
+<pre><code class="language-text">padded shape: (3, 5)  mask true count: 12
+tensor([[1., 2., 3., 4., 5.],
+        [1., 2., 3., 0., 0.],
+        [1., 2., 3., 4., 0.]])
+tensor([[ True,  True,  True,  True,  True],
+        [ True,  True,  True, False, False],
+        [ True,  True,  True,  True, False]])
+</code></pre>
+<div class="code-caption"><strong>Output 9.2.1:</strong> The padded batch has shape $(3, 5)$ and exactly $12$ true mask entries, matching the $5 + 3 + 4$ real positions counted by hand. The two padding zeros in row two and the one in row three are marked <code>False</code> so the loss will ignore them.</div>
+<p>With the batch in hand, Code 9.2.2 runs a recurrent encoder and attaches the two heads. The many-to-one head must pool over time, and pooling correctly means averaging only over real positions using the mask, the masked mean that prevents the padding bug quantified earlier. The many-to-many head instead keeps a prediction at every step. The shapes printed at the end are the point: one head collapses the time axis, the other preserves it.</p>
+<pre><code class="language-python">import torch.nn as nn
+
+class TwoHeadEncoder(nn.Module):
+    def __init__(self, hidden=8, n_classes=2):
+        super().__init__()
+        self.rnn = nn.RNN(input_size=1, hidden_size=hidden, batch_first=True)
+        self.cls_head = nn.Linear(hidden, n_classes)   # many-to-one: one label
+        self.step_head = nn.Linear(hidden, 1)          # aligned m-to-m: per step
+    def forward(self, x, mask):
+        h_all, _ = self.rnn(x.unsqueeze(-1))           # (B, T, hidden)
+        # many-to-one: masked mean pool over real steps only
+        m = mask.unsqueeze(-1).float()                 # (B, T, 1)
+        pooled = (h_all * m).sum(1) / m.sum(1)         # (B, hidden) masked mean
+        logits = self.cls_head(pooled)                 # (B, n_classes)
+        # aligned many-to-many: a prediction at every step
+        per_step = self.step_head(h_all).squeeze(-1)   # (B, T)
+        return logits, per_step
+
+model = TwoHeadEncoder()
+logits, per_step = model(padded, mask)
+print("many-to-one logits:", tuple(logits.shape))     # (B, n_classes)
+print("many-to-many out:  ", tuple(per_step.shape))   # (B, T)
+
+# masked per-step regression loss: never count a padding position
+target_steps = padded                                  # toy target = the input
+sq_err = (per_step - target_steps) ** 2
+masked_loss = (sq_err * mask).sum() / mask.sum()       # divide by 12, not 15
+print("masked per-step MSE: %.4f" % masked_loss.item())
+</code></pre>
+<div class="code-caption"><strong>Code 9.2.2:</strong> One recurrent backbone, two heads. The many-to-one head masked-mean-pools the hidden states into a single class logit vector; the aligned many-to-many head reads out every step. The loss divides by <code>mask.sum()</code> (twelve), so padding never dilutes it.</div>
+<pre><code class="language-text">many-to-one logits: (3, 2)
+many-to-many out:   (3, 5)
+masked per-step MSE: 6.8123
+</code></pre>
+<div class="code-caption"><strong>Output 9.2.2:</strong> The same batch yields a $(3, 2)$ class-logit tensor from the many-to-one head and a $(3, 5)$ per-step tensor from the many-to-many head. The collapsed time axis of the first and the preserved time axis of the second are the taxonomy of subsection one made visible in tensor shapes.</div>
+<p>Now the library pair. Our hand-written <code>collate_pad</code> plus the manual masked mean ran about a dozen lines and silently processed padding through the RNN before discarding it. PyTorch's <code>nn.utils.rnn</code> utilities do better: <code>pad_sequence</code> pads, and <code>pack_padded_sequence</code> compresses the padded batch into a packed form that the RNN steps over <em>without ever computing on padding</em>, which is both faster and removes any chance of padding contaminating the hidden states. Code 9.2.3 shows the same pipeline through these utilities and then performs one teacher-forcing decoder step, feeding the ground-truth previous value rather than the model's own output.</p>
+<pre><code class="language-python">from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence, pad_packed_sequence
+
+# LIBRARY PAIR: pad_sequence replaces the hand-written padding loop.
+padded_lib = pad_sequence(seqs, batch_first=True)      # (B, T_max), zero-padded
+lengths = torch.tensor([len(s) for s in seqs])
+
+# pack so the RNN skips padding entirely (lengths must be on CPU)
+packed = pack_padded_sequence(padded_lib.unsqueeze(-1), lengths,
+                              batch_first=True, enforce_sorted=False)
+enc = nn.RNN(input_size=1, hidden_size=8, batch_first=True)
+packed_out, h_n = enc(packed)                          # RNN never sees padding
+h_all, out_lengths = pad_packed_sequence(packed_out, batch_first=True)
+print("unpacked hidden shape:", tuple(h_all.shape))    # (B, T_max, 8)
+
+# --- one TEACHER-FORCING decoder step ---
+dec = nn.RNNCell(input_size=1, hidden_size=8)
+s = h_n.squeeze(0)                                      # decoder init = encoder final state
+y_prev_truth = padded_lib[:, 0:1]                      # GROUND TRUTH y_0, not a prediction
+s = dec(y_prev_truth, s)                               # teacher-forced step
+print("decoder state after one teacher-forced step:", tuple(s.shape))
+</code></pre>
+<div class="code-caption"><strong>Code 9.2.3:</strong> The library equivalent and a teacher-forcing step. <code>pack_padded_sequence</code> makes the RNN skip padding outright, and the decoder is fed the ground-truth previous value <code>y_prev_truth</code>, the training-time regime of Figure 9.2.2 whose mismatch with inference is exposure bias.</div>
+<pre><code class="language-text">unpacked hidden shape: (3, 5, 8)
+decoder state after one teacher-forced step: (3, 8)
+</code></pre>
+<div class="code-caption"><strong>Output 9.2.3:</strong> Packing then unpacking reproduces the $(3, 5, 8)$ hidden-state tensor, but the padded steps were never computed on. The teacher-forced decoder step consumes the ground-truth first value and returns a $(3, 8)$ state, ready to emit $\hat{y}_1$.</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: pack and pad Replace Hand-Rolled Masking</div>
+<p>The from-scratch <code>collate_pad</code> plus the manual masked mean pool of Code 9.2.1 and 9.2.2 ran about a dozen lines and still paid to push padding through the RNN before masking it out. The <code>torch.nn.utils.rnn</code> trio (<code>pad_sequence</code>, <code>pack_padded_sequence</code>, <code>pad_packed_sequence</code>) collapses the padding-and-masking logic to three calls and, crucially, makes the recurrent layer skip padded steps entirely rather than compute and discard them, handling the variable-length bookkeeping, the per-sequence length tracking, and the contiguity reordering internally. The line count drops from roughly twelve to three, and the result is both faster and immune to the padding-contamination bug, which is why production sequence pipelines in <a href="../../toc.html">Chapter 10</a> use packing rather than hand masking for recurrent models.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Picking the Right Shape for Predictive Maintenance</div>
+<p><strong>Who:</strong> A reliability-engineering team at a wind-farm operator instrumenting turbines with vibration, temperature, and rotor-speed sensors, the sensor and IoT series threaded through <a href="../../toc.html">Chapter 8</a> and beyond.</p>
+<p><strong>Situation:</strong> Each turbine emits a multivariate stream, and maintenance logs record both whole-turbine failure events and the exact timestamps of incipient fault onsets within a stream.</p>
+<p><strong>Problem:</strong> The first modeling attempt framed everything as many-to-one, classifying each fixed window as "will fail soon" or "healthy". It missed slow-developing faults whose signature was a gradual per-step drift, because collapsing the window to one label discarded the timing the maintenance crew actually needed.</p>
+<p><strong>Dilemma:</strong> Three framings competed. Keep the many-to-one window classifier, which is simple but timing-blind. Switch to an aligned many-to-many tagger that labels each timestamp's fault state, recovering timing but needing per-step labels. Or an unaligned seq2seq that transduces a raw burst into a variable-length fault-code sequence for the work order.</p>
+<p><strong>Decision:</strong> They split the system by the taxonomy of this section. An aligned many-to-many tagger produced the per-step fault-onset signal the crew scheduled on, while a separate many-to-one regressor estimated remaining useful life for the dashboard, each with the head and loss Table 9.2.1 prescribes.</p>
+<p><strong>How:</strong> Both heads sat on one shared recurrent encoder over the same padded, masked batches built exactly as in Code 9.2.2, with rotor-speed and temperature as past covariates and scheduled-maintenance windows as known-future covariates routed per subsection four.</p>
+<p><strong>Result:</strong> The aligned tagger caught the slow-drift faults the window classifier had missed, and because the loss was masked per step, ragged sensor bursts of different lengths trained together without the padding diluting the fault-onset signal.</p>
+<p><strong>Lesson:</strong> The failure was a task-classification error, not a model-capacity error. Naming the shape first, aligned many-to-many for timing, many-to-one for a scalar, dictated the heads and losses and fixed the problem without a fancier cell.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Mask Is the Most Underrated Tensor in Deep Learning</div>
+<p>For a tensor that holds nothing but ones and zeros, the mask does astonishing amounts of work and causes astonishing amounts of grief. Forget it in the loss and your metrics flatter you by the padding ratio. Forget it in an attention layer and the model peers at positions that do not exist. Forget it in a pooling layer and your "average" is an average over imaginary timesteps. Veteran sequence engineers develop a reflex: the moment a sequence becomes a rectangular tensor, the very next question is "where is the mask, and is everything that should consult it consulting it?". The mask is the bookkeeping that lets a ragged world fit into rectangular hardware, and respecting it is half of getting sequence models right.</p>
+</div>
+
+<div class="callout warning">
+<div class="callout-title">Common Pitfalls in Task Setup</div>
+<p>Four mistakes recur when readers first set up a temporal learning task, and naming them now saves debugging later:</p>
+<ul>
+<li><strong>Confusing the two many-to-many shapes.</strong> An aligned tagger ($T'=T$, given correspondence) and an unaligned transducer ($T' \ne T$, no correspondence) need different heads and architectures. Building one when the task is the other is the single most common task-classification error.</li>
+<li><strong>Letting padding into the loss.</strong> Any per-step loss, pool, or attention that does not consult the mask quietly counts padding positions, flattering metrics by the padding ratio and corrupting gradients.</li>
+<li><strong>Leaking a past covariate.</strong> Feeding a past-only covariate's future value at training time manufactures an optimistic backtest that collapses in deployment. Sort every covariate into static, known-future, or past-only first.</li>
+<li><strong>Ignoring exposure bias.</strong> A model trained only with teacher forcing can look excellent on validation yet drift at free-running inference. If generations degrade over the horizon, suspect exposure bias before suspecting capacity.</li>
+</ul>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 9.2.1: Classify Five Tasks <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each of the following, name the shape from the five-cell taxonomy of subsection one and state the output head and loss it implies, justifying your choice against Table 9.2.1: (a) predicting tomorrow's electricity demand from the past 168 hourly readings; (b) flagging each minute of an ECG as normal or arrhythmic; (c) generating a 24-step synthetic load profile from a building's static metadata; (d) transcribing a variable-length keystroke-timing burst into a variable-length command-token sequence; (e) deciding whether a 30-second accelerometer clip is "walking", "running", or "still". For one of the two many-to-many cases, explain precisely why it is aligned or unaligned.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 9.2.2: Quantify the Padding Bug <span class="exercise-type analysis">Analysis</span></div>
+<p>A batch contains sequences of lengths $8$, $2$, $6$, and $4$, padded to $T_{\max}$ with zeros, and the targets at padding positions are also zero. Suppose the model's per-step squared error at every real position is exactly $4.0$. Compute the correct masked mean-squared error, then compute the unmasked mean over the full $(B, T_{\max})$ tensor, and report the ratio. Generalize: show that the unmasked loss equals the masked loss times the fraction of real positions, and state the one condition under which the bug happens to vanish.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 9.2.3: Two Heads on One Backbone <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 9.2.2 with a third head that performs direct multi-horizon forecasting: from the masked-pooled encoder state, emit a vector of $H = 3$ future values in one linear layer, and train it against a toy target with a masked-aware MSE. Then implement the autoregressive alternative using the <code>nn.RNNCell</code> decoder of Code 9.2.3, generating the same three steps one at a time with teacher forcing during training. Compare the two heads' output shapes and write two sentences on when each is preferable, referencing the autoregressive-versus-direct fork of subsection two.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 9.2.4: Route the Covariates <span class="exercise-type open">Open-Ended</span></div>
+<p>You are forecasting daily store sales 14 days ahead. Available columns: store region and store size (fixed), day-of-week and a public-holiday calendar (known for the whole horizon), yesterday's local weather and a realized competitor-price index (known only up to today). Sort each column into static, known-future, or past-only, and design, on paper, how each enters an encoder-decoder: which features initialize the state, which feed the encoder over the observed window, and which feed the decoder over the horizon. Argue why misrouting the competitor-price index as known-future would leak, and connect your routing to the Temporal Fusion Transformer of <a href="../../toc.html">Chapter 14</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-9.1.html"><span class="nav-label">Previous</span><span class="nav-num">Section 9.1</span><span class="nav-title">From Classical Filters to Learned Sequence Models</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 9</span><span class="nav-num">Contents</span><span class="nav-title">Neural Sequence Modeling Fundamentals</span></a>
+<a class="next" href="section-9.3.html"><span class="nav-label">Next</span><span class="nav-num">Section 9.3</span><span class="nav-title">Backpropagation Through Time</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

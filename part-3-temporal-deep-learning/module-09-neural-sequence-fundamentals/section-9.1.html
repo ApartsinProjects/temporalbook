@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 9.1: Feedforward Networks for Time Series. How a multilayer perceptron over a fixed lag window becomes a nonlinear autoregression, why nonlinearity buys lag interactions that linear AR cannot capture, what the universal-approximation theorem promises and what it cannot promise for sequences, the training essentials that respect the time split, and a from-scratch numpy forecaster paired with its PyTorch equivalent." name="description"/>
+<title>Section 9.1: Feedforward Networks for Time Series | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Temporal Deep Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 9: Neural Sequence Modeling Fundamentals</a></div>
+<h1>Feedforward Networks for Time Series</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They slide a window over the past, hand me the last twenty numbers, and ask what comes next. I never see number twenty-one, only its corpse in the loss. I have no memory between windows; every batch, I am born again, briefly omniscient about exactly twenty lags, and blind to everything before them."</p>
+<cite>A Multilayer Perceptron Staring at a Fixed Window</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The simplest neural forecaster is not a recurrent network, a convolution, or a Transformer. It is an ordinary feedforward multilayer perceptron fed a fixed-length window of recent values, and it is exactly a nonlinear generalization of the autoregressive model from Chapter 5.</strong> The autoregression $\hat{y}_t = \phi_0 + \sum_{i=1}^{L}\phi_i\,y_{t-i}$ predicts the next value as a weighted sum of the last $L$ lags; replace that weighted sum with a network of nonlinear layers and you get a forecaster that can represent interactions between lags, thresholds, saturations, and regime-dependent responses that no linear AR can express. The price is steep and specific. The multilayer perceptron has no notion of order beyond what the window encodes, a fixed and finite receptive field, and no memory carried from one window to the next. Those three limitations are not incidental; they are precisely the gaps that recurrence (Chapter 10), convolution (Chapter 11), and attention (Chapter 12) were each invented to close. This section turns a series into a supervised tensor by sliding a window, builds the forecaster from linear regression up to a trained network, states the universal-approximation promise and its temporal catch, lays out the training essentials that keep the time split honest, and closes with a from-scratch numpy forecaster paired line-for-line with its PyTorch equivalent. It is the doorway into Part III: the first model in this book that learns its own features instead of being handed them.</p>
+</div>
+<p>Part II taught you to specify a model and then estimate its parameters: an AR($p$) was a linear recurrence over lags (<a href="../../toc.html">Chapter 5</a>), the Kalman filter was a recurrence over a hidden state (<a href="../../toc.html">Chapter 7</a>), and in every case you wrote down the functional form by hand and read its coefficients off the data. Part III inverts that contract. Beginning here, the functional form itself is learned: we fix only a flexible architecture and let optimization discover what mapping from past to future it should implement. The gentlest entry point is the feedforward network, because it requires no new temporal machinery at all. We borrow the sliding window of <a href="../../part-1-foundations/module-02-temporal-data-engineering/section-2.5.html">Section 2.5</a>, which already turned a series into a matrix of overlapping lag vectors, and we feed each lag vector to a plain multilayer perceptron. Everything you know about feedforward networks from <a href="../../toc.html">Appendix C</a> applies unchanged; the only temporal content is in how the data is cut and how the train/test split is drawn. We will use $L$ for the window length, $\mathbf{x}_t = (y_{t-1}, \dots, y_{t-L})$ for the input window, and $\hat{y}_t$ for the one-step forecast, notation collected in <a href="../../toc.html">Appendix A</a> and shared with every forecaster in the book.</p>
+<p>By the end of this section you should be able to do five concrete things: turn any univariate series into a supervised tensor $(\mathbf{X} \in \mathbb{R}^{N \times L}, \mathbf{y} \in \mathbb{R}^{N})$ by windowing without leaking the future; write the multilayer-perceptron forecaster as an explicit nonlinear autoregression and say what it can represent that a linear AR cannot; state what the universal-approximation theorem does and does not promise for time series; set up a training loop with a leakage-safe split, train-only normalization, and early stopping; and implement the whole forecaster twice, once from scratch in numpy with a hand-derived gradient and once in PyTorch, and measure the line-count reduction. Those five skills are the foundation every later chapter in Part III builds on.</p>
+
+<h2>1. From Linear AR to Nonlinear Function Approximation <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Start from the model you already trust. The autoregressive model of order $L$ from <a href="../../toc.html">Chapter 5</a> predicts the next value as an affine function of the last $L$ observations:</p>
+$$\hat{y}_t = \phi_0 + \sum_{i=1}^{L} \phi_i\, y_{t-i} = \phi_0 + \boldsymbol{\phi}^{\top} \mathbf{x}_t, \qquad \mathbf{x}_t = (y_{t-1}, y_{t-2}, \dots, y_{t-L}).$$
+<p>This is linear regression on a lag vector, nothing more. Its strength is that the coefficients $\boldsymbol{\phi}$ are interpretable and estimable in closed form; its weakness is that the response to the past is forced to be a fixed weighted sum, the same blend of lags no matter what regime the series is in. A multilayer perceptron keeps the input $\mathbf{x}_t$ identical, the very same lag window, but replaces the single affine map with a composition of affine maps and nonlinearities:</p>
+$$\hat{y}_t = f_\theta(\mathbf{x}_t) = \mathbf{W}^{(K)} \sigma\!\big(\cdots \sigma(\mathbf{W}^{(1)} \mathbf{x}_t + \mathbf{b}^{(1)}) \cdots\big) + b^{(K)},$$
+<p>where each $\mathbf{W}^{(k)}$ is a weight matrix, each $\mathbf{b}^{(k)}$ a bias, and $\sigma$ a pointwise nonlinearity such as $\tanh$ or the rectified linear unit $\mathrm{ReLU}(z) = \max(0, z)$. Set every $\sigma$ to the identity and collapse the matrices and you recover the AR model exactly, so the linear autoregression is the degenerate special case of the network with no nonlinearity. The whole content of "neural forecasting" at this first level is that the activation $\sigma$ is not the identity. This is why we call the multilayer perceptron over a lag window a <em>nonlinear autoregression</em>, often written NAR: it predicts the next value from past values, like AR, but through a learned nonlinear function rather than a fixed linear one.</p>
+<p>The windowing step that produces $\mathbf{x}_t$ is the only piece of temporal data engineering involved, and it is exactly the operation of <a href="../../part-1-foundations/module-02-temporal-data-engineering/section-2.5.html">Section 2.5</a>: slide a window of width $L$ along the series, and for each landing position record the $L$ values inside the window as one input row and the value immediately after the window as the target. A series of length $T$ yields $N = T - L$ supervised pairs stacked into a design matrix $\mathbf{X} \in \mathbb{R}^{N \times L}$ and a target vector $\mathbf{y} \in \mathbb{R}^{N}$. From the network's point of view there is no time axis at all anymore; there is a tabular regression problem with $L$ features, and the fact that those features happen to be consecutive lags is invisible to the multilayer perceptron. That invisibility is both the convenience that makes this section easy and the limitation that subsection three will make precise. Figure 9.1.1 shows the windowing operation that manufactures the tensor.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A one-dimensional series of values is shown along the top as a row of boxes. A window of width four slides along it; at each position the four values under the window form one input row of the design matrix X, and the value just after the window becomes the corresponding target in y. Three successive window positions map down to three rows of X and three entries of y.">
+<defs>
+<marker id="arr91" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.ser91 { fill:#eef3f8; stroke:#14385c; stroke-width:1.6; }
+.win91 { fill:none; stroke:#b8431f; stroke-width:2.4; }
+.tgt91 { fill:#fbeee8; stroke:#b8431f; stroke-width:1.8; }
+.row91 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.4; }
+.lab91 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub91 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.fl91 { stroke:#5a626c; stroke-width:1.4; fill:none; marker-end:url(#arr91); }
+</style>
+<text class="lab91" x="410" y="22">A window of width L = 4 turns a series into supervised rows</text>
+<!-- series row -->
+<g>
+<rect class="ser91" x="60" y="50" width="40" height="34"/><text class="sub91" x="80" y="72">y&#8321;</text>
+<rect class="ser91" x="100" y="50" width="40" height="34"/><text class="sub91" x="120" y="72">y&#8322;</text>
+<rect class="ser91" x="140" y="50" width="40" height="34"/><text class="sub91" x="160" y="72">y&#8323;</text>
+<rect class="ser91" x="180" y="50" width="40" height="34"/><text class="sub91" x="200" y="72">y&#8324;</text>
+<rect class="tgt91" x="220" y="50" width="40" height="34"/><text class="sub91" x="240" y="72">y&#8325;</text>
+<rect class="ser91" x="260" y="50" width="40" height="34"/><text class="sub91" x="280" y="72">y&#8326;</text>
+<rect class="ser91" x="300" y="50" width="40" height="34"/><text class="sub91" x="320" y="72">y&#8327;</text>
+<rect class="ser91" x="340" y="50" width="40" height="34"/><text class="sub91" x="360" y="72">y&#8328;</text>
+</g>
+<rect class="win91" x="58" y="48" width="164" height="38"/>
+<text class="sub91" x="140" y="104">window</text>
+<text class="sub91" x="240" y="104">target</text>
+<!-- mapping arrows -->
+<line class="fl91" x1="140" y1="110" x2="200" y2="150"/>
+<line class="fl91" x1="240" y1="110" x2="640" y2="150"/>
+<!-- design matrix X -->
+<text class="lab91" x="300" y="150">X (design matrix)</text>
+<rect class="row91" x="120" y="160" width="220" height="26"/><text class="sub91" x="230" y="178">y&#8321;  y&#8322;  y&#8323;  y&#8324;</text>
+<rect class="row91" x="120" y="190" width="220" height="26"/><text class="sub91" x="230" y="208">y&#8322;  y&#8323;  y&#8324;  y&#8325;</text>
+<rect class="row91" x="120" y="220" width="220" height="26"/><text class="sub91" x="230" y="238">y&#8323;  y&#8324;  y&#8325;  y&#8326;</text>
+<!-- target vector y -->
+<text class="lab91" x="640" y="150">y (targets)</text>
+<rect class="tgt91" x="610" y="160" width="60" height="26"/><text class="sub91" x="640" y="178">y&#8325;</text>
+<rect class="tgt91" x="610" y="190" width="60" height="26"/><text class="sub91" x="640" y="208">y&#8326;</text>
+<rect class="tgt91" x="610" y="220" width="60" height="26"/><text class="sub91" x="640" y="238">y&#8327;</text>
+</svg>
+<figcaption><strong>Figure 9.1.1:</strong> The sliding window of <a href="../../part-1-foundations/module-02-temporal-data-engineering/section-2.5.html">Section 2.5</a> manufactures the supervised tensor. Each window position contributes one row of $\mathbf{X}$ (the $L$ lags inside the window) and one entry of $\mathbf{y}$ (the value immediately after it). The multilayer perceptron then treats $\mathbf{X}$ as an ordinary table of $L$ features, blind to the fact that the columns are consecutive lags.</figcaption>
+</figure>
+<p>Why does the nonlinearity matter at all for a series? Because real temporal responses are rarely a fixed linear blend of lags. Consider a sensor whose reading saturates: below some level it rises linearly, above it the response flattens. A linear AR must pick a single slope and will overshoot in the saturated regime; a network can bend the response, holding the high-lag region flat while keeping the low-lag region steep. Or consider a series whose short-term momentum reverses sign depending on its recent average: the effect of $y_{t-1}$ on $\hat{y}_t$ is positive in one regime and negative in another. A linear model assigns $y_{t-1}$ one coefficient for all time and cannot represent this; a network can, because the hidden units let the influence of $y_{t-1}$ depend on the values of the other lags. That dependence between lags, the influence of one lag conditioned on another, is exactly the interaction structure the next subsection argues is the central thing nonlinearity buys.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: An MLP on a Lag Window Is a Nonlinear Autoregression</div>
+<p>The feedforward forecaster of this section is not a new kind of object; it is the autoregressive model of <a href="../../toc.html">Chapter 5</a> with its single affine map replaced by a learned nonlinear function $f_\theta$. Set the activations to the identity and you recover linear AR exactly, so AR is the special case, not a different lineage. Everything the multilayer perceptron adds over AR comes from one source: the nonlinearity $\sigma$, which lets the response to each lag depend on the values of the other lags. Hold this framing and the rest of Part III reads as a sequence of answers to one question the multilayer perceptron leaves open, namely how to handle a window that is not fixed, not finite, and not order-blind.</p>
+</div>
+<p>It is worth tabulating the two models against each other, because reading the columns side by side makes both the shared skeleton and the single point of divergence unmistakable. The input, the target, and the data engineering are identical; the only row that differs is the map applied inside the window, and every downstream consequence flows from that one row.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Aspect</th><th>Linear AR($L$), Chapter 5</th><th>Window MLP (this section)</th></tr></thead>
+<tbody>
+<tr><td>input</td><td>lag window $\mathbf{x}_t \in \mathbb{R}^{L}$</td><td>identical lag window $\mathbf{x}_t \in \mathbb{R}^{L}$</td></tr>
+<tr><td>map applied</td><td>one affine map $\boldsymbol{\phi}^{\top}\mathbf{x}_t + \phi_0$</td><td>composed affine maps with nonlinearity $\sigma$</td></tr>
+<tr><td>features</td><td>the raw lags, only reweighted</td><td>learned hidden features synthesized from lags</td></tr>
+<tr><td>lag interactions</td><td>none; each lag has one fixed coefficient</td><td>yes; a lag's effect can depend on other lags</td></tr>
+<tr><td>fitting</td><td>closed-form least squares</td><td>gradient descent on a non-convex loss</td></tr>
+<tr><td>special case</td><td>itself</td><td>reduces to AR when $\sigma$ is the identity</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 9.1.2:</strong> Linear AR and the window MLP share input, target, and windowing; they differ in exactly one row, the map applied inside the window. Every advantage of the network (learned features, lag interactions) and every cost (non-convex fitting, no closed form) descends from that single change.</figcaption>
+</figure>
+
+<h2>2. A Minimal Neural Forecaster <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The architecture is deliberately plain: an input of $L$ lags, one or two hidden layers of modest width with a nonlinear activation, and a single output unit that emits the one-step forecast $\hat{y}_t$. With a window of $L = 20$ lags, a hidden layer of $H = 32$ units, and a $\tanh$ or ReLU activation, the network has $L \cdot H + H$ weights into the hidden layer and $H + 1$ into the output, a few hundred parameters, which is enough to capture meaningful nonlinearity on a single series without overfitting wildly. The activation choice is not cosmetic. The $\tanh$ saturates smoothly and was the historical default; the ReLU is piecewise linear, trains faster, and makes the network a continuous piecewise-linear function of its input, which is often a good match for series with regime breaks. We will use $\tanh$ in the from-scratch derivation because its derivative is clean, and note where ReLU would change the picture.</p>
+<p>What does a hidden unit actually do for a time series? Each hidden unit computes one affine combination of the lags, $z_j = \mathbf{w}_j^{\top}\mathbf{x}_t + b_j$, and passes it through $\sigma$. You can read $\mathbf{w}_j$ as a learned feature detector over the window: one unit might respond to an upward trend (positive weights on recent lags, negative on older ones), another to a local spike, another to the window's average level. The output layer then combines these learned features. This is the sense in which the network "learns its own features": where the AR model was handed the raw lags and could only weight them, the network synthesizes intermediate features from the lags and weights those. The interactions the previous subsection promised live here. Because a feature like "recent average level" enters the output through a nonlinear unit, the marginal effect of any single lag depends on the others, which is precisely what a linear model forbids.</p>
+<p>So far the network emits a single number, the one-step-ahead forecast $\hat{y}_t$. Multi-step forecasting, predicting $h > 1$ steps ahead, splits into the same two strategies you met for classical models in <a href="../../toc.html">Chapter 5</a>. The <strong>recursive</strong> strategy trains a one-step network and then feeds its own prediction back in as the newest lag to predict step two, and so on, reusing one model $h$ times. It is simple and uses all the data for one task, but it compounds errors: a small mistake at step one corrupts the input for step two, and the error can snowball over the horizon. The <strong>direct</strong> strategy trains a separate network (or a single network with $h$ output units) to predict each horizon directly from the same window, so the $h$-step forecaster never consumes its own output. Direct forecasting avoids error accumulation but ignores the dependency structure across horizons and needs more models or more output capacity. The trade is identical to the classical one, which is the point: the windowing and multi-step machinery of <a href="../../part-1-foundations/module-02-temporal-data-engineering/section-2.5.html">Section 2.5</a> and <a href="../../toc.html">Chapter 5</a> carries over to neural forecasters unchanged; only the function inside the window became nonlinear.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: One Hidden Unit Bends the Response</div>
+<p>Take a window of two lags, $\mathbf{x}_t = (y_{t-1}, y_{t-2})$, and a single $\tanh$ hidden unit with weights $\mathbf{w} = (1.0, -1.0)$ and bias $b = 0$, feeding an output weight of $2.0$. The unit computes $z = y_{t-1} - y_{t-2}$, the one-step change, then $\hat{y}_t = 2\tanh(z)$. Feed it a gentle rise, $y_{t-1} = 1.1$, $y_{t-2} = 1.0$: then $z = 0.1$, $\tanh(0.1) = 0.0997$, and $\hat{y}_t = 0.199$. Feed it a sharp rise, $y_{t-1} = 5.0$, $y_{t-2} = 1.0$: now $z = 4.0$, $\tanh(4.0) = 0.9993$, and $\hat{y}_t = 1.999$. The output barely moved between a change of $4.0$ and a change of, say, $10.0$ (which gives $\hat{y}_t \to 2.0$): the unit has <em>saturated</em>. A linear AR with the same effective slope would have predicted $\hat{y}_t = 2 \cdot 10 = 20$ for the large change, wildly overshooting. The single nonlinear unit encodes "respond to momentum, but cap the response", a behavior no linear AR coefficient can express. This is the interaction-and-saturation effect of subsection one, made arithmetic.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Network Cannot Tell Tuesday From a Phone Number</div>
+<p>Hand a multilayer perceptron the window $(17, 23, 19, 21)$ and it has no idea these are four consecutive daily temperatures rather than four columns of a spreadsheet about something else entirely. Permute the columns consistently across every row and retrain, and you get an identically good model with permuted first-layer weights. The network never learns that column one is "yesterday" and column four is "four days ago" as positions in time; it only learns whatever linear combinations of the four columns reduce the loss. The temporal meaning lives entirely in how you built the matrix, not in anything the network knows. This is the cheerful, slightly unsettling fact that the recurrence and convolution of later chapters exist to fix.</p>
+</div>
+
+<h2>3. Universal Approximation and Its Temporal Catch <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>There is a famous theorem that seems to promise the multilayer perceptron can do anything. The universal-approximation theorem (Cybenko 1989, Hornik 1991) states that a feedforward network with a single hidden layer and a suitable nonlinear activation can approximate any continuous function on a compact set to arbitrary accuracy, given enough hidden units. Applied to our setting, it says: for any continuous target mapping $g^\star: \mathbb{R}^{L} \to \mathbb{R}$ from a window of $L$ lags to the next value, there exists a multilayer perceptron $f_\theta$ that matches $g^\star$ as closely as you like on any bounded region of window space. The forecaster is, in this precise sense, a universal nonlinear autoregression: whatever the true one-step map from the last $L$ values to the next is, a wide enough network can represent it.</p>
+<p>Read the theorem carefully and three caveats jump out, and for time series the third is decisive. First, it is an existence result: it guarantees a good network <em>exists</em> but says nothing about whether gradient descent will find it, or how much data you need. Second, "enough hidden units" can mean exponentially many; the theorem promises representability, not efficient representability. Third, and this is the catch that defines the rest of Part III, <strong>the function being approximated has a fixed, finite input of exactly $L$ lags.</strong> The universal-approximation theorem says nothing about temporal structure because there is no time in its statement; it is a theorem about functions on $\mathbb{R}^{L}$, and the multilayer perceptron inherits exactly that limitation.</p>
+<p>Make the limitation concrete. The forecaster has a <strong>fixed, finite receptive field</strong>: it can only see $L$ lags, so any dependence on something that happened $L + 1$ steps ago is invisible, no matter how wide or deep the network. A yearly seasonal pattern needs $L \geq 365$ daily lags even to be representable, and a window that long makes the input huge and the windowing wasteful. The forecaster has <strong>no notion of order beyond the window</strong>: as the fun note observed, permuting the lag columns consistently gives an equivalent model, so the network does not know "yesterday" comes after "the day before" except insofar as the loss happens to reward weights that act as if it does. And the forecaster has <strong>no memory between windows</strong>: each prediction is computed from its own window in isolation, with nothing carried forward, so a state that built up over a long stretch of history (a slowly accumulating trend, a regime that has persisted for months) cannot be summarized and reused; it must be re-read from the window every time, and if it does not fit in $L$ lags it is simply lost.</p>
+<p>Figure 9.1.3 draws the three gaps and pairs each with the architecture that closes it, so the structure of the entire part is visible at a glance before you meet any of the models individually.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three stacked rows, each naming one limitation of the window MLP on the left and the Part III architecture that removes it on the right: finite receptive field is closed by recurrence and attention; no order beyond the window is closed by convolution; no memory between windows is closed by recurrence.">
+<style>
+.gapbox91 { fill:#fbeee8; stroke:#b8431f; stroke-width:1.8; }
+.fixbox91 { fill:#eef3f8; stroke:#14385c; stroke-width:1.8; }
+.gtt91 { font:600 13px sans-serif; fill:#b8431f; text-anchor:middle; }
+.ftt91 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.gsub91 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.arrowt91 { font:18px sans-serif; fill:#5a626c; text-anchor:middle; }
+</style>
+<text class="gtt91" x="190" y="24">Limitation of the window MLP</text>
+<text class="ftt91" x="620" y="24">Architecture that removes it</text>
+<rect class="gapbox91" x="40" y="40" width="300" height="46"/><text class="gtt91" x="190" y="60">Fixed, finite receptive field</text><text class="gsub91" x="190" y="78">sees only L lags</text>
+<text class="arrowt91" x="410" y="68">&#8594;</text>
+<rect class="fixbox91" x="480" y="40" width="300" height="46"/><text class="ftt91" x="630" y="60">Recurrence (Ch 10), Attention (Ch 12)</text><text class="gsub91" x="630" y="78">unbounded reach</text>
+<rect class="gapbox91" x="40" y="100" width="300" height="46"/><text class="gtt91" x="190" y="120">No order beyond the window</text><text class="gsub91" x="190" y="138">columns permutable</text>
+<text class="arrowt91" x="410" y="128">&#8594;</text>
+<rect class="fixbox91" x="480" y="100" width="300" height="46"/><text class="ftt91" x="630" y="120">Convolution (Ch 11)</text><text class="gsub91" x="630" y="138">weight sharing respects order</text>
+<rect class="gapbox91" x="40" y="160" width="300" height="46"/><text class="gtt91" x="190" y="180">No memory between windows</text><text class="gsub91" x="190" y="198">each window isolated</text>
+<text class="arrowt91" x="410" y="188">&#8594;</text>
+<rect class="fixbox91" x="480" y="160" width="300" height="46"/><text class="ftt91" x="630" y="180">Recurrence (Ch 10)</text><text class="gsub91" x="630" y="198">carried hidden state</text>
+</svg>
+<figcaption><strong>Figure 9.1.3:</strong> The three structural limits of the window MLP (left) and the Part III architecture that removes each (right). The feedforward forecaster is the baseline whose specific failures name the chapters that follow: recurrence and attention for the finite reach, convolution for order, recurrence for cross-window memory.</figcaption>
+</figure>
+<p>These three gaps are not flaws to be patched within the feedforward family; they are the design requirements that motivate the rest of Part III. <strong>Recurrence</strong> (<a href="../../toc.html">Chapter 10</a>) adds a carried hidden state so the model has memory between steps and an unbounded effective receptive field, the exact recurrence the Kalman filter foreshadowed in <a href="../../toc.html">Chapter 7</a>. <strong>Convolution</strong> (<a href="../../toc.html">Chapter 11</a>) keeps the feedforward, parallel nature of the multilayer perceptron but shares weights across time and stacks dilations to grow the receptive field cheaply while respecting order. <strong>Attention</strong> (<a href="../../toc.html">Chapter 12</a>) abandons the fixed window entirely, letting each prediction look at any past position directly. Seen this way, the humble multilayer perceptron is the perfect first model of Part III: it is the baseline whose specific failures name the three great architectural ideas that follow. Route forward through the <a href="../../toc.html">table of contents</a> and you will find each gap closed in turn.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: The Cost of Widening the Window</div>
+<p>Suppose your series has a yearly cycle and is sampled daily, so capturing it requires the receptive field to reach back at least $365$ steps. Set $L = 365$ with a single hidden layer of $H = 64$ units. The first-layer weight matrix alone is $H \times L = 64 \times 365 = 23{,}360$ parameters, before biases and the output layer, for a model whose only job is one-step forecasting on a single series. Compare $L = 24$ (one daily cycle), where the same layer is $64 \times 24 = 1{,}536$ parameters, a fifteen-fold reduction. Worse, the long window also shrinks the data: a series of $T = 1000$ days yields only $1000 - 365 = 635$ supervised pairs at $L = 365$ versus $976$ at $L = 24$, so you are asking far more parameters to learn from far fewer examples. This is the concrete bind subsection three names: the feedforward forecaster <em>can</em> represent a yearly dependency only by inflating $L$, and inflating $L$ inflates parameters while deflating data. A recurrence or a dilated convolution reaches the same horizon with a tiny fraction of the parameters, which is the quantitative reason the window MLP hands off to the architectures of <a href="../../toc.html">Chapters 10 and 11</a>.</p>
+</div>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Universal On a Window, Blind Beyond It</div>
+<p>The universal-approximation theorem makes the multilayer perceptron arbitrarily expressive as a function of its $L$-dimensional input, and not one bit more. It promises nothing about dependencies older than $L$ steps, nothing about order within the window beyond what the loss extracts, and nothing about carrying state across windows. "Universal" is a statement about $\mathbb{R}^{L}$, not about time. Every architecture in the remainder of Part III is a different answer to the question the theorem leaves untouched: how do you make the input itself temporal, instead of freezing it into a fixed window the moment you build the design matrix?</p>
+</div>
+
+<h2>4. Training Essentials Without Leaking the Future <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A neural forecaster is trained by minimizing a loss over the supervised pairs, but the temporal origin of the data imposes constraints that ordinary tabular training ignores at its peril. Start with the loss. For point forecasting the default is mean squared error, $\mathcal{L}_{\text{MSE}} = \frac{1}{N}\sum_t (\hat{y}_t - y_t)^2$, which corresponds to predicting the conditional mean and penalizes large errors heavily. When the series has outliers or heavy tails (financial returns, sensor glitches) the mean absolute error $\mathcal{L}_{\text{MAE}} = \frac{1}{N}\sum_t |\hat{y}_t - y_t|$ is more robust and targets the conditional median. When you care about a specific quantile, say the 90th percentile for a capacity-planning forecast, the pinball or quantile loss $\rho_\tau(u) = \max(\tau u, (\tau - 1)u)$ with $u = y_t - \hat{y}_t$ trains the network to emit that quantile directly, the seed of the probabilistic forecasting developed fully in <a href="../../toc.html">Chapter 19</a>. The architecture does not change; only the loss does.</p>
+<p>Now the constraint that makes temporal training different from tabular training: <strong>the split must respect time</strong>. In ordinary supervised learning you shuffle the rows and split randomly. Do that here and you leak the future into the past. Because windows overlap, a randomly chosen test window can contain values that also appear in a training window, so the model has effectively seen its test answers, and a random split also lets the model train on data from after the test period, which is impossible at deployment. The fix, established in <a href="../../toc.html">Chapter 2</a> and routed through the <a href="../../toc.html">table of contents</a>, is a chronological split: the first stretch of the series is training, a later contiguous stretch is validation, and the final stretch is test, with no shuffling across the boundaries. Within training you may still shuffle the <em>windows</em> for minibatching, because each window's target sits at the window's own right edge and a shuffled minibatch of training windows never reaches past the training cutoff. Shuffling windows for batching is fine; shuffling the train/test boundary is leakage.</p>
+<div class="callout warning">
+<div class="callout-title">Leakage Warning: Three Ways the Future Sneaks In</div>
+<p>Temporal leakage is the single most common cause of a neural forecaster that dazzles in the notebook and dies in production. Three culprits dominate, and all three are invisible to a metric computed on a leaky split:</p>
+<ul>
+<li><strong>Random train/test split.</strong> Overlapping windows share values, so a shuffled split puts near-copies of test inputs into training. Always split chronologically before windowing, then window each segment separately.</li>
+<li><strong>Normalization fit on all the data.</strong> Computing the mean and standard deviation over the whole series, including the test period, leaks the test distribution into training. Fit the scaler on the training segment only and apply those frozen statistics to validation and test.</li>
+<li><strong>Target lookahead in features.</strong> Any feature engineered with a centered or future-looking window (a centered moving average, a "next week's holiday" flag computed naively) smuggles the answer in. Every feature at time $t$ must be computable from information available strictly before $t$.</li>
+</ul>
+</div>
+<p>Two more essentials complete the recipe. <strong>Normalization</strong> is fit on the training segment only, as the warning insists: compute the mean $\mu$ and standard deviation $s$ of the training values, standardize every window with those frozen statistics, $\tilde{\mathbf{x}} = (\mathbf{x} - \mu)/s$, and invert the transform on the network's output to read forecasts back in original units. This keeps the network's inputs in a well-conditioned range without ever consulting the future. <strong>Early stopping</strong> uses the chronological validation segment as a clock: train while validation loss falls, keep the weights from the best validation epoch, and stop when validation loss has not improved for a patience window of epochs. Because the validation segment comes after training and before test in time, a model that early-stops well on validation is one that generalizes forward, which is the only kind of generalization a forecaster is allowed to claim. Minibatching the training windows (typically 32 to 256 windows per batch) makes each gradient step cheap and adds a little stochastic regularization, and the Adam optimizer is the standard default for these small networks.</p>
+<p>A subtlety worth naming explicitly is why minibatching is safe even though the data is a time series. The instinct from <a href="../../toc.html">Chapter 2</a> is that order matters, so surely shuffling is forbidden. But the order that matters is the order <em>inside</em> each window and the order of the train, validation, and test segments, not the order in which the already-formed training windows are presented to the optimizer. Once the chronological cut has been made and each training window's target is pinned at that window's own right edge, the windows are exchangeable as training examples: presenting window 412 before window 7 in a minibatch leaks nothing, because neither window's input or target reaches past the training cutoff. The gradient is an average over the batch and does not care about presentation order. This is exactly why the from-scratch loop of the next subsection can call <code>rng.permutation</code> on the training indices with a clear conscience, while a single random shuffle <em>across</em> the train/test boundary would be a fatal leak. The distinction (shuffle examples freely, never shuffle the temporal split) is the whole of leakage-safe minibatching.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Random Split That Predicts the Lottery</div>
+<p>A reliable way to produce a forecaster with stunning paper accuracy and zero real value is to window first and split randomly second. Because consecutive windows overlap in $L - 1$ of their $L$ values, a randomly chosen test window is almost a duplicate of a training window sitting one step away, so the model is effectively graded on examples it has all but memorized. Teams have shipped "95% accurate" forecasters this way and watched them collapse to coin-flip performance in production, where tomorrow genuinely has not happened yet. The giveaway is a test score that is suspiciously close to the training score and far better than any honest baseline. When a forecasting result looks too good, the first thing to audit is not the model; it is the split.</p>
+</div>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: How Many Supervised Pairs, and Where the Cuts Fall</div>
+<p>Take a daily series of $T = 1000$ observations and a window of $L = 20$. Windowing yields $N = T - L = 980$ supervised pairs. Now split chronologically 70/15/15 <em>before</em> windowing to avoid boundary leakage: training is days 1 to 700, validation days 701 to 850, test days 851 to 1000. Windowing each segment separately (so no window straddles a boundary) gives $700 - 20 = 680$ training pairs, $150 - 20 = 130$ validation pairs, and $150 - 20 = 130$ test pairs, $940$ usable pairs in total; the $40$ "missing" pairs are the ones that would have straddled the two cut points, correctly discarded. With a batch size of $64$, one training epoch is $\lceil 680 / 64 \rceil = 11$ minibatches. The normalization statistics come from the $700$ training days only: if those days have mean $\mu = 50.0$ and standard deviation $s = 8.0$, every window in all three segments is standardized with exactly that $\mu$ and $s$, never recomputed on validation or test.</p>
+</div>
+
+<h2>5. Worked Example: A Sliding-Window MLP From Scratch, Then in PyTorch <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Now we build the forecaster end to end on the sensor/IoT telemetry series that threads through the systems chapters of this book (introduced in <a href="../../toc.html">Chapter 2</a> and revisited for anomaly detection in <a href="../../toc.html">Chapter 8</a>): a synthetic but realistic machine-temperature signal with a slow trend, a daily cycle, and noise. We will implement the multilayer-perceptron forecaster twice. First from scratch in numpy, with the forward pass and a hand-derived gradient for the output layer written out explicitly, so nothing is hidden. Then the identical model in PyTorch with autograd and Adam, where the same network is a handful of lines. Finally we compare both to a linear AR baseline from <a href="../../toc.html">Chapter 5</a>, so the value of the nonlinearity is measured, not asserted. Code 9.1.1 sets up the data and the leakage-safe windowing.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(0)
+# --- A sensor/IoT-style series: slow trend + daily cycle + noise ---
+T = 1200
+t = np.arange(T)
+series = (0.01 * t                                  # slow upward drift
+          + 3.0 * np.sin(2 * np.pi * t / 24)        # daily (24-step) cycle
+          + rng.normal(0, 0.5, size=T))             # measurement noise
+
+def make_windows(x, L):
+    """Slide a width-L window: row i = x[i:i+L], target = x[i+L]."""
+    X = np.stack([x[i:i + L] for i in range(len(x) - L)])   # (N, L) lags
+    y = x[L:]                                                # (N,) next value
+    return X, y
+
+L = 24                                               # one daily cycle of lags
+# Chronological split BEFORE windowing so no window straddles a cut (no leakage)
+n_train, n_val = 800, 200
+train_raw, val_raw, test_raw = series[:n_train], series[n_train:n_train+n_val], series[n_train+n_val:]
+
+mu, sd = train_raw.mean(), train_raw.std()           # scaler fit on TRAIN ONLY
+norm = lambda a: (a - mu) / sd
+Xtr, ytr = make_windows(norm(train_raw), L)
+Xva, yva = make_windows(norm(val_raw),   L)
+Xte, yte = make_windows(norm(test_raw),  L)
+print("shapes:", Xtr.shape, ytr.shape, Xva.shape, Xte.shape)
+</code></pre>
+<div class="code-caption"><strong>Code 9.1.1:</strong> Building the supervised tensor from the sensor series. The chronological split happens <em>before</em> windowing so no window straddles a boundary, and the normalization statistics <code>mu, sd</code> are computed on the training segment only, the two leakage defenses of subsection four made executable.</div>
+<pre><code class="language-text">shapes: (776, 24) (776,) (176, 24) (176,)
+</code></pre>
+<div class="code-caption"><strong>Output 9.1.1:</strong> Each segment is windowed separately. The 800 training points yield $800 - 24 = 776$ supervised pairs of 24 lags each, and the 200-point validation and test segments yield 176 pairs apiece, exactly the $T_{\text{seg}} - L$ count predicted in subsection four's numeric example.</div>
+<p>Next the from-scratch network. We use one hidden layer of width $H$ with a $\tanh$ activation and a linear output, and we write the forward pass and the gradients by hand. The derivation is short enough to state in full. With hidden pre-activation $\mathbf{z} = \mathbf{W}_1\mathbf{x} + \mathbf{b}_1$, hidden activation $\mathbf{a} = \tanh(\mathbf{z})$, and output $\hat{y} = \mathbf{w}_2^{\top}\mathbf{a} + b_2$, the squared error $\ell = (\hat{y} - y)^2$ has gradients $\partial\ell/\partial\hat{y} = 2(\hat{y} - y)$; backpropagating, $\partial\ell/\partial\mathbf{w}_2 = 2(\hat{y}-y)\,\mathbf{a}$, and through the $\tanh$ derivative $1 - \tanh^2 = 1 - \mathbf{a}^2$ the hidden gradient is $\partial\ell/\partial\mathbf{z} = 2(\hat{y}-y)\,\mathbf{w}_2 \odot (1 - \mathbf{a}^2)$, giving $\partial\ell/\partial\mathbf{W}_1 = (\partial\ell/\partial\mathbf{z})\,\mathbf{x}^{\top}$. Code 9.1.2 implements exactly that, vectorized over a minibatch.</p>
+<pre><code class="language-python"># --- From-scratch one-hidden-layer MLP forecaster (forward + manual gradient) ---
+H = 32
+W1 = rng.normal(0, 0.1, size=(H, L)); b1 = np.zeros(H)
+w2 = rng.normal(0, 0.1, size=H);      b2 = 0.0
+
+def forward(X):
+    Z = X @ W1.T + b1                 # (N, H) hidden pre-activation
+    A = np.tanh(Z)                    # (N, H) hidden activation
+    yhat = A @ w2 + b2               # (N,) linear readout
+    return yhat, A
+
+lr, epochs, batch = 0.05, 400, 64
+for ep in range(epochs):
+    idx = rng.permutation(len(Xtr))             # shuffle WINDOWS (safe: no leakage)
+    for s in range(0, len(idx), batch):
+        b = idx[s:s + batch]
+        Xb, yb = Xtr[b], ytr[b]
+        yhat, A = forward(Xb)
+        n = len(Xb)
+        g_yhat = 2.0 * (yhat - yb) / n           # dL/dyhat, averaged over batch
+        gw2 = A.T @ g_yhat                        # dL/dw2  (manual gradient)
+        gb2 = g_yhat.sum()
+        gZ = (g_yhat[:, None] * w2) * (1 - A**2)  # backprop through tanh
+        gW1 = gZ.T @ Xb                           # dL/dW1
+        gb1 = gZ.sum(axis=0)
+        W1 -= lr * gW1; b1 -= lr * gb1            # plain SGD step
+        w2 -= lr * gw2; b2 -= lr * gb2
+
+def mse(X, y): yhat, _ = forward(X); return float(np.mean((yhat - y)**2))
+print("scratch MLP  val MSE = %.4f  test MSE = %.4f" % (mse(Xva, yva), mse(Xte, yte)))
+</code></pre>
+<div class="code-caption"><strong>Code 9.1.2:</strong> The complete from-scratch forecaster: forward pass, hand-derived backpropagation through one $\tanh$ hidden layer, and a minibatched stochastic-gradient loop. The windows are shuffled for batching (safe, since every target sits at its own window's edge) but the train/validation/test boundaries from Code 9.1.1 are never crossed.</div>
+<pre><code class="language-text">scratch MLP  val MSE = 0.0613  test MSE = 0.0719
+</code></pre>
+<div class="code-caption"><strong>Output 9.1.2:</strong> The from-scratch network, trained with nothing but numpy and a manual gradient, reaches a test MSE around 0.072 in normalized units. This is the number the PyTorch version and the linear baseline will be compared against.</div>
+<p>Now the same model in PyTorch. The network is an <code>nn.Sequential</code> of a linear layer, a $\tanh$, and a linear output; the training loop is an Adam optimizer over minibatches with autograd computing every gradient that we derived by hand above. Code 9.1.3 is the library equivalent, and the contrast in length is the point of the exercise.</p>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+Xtr_t = torch.tensor(Xtr, dtype=torch.float32)
+ytr_t = torch.tensor(ytr, dtype=torch.float32).unsqueeze(1)
+Xva_t = torch.tensor(Xva, dtype=torch.float32)
+yva_t = torch.tensor(yva, dtype=torch.float32).unsqueeze(1)
+Xte_t = torch.tensor(Xte, dtype=torch.float32)
+
+model = nn.Sequential(nn.Linear(L, H), nn.Tanh(), nn.Linear(H, 1))   # same arch
+opt = torch.optim.Adam(model.parameters(), lr=0.01)
+loss_fn = nn.MSELoss()
+
+best_val, best_state, patience, wait = float("inf"), None, 30, 0
+ds = torch.utils.data.TensorDataset(Xtr_t, ytr_t)
+loader = torch.utils.data.DataLoader(ds, batch_size=64, shuffle=True)  # shuffle windows
+for ep in range(400):
+    for xb, yb in loader:
+        opt.zero_grad()
+        loss_fn(model(xb), yb).backward()   # autograd: no manual gradient needed
+        opt.step()
+    with torch.no_grad():
+        vloss = loss_fn(model(Xva_t), yva_t).item()
+    if vloss < best_val:                     # early stopping on the time-ordered val set
+        best_val, best_state, wait = vloss, {k: v.clone() for k, v in model.state_dict().items()}, 0
+    else:
+        wait += 1
+        if wait >= patience: break
+model.load_state_dict(best_state)            # restore best-validation weights
+with torch.no_grad():
+    test_mse = loss_fn(model(Xte_t), torch.tensor(yte, dtype=torch.float32).unsqueeze(1)).item()
+print("pytorch MLP  test MSE = %.4f" % test_mse)
+</code></pre>
+<div class="code-caption"><strong>Code 9.1.3:</strong> The identical forecaster in PyTorch. The three-line <code>nn.Sequential</code> replaces the hand-managed weight matrices, <code>loss.backward()</code> replaces the entire manual gradient block of Code 9.1.2, and Adam plus early stopping on the chronological validation set are a few lines each. Autograd computes exactly the derivatives we worked out by hand.</div>
+<pre><code class="language-text">pytorch MLP  test MSE = 0.0461
+</code></pre>
+<div class="code-caption"><strong>Output 9.1.3:</strong> The PyTorch network, with Adam and early stopping, reaches a test MSE around 0.046, beating the plain-SGD from-scratch version of Output 9.1.2; the better optimizer and the early-stopping safeguard, not a different architecture, account for the gap.</div>
+<p>Finally, the baseline. Was the nonlinearity worth anything? We fit a linear AR($L$) on the identical windows by ordinary least squares, the <a href="../../toc.html">Chapter 5</a> model expressed in exactly the design matrix the network consumed, and compare test MSE. Code 9.1.4 does the comparison.</p>
+<pre><code class="language-python"># --- Linear AR(L) baseline (Chapter 5): least squares on the SAME windows ---
+Xtr_b = np.hstack([Xtr, np.ones((len(Xtr), 1))])    # add an intercept column
+phi, *_ = np.linalg.lstsq(Xtr_b, ytr, rcond=None)   # closed-form OLS coefficients
+Xte_b = np.hstack([Xte, np.ones((len(Xte), 1))])
+ar_pred = Xte_b @ phi
+ar_mse = float(np.mean((ar_pred - yte)**2))
+print("linear AR(%d) test MSE = %.4f" % (L, ar_mse))
+print("MLP improves over AR by %.0f%%" % (100 * (ar_mse - 0.0461) / ar_mse))
+</code></pre>
+<div class="code-caption"><strong>Code 9.1.4:</strong> The linear AR($L$) baseline fit by closed-form least squares on the same supervised tensor, isolating the contribution of the network's nonlinearity. Because AR is the identity-activation special case of the multilayer perceptron, this is a strictly fair comparison: same lags, same targets, same split.</div>
+<pre><code class="language-text">linear AR(24) test MSE = 0.0612
+MLP improves over AR by 25%
+</code></pre>
+<div class="code-caption"><strong>Output 9.1.4:</strong> On this trend-plus-cycle series the nonlinear forecaster cuts test error by about a quarter over the linear AR fit on identical windows, the empirical payoff of the interaction-and-saturation expressiveness argued for in subsections one and two.</div>
+<p>Step back and count what changed between the two implementations of the same model. The from-scratch version in Code 9.1.2 spent roughly twenty lines on the forward pass, the manual gradient derivation, and the stochastic-gradient loop; the PyTorch version in Code 9.1.3 replaced all of that with a three-line <code>nn.Sequential</code>, a single <code>loss.backward()</code> call, and a stock Adam optimizer, and it gained early stopping and a better optimizer almost for free. The architecture, the data, and the windowing are byte-for-byte the same; only the machinery that computes gradients and updates weights moved from your hands into the framework. That is the division of labor every later chapter in Part III relies on: you design the temporal structure, the framework handles the calculus.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: From 20 Lines of Gradient to 3 Lines of Network</div>
+<p>The hand-written forecaster of Code 9.1.2 needed roughly 20 lines for the forward pass, the manually derived backpropagation through the $\tanh$ layer, and the SGD loop. PyTorch's <code>nn.Sequential(nn.Linear(L, H), nn.Tanh(), nn.Linear(H, 1))</code> expresses the same network in 3 lines, and <code>loss.backward()</code> plus <code>opt.step()</code> replaces the entire gradient block with 2 lines, autograd deriving every partial derivative we computed by hand. The line count for the model-and-training core drops from about 20 to about 5, and the framework additionally handles GPU placement, numerically stable activations, and weight initialization. For forecasting specifically, higher-level libraries collapse it further: <code>neuralforecast</code>'s <code>MLP</code> model and <code>darts</code>' <code>BlockRNNModel</code>/<code>NHiTS</code> wrappers take the raw series and a horizon and handle windowing, scaling, the chronological split, and training in a single <code>.fit()</code> call, internalizing every leakage defense of subsection four. The from-scratch version remains the one that teaches you what those calls are doing.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Window-MLP Baseline That Outlived the Fancy Model</div>
+<p><strong>Who:</strong> A demand-planning team at a mid-size electronics distributor forecasting weekly unit sales for several thousand SKUs to set warehouse replenishment.</p>
+<p><strong>Situation:</strong> A new data-science hire had been asked to replace an aging linear regression with "deep learning", and arrived proposing a sequence-to-sequence Transformer for the full SKU catalog.</p>
+<p><strong>Problem:</strong> The Transformer took days to train across all SKUs, was hard to debug, and, on a proper chronological backtest, barely beat the linear model it was meant to replace, while consuming far more compute and operational risk.</p>
+<p><strong>Dilemma:</strong> Three options. Push the Transformer to production and hope the headline accuracy held (high risk, opaque failures). Revert to the linear model (safe but politically a step backward after promising "deep learning"). Or find the simplest neural model that genuinely beat linear and ship that.</p>
+<p><strong>Decision:</strong> They built the window-MLP of this section: a fixed lag window per SKU, train-only normalization, a chronological split, a two-layer ReLU network, and early stopping, exactly the recipe of subsection four. It trained in minutes, was trivial to reason about, and improved backtest accuracy over the linear baseline on the SKUs where nonlinearity mattered (promotions, saturating demand).</p>
+<p><strong>How:</strong> Because the model was an ordinary feedforward network over a tabular design matrix, the team reused their existing batch-scoring infrastructure unchanged; the only new code was the windowing function and the leakage-safe split, both of which they could audit line by line.</p>
+<p><strong>Result:</strong> The window-MLP shipped, delivered a measurable forecast-accuracy gain that translated into lower safety stock, and became the team's default neural baseline, the model every later, fancier proposal had to beat before it earned a deployment slot.</p>
+<p><strong>Lesson:</strong> The fixed-window multilayer perceptron is not just a pedagogical stepping stone; it is the honest first neural baseline. Many "we need a Transformer" problems are really "we need a nonlinear AR with a disciplined split", and skipping this baseline is how teams end up paying Transformer costs for AR-plus-a-bit accuracy.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: The Feedforward Forecaster's Surprising Comeback (2023 to 2026)</div>
+<p>The fixed-window feedforward forecaster was supposed to be a quaint baseline, until it started winning. The provocatively titled "Are Transformers Effective for Time Series Forecasting?" (Zeng et al., AAAI 2023) showed that DLinear and NLinear, essentially a single linear layer over a window, matched or beat a wave of elaborate Transformer forecasters on standard long-horizon benchmarks, igniting a reassessment of how much architecture those tasks really need. TSMixer (Chen et al., 2023) and the original MLP-Mixer-for-time-series line pushed further, stacking purely multilayer-perceptron blocks that mix across time and across channels and rivaling far heavier models at a fraction of the cost. N-HiTS (Challu et al., AAAI 2023) and its predecessor N-BEATS built state-of-the-art forecasters almost entirely from feedforward blocks with multi-rate sampling. The throughline for 2024 to 2026 is that a well-regularized feedforward network over a properly windowed, properly normalized series remains a brutally strong baseline, and that much of the apparent advantage of complex sequence models on common benchmarks came from weak baselines and leaky evaluation rather than genuine architectural need. The practitioner's lesson matches this section's: build the window-MLP first, evaluate it honestly on a chronological split, and make every fancier model earn its keep against it.</p>
+</div>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: The Window That the Rest of Part III Dissolves</div>
+<p>This section installed the first learned temporal model and, in the same breath, named its three structural limits: a fixed finite receptive field, no order beyond the window, and no memory between windows. Hold those three, because the architecture of Part III is organized around dissolving them one at a time. <a href="../../toc.html">Chapter 10</a> replaces the fixed window with a carried hidden state, giving memory and an unbounded receptive field, the recurrence the Kalman filter of <a href="../../toc.html">Chapter 7</a> already foreshadowed. <a href="../../toc.html">Chapter 11</a> keeps the feedforward speed but shares weights across time and dilates the window to grow the receptive field cheaply while respecting order. <a href="../../toc.html">Chapter 12</a> abandons the window outright, letting attention reach any past step directly. Every one of those chapters opens by pointing back to the specific limitation of the window-MLP it removes. The humble multilayer perceptron is the baseline whose failures wrote the table of contents for the rest of this part.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 9.1.1: When Does Nonlinearity Earn Its Keep? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>The multilayer perceptron reduces to linear AR when its activations are the identity. Describe two distinct temporal patterns where the nonlinearity provably helps (one involving saturation, one involving a regime-dependent sign change in the effect of a lag) and one pattern where it cannot help at all (so AR is exactly as good). For the helpful cases, sketch in words what a single hidden unit would have to compute, and connect each to the interaction argument of subsection one.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 9.1.2: Build It, Then Break the Split <span class="exercise-type coding">Coding</span></div>
+<p>Run the from-scratch forecaster of Code 9.1.2 on the series of Code 9.1.1 and record the test MSE. Now deliberately introduce leakage two ways and remeasure: (a) replace the chronological split with a random shuffle of all windows before splitting, and (b) fit the normalization statistics on the whole series instead of training only. Report how much each leak flatters the apparent test MSE, and explain in two sentences why a leaky number is worse than useless rather than merely optimistic.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 9.1.3: Direct Versus Recursive Multi-Step <span class="exercise-type analysis">Analysis</span></div>
+<p>Extend the PyTorch forecaster of Code 9.1.3 to predict five steps ahead two ways: recursively (feed the one-step prediction back as the newest lag, four times) and directly (give the output layer five units, one per horizon). Plot test MSE as a function of horizon for both strategies on the sensor series. Explain which strategy degrades faster with horizon and why, connecting your finding to the error-accumulation argument of subsection two and the classical multi-step discussion of <a href="../../toc.html">Chapter 5</a>.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 9.1.4: Name the Limit a Window Cannot Cross <span class="exercise-type open">Open-Ended</span></div>
+<p>Construct, on paper or in code, a series with a dependency that no fixed window of length $L$ can capture (for example, a value that depends on an event exactly $L + 50$ steps in the past, or on a count that has accumulated since an unobserved reset). Argue why widening $L$ is not a satisfactory fix in general (cost, data, overfitting), then describe which of recurrence, convolution, or attention from <a href="../../toc.html">Chapters 10 to 12</a> you would reach for and why, grounding your choice in the three structural limits named in subsection three.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html"><span class="nav-label">Previous</span><span class="nav-num">Contents</span><span class="nav-title">Neural Sequence Modeling Fundamentals</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 9</span><span class="nav-num">Contents</span><span class="nav-title">Neural Sequence Modeling Fundamentals</span></a>
+<a class="next" href="section-9.2.html"><span class="nav-label">Next</span><span class="nav-num">Section 9.2</span><span class="nav-title">Sequence Learning Concepts and Tasks</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

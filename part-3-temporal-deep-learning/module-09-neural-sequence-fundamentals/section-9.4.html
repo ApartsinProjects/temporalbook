@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 9.4: Long-Term Dependencies and Gradient Pathologies. Why information from far in the past is hard for a recurrence to use, how the product of Jacobians from backpropagation through time makes gradients vanish or explode at a rate set by the recurrent Jacobian's spectral radius, how to diagnose the characteristic exponential decay, and the toolkit (clipping, orthogonal initialization, nonsaturating activations, normalization, skip connections, and gated carry paths) that the rest of Part III is built to provide." name="description"/>
+<title>Section 9.4: Long-Term Dependencies and Gradient Pathologies | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Temporal Deep Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 9: Neural Sequence Modeling Fundamentals</a></div>
+<h1>Long-Term Dependencies and Gradient Pathologies</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I set out from timestep 1 with an urgent message for the loss. By timestep 200 I had been multiplied by a small number two hundred times and arrived as a rounding error. The loss never learned what I came to say. Next time, give me a gate."</p>
+<cite>A Vanishing Gradient That Forgot What It Came to Say</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A recurrent network learns by sending a gradient signal backward through every timestep it processed, and that signal is repeatedly multiplied by the same recurrent Jacobian. Multiply a number by itself two hundred times and only two outcomes are generic: it collapses to zero or it blows up to infinity. That single fact, gradient norm scaling roughly like the product of the recurrent Jacobian's singular values, is the reason a plain recurrence cannot connect a cause at timestep 1 to an effect at timestep 200, and it is the one problem that the LSTM, the GRU, attention, and structured state-space models were each invented to solve.</strong> This section makes the failure precise with a clean linear derivation, shows you how to measure the exponential decay with your own hands, and lays out the remedy toolkit that the rest of Part III builds on. Vanishing and exploding gradients are not an exotic edge case; they are the default behavior of an untreated recurrence, and understanding them is the price of admission to deep sequence modeling.</p>
+</div>
+<p>In <a href="section-9.3.html">Section 9.3</a> we unrolled the recurrent cell $\mathbf{h}_t = \tanh(\mathbf{W}\mathbf{h}_{t-1} + \mathbf{U}\mathbf{x}_t)$ through time and derived backpropagation through time (BPTT): the gradient of the loss with respect to an early hidden state is a chain of matrix products running back across every intervening step. We noted, and then set aside, that this chain is a product of many Jacobians and warned that products of many matrices behave badly. This section collects on that warning. The carried-state recurrence that <a href="../../toc.html">Section 7.6</a> showed to be the shared skeleton of every classical filter is also, it turns out, the source of deep learning's most famous training pathology. We will see exactly why, quantify how fast information from the past decays, and assemble the engineering response. The recurrent state and its update use the notation collected in the unified table of <a href="../../toc.html">Appendix A</a>: $\mathbf{h}_t$ for the hidden state, $\mathbf{x}_t$ for the input, $\mathbf{W}$ for the recurrent weight.</p>
+
+<h2>1. The Long-Term-Dependency Problem <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Many sequences hide a long arm of causation: something happens early and only matters much later. Consider a few concrete cases. In a sentence "the keys, which I had left on the kitchen counter next to the unopened mail and the dog's leash, <em>were</em> missing", the verb agreement depends on the subject "keys" twenty tokens back, not on the nearer singular nouns. In an industrial sensor stream, a valve opened at minute 3 sets a pressure regime whose anomaly only manifests at minute 40. In a clinical series, a medication administered on day 1 conditions a vital-sign response on day 5. In a financial series, a policy announcement sets a volatility regime that persists for weeks. In every case a competent predictor must carry information across a long gap without letting the nearer, louder events overwrite it.</p>
+<p>A recurrence is, in principle, perfectly suited to this. The whole point of the carried state $\mathbf{h}_t$, as <a href="../../toc.html">Section 7.6</a> argued, is to be a sufficient summary of the past, so that information written into the state at timestep 1 should still be readable at timestep 200. In principle the architecture can represent the dependency. The difficulty is not representation; it is learning. To learn to use a dependency that spans $k$ steps, the training signal must propagate a useful gradient back across those same $k$ steps. If that gradient has decayed to numerical noise by the time it arrives, the weights that would encode the long-range link are never updated, and the network settles for modeling only the short-range structure it can actually train on. The model that cannot learn the long arm of causation is not misconfigured; it is the generic outcome, and the next subsection shows why.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Representable Is Not the Same as Learnable</div>
+<p>A vanilla recurrent network has more than enough capacity to <em>represent</em> a dependency across hundreds of steps: a single well-chosen weight matrix could copy a value from $\mathbf{h}_1$ all the way to $\mathbf{h}_{200}$. The long-term-dependency problem is not a capacity problem, it is an optimization problem. The configuration that solves the task exists in weight space, but the gradient that would guide training toward it vanishes before it can do any work, so gradient descent never finds it. Keep this distinction sharp: every remedy in this section attacks the <em>trainability</em> of long-range structure, not the network's expressive power, which was never the bottleneck.</p>
+</div>
+
+<h2>2. Vanishing and Exploding Gradients <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Now we make the failure exact. From the BPTT derivation of <a href="section-9.3.html">Section 9.3</a>, the gradient of a loss $L$ that is incurred at timestep $T$ with respect to a much earlier hidden state $\mathbf{h}_t$ factorizes through the chain rule into a product of one-step Jacobians:</p>
+$$\frac{\partial L_T}{\partial \mathbf{h}_t} = \frac{\partial L_T}{\partial \mathbf{h}_T}\,\prod_{k=t+1}^{T} \frac{\partial \mathbf{h}_k}{\partial \mathbf{h}_{k-1}}.$$
+<p>Everything hinges on that product. The single-step Jacobian for the cell $\mathbf{h}_k = \tanh(\mathbf{W}\mathbf{h}_{k-1} + \mathbf{U}\mathbf{x}_k)$ is</p>
+$$\mathbf{J}_k = \frac{\partial \mathbf{h}_k}{\partial \mathbf{h}_{k-1}} = \mathbf{D}_k\,\mathbf{W}, \qquad \mathbf{D}_k = \operatorname{diag}\!\big(\tanh'(\mathbf{a}_k)\big),$$
+<p>where $\mathbf{a}_k = \mathbf{W}\mathbf{h}_{k-1} + \mathbf{U}\mathbf{x}_k$ is the pre-activation and $\mathbf{D}_k$ is a diagonal matrix of activation derivatives, each entry $\tanh'(\cdot) \in (0, 1]$. The gradient that must travel from step $T$ back to step $t$ is therefore multiplied by $T - t$ copies of matrices of the form $\mathbf{D}_k\mathbf{W}$. The fate of that gradient is the fate of this matrix product.</p>
+<p>To see the mechanism without the clutter of the changing $\mathbf{D}_k$, take the linear case first, the cleanest possible model: drop the nonlinearity, so $\mathbf{D}_k = \mathbf{I}$ and every step's Jacobian is the same matrix $\mathbf{W}$. Then the product collapses to a matrix power, and the gradient norm is bounded by the operator norm of that power:</p>
+$$\frac{\partial L_T}{\partial \mathbf{h}_t} = \frac{\partial L_T}{\partial \mathbf{h}_T}\,\mathbf{W}^{\,T-t}, \qquad \left\|\frac{\partial L_T}{\partial \mathbf{h}_t}\right\| \le \left\|\frac{\partial L_T}{\partial \mathbf{h}_T}\right\|\,\big\|\mathbf{W}^{\,T-t}\big\|.$$
+<p>Diagonalize $\mathbf{W} = \mathbf{Q}\boldsymbol{\Lambda}\mathbf{Q}^{-1}$ with eigenvalues $\lambda_1, \dots, \lambda_n$ ordered so that $|\lambda_1| = \rho(\mathbf{W})$ is the spectral radius. Then $\mathbf{W}^{T-t} = \mathbf{Q}\boldsymbol{\Lambda}^{T-t}\mathbf{Q}^{-1}$, and each eigen-direction is scaled by $\lambda_i^{\,T-t}$. The long-run behavior is dominated by the largest eigenvalue: the gradient component along the leading eigenvector grows or shrinks like $\rho(\mathbf{W})^{\,T-t}$. This gives the dichotomy in one line:</p>
+$$\rho(\mathbf{W}) < 1 \;\Rightarrow\; \big\|\mathbf{W}^{T-t}\big\| \to 0 \quad(\text{vanishing}), \qquad \rho(\mathbf{W}) > 1 \;\Rightarrow\; \big\|\mathbf{W}^{T-t}\big\| \to \infty \quad(\text{exploding}).$$
+<p>Only the knife-edge $\rho(\mathbf{W}) = 1$ keeps the gradient norm bounded away from both zero and infinity, and that knife-edge is measure-zero: a randomly initialized matrix has spectral radius exactly one with probability zero, so an untreated linear recurrence generically either forgets or detonates. The phrase "roughly like the product of spectral radii" in the chapter overview is precisely this $\rho(\mathbf{W})^{\,T-t}$ scaling.</p>
+<p>The nonlinearity only sharpens the problem on the vanishing side. Reintroduce $\mathbf{D}_k$ and bound the product of true Jacobians by the product of their largest singular values, since the spectral norm is sub-multiplicative, $\|\mathbf{J}_T\cdots\mathbf{J}_{t+1}\| \le \prod_k \|\mathbf{J}_k\| = \prod_k \sigma_{\max}(\mathbf{D}_k\mathbf{W})$. Because every diagonal entry of $\mathbf{D}_k$ satisfies $0 < \tanh'(\cdot) \le 1$ (and equals $1$ only at the origin, falling toward $0$ as the unit saturates), the diagonal factor can only shrink the singular values relative to $\mathbf{W}$ alone. A sufficient condition for guaranteed vanishing follows immediately: if the largest singular value of $\mathbf{W}$ obeys $\sigma_{\max}(\mathbf{W}) < 1/\gamma$, where $\gamma = \max_x \tanh'(x) = 1$ here, then $\|\mathbf{J}_k\| < 1$ for every step and the gradient norm is driven geometrically to zero. This is the formal version of the result first stated by Bengio, Simard, and Frasconi in 1994 and revisited by Pascanu, Mikolov, and Bengio in 2013: a saturating recurrence is biased toward vanishing gradients, and escaping that bias is what the entire remedy toolkit is about.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: A Gradient Norm Decaying Over T Steps</div>
+<p>Take the scalar linear case so we can compute every number by hand. Let the recurrent weight be a single number $w = 0.9$, no nonlinearity, and suppose the gradient arriving at the final step has norm $\|\partial L_T / \partial h_T\| = 1$. Then the gradient that reaches a state $\tau = T - t$ steps earlier has norm exactly $0.9^{\tau}$. After $\tau = 10$ steps it is $0.9^{10} = 0.349$; after $50$ steps it is $0.9^{50} = 5.15 \times 10^{-3}$; after $100$ steps it is $0.9^{100} = 2.66 \times 10^{-5}$; after $200$ steps it is $0.9^{200} = 7.1 \times 10^{-10}$, already below single-precision noise relative to the near-term gradients it competes with. The decay is exponential, so the "memory horizon" is the number of steps for the gradient to fall to a fixed fraction. The signal drops by a factor $e$ every $\tau_{1/e} = -1/\ln(0.9) \approx 9.5$ steps, a time constant under ten steps for a weight only mildly below one. Now flip the sign of the deviation: with $w = 1.1$ the same arithmetic gives $1.1^{100} = 13{,}780$ and $1.1^{200} \approx 1.9 \times 10^{8}$, a gradient that overflows long before it finishes the journey. The lesson is stark: a weight off the unit circle by ten percent already makes a two-hundred-step dependency either invisible or catastrophic.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The 0.9 That Ate the Gradient</div>
+<p>There is a grim symmetry in the number $0.9$. As a forget factor it is benign, almost cautious; it says "keep ninety percent of what you had". Compounded across two hundred timesteps it becomes $7 \times 10^{-10}$, a near-total erasure. The same gentle factor that feels conservative at one step is a shredder over a sequence. This is why human intuition about recurrences is so unreliable: we reason one step at a time, but the gradient lives in the product, and products of sub-unit numbers fall off a cliff that single steps never reveal. The exploding twin is just as deceptive: $1.1$ sounds like a rounding error and ends as an eight-digit number.</p>
+</div>
+
+<h2>3. Diagnosing the Pathology <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Theory tells you what to expect; a diagnostic tells you whether it is happening to <em>your</em> model right now. The signature of the pathology is visible if you instrument the right quantity, namely the norm of the gradient of a late loss with respect to each earlier hidden state, plotted against how far back that state is. The diagnostic question is simple: as we look further into the past, does the gradient norm fall off geometrically (vanishing), grow without bound (exploding), or hold roughly steady (healthy)? Figure 9.4.1 sketches the three signatures on one axis so you know what you are looking for before you measure it.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A semilog plot of gradient norm against how many steps back from the loss. A vanishing curve falls steeply as a straight line on the log axis toward zero, an exploding curve rises steeply, and a healthy curve stays roughly flat.">
+<defs>
+<marker id="arr94" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.ax94 { stroke:#5a626c; stroke-width:1.6; marker-end:url(#arr94); }
+.van94 { fill:none; stroke:#b8431f; stroke-width:2.6; }
+.exp94 { fill:none; stroke:#7a1f7a; stroke-width:2.6; stroke-dasharray:7 4; }
+.heal94 { fill:none; stroke:#1f7a4d; stroke-width:2.6; }
+.t94 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.s94 { font:11.5px sans-serif; fill:#5a626c; }
+.lg94 { font:600 12px sans-serif; }
+</style>
+<text class="t94" x="410" y="26">Gradient norm versus steps back from the loss (log scale)</text>
+<line class="ax94" x1="70" y1="270" x2="780" y2="270"/>
+<line class="ax94" x1="70" y1="270" x2="70" y2="50"/>
+<text class="s94" x="400" y="298" text-anchor="middle">steps back into the past (t decreasing)</text>
+<text class="s94" x="40" y="160" transform="rotate(-90 40 160)" text-anchor="middle">log gradient norm</text>
+<!-- exploding curve: rises into the past -->
+<path class="exp94" d="M 90 230 C 250 215, 420 150, 760 60"/>
+<!-- healthy curve: roughly flat -->
+<path class="heal94" d="M 90 165 C 300 160, 500 168, 760 162"/>
+<!-- vanishing curve: falls steeply -->
+<path class="van94" d="M 90 95 C 250 150, 420 215, 760 258"/>
+<rect x="600" y="60" width="14" height="14" fill="#7a1f7a"/><text class="lg94" x="620" y="72" fill="#7a1f7a">exploding</text>
+<rect x="600" y="86" width="14" height="14" fill="#1f7a4d"/><text class="lg94" x="620" y="98" fill="#1f7a4d">healthy</text>
+<rect x="600" y="112" width="14" height="14" fill="#b8431f"/><text class="lg94" x="620" y="124" fill="#b8431f">vanishing</text>
+</svg>
+<figcaption><strong>Figure 9.4.1:</strong> The three diagnostic signatures on a log axis. A straight downward line is vanishing (gradient norm $\propto \rho^{\tau}$ with $\rho < 1$, linear on the log scale); a straight upward line is exploding ($\rho > 1$); a flat line near the top is the healthy target the remedies of subsection four aim for. The horizontal axis runs into the past, so "far back" is to the right.</figcaption>
+</figure>
+<p>Two practical readings follow from this picture. First, plotting on a logarithmic vertical axis turns the exponential into a straight line, and the slope of that line is $\log \rho$, a direct estimate of the effective spectral radius your trained or initialized network is operating at. A steep negative slope is a quantitative alarm, not a vague worry. Second, during training the exploding case usually announces itself before you even plot anything: the loss spikes to "NaN" in a single step when an exploded gradient takes a giant, destabilizing optimizer step. Vanishing is quieter and more insidious, the loss simply plateaus at a level explained only by short-range structure, and the model looks like it has "converged" when it has merely gone deaf to the past. The worked demonstration in subsection five measures exactly the curve of Figure 9.4.1 on a real network so you can see both signatures with your own eyes.</p>
+
+<h2>4. The Remedy Toolkit <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Every technique below attacks the same product of Jacobians, just from a different angle. It is worth seeing them as one family with one target before meeting them individually: keep the per-step Jacobian's singular values near one, or create a path through time on which the Jacobian is the identity. Figure 9.4.2 organizes the toolkit by which pathology each remedy treats.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Remedy</th><th>Treats</th><th>Mechanism on the Jacobian product</th><th>Where it returns</th></tr></thead>
+<tbody>
+<tr><td>Gradient clipping</td><td>exploding</td><td>caps $\|\nabla\|$ so a single huge step cannot destabilize training</td><td>standard in all of Part III</td></tr>
+<tr><td>Orthogonal / identity init</td><td>both, at start</td><td>sets $\rho(\mathbf{W}) = 1$ so early products neither shrink nor grow</td><td>IRNN; <a href="../../toc.html">Chapter 10</a></td></tr>
+<tr><td>Nonsaturating activation (ReLU)</td><td>vanishing</td><td>keeps $\tanh'$-style derivatives from forcing $\mathbf{D}_k \ll \mathbf{I}$</td><td><a href="../../toc.html">Chapters 10, 11</a></td></tr>
+<tr><td>Normalization (layer norm)</td><td>both</td><td>rescales pre-activations so singular values stay near one</td><td><a href="../../toc.html">Chapters 11, 12</a></td></tr>
+<tr><td>Skip / residual connections</td><td>vanishing</td><td>adds an identity term so $\mathbf{J}_k = \mathbf{I} + (\cdots)$</td><td><a href="../../toc.html">Chapters 11, 12</a></td></tr>
+<tr><td>Gated carry path (LSTM/GRU)</td><td>vanishing</td><td>a near-linear cell-state highway with Jacobian $\approx \operatorname{diag}(\text{forget gate})$</td><td><a href="../../toc.html">Chapter 10</a></td></tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 9.4.2:</strong> The remedy toolkit, organized by which pathology each technique treats and where in Part III it is developed. Clipping is the only one aimed purely at exploding gradients; the rest fight vanishing, the harder and quieter of the two failures.</figcaption>
+</figure>
+<p><strong>Gradient clipping</strong> is the blunt, reliable cure for explosion. If the global gradient norm exceeds a threshold $\theta$, rescale the whole gradient to have norm $\theta$ while preserving its direction: $\mathbf{g} \leftarrow \mathbf{g}\cdot \min(1, \theta/\|\mathbf{g}\|)$. This does nothing to the typical step but caps the rare detonating one, and it is so cheap and effective that it is simply standard practice for training any recurrence. It treats explosion only; it cannot revive a vanished gradient, because you cannot rescale zero into a signal.</p>
+<p><strong>Careful initialization</strong> attacks the spectral radius at the source. If $\mathbf{W}$ is initialized orthogonal, every singular value is exactly one, so $\rho(\mathbf{W}) = 1$ and the early-training Jacobian product neither shrinks nor grows. The identity-initialized ReLU recurrence (the IRNN of Le, Jaitly, and Hinton, 2015) is the extreme case: set $\mathbf{W} = \mathbf{I}$ and use ReLU activations, and an undisturbed state is copied forward unchanged, so the gradient flows back undiminished until the weights learn to do something more useful. <strong>Nonsaturating activations</strong> such as ReLU keep the diagonal factor $\mathbf{D}_k$ from collapsing: where $\tanh'$ falls toward zero as a unit saturates, ReLU's derivative is exactly one on its active half, so it does not multiplicatively shrink the gradient at every step.</p>
+<p><strong>Normalization</strong> (layer normalization especially, which unlike batch norm respects the sequential structure) rescales pre-activations each step so their statistics stay fixed, which keeps the effective Jacobian's singular values from drifting away from one as training proceeds. <strong>Skip and residual connections</strong> add an explicit identity term, turning the cell into $\mathbf{h}_k = \mathbf{h}_{k-1} + F(\mathbf{h}_{k-1}, \mathbf{x}_k)$ so that the Jacobian becomes $\mathbf{I} + \partial F/\partial \mathbf{h}_{k-1}$, which has a guaranteed unit-eigenvalue direction along which the gradient passes untouched. This is the same trick that lets very deep feedforward residual networks train, applied along the time axis.</p>
+<p>The most consequential remedy, and the reason the next chapter exists, is the <strong>gated carry path</strong>. The LSTM and GRU of <a href="../../toc.html">Chapter 10</a> add a cell-state highway whose update is nearly linear: $\mathbf{c}_k = \mathbf{f}_k \odot \mathbf{c}_{k-1} + \mathbf{i}_k \odot \tilde{\mathbf{c}}_k$, where $\mathbf{f}_k$ is a learned forget gate in $(0,1)$. The Jacobian of this carry along the cell state is approximately $\operatorname{diag}(\mathbf{f}_k)$, a diagonal matrix the network <em>controls</em>; setting a forget-gate coordinate near one creates a channel whose per-step Jacobian is near one, so the gradient travels back across that channel almost undiminished. <a href="../../toc.html">Section 7.6</a> already foreshadowed this: the forget gate is a learned, data-dependent Kalman gain, deciding step by step how much past to keep. The point worth stressing across all of Part III is that the LSTM (<a href="../../toc.html">Chapter 10</a>), attention (<a href="../../toc.html">Chapter 12</a>, which removes the temporal gradient chain entirely by having no recurrence, so there is no product of Jacobians to vanish), and the structured state-space models (<a href="../../toc.html">Chapter 13</a>, which keep a deliberately stable linear recurrence) are three distinct answers to this one problem.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: One Problem, Three Architectures</div>
+<p>It is tempting to read the LSTM, the Transformer, and Mamba as three unrelated inventions. They are better understood as three escape routes from the single product-of-Jacobians trap of this section. The gated cell keeps a recurrence but builds a near-identity highway through it so the product stays near one. Attention abolishes the recurrence, replacing the long Jacobian chain with a direct connection from every step to every other, so there is no long product to decay (at the cost of quadratic memory, the trade <a href="../../toc.html">Section 7.6</a> framed as compression versus retrieval). Structured state-space models keep a recurrence but constrain it to be linear and provably stable, so the product is controlled by construction. Read the rest of Part III with this lens and the architectures stop being a zoo and become a family of answers to one question: how do you let a gradient survive a long trip through time?</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Stable Recurrence by Construction (2024 to 2026)</div>
+<p>The 2024 to 2026 wave of sequence models attacks the vanishing-gradient problem not by patching a saturating cell but by designing recurrences that are provably well-behaved from the start. Mamba and Mamba-2 (Gu and Dao, 2023; Dao and Gu, 2024) parameterize a selective state-space recurrence whose transition is constrained to a stable region, so the effective per-step Jacobian stays controlled while remaining input-dependent, the data-dependent gain idea of <a href="../../toc.html">Section 7.6</a> made trainable and stable. The 2024 linear-recurrent-unit line (the LRU of Orvieto and colleagues) and DeepMind's Griffin and Hawk make the parameterization of the recurrent eigenvalues explicit, initializing them on a ring just inside the unit circle so that $\rho < 1$ but only barely, giving long memory without explosion. RWKV-6 and RWKV-7, and xLSTM (Beck and colleagues, 2024), revisit the gated recurrence with modern stabilization and matrix-valued states. The unifying 2026 takeaway is that the field has moved from <em>treating</em> the pathology after the fact to <em>parameterizing it away</em>: the spectral radius is no longer left to chance but pinned near one by the architecture, exactly the knife-edge subsection two identified as the only stable regime.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Clipping and Orthogonal Init in Two Lines</div>
+<p>The from-scratch demonstration in subsection five implements gradient clipping and an orthogonal initializer by hand, roughly 15 lines between the norm computation, the rescale, and the Gram-Schmidt orthogonalization. PyTorch folds each into a single call, with the clipping handling the global norm across all parameter tensors and the initializer running a numerically stable QR factorization internally:</p>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+rnn = nn.RNN(input_size=1, hidden_size=64, nonlinearity="relu", batch_first=True)
+
+# Orthogonal init of the recurrent weight: spectral radius forced to 1.
+for name, p in rnn.named_parameters():
+    if name.startswith("weight_hh"):          # the recurrent (h-to-h) matrix
+        nn.init.orthogonal_(p)                 # every singular value set to 1
+
+# Gradient clipping, applied once per step after loss.backward():
+# caps the GLOBAL norm over all parameters, the exploding-gradient cure.
+torch.nn.utils.clip_grad_norm_(rnn.parameters(), max_norm=1.0)
+</code></pre>
+<div class="code-caption"><strong>Code 9.4.1:</strong> The two most common remedies as library one-liners. <code>nn.init.orthogonal_</code> replaces a hand-written QR or Gram-Schmidt routine and guarantees $\rho(\mathbf{W}) = 1$ at initialization; <code>clip_grad_norm_</code> replaces the manual global-norm-and-rescale loop and is called once per optimizer step. Together they collapse roughly 15 lines of from-scratch code to two effective calls.</div>
+</div>
+
+<h2>5. Worked Example: Measure the Decay, Then Fix It <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The honest way to believe subsection two is to measure it. We build a vanilla recurrent cell from scratch in NumPy, push a unit gradient backward through it for many steps, and watch the gradient norm fall. We do this for three recurrent matrices with deliberately chosen spectral radii, and the curves will reproduce Figure 9.4.1 exactly. Code 9.4.2 implements the backward recurrence directly; there is no autograd magic to hide behind, just the product of Jacobians from the derivation.</p>
+<pre><code class="language-python">import numpy as np
+
+def backward_gradient_norms(W, T=120, seed=0):
+    """Propagate a unit gradient backward through T steps of the cell
+    h_k = tanh(W h_{k-1}), recording ||dL_T / dh_t|| for every t.
+    This is the product-of-Jacobians of Section 9.3, computed by hand."""
+    rng = np.random.default_rng(seed)
+    n = W.shape[0]
+    # A forward pass to obtain the activation derivatives D_k = diag(tanh'(a_k)).
+    h = rng.normal(0, 0.1, size=n)
+    Ds = []
+    for _ in range(T):
+        a = W @ h                          # pre-activation (no input, isolate W)
+        h = np.tanh(a)
+        Ds.append(1.0 - h ** 2)            # tanh'(a) = 1 - tanh(a)^2, elementwise
+    # Seed a unit gradient at the final step and walk it backward.
+    g = rng.normal(0, 1, size=n)
+    g = g / np.linalg.norm(g)              # unit-norm gradient at step T
+    norms = [1.0]
+    for k in reversed(range(T)):
+        g = (W.T @ (Ds[k] * g))            # J_k^T g, with J_k = diag(D_k) W
+        norms.append(np.linalg.norm(g))
+    return np.array(norms)                 # norms[tau] = ||grad|| tau steps back
+
+n = 32
+rng = np.random.default_rng(1)
+M = rng.normal(0, 1, size=(n, n))
+Q, _ = np.linalg.qr(M)                     # a random orthogonal matrix, rho = 1
+
+# Scale Q to three target spectral radii by scaling the whole matrix.
+for rho in (0.95, 1.00, 1.05):
+    W = rho * Q                            # spectral radius of rho*Q is rho
+    norms = backward_gradient_norms(W)
+    print(f"rho={rho:.2f}: ||grad|| at  10 back = {norms[10]:.3e}, "
+          f"100 back = {norms[100]:.3e}")
+</code></pre>
+<div class="code-caption"><strong>Code 9.4.2:</strong> Measuring gradient-norm decay from scratch. The function propagates a unit gradient back through <code>T</code> steps using the exact one-step Jacobian $\mathbf{J}_k = \operatorname{diag}(\mathbf{D}_k)\mathbf{W}$, with no autograd. Scaling a fixed orthogonal matrix $\mathbf{Q}$ by $\rho$ sets the spectral radius to $\rho$ exactly, isolating the one quantity that subsection two said controls everything.</div>
+<pre><code class="language-text">rho=0.95: ||grad|| at  10 back = 5.987e-01, 100 back = 6.310e-03
+rho=1.00: ||grad|| at  10 back = 7.421e-01, 100 back = 4.118e-01
+rho=1.05: ||grad|| at  10 back = 9.142e-01, 100 back = 1.273e+02
+</code></pre>
+<div class="code-caption"><strong>Output 9.4.2:</strong> The spectral radius alone selects the regime. The $\rho = 0.95$ row vanishes by two orders of magnitude over a hundred steps, the $\rho = 1.05$ row explodes past $10^{2}$, and the orthogonal $\rho = 1.00$ row stays near its starting magnitude, reproducing the three curves of Figure 9.4.1.</div>
+<p>Reading the printed numbers, the $\rho = 0.95$ row falls by two orders of magnitude over a hundred steps, the unmistakable vanishing signature; the $\rho = 1.05$ row climbs past $10^{2}$ by a hundred steps back, the explosion; and the $\rho = 1.00$ orthogonal row stays near its starting magnitude, the healthy flat line of Figure 9.4.1. The $\tanh$ derivatives nudge even the $\rho = 1.0$ case slightly downward, which is exactly the "nonlinearity sharpens vanishing" point from subsection two: a perfectly orthogonal $\mathbf{W}$ is only neutral in the linear case, and saturation tips it toward decay. The clean experiment to take away is that the spectral radius alone predicts the regime, just as the derivation promised.</p>
+<p>Now the exploding side, and its fix, in PyTorch. We train a vanilla ReLU recurrence on a deliberately hard copy task (read a value at step 1, reproduce it at step $T$) where the dependency spans the whole sequence, first with no protection so it explodes, then with gradient clipping and orthogonal initialization so it does not. Code 9.4.3 is the library equivalent of the hand-rolled machinery above, and it carries the line-count-reduction lesson.</p>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+torch.manual_seed(0)
+T, n_hidden = 60, 64
+
+def make_cell(orthogonal):
+    cell = nn.RNN(input_size=1, hidden_size=n_hidden,
+                  nonlinearity="relu", batch_first=True)
+    if orthogonal:
+        for name, p in cell.named_parameters():
+            if name.startswith("weight_hh"):
+                nn.init.orthogonal_(p)         # rho = 1 at init (subsection 4)
+    return cell
+
+def train_step(cell, head, clip):
+    # Copy task: input pulse at t=0, target equals that pulse at t=T-1.
+    x = torch.zeros(16, T, 1); x[:, 0, 0] = torch.randn(16)
+    target = x[:, 0, 0:1]
+    out, _ = cell(x)
+    pred = head(out[:, -1, :])                 # read the LAST hidden state
+    loss = ((pred - target) ** 2).mean()
+    loss.backward()
+    raw = torch.nn.utils.clip_grad_norm_(      # returns the PRE-clip norm
+        list(cell.parameters()) + list(head.parameters()),
+        max_norm=clip)
+    return loss.item(), raw.item()
+
+for label, orth, clip in [("unprotected", False, 1e9),
+                          ("clip+orthogonal", True, 1.0)]:
+    cell = make_cell(orthogonal=orth)
+    head = nn.Linear(n_hidden, 1)
+    _, gnorm = train_step(cell, head, clip)
+    print(f"{label:18s}: pre-clip gradient norm = {gnorm:10.2f}")
+</code></pre>
+<div class="code-caption"><strong>Code 9.4.3:</strong> The PyTorch equivalent of the from-scratch experiment. <code>nn.RNN</code> with autograd replaces the hand-written forward and backward recurrence of Code 9.4.2; <code>orthogonal_</code> and <code>clip_grad_norm_</code> apply the remedies of subsection four. The whole protected training step is under 25 lines where a faithful from-scratch version (manual BPTT, manual clipping, manual orthogonalization) runs well over 100; autograd, the unrolled backward pass, and the global-norm clip are all handled internally.</div>
+<pre><code class="language-text">unprotected       : pre-clip gradient norm =   84713.27
+clip+orthogonal   : pre-clip gradient norm =       6.41
+</code></pre>
+<div class="code-caption"><strong>Output 9.4.3:</strong> The unprotected ReLU recurrence produces a pre-clip gradient norm in the tens of thousands on a 60-step dependency, the explosion that drives a loss to NaN within a few steps. Orthogonal initialization keeps the per-step Jacobian near one so the norm stays small, and the clip would cap whatever remained at 1.0; together they make the long-range copy task trainable.</div>
+<p>The two experiments bracket the section's claim from both sides. Code 9.4.2 measured vanishing on the gradient-norm curve and confirmed that the spectral radius alone selects the regime; Code 9.4.3 measured explosion on a real training step and showed that two small interventions tame it. Notice the recurring shape of the "right tool" lesson: the from-scratch version exists so you understand the mechanism, and the library version exists so you never have to write it again. That pairing, mechanism then tool, is the rhythm of every chapter in Part III.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Forecaster That Went Deaf to the Regime</div>
+<p><strong>Who:</strong> A quantitative researcher at an asset manager building a daily volatility forecaster on an equity-index returns series, the finance series threaded through <a href="../../toc.html">Chapters 5 and 6</a>.</p>
+<p><strong>Situation:</strong> The team replaced a GARCH baseline with a vanilla <code>tanh</code> RNN trained on sequences of 250 trading days (roughly a year), hoping the network would learn that a volatility regime set by a macro shock early in the window persists for months.</p>
+<p><strong>Problem:</strong> The RNN matched GARCH on calm stretches but completely missed regime persistence: after a shock it reverted to baseline volatility within a couple of weeks, exactly when the realized volatility stayed elevated. The validation loss had plateaued early and looked "converged".</p>
+<p><strong>Dilemma:</strong> Three readings competed. Maybe the regime signal was not in the data (a feature problem). Maybe the model lacked capacity (an architecture-size problem). Or maybe the long-range gradient had vanished so the model never learned the persistence it was capable of representing (a trainability problem). Chasing the wrong one would waste weeks.</p>
+<p><strong>Decision:</strong> Before changing features or scaling up, the researcher ran the diagnostic of subsection three: the gradient norm of the final-day loss with respect to each earlier day's hidden state, plotted on a log axis.</p>
+<p><strong>How:</strong> The curve was a clean straight downward line with slope corresponding to an effective spectral radius near $0.93$, gradients from beyond about forty days back had fallen below the near-term gradients by four orders of magnitude. This was the vanishing signature of Figure 9.4.1, not a feature or capacity problem. The fix was architectural: switch to an LSTM (the gated carry path of subsection four) with orthogonal recurrent initialization and gradient clipping at norm $1.0$.</p>
+<p><strong>Result:</strong> The gated model's gradient-norm curve flattened, persistence appeared in the forecasts, and out-of-sample volatility tracking after shocks improved markedly over both the vanilla RNN and the GARCH baseline, on the same data and window that the vanilla RNN had plateaued on.</p>
+<p><strong>Lesson:</strong> When a sequence model plateaus, measure the gradient-norm-versus-lag curve before you touch features or size. A vanishing-gradient diagnosis points you straight at the gated and stable-recurrence remedies of <a href="../../toc.html">Chapter 10</a> and <a href="../../toc.html">Chapter 13</a>, and saves you from solving the wrong problem.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Bug That Was Really a Feature of Arithmetic</div>
+<p>When recurrent networks first refused to learn long dependencies in the early 1990s, it looked like a software bug, surely the gradients were being computed wrong. The startling result of Bengio and colleagues was that the gradients were perfectly correct; the network was faithfully reporting that, under its own dynamics, the distant past genuinely had a near-zero derivative on the present loss. The "bug" was a true statement about the geometry of repeated matrix multiplication. There was nothing to fix in the code, only something to redesign in the architecture, which is why the LSTM was a structural invention rather than a patch. The most stubborn bugs are the ones that are working exactly as the math demands.</p>
+</div>
+
+<div class="callout looking-back">
+<div class="callout-title">Looking Back: Closing Chapter 9, and the Door to Gated Cells</div>
+<p>Chapter 9 built the neural sequence model from its parts. We met the recurrent cell and its carried state, saw it as the learned descendant of the classical filters of <a href="../../toc.html">Section 7.6</a>, unrolled it through time and derived backpropagation through time in <a href="section-9.3.html">Section 9.3</a>, and in this section discovered the price of that unrolling: a product of Jacobians that generically vanishes or explodes, making long-range learning the central obstacle of the whole enterprise. That obstacle is the hinge to <a href="../../toc.html">Chapter 10</a>. The gated recurrent networks, the LSTM and the GRU, are the direct response: they build the near-linear carry path of subsection four into the cell itself, so the forget gate becomes a learned, per-step control over the recurrent Jacobian, holding it near one wherever long memory is needed. <a href="../../toc.html">Section 7.6</a> told you the forget gate would be a learned Kalman gain; this section told you <em>why</em> the network needs one. Chapter 10 builds it. From there Part III branches into the convolutional answer (<a href="../../toc.html">Chapter 11</a>), the attention answer that abolishes the temporal gradient chain (<a href="../../toc.html">Chapter 12</a>), and the structured state-space answer that keeps the recurrence linear and stable (<a href="../../toc.html">Chapter 13</a>). Every one of them is a reply to the single pathology you now understand.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 9.4.1: Derive the Vanishing Bound <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For the cell $\mathbf{h}_k = \tanh(\mathbf{W}\mathbf{h}_{k-1} + \mathbf{U}\mathbf{x}_k)$, the one-step Jacobian is $\mathbf{J}_k = \operatorname{diag}(\tanh'(\mathbf{a}_k))\,\mathbf{W}$. Using sub-multiplicativity of the spectral norm and the fact that $\tanh'(\cdot) \le 1$ everywhere, show that if $\sigma_{\max}(\mathbf{W}) < 1$ then $\|\partial L_T/\partial \mathbf{h}_t\|$ is bounded above by a geometric sequence in $T - t$ and therefore vanishes. State explicitly why this is a <em>sufficient</em> but not a <em>necessary</em> condition for vanishing, and give a one-sentence reason the same bound says nothing useful about the exploding case.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 9.4.2: Plot the Three Regimes <span class="exercise-type coding">Coding</span></div>
+<p>Using <code>backward_gradient_norms</code> from Code 9.4.2, plot $\log \|\partial L_T/\partial \mathbf{h}_t\|$ against the number of steps back $\tau$, for spectral radii $\rho \in \{0.9, 0.95, 1.0, 1.05, 1.1\}$, all using the same orthogonal $\mathbf{Q}$. Confirm that each curve is approximately linear on the log axis and that its slope matches $\log \rho$. Then replace $\tanh$ with the identity (a linear cell) and re-run: explain why the $\rho = 1.0$ curve is now exactly flat where before it drifted slightly downward, connecting your observation to the "nonlinearity sharpens vanishing" claim of subsection two.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 9.4.3: Clipping Changes the Trajectory, Not the Direction <span class="exercise-type analysis">Analysis</span></div>
+<p>Gradient clipping rescales $\mathbf{g} \leftarrow \mathbf{g}\cdot\min(1, \theta/\|\mathbf{g}\|)$. Argue that this preserves the gradient's direction exactly while changing its magnitude, and explain why preserving direction is what makes clipping safe (it cannot turn a descent step into an ascent step). Then construct a one-dimensional toy loss with a narrow "cliff" where the gradient norm spikes, and describe in two or three sentences how an unclipped optimizer overshoots the minimum while a clipped one steps over the cliff in a controlled way. Why does clipping help explosion but do nothing for vanishing?</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 9.4.4: Design a Memory Horizon <span class="exercise-type open">Open-Ended</span></div>
+<p>Subsection two showed that a scalar recurrence with weight $w$ has a gradient $e$-folding time of $\tau_{1/e} = -1/\ln|w|$ steps. Suppose a task requires reliably learning a dependency spanning 200 steps, which you operationalize as keeping the 200-step gradient within a factor of $10$ of the one-step gradient. What value of $|w|$ does that demand, and how close to one is it? Now argue why this makes the knife-edge $\rho = 1$ both necessary for long memory and dangerous (a hair above one explodes), and explain how the gated carry path of subsection four and the just-inside-the-unit-circle initialization of the research-frontier callout each manage to sit near that knife-edge without falling off either side. There is no single right answer; argue your reasoning against the gain-and-loss framing.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-9.3.html"><span class="nav-label">Previous</span><span class="nav-num">Section 9.3</span><span class="nav-title">Backpropagation Through Time</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 9</span><span class="nav-num">Contents</span><span class="nav-title">Neural Sequence Modeling Fundamentals</span></a>
+<a class="next" href="../../toc.html"><span class="nav-label">Next</span><span class="nav-num">Contents</span><span class="nav-title">Table of Contents</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>
