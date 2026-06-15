@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 10.1: Vanilla RNNs. The Elman recurrence h_t = tanh(W_h h_{t-1} + W_x x_t + b) and readout y_t = W_y h_t as a learned running summary, the forward pass over a sequence with parameter sharing across time, many-to-one and many-to-many output heads, what unbounded context an RNN can represent that a window MLP cannot, the vanishing-gradient limit in practice, and a from-scratch numpy/torch RNN cell trained on a sequence task with its nn.RNN library-shortcut equivalent struggling on a long-lag task." name="description"/>
+<title>Section 10.1: Vanilla RNNs | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Temporal Deep Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 10: Recurrent Neural Networks</a></div>
+<h1>Vanilla RNNs</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I have exactly one hidden state and I pour everything I have ever seen into it. The opening of the sequence, the surprise in the middle, the thing you told me a thousand steps ago: all of it, into the same little vector, overwritten a little more every step. I am not forgetful on purpose. I simply ran out of room around step thirty and have been improvising ever since."</p>
+<cite>A Vanilla RNN Doing Its Best With One Hidden State</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A vanilla recurrent neural network is the simplest possible learned sequence model: one hidden state vector $\mathbf{h}_t$ that is updated at every timestep by the same small rule, $\mathbf{h}_t = \tanh(\mathbf{W}_h \mathbf{h}_{t-1} + \mathbf{W}_x \mathbf{x}_t + \mathbf{b})$, with a readout $\mathbf{y}_t = \mathbf{W}_y \mathbf{h}_t$ on top.</strong> That single equation is the entire architecture, and it carries a surprising amount of conceptual weight. The hidden state is a <em>running summary</em> of the whole past, compressed into a fixed-width vector and refreshed by a rule whose weights are shared across every step. That sharing is what lets one finite network read a sequence of any length and, in principle, condition its prediction on the entire history rather than a fixed window. This section writes the Elman recurrence precisely, runs its forward pass over a sequence, shows why parameter sharing gives an RNN unbounded context that a window MLP can never have, then confronts the hard practical truth: the same repeated multiplication that gives the RNN its reach also makes its gradient vanish, so in practice a vanilla RNN forgets the distant past it could represent in theory. We build the cell from scratch in numpy and torch, train it on a real sequence task, collapse it to three lines with <code>nn.RNN</code> and Adam, and watch it fail on a long-lag task, the failure that motivates the gated cells of <a href="section-10.2.html">Sections 10.2</a> and <a href="section-10.3.html">10.3</a>.</p>
+</div>
+<p>Chapter 9 built the machinery of neural sequence modeling without committing to a specific architecture: <a href="../module-09-neural-sequence-fundamentals/section-9.3.html">Section 9.3</a> derived backpropagation through time over a generic recurrence, and Section 9.4 dissected the vanishing and exploding gradients that the unrolled chain produces. This section fills in the simplest concrete cell that lives inside that machinery, the Elman recurrent network, and makes it run. The recurrence we use is exactly the skeleton that closed Part II, where <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/section-7.6.html">Section 7.6</a> showed the Kalman filter, the HMM forward pass, and the RNN to be one loop, $\mathbf{h}_t = f(\mathbf{h}_{t-1}, \mathbf{x}_t)$, $\mathbf{y}_t = g(\mathbf{h}_t)$, distinguished only by how $f$ and $g$ are chosen. The state-space models of Part II fixed $f$ and $g$ from a hand-specified dynamical model; the RNN of this section <em>learns</em> them by gradient descent. Throughout we use the unified notation of <a href="../../toc.html">Appendix A</a>: $\mathbf{x}_t$ the input at step $t$, $\mathbf{h}_t$ the hidden state, $\mathbf{y}_t$ the readout, $\mathbf{W}_h, \mathbf{W}_x, \mathbf{W}_y$ the shared weights.</p>
+<p>By the end of this section you will be able to write the Elman recurrence and explain each term; run the forward pass over a batch of sequences and pick the right output head (many-to-one versus many-to-many) for a task; argue precisely what an RNN can represent that a fixed-window MLP cannot; explain why that representational reach is undercut in practice by vanishing gradients; and implement, train, and library-shortcut a vanilla RNN, including a demonstration of its long-lag failure. These competencies are the foundation for every recurrent architecture in this chapter, and the failure we end on is the precise motivation for the gates that follow.</p>
+
+<h2>1. The Elman Recurrence: One State, One Rule, Shared Across Time <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The vanilla RNN, introduced by Jeffrey Elman in 1990, is defined by two equations and nothing more. At each timestep it updates a hidden state and reads out a prediction:</p>
+$$\mathbf{h}_t = \tanh\!\big(\mathbf{W}_h \mathbf{h}_{t-1} + \mathbf{W}_x \mathbf{x}_t + \mathbf{b}\big), \qquad \mathbf{y}_t = \mathbf{W}_y \mathbf{h}_t.$$
+<p>Read the update term by term. The input $\mathbf{x}_t \in \mathbb{R}^{d_x}$ is the observation at step $t$; the matrix $\mathbf{W}_x \in \mathbb{R}^{d_h \times d_x}$ projects it into the hidden space. The previous state $\mathbf{h}_{t-1} \in \mathbb{R}^{d_h}$ is everything the network remembers about the past; the recurrent matrix $\mathbf{W}_h \in \mathbb{R}^{d_h \times d_h}$ decides how that memory is carried forward and mixed. Their sum, plus a bias $\mathbf{b}$, is squashed through $\tanh$ into the new state $\mathbf{h}_t$, which is bounded componentwise in $(-1, 1)$. The readout matrix $\mathbf{W}_y \in \mathbb{R}^{d_y \times d_h}$ turns the state into an output of whatever dimension the task needs. The sequence is initialized with $\mathbf{h}_0$, usually the zero vector or a learned constant.</p>
+<p>The single most important property is hidden in plain sight: the three matrices $\mathbf{W}_h$, $\mathbf{W}_x$, $\mathbf{W}_y$ and the bias $\mathbf{b}$ do not depend on $t$. The <em>same</em> rule is applied at step one, step ten, and step ten thousand. This is the recurrence skeleton of <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/section-7.6.html">Section 7.6</a>, now with the transition and emission learned rather than derived from physics. And it is precisely the unrolling target of <a href="../module-09-neural-sequence-fundamentals/section-9.3.html">Section 9.3</a>: stamp this one cell onto every timestep, tie the weights, and you get the deep feedforward graph that backpropagation through time differentiates. The whole of Section 10.1 is an exploration of what this two-line rule can and cannot do.</p>
+<p>The right way to think about $\mathbf{h}_t$ is as a <em>running summary</em> of the sequence so far. It is the network's lossy compression of $\mathbf{x}_1, \dots, \mathbf{x}_t$ into a fixed-size $d_h$-dimensional vector. Nothing in the architecture grows as the sequence lengthens: a single $d_h$-vector must hold whatever the network needs from a past of arbitrary length. This is the source of both the RNN's power (a fixed network handles any length) and its central weakness (a fixed-width summary must forget, and the next subsection's gradient analysis shows it forgets the distant past first). The state is a memory with a hard size budget and an overwrite-every-step update policy.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Hidden State Is a Fixed-Width Compression of an Unbounded Past</div>
+<p>An RNN does not store the sequence; it stores a summary. Every step, the old summary $\mathbf{h}_{t-1}$ is linearly remixed by $\mathbf{W}_h$, blended with the new input through $\mathbf{W}_x$, and squashed back into the same $d_h$-dimensional box. Because the box never grows, the network is forced to decide, implicitly through its learned weights, what to keep and what to discard. A well-trained $\mathbf{W}_h$ keeps the task-relevant signal alive across many steps; a poorly conditioned one lets it leak away in a few. The entire study of recurrent architectures, from this vanilla cell through the gates of <a href="section-10.2.html">Section 10.2</a> to the state-space models of <a href="../../toc.html">Chapter 13</a>, is the study of how to make a fixed-width state hold the right information for long enough.</p>
+</div>
+
+<h2>2. The Forward Pass: Parameter Sharing and Output Heads <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Running an RNN forward is a single loop. Start at $\mathbf{h}_0$, then for $t = 1, \dots, T$ apply the update to fold in $\mathbf{x}_t$ and produce $\mathbf{h}_t$ (and, if the task wants it, a per-step output $\mathbf{y}_t$). Because the weights are shared, the same handful of matrices is reused at every iteration: an RNN with $d_h = 128$, $d_x = 10$, $d_y = 1$ has a few tens of thousands of parameters whether it processes sequences of length ten or length ten thousand. Figure 10.1.1 shows the recurrence drawn as a folded loop on the left and unrolled across three steps on the right, the two views we move between constantly.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 290" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Left: the RNN drawn as a single cell with a self-loop labeled W_h, fed by input x through W_x and emitting output y through W_y. Right: the same cell unrolled over three timesteps into a left-to-right chain of hidden states h1, h2, h3 connected by the shared recurrent weight W_h, each receiving an input x through the shared W_x and emitting an output y through the shared W_y.">
+<defs>
+<marker id="arr101" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.cell101 { fill:#eef3f8; stroke:#14385c; stroke-width:2; }
+.io101 { fill:#fbeee8; stroke:#b8431f; stroke-width:1.6; }
+.fl101 { stroke:#5a626c; stroke-width:1.8; fill:none; marker-end:url(#arr101); }
+.lab101 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub101 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.wt101 { font:600 12px sans-serif; fill:#b8431f; text-anchor:middle; }
+.ttl101 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+</style>
+<text class="ttl101" x="160" y="22">Folded</text>
+<text class="ttl101" x="560" y="22">Unrolled over three steps</text>
+<!-- folded -->
+<rect class="cell101" x="120" y="120" width="80" height="56" rx="9"/><text class="lab101" x="160" y="153">h</text>
+<path class="fl101" d="M200,128 C260,90 260,206 200,168"/><text class="wt101" x="252" y="152">W&#8341;</text>
+<rect class="io101" x="125" y="232" width="70" height="26" rx="6"/><text class="sub101" x="160" y="249">x&#8348;</text>
+<line class="fl101" x1="160" y1="232" x2="160" y2="178"/><text class="wt101" x="178" y="208">W&#8339;</text>
+<rect class="io101" x="125" y="62" width="70" height="26" rx="6"/><text class="sub101" x="160" y="79">y&#8348;</text>
+<line class="fl101" x1="160" y1="118" x2="160" y2="90"/><text class="wt101" x="178" y="106">W&#8349;</text>
+<!-- unrolled -->
+<rect class="cell101" x="380" y="120" width="70" height="50" rx="9"/><text class="lab101" x="415" y="150">h&#8321;</text>
+<rect class="cell101" x="525" y="120" width="70" height="50" rx="9"/><text class="lab101" x="560" y="150">h&#8322;</text>
+<rect class="cell101" x="670" y="120" width="70" height="50" rx="9"/><text class="lab101" x="705" y="150">h&#8323;</text>
+<line class="fl101" x1="320" y1="145" x2="378" y2="145"/><text class="sub101" x="345" y="136">h&#8320;</text>
+<line class="fl101" x1="450" y1="145" x2="523" y2="145"/><text class="wt101" x="487" y="136">W&#8341;</text>
+<line class="fl101" x1="595" y1="145" x2="668" y2="145"/><text class="wt101" x="632" y="136">W&#8341;</text>
+<line class="fl101" x1="415" y1="232" x2="415" y2="172"/><text class="sub101" x="415" y="248">x&#8321;</text>
+<line class="fl101" x1="560" y1="232" x2="560" y2="172"/><text class="sub101" x="560" y="248">x&#8322;</text>
+<line class="fl101" x1="705" y1="232" x2="705" y2="172"/><text class="sub101" x="705" y="248">x&#8323;</text>
+<line class="fl101" x1="415" y1="118" x2="415" y2="92"/><text class="sub101" x="415" y="84">y&#8321;</text>
+<line class="fl101" x1="560" y1="118" x2="560" y2="92"/><text class="sub101" x="560" y="84">y&#8322;</text>
+<line class="fl101" x1="705" y1="118" x2="705" y2="92"/><text class="sub101" x="705" y="84">y&#8323;</text>
+</svg>
+<figcaption><strong>Figure 10.1.1:</strong> The vanilla RNN folded (left) and unrolled (right). The self-loop on the left, labeled with the recurrent weight $\mathbf{W}_h$, becomes the horizontal chain on the right; the same $\mathbf{W}_h$, $\mathbf{W}_x$, $\mathbf{W}_y$ appear at every step. The folded view is the model; the unrolled view is what backpropagation through time (Section 9.3) differentiates.</figcaption>
+</figure>
+<p>How we read predictions off the state depends on the task, and there are two dominant patterns. In a <strong>many-to-one</strong> head the network consumes the whole sequence and produces a single output, almost always from the final state: $\mathbf{y} = \mathbf{W}_y \mathbf{h}_T$. This is the shape of sequence classification (is this ECG trace arrhythmic?) and of point forecasting (given the last $T$ observations, predict the next value). In a <strong>many-to-many</strong> head the network produces an output at every step, $\mathbf{y}_t = \mathbf{W}_y \mathbf{h}_t$ for all $t$, which is the shape of sequence labeling (tag each token), of next-step prediction in language modeling, and of multi-step forecasting where each step emits a prediction. The two heads share the identical recurrence; they differ only in which states feed the readout and the loss. Table 10.1.2 lays out the common configurations.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Head</th><th>Reads out at</th><th>Loss over</th><th>Typical temporal task</th></tr></thead>
+<tbody>
+<tr><td>many-to-one</td><td>final state $\mathbf{h}_T$</td><td>one output</td><td>sequence classification; one-step-ahead point forecast</td></tr>
+<tr><td>many-to-many (aligned)</td><td>every state $\mathbf{h}_t$</td><td>all $T$ outputs</td><td>per-step labeling; next-token / next-value prediction</td></tr>
+<tr><td>many-to-many (delayed)</td><td>states after an encode phase</td><td>output window</td><td>sequence-to-sequence forecasting (encoder then decoder)</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Table 10.1.2:</strong> Output heads on the same vanilla recurrence. The recurrence is identical across all three; only the choice of which states feed the readout, and where the loss is measured, changes. The encoder-decoder (delayed) variant is the bridge to the sequence-to-sequence models of <a href="../../toc.html">Chapter 14</a>.</figcaption>
+</figure>
+<p>One consequence of parameter sharing deserves emphasis because it is easy to miss and central to everything that follows. Because $\mathbf{W}_x$ is shared, the RNN applies the <em>same</em> feature extractor to the input at every position; it does not have a separate "position 5 weight" the way a window MLP has a separate weight for each slot of its window. This positional invariance is a strong, often correct, inductive bias for time series: a pattern means the same thing whether it appears early or late. It is also why an RNN trained on length-50 sequences can be run, without retraining, on length-500 sequences: there is no parameter tied to a position that does not exist at training time. We exploit exactly this in subsection four when the model trained on short sequences is asked to handle a long lag.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Network That Refuses to Count Its Own Layers</div>
+<p>Ask a 50-layer ResNet how deep it is and it will tell you: fifty, fixed at construction. Ask a vanilla RNN and it shrugs, because its depth is whatever the sequence happens to be today. Feed it three steps and it is a three-layer net; feed it three thousand and it is a three-thousand-layer net, with the exact same parameters. It is the only architecture in this book whose depth is decided by its input rather than its blueprint. This is a delightful flexibility and, as subsection three reveals, the precise reason it has trouble: a network that can become three thousand layers deep inherits every gradient pathology that three thousand layers imply.</p>
+</div>
+
+<h2>3. Reach Versus Reality: Unbounded Context and the Vanishing-Gradient Limit <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>What can an RNN represent that a fixed-window model cannot? The honest answer is the whole reason RNNs exist. Consider the natural baseline: a window MLP that takes the last $w$ observations $\mathbf{x}_{t-w+1}, \dots, \mathbf{x}_t$ as a flat input vector and predicts $\mathbf{y}_t$. Such a model is structurally blind beyond its window. Any dependency longer than $w$ steps simply cannot reach its output, because the inputs that would carry it were never presented. To capture a longer dependency you must enlarge $w$, and the parameter count grows with the window, so unbounded context demands unbounded parameters. The window is a hard horizon baked into the architecture.</p>
+<p>The RNN removes that horizon in principle. Because the hidden state is carried forward indefinitely and updated by a rule that never resets, information from $\mathbf{x}_1$ can in principle still be present in $\mathbf{h}_T$ for any $T$, with a fixed parameter count. The recurrence is, in the formal sense, a universal model of sequences: an RNN with enough hidden units can approximate any measurable sequence-to-sequence mapping, and with unbounded precision and time it is Turing complete (Siegelmann and Sontag, 1992). So on paper the vanilla RNN dominates the window MLP outright: unbounded context, no horizon, constant parameters. Figure 10.1.3 contrasts the two reaches.</p>
+<figure class="diagram">
+<svg viewBox="0 0 760 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Top row: a window MLP at time t connects only to the last four inputs inside a shaded box; earlier inputs are outside its reach. Bottom row: an RNN at time t connects through a chain of hidden states all the way back to the first input, so every past input is in principle reachable.">
+<style>
+.in101b { fill:#eef3f8; stroke:#14385c; stroke-width:1.5; }
+.win101 { fill:#fdf3ee; stroke:#b8431f; stroke-width:1.6; stroke-dasharray:5 3; }
+.st101 { fill:#e8f0ea; stroke:#1f6b3a; stroke-width:1.5; }
+.cn101 { stroke:#5a626c; stroke-width:1.4; fill:none; }
+.cn101g { stroke:#1f6b3a; stroke-width:1.4; fill:none; }
+.lab101b { font:600 12px sans-serif; fill:#14385c; text-anchor:middle; }
+.note101 { font:12px sans-serif; fill:#5a626c; text-anchor:start; }
+.note101g { font:12px sans-serif; fill:#1f6b3a; text-anchor:start; }
+</style>
+<text class="lab101b" x="380" y="20" style="fill:#b8431f">Window MLP: reach = w (here 4)</text>
+<rect class="win101" x="430" y="36" width="250" height="40" rx="6"/>
+<g>
+<rect class="in101b" x="60" y="44" width="40" height="24" rx="4"/><text class="lab101b" x="80" y="61">x&#8321;</text>
+<rect class="in101b" x="150" y="44" width="40" height="24" rx="4"/><text class="lab101b" x="170" y="61">x&#8322;</text>
+<rect class="in101b" x="340" y="44" width="40" height="24" rx="4"/><text class="lab101b" x="360" y="61">&#8230;</text>
+<rect class="in101b" x="440" y="44" width="40" height="24" rx="4"/><text class="lab101b" x="460" y="61">x&#8348;&#8331;&#8323;</text>
+<rect class="in101b" x="510" y="44" width="40" height="24" rx="4"/><text class="lab101b" x="530" y="61">x&#8348;&#8331;&#8322;</text>
+<rect class="in101b" x="580" y="44" width="40" height="24" rx="4"/><text class="lab101b" x="600" y="61">x&#8348;&#8331;&#8321;</text>
+<rect class="in101b" x="640" y="44" width="34" height="24" rx="4"/><text class="lab101b" x="657" y="61">x&#8348;</text>
+</g>
+<text class="note101" x="60" y="100">x&#8321;, x&#8322; lie outside the window: structurally unreachable.</text>
+<text class="lab101b" x="380" y="146" style="fill:#1f6b3a">RNN: reach = entire history through the state chain</text>
+<g>
+<rect class="st101" x="60" y="160" width="40" height="24" rx="4"/><text class="lab101b" x="80" y="177">h&#8321;</text>
+<rect class="st101" x="150" y="160" width="40" height="24" rx="4"/><text class="lab101b" x="170" y="177">h&#8322;</text>
+<rect class="st101" x="340" y="160" width="40" height="24" rx="4"/><text class="lab101b" x="360" y="177">&#8230;</text>
+<rect class="st101" x="640" y="160" width="34" height="24" rx="4"/><text class="lab101b" x="657" y="177">h&#8348;</text>
+<path class="cn101g" d="M100,172 L150,172"/><path class="cn101g" d="M190,172 L340,172"/><path class="cn101g" d="M380,172 L640,172"/>
+</g>
+<text class="note101g" x="60" y="208">A path of state updates links every x&#8342; to h&#8348;: unbounded reach in principle.</text>
+</svg>
+<figcaption><strong>Figure 10.1.3:</strong> Why an RNN can represent what a window MLP cannot. The MLP's reach is its window $w$; anything older is structurally invisible. The RNN's hidden-state chain connects every past input to the present state, so unbounded context is available in principle, with a constant parameter count.</figcaption>
+</figure>
+<p>Now the reality. The path that gives the RNN its reach is a chain of state updates, and a gradient that must train that reach has to travel back along the same chain, multiplying one hidden-to-hidden Jacobian per step exactly as <a href="../module-09-neural-sequence-fundamentals/section-9.3.html">Section 9.3</a> derived. For the $\tanh$ cell that Jacobian is $\mathbf{J}_t = \operatorname{diag}(1 - \mathbf{h}_t^2)\,\mathbf{W}_h$, and a gradient travelling from step $t$ back to step $k$ is multiplied by the product $\prod_{j=k+1}^{t} \mathbf{J}_j$. Because $\tanh'$ is at most one and typically much less, and because a randomly initialized $\mathbf{W}_h$ has a spectral radius that is rarely exactly one, this product shrinks geometrically when the per-step Jacobian norm is below one (the gradient vanishes) or grows geometrically when it is above one (the gradient explodes). This is the vanishing/exploding gradient pathology that <a href="../../toc.html">Section 9.4</a> analyzed in full, and for the vanilla RNN it is decisive.</p>
+<p>The practical consequence is a painful gap between representation and learning. An RNN <em>can</em> represent a 200-step dependency, but if the gradient that would teach it that dependency has decayed by a factor of, say, $0.8^{200} \approx 10^{-19}$ by the time it reaches the relevant early weights, the dependency is never learned. The network has the capacity and lacks the training signal. Empirically, vanilla RNNs reliably learn dependencies of roughly ten to twenty steps and struggle badly beyond that, a limit that has nothing to do with their representational power and everything to do with the geometry of the gradient. This single fact, the unbounded reach undercut by a vanishing gradient, is the reason the rest of this chapter exists.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: How Fast the Signal Fades</div>
+<p>Suppose the per-step hidden-to-hidden Jacobian has settled to a roughly constant magnitude $\gamma = \|\mathbf{J}_t\| \approx 0.85$, a perfectly ordinary value for a $\tanh$ RNN whose states are not saturated. The gradient signal carrying a dependency of length $s$ scales as $\gamma^{s}$. For $s = 10$, $\gamma^{10} = 0.85^{10} \approx 0.197$, about a fifth of full strength: still learnable. For $s = 50$, $\gamma^{50} \approx 2.7 \times 10^{-4}$, three to four orders of magnitude down: marginal. For $s = 200$, $\gamma^{200} \approx 5.2 \times 10^{-15}$: utterly swamped by numerical noise and by the gradients of nearer steps, so the long dependency is effectively invisible to the optimizer. Flip to the exploding side with $\gamma = 1.15$: now $\gamma^{200} \approx 1.6 \times 10^{12}$, and the gradient overflows instead. The window the vanilla RNN can actually train is set by how close $\gamma$ sits to one, and one is a knife edge it almost never balances on, which is exactly the problem the gated cells of <a href="section-10.2.html">Section 10.2</a> are engineered to fix.</p>
+</div>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Representational Reach and Trainable Reach Are Different Quantities</div>
+<p>The vanilla RNN's headline property, unbounded context, is a statement about what it can <em>represent</em>, not about what gradient descent can <em>teach</em> it. Representation is generous: a fixed network can in principle condition on an arbitrarily long past. Training is stingy: the gradient that would shape that conditioning decays (or blows up) geometrically with the dependency length, so the effectively trainable horizon is short, on the order of ten to twenty steps for a plain $\tanh$ RNN. Keep these two horizons separate in your head. Almost every advance in this chapter, from LSTM and GRU gates to the parallel scans of <a href="../../toc.html">Chapter 13</a>, is an attempt to widen the trainable horizon up toward the representational one without giving up the constant-parameter, any-length virtues of recurrence.</p>
+</div>
+
+<h2>4. Worked Example: A Vanilla RNN From Scratch, Then With nn.RNN <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make the cell run. The task is deliberately small and interpretable so the mechanics stay visible. We pose a <em>cumulative-sum threshold</em> problem: each input is a short window of a noisy sensor stream (the sensor-IoT series threaded through <a href="../../toc.html">Chapter 8</a>), and the many-to-one target at the final step is whether the running sum of a hidden driver has crossed a threshold. The dependency is short here, well inside the trainable horizon, so the vanilla RNN learns it cleanly. Then we deliberately stretch the lag and watch it fail. Code 10.1.1 implements the Elman cell and its forward pass from scratch with torch tensors, no <code>nn</code> module, so every matrix multiply of subsection one is visible.</p>
+<pre><code class="language-python">import torch
+
+torch.manual_seed(0)
+d_x, d_h, d_y = 4, 32, 1                       # input, hidden, output widths
+
+def make_batch(n, T, lag):
+    """n sequences of length T; label = 1 if the driver summed over the FIRST
+    `lag` steps exceeds 0. Long lag => long-range dependency the RNN must learn."""
+    x = torch.randn(n, T, d_x)                 # noisy multivariate sensor windows
+    driver = x[:, :lag, 0].sum(dim=1)          # the signal lives in feature 0, first `lag` steps
+    y = (driver > 0).float().unsqueeze(1)      # many-to-one binary target at the final step
+    return x, y
+
+# --- The Elman cell, from scratch: parameters are bare tensors we update by hand. ---
+def init_params():
+    g = 1.0 / d_h ** 0.5
+    return {
+        "Wx": (torch.randn(d_h, d_x) * g).requires_grad_(),   # input -> hidden
+        "Wh": (torch.randn(d_h, d_h) * g).requires_grad_(),   # hidden -> hidden (the recurrence)
+        "b":  torch.zeros(d_h, requires_grad=True),           # hidden bias
+        "Wy": (torch.randn(d_y, d_h) * g).requires_grad_(),   # hidden -> output
+    }
+
+def rnn_forward(p, x):
+    """Run h_t = tanh(Wh h_{t-1} + Wx x_t + b) over the sequence; read out from h_T."""
+    n, T, _ = x.shape
+    h = torch.zeros(n, d_h)                     # h_0 = 0, the running summary starts empty
+    for t in range(T):                          # the time loop: same weights every step
+        h = torch.tanh(x[:, t] @ p["Wx"].T + h @ p["Wh"].T + p["b"])
+    return h @ p["Wy"].T                         # many-to-one readout from the FINAL state
+
+def train(p, T, lag, steps=400, lr=0.05):
+    bce = torch.nn.BCEWithLogitsLoss()
+    for s in range(steps):
+        x, y = make_batch(128, T, lag)
+        logits = rnn_forward(p, x)
+        loss = bce(logits, y)
+        loss.backward()
+        with torch.no_grad():                   # manual SGD step on the bare tensors
+            for v in p.values():
+                v -= lr * v.grad; v.grad.zero_()
+    return loss.item()
+
+p = init_params()
+final_loss = train(p, T=12, lag=4)              # SHORT lag: dependency well inside trainable horizon
+# evaluate accuracy on a fresh batch
+xe, ye = make_batch(2000, 12, 4)
+acc = ((torch.sigmoid(rnn_forward(p, xe)) > 0.5).float() == ye).float().mean()
+print("from-scratch RNN, short lag=4:  train loss %.3f  test acc %.3f" % (final_loss, acc))
+</code></pre>
+<div class="code-caption"><strong>Code 10.1.1:</strong> The vanilla RNN built from scratch with bare torch tensors. The forward pass is the literal time loop of subsection one, $\mathbf{h}_t = \tanh(\mathbf{W}_x\mathbf{x}_t + \mathbf{W}_h\mathbf{h}_{t-1} + \mathbf{b})$, with a many-to-one readout from the final state and a hand-written SGD update. Counting the parameter dictionary, forward loop, and training loop, this is roughly 30 lines of explicit recurrence.</div>
+<pre><code class="language-text">from-scratch RNN, short lag=4:  train loss 0.118  test acc 0.961
+</code></pre>
+<div class="code-caption"><strong>Output 10.1.1:</strong> On the short-lag task (dependency length 4, inside the trainable horizon) the from-scratch vanilla RNN converges and reaches 96 percent test accuracy. The recurrence learns the short dependency without difficulty.</div>
+<p>Now the library pair. Code 10.1.2 replaces the entire hand-built cell, the parameter dictionary, the explicit time loop, and the manual SGD step, with <code>nn.RNN</code> (which is exactly the Elman $\tanh$ cell of subsection one) plus an Adam optimizer. The recurrence, the weight management, and backpropagation through time are all internal.</p>
+<pre><code class="language-python">import torch.nn as nn
+
+class RNNClassifier(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.rnn = nn.RNN(d_x, d_h, batch_first=True, nonlinearity="tanh")  # the Elman cell
+        self.head = nn.Linear(d_h, d_y)                                     # readout from h_T
+
+    def forward(self, x):
+        out, h_T = self.rnn(x)            # out: all states; h_T: final state (1, n, d_h)
+        return self.head(h_T.squeeze(0))  # many-to-one: classify from the final state
+
+def train_lib(T, lag, steps=400):
+    model = RNNClassifier()
+    opt = torch.optim.Adam(model.parameters(), lr=0.01)   # Adam, not hand-rolled SGD
+    bce = nn.BCEWithLogitsLoss()
+    for s in range(steps):
+        x, y = make_batch(128, T, lag)
+        loss = bce(model(x), y)
+        opt.zero_grad(); loss.backward(); opt.step()
+    xe, ye = make_batch(2000, T, lag)
+    acc = ((torch.sigmoid(model(xe)) > 0.5).float() == ye).float().mean()
+    return loss.item(), acc.item()
+
+l_short, a_short = train_lib(T=12, lag=4)    # short lag: should match the from-scratch result
+l_long,  a_long  = train_lib(T=60, lag=55)   # LONG lag: dependency far beyond the trainable horizon
+print("nn.RNN short lag=4:   train loss %.3f  test acc %.3f" % (l_short, a_short))
+print("nn.RNN long  lag=55:  train loss %.3f  test acc %.3f" % (l_long,  a_long))
+</code></pre>
+<div class="code-caption"><strong>Code 10.1.2:</strong> The same model with <code>nn.RNN</code> and Adam. The from-scratch parameter dictionary, the explicit time loop, and the hand-written SGD update of Code 10.1.1 (about 30 lines) collapse to one <code>nn.RNN</code> layer plus one <code>nn.Linear</code>, roughly an eight-line model: the library supplies the Elman recurrence, the weight initialization, and backpropagation through time internally. The second training call stretches the lag to 55 steps to probe the long-range limit.</div>
+<pre><code class="language-text">nn.RNN short lag=4:   train loss 0.087  test acc 0.974
+nn.RNN long  lag=55:  train loss 0.690  test acc 0.531
+</code></pre>
+<div class="code-caption"><strong>Output 10.1.2:</strong> On the short lag the library RNN matches the from-scratch version (97 percent). On the 55-step lag it collapses to chance (53 percent, loss stuck near $\ln 2 \approx 0.693$): the dependency is representable but, because the gradient has vanished across 55 steps, untrainable. This is the limit of subsection three, made concrete.</div>
+<p>Read the three numbers together. Both the from-scratch cell and the library cell solve the short-lag task at well above 95 percent, confirming that the two implementations are the same model and that short dependencies are easy. The library cell then fails on the long-lag task, dropping to chance with a loss pinned at $\ln 2$, the loss of a classifier that has learned nothing. The model did not run out of capacity; it ran out of gradient. A 55-step dependency is trivially representable by the recurrence and entirely invisible to the optimizer, because the signal that would teach it has decayed below noise. This is precisely the gap between representational reach and trainable reach from subsection three, reproduced in twenty lines of code, and it is the exact failure the gated cells of the next section repair.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: When a Vanilla RNN Was the Right Call (and When It Was Not)</div>
+<p><strong>Who:</strong> A wearables startup building a real-time gesture detector that runs on-device on a low-power microcontroller, classifying short accelerometer sequences into a small gesture vocabulary.</p>
+<p><strong>Situation:</strong> The team's first instinct, fresh off a transformer course, was to ship an attention model. The device had a few hundred kilobytes of RAM and a strict per-inference energy budget; a transformer's memory and compute did not fit.</p>
+<p><strong>Problem:</strong> The relevant gestures unfold over roughly 20 to 40 samples at the chosen sampling rate, a genuinely short temporal dependency, and inference had to be cheap, streaming, and constant-memory per step.</p>
+<p><strong>Dilemma:</strong> A vanilla RNN is tiny, streams naturally (one state vector carried forward), and trains easily on short dependencies, but it cannot learn long-range structure. A gated cell (LSTM/GRU) handles long range but is three to four times larger and slower. A transformer is the most capable and the least deployable here.</p>
+<p><strong>Decision:</strong> Because the dependency length (under 40 steps) sat right at the edge of the vanilla RNN's trainable horizon and the deployment budget was brutal, they shipped a small vanilla RNN with careful gradient clipping and orthogonal recurrent initialization to keep the per-step Jacobian near one.</p>
+<p><strong>How:</strong> They trained with <code>nn.RNN</code>, clipped gradient norm at 1.0 to tame the exploding side, initialized $\mathbf{W}_h$ orthogonally so its spectral radius started at one, and kept sequences short by windowing the stream, exactly the regime where subsection three says the vanilla cell works.</p>
+<p><strong>Result:</strong> The model fit in 60 KB, ran within budget, and matched a GRU's accuracy on this short-dependency task while being a third the size. Two months later, asked to also recognize a slow two-second gesture (200 samples), the same architecture failed to learn it, and they switched that head to a GRU.</p>
+<p><strong>Lesson:</strong> The vanilla RNN is not obsolete; it is the right tool when dependencies are short and the deployment budget is tight. Match the architecture's trainable horizon to the task's real dependency length, and do not reach for a transformer when a 60 KB recurrence will do, nor cling to a vanilla cell when the dependency outruns its horizon.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: One Layer Instead of a Hand-Written Loop</div>
+<p>The from-scratch cell of Code 10.1.1, the parameter dictionary, the explicit <code>for t in range(T)</code> recurrence, and the manual SGD step, ran about 30 lines. PyTorch collapses all of it to a single layer: <code>nn.RNN</code> is the Elman $\tanh$ cell verbatim, with the time loop, weight initialization, and backpropagation through time handled internally and in optimized C++/CUDA. Stack layers, run bidirectionally, or process packed variable-length batches by flipping arguments, none of which the hand-written version supports without substantial extra code.</p>
+<pre><code class="language-python">import torch.nn as nn
+
+# A 2-layer, bidirectional vanilla RNN over batched, variable-length sequences:
+rnn = nn.RNN(input_size=4, hidden_size=32, num_layers=2,
+             nonlinearity="tanh", batch_first=True, bidirectional=True)
+outputs, h_final = rnn(x)        # x: (batch, time, 4); outputs: (batch, time, 64)
+# the entire recurrence + BPTT is inside this one call; .backward() trains it
+</code></pre>
+<div class="code-caption"><strong>Code 10.1.3:</strong> <code>nn.RNN</code> reduces the from-scratch cell to one line and adds stacking, bidirectionality, and variable-length support for free. The library handles the recurrence, parameter sharing, and backpropagation through time that subsections one through three derived by hand.</div>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: The Vanilla Recurrence, Reborn (2023 to 2026)</div>
+<p>The vanilla RNN was widely declared dead after the transformer era began, yet the simple recurrence has come roaring back in a new guise. Two 2023 papers reframe it directly. <em>Resurrecting Recurrent Neural Networks for Long Sequences</em> (Orvieto et al., 2023) shows that a <em>linear</em> recurrence (dropping the $\tanh$), with careful complex-diagonal initialization and normalization, matches deep state-space models on long-range benchmarks while training by a parallel scan rather than a sequential loop, the Linear Recurrent Unit. In parallel, the selective state-space model Mamba (Gu and Dao, 2023) and Mamba-2 (Dao and Gu, 2024) are, at heart, input-dependent linear recurrences trained with the same parallel-scan trick, and they rival transformers on language while keeping the constant-per-step memory that drew people to RNNs in the first place. A third strand, the minimal-gated revisits such as minGRU and minLRU (Feng et al., 2024), strips recurrent cells down to a parallelizable core and finds that much of the gating machinery of <a href="section-10.2.html">Section 10.2</a> can be simplified once the recurrence is made linear and scannable. The lesson for 2026: the vanilla RNN's weakness was never the recurrence itself but the $\tanh$ nonlinearity inside the loop and the sequential training it forced; remove those and the humble running-summary state, the very idea this section introduces, is once again competitive with attention. These linear-recurrence descendants are the subject of <a href="../../toc.html">Chapter 13</a>.</p>
+</div>
+
+<h2>Exercises</h2>
+<ol class="exercises">
+<li><strong>(Conceptual)</strong> A colleague claims that "an RNN and a window MLP with a very large window are basically equivalent, since both can see far into the past." State precisely the two ways this claim is wrong: one about parameter count as the horizon grows, and one about the difference between what an RNN can <em>represent</em> and what it can <em>train</em>. Then describe a task on which the RNN's positional weight sharing (subsection two) is the <em>wrong</em> inductive bias, and explain why.</li>
+<li><strong>(Coding)</strong> Extend Code 10.1.1 to a <em>many-to-many</em> head: read out $\mathbf{y}_t = \mathbf{W}_y\mathbf{h}_t$ at every step and define the task as predicting, at each step, the sign of the running cumulative sum so far. Train it and report per-step accuracy as a function of position $t$. Verify empirically that accuracy degrades for later positions when you increase the sequence length past about 20, and connect the degradation to the $\gamma^{s}$ decay of the numeric example in subsection three.</li>
+<li><strong>(Analysis)</strong> Using the from-scratch cell, sweep the spectral radius of the recurrent matrix $\mathbf{W}_h$ at initialization (scale $\mathbf{W}_h$ by factors $0.5, 0.9, 1.0, 1.1, 1.5$) and, for a fixed long-lag task, measure (a) the norm of the gradient $\partial \mathcal{L}/\partial \mathbf{W}_h$ and (b) final test accuracy. Plot both against the scale factor. Explain the U-shaped or cliff-shaped curve you observe in terms of the vanishing/exploding-gradient argument, and identify which scale corresponds to the orthogonal initialization the practical example used.</li>
+</ol>
+
+<nav class="chapter-nav">
+<a class="nav-prev" href="index.html">&#8592; Contents</a>
+<a class="nav-up" href="index.html">Chapter 10: Recurrent Neural Networks</a>
+<a class="nav-next" href="section-10.2.html">LSTM Networks &#8594;</a>
+</nav>
+</main>
+<footer class="site-footer">
+<p class="edition-line">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="copyright">&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+<p class="last-updated"><script>document.write("Last updated: " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

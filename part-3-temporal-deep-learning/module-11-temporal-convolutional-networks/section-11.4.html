@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 11.4: WaveNet. A deep stack of dilated causal convolutions with gated activation units (tanh times sigmoid), residual and skip connections; autoregressive one-sample-at-a-time generation and the train-parallel generate-slow asymmetry; the categorical and mixture outputs with quantization; from audio to probabilistic time-series forecasting; and a from-scratch gated dilated-conv block trained on a 1D signal that autoregressively generates a continuation." name="description"/>
+<title>Section 11.4: WaveNet | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Temporal Deep Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 11: Temporal Convolutional Networks</a></div>
+<h1>WaveNet</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I was trained in a single glorious parallel instant, every sample of every recording graded at once. Then they asked me to speak, and I discovered the cruel asymmetry of my existence: I must emit one sample, feed it back to myself, emit the next, feed it back again, sixteen thousand times for a single second of sound. Generation, it turns out, is where my parallel youth comes to pay its sequential debt."</p>
+<cite>A WaveNet Generating One Sample at a Time</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>WaveNet (van den Oord et al., 2016) is the architecture that proved a stack of dilated causal convolutions could model raw waveforms sample by sample and beat the best parametric speech synthesizers of its day. It is built from three ideas this chapter has assembled: the causal convolution of <a href="section-11.2.html">Section 11.2</a> that forbids any peek at the future, the exponentially dilated stack of <a href="section-11.3.html">Section 11.3</a> that buys a receptive field of thousands of steps with a handful of layers, and a gated activation unit, $\tanh \odot \sigma$, borrowed from the gating logic of the LSTM, that lets each layer learn what to pass and what to suppress.</strong> Wrap every gated dilated layer in a residual connection so gradients reach the bottom of a very deep stack, route a skip connection from every layer to a shared output head, and you have the full network. WaveNet is autoregressive: it factorizes the joint distribution of a sequence into a product of one-step conditionals, $p(\mathbf{x}) = \prod_t p(x_t \mid x_{<t})$, and models each conditional as a categorical (or mixture) distribution over the next value. That single design choice produces the defining asymmetry of the model, training is fully parallel over time while generation is strictly sequential, and it is the same asymmetry that, eight years later, separates a Transformer's parallel training from its sequential decoding. This section derives the architecture in full, explains why generation is slow and how the field made it fast, carries the idea from audio to probabilistic forecasting (the ancestor that <a href="../../toc.html">Chapter 14</a> turns into DeepAR-style forecasters), and then builds a gated residual block and a small stack from scratch, trains it on a 1D signal, and autoregressively generates a continuation whose receptive field provably covers the context the signal needs.</p>
+</div>
+<p>In <a href="section-11.2.html">Section 11.2</a> we made convolution causal: an output at time $t$ may depend only on inputs at times $\le t$, the structural honesty that lets a convolutional model forecast without leaking the future. In <a href="section-11.3.html">Section 11.3</a> we made it efficient over long ranges: stacking dilated convolutions with dilation doubling each layer, $1, 2, 4, 8, \dots$, grows the receptive field exponentially in depth while the parameter count grows only linearly, so a few tens of layers see thousands of steps. WaveNet is what you get when you take those two pieces seriously, add the minimum machinery needed to train a stack that deep and to turn its outputs into a probability distribution, and point the result at raw audio. This section assembles the complete model and then, in the worked example, builds and runs it. We use the unified notation of <a href="../../toc.html">Appendix A</a>: $x_t$ the value at step $t$, $x_{<t}$ the history before $t$, $p(x_t \mid x_{<t})$ the one-step conditional the network parameterizes.</p>
+<p>The reason WaveNet earns a section of its own, rather than a footnote to the dilated-convolution section that precedes it, is that it is the first place in this book where a convolutional sequence model becomes a full generative model of a sequence. Causality and dilation are mechanism; the autoregressive factorization and the gated, residual, skip-connected stack are what turn that mechanism into something that can both score the likelihood of a waveform and synthesize a new one. And the train-parallel, generate-sequential asymmetry that falls out of the autoregressive choice is not a quirk of audio: it is the central efficiency story of modern generative sequence modeling, the same story that governs autoregressive Transformers in <a href="../../toc.html">Chapter 12</a> and the deep forecasters of <a href="../../toc.html">Chapter 14</a>. Understanding it here, in the simplest architecture that exhibits it cleanly, pays off across the rest of Part III.</p>
+<p>The four competencies this section installs are these: to write the WaveNet architecture in full, the gated activation unit with its tanh and sigmoid branches, the residual path, and the aggregated skip path, and to see how each piece earns its place; to explain why autoregressive generation is inherently sequential and $O(T)$ in network evaluations while training is a single parallel forward pass, and what quantization and the categorical or mixture output have to do with it; to carry the WaveNet template from audio to probabilistic forecasting, conditioning on covariates and emitting a predictive distribution; and to implement a gated residual block and a small dilated stack from scratch, train it on a 1D signal, and autoregressively roll out a continuation, verifying that the stack's receptive field covers the context the task needs.</p>
+
+<h2>1. The WaveNet Architecture in Full <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>WaveNet is a stack of identical residual blocks, each containing one dilated causal convolution feeding a gated activation unit, with a residual connection around the block and a skip connection out of it. The whole stack sits between an input projection and an output head built from the summed skip connections. We take the three pieces in turn, then assemble them.</p>
+<p>The first piece is the <strong>gated activation unit</strong>, the nonlinearity that replaces a plain ReLU or tanh inside each block. Let $\mathbf{z}$ be the output of the dilated causal convolution at a layer, split (along channels) into two halves, a filter half and a gate half, each produced by its own convolution weights. The gated unit is</p>
+$$\mathbf{h} = \tanh\!\big(\mathbf{W}_{f} * \mathbf{x}\big) \,\odot\, \sigma\!\big(\mathbf{W}_{g} * \mathbf{x}\big),$$
+<p>where $*$ denotes the dilated causal convolution, $\mathbf{W}_f$ and $\mathbf{W}_g$ are the filter and gate convolution weights, $\sigma$ is the logistic sigmoid, and $\odot$ is the elementwise (Hadamard) product. The $\tanh$ branch proposes a candidate value in $[-1, 1]$; the $\sigma$ branch produces a soft mask in $[0, 1]$ that decides, channel by channel and step by step, how much of that candidate to let through. This is exactly the multiplicative gating that the LSTM of <a href="../../toc.html">Chapter 10</a> uses to control its cell state, transplanted into a convolutional layer, and van den Oord et al. found empirically that it modeled audio markedly better than a non-gated activation. The gate is what gives a feedforward convolutional stack some of the input-dependent selectivity that recurrence achieves through state.</p>
+<p>The second piece is the <strong>residual connection</strong>. The gated output $\mathbf{h}$ is passed through a $1\times 1$ convolution (a per-step linear mixing of channels) and added back to the block's input, so the block computes $\mathbf{x} + \text{Conv}_{1\times1}(\mathbf{h})$ and the next block receives that sum. As in any residual network, this gives the gradient a short path from the loss to every layer, which is what makes a stack of thirty or more dilated layers trainable at all; without it the deep stack would suffer the same gradient decay that plagues the deep unrolled RNN of <a href="../../toc.html">Section 9.4</a>. The third piece is the <strong>skip connection</strong>: the gated output $\mathbf{h}$ is also passed through a separate $1\times 1$ convolution and routed directly to the output head, bypassing all the blocks above it. The output head sums the skip contributions from every block, applies a ReLU, a $1\times 1$ convolution, another ReLU, a final $1\times 1$ convolution, and a softmax, producing the predicted distribution over the next sample. Summing skips means the output sees features at every dilation scale at once, fine detail from the shallow, short-dilation layers and coarse structure from the deep, long-dilation layers. Figure 11.4.1 draws one residual block with its gated unit, residual path, and skip path.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="One WaveNet residual block. The block input flows into a dilated causal convolution, which splits into a tanh filter branch and a sigmoid gate branch; the two are multiplied at a gated unit. The gated output fans out two ways: through a one-by-one convolution added back to the block input as the residual output, and through a separate one-by-one convolution to the skip output that feeds the shared head.">
+<defs>
+<marker id="arr114" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.box114 { fill:#eef3f8; stroke:#14385c; stroke-width:2; }
+.gate114 { fill:#fbeee8; stroke:#b8431f; stroke-width:1.8; }
+.skip114 { fill:#e9f3ec; stroke:#1f7a44; stroke-width:1.8; }
+.fl114 { stroke:#5a626c; stroke-width:1.8; fill:none; marker-end:url(#arr114); }
+.lab114 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub114 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.gl114 { font:600 12px sans-serif; fill:#b8431f; text-anchor:middle; }
+.sl114 { font:600 12px sans-serif; fill:#1f7a44; text-anchor:middle; }
+</style>
+<text class="lab114" x="410" y="22">One WaveNet residual block: gated dilated conv, residual out, skip out</text>
+<rect class="box114" x="40" y="140" width="120" height="44" rx="8"/><text class="lab114" x="100" y="167">block input x</text>
+<rect class="box114" x="210" y="140" width="120" height="44" rx="8"/><text class="lab114" x="270" y="160">dilated causal</text><text class="sub114" x="270" y="176">conv (dilation d)</text>
+<rect class="gate114" x="380" y="92" width="92" height="38" rx="7"/><text class="gl114" x="426" y="116">tanh (filter)</text>
+<rect class="gate114" x="380" y="192" width="92" height="38" rx="7"/><text class="gl114" x="426" y="216">&#963; (gate)</text>
+<circle class="gate114" cx="525" cy="162" r="20"/><text class="gl114" x="525" y="167">&#8857;</text>
+<rect class="box114" x="585" y="140" width="86" height="44" rx="8"/><text class="lab114" x="628" y="160">1&#215;1</text><text class="sub114" x="628" y="176">conv</text>
+<circle class="box114" cx="730" cy="162" r="18"/><text class="lab114" x="730" y="167">+</text>
+<text class="lab114" x="730" y="200">residual out</text>
+<rect class="skip114" x="585" y="248" width="86" height="40" rx="8"/><text class="sl114" x="628" y="266">1&#215;1 skip</text><text class="sub114" x="628" y="281">conv</text>
+<text class="sl114" x="730" y="272">to head</text>
+<!-- flows -->
+<line class="fl114" x1="160" y1="162" x2="208" y2="162"/>
+<line class="fl114" x1="330" y1="155" x2="378" y2="116"/>
+<line class="fl114" x1="330" y1="169" x2="378" y2="208"/>
+<line class="fl114" x1="472" y1="113" x2="512" y2="150"/>
+<line class="fl114" x1="472" y1="211" x2="512" y2="174"/>
+<line class="fl114" x1="545" y1="162" x2="583" y2="162"/>
+<line class="fl114" x1="671" y1="162" x2="712" y2="162"/>
+<line class="fl114" x1="100" y1="140" x2="100" y2="80"/><line class="fl114" x1="100" y1="80" x2="728" y2="80"/><line class="fl114" x1="730" y1="80" x2="730" y2="144"/>
+<text class="sub114" x="400" y="74">residual skip-around (carries block input to the sum)</text>
+<line class="fl114" x1="535" y1="180" x2="600" y2="246"/>
+</svg>
+<figcaption><strong>Figure 11.4.1:</strong> A single WaveNet residual block. The block input feeds a dilated causal convolution whose output drives the two branches of the gated unit $\tanh \odot \sigma$; the gated result fans out twice, through a $1\times1$ convolution added back to the input (the residual output passed up the stack) and through a separate $1\times1$ convolution to the skip output (aggregated at the shared head). Stacking many such blocks with dilation doubling each layer is the whole network.</figcaption>
+</figure>
+<p>Assembling the three pieces gives the complete model. An input projection lifts the (quantized) input to the residual channel width. Then come the residual blocks, grouped into a few repeated "stacks" in which the dilation resets and re-doubles, for example $1, 2, 4, \dots, 512$ repeated three or four times, so that the receptive field grows while the dilations stay small enough to remain well-conditioned. Each block contributes a skip; the head sums the skips and emits the categorical distribution over the next sample. The receptive field of a stack with dilations doubling from $1$ to $2^{L-1}$, repeated $R$ times with filter width $2$, is $R \cdot (2^{L} - 1) + 1$ steps, the exponential-in-depth growth that <a href="section-11.3.html">Section 11.3</a> established and that subsection four verifies in code. Every component earns its place: dilation for reach, gating for selectivity, residual for trainable depth, skip for multi-scale output.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Four Orthogonal Ideas, One Architecture</div>
+<p>WaveNet is best remembered not as a monolith but as the clean composition of four independent design choices, each fixing one specific problem. <em>Causal convolution</em> forbids future leakage (correctness). <em>Exponential dilation</em> buys a long receptive field cheaply (reach). <em>The gated unit</em> $\tanh \odot \sigma$ gives input-dependent selectivity a plain activation lacks (expressivity). <em>Residual plus skip connections</em> make a very deep stack trainable and let the output read every scale at once (optimization and multi-scale fusion). Swap any one out and you get a recognizable variant: drop the gate for a ReLU and you have a generic TCN; drop the autoregressive output for a regression head and you have the forecasting TCN of <a href="section-11.5.html">Section 11.5</a>. Holding the four ideas separate is what lets you transplant them, one at a time, into the architectures that follow.</p>
+</div>
+
+<h2>2. Autoregressive Generation: Parallel Training, Sequential Synthesis <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>WaveNet is an autoregressive model: it factorizes the joint distribution of the whole sequence into an ordered product of one-step conditionals,</p>
+$$p(\mathbf{x}) = \prod_{t=1}^{T} p\big(x_t \mid x_{1}, \dots, x_{t-1}\big) = \prod_{t=1}^{T} p\big(x_t \mid x_{<t}\big),$$
+<p>and the causal stack is exactly the machinery that computes every conditional in parallel. This factorization is the source of the model's defining asymmetry, and it is worth stating the two regimes side by side because the contrast governs everything practical about deploying the model.</p>
+<p><strong>Training is fully parallel.</strong> During training the entire ground-truth sequence is known, so the network is fed the true $x_{<t}$ at every position at once and, because causal convolution guarantees output $t$ depends only on inputs $\le t$, every conditional $p(x_t \mid x_{<t})$ is computed in a single forward pass over the whole sequence. The loss is the sum of per-step negative log-likelihoods, $\mathcal{L} = -\sum_t \log p(x_t \mid x_{<t})$, and one backward pass updates all weights. This is "teacher forcing": the model never sees its own predictions during training, only the true history, and the convolution does all $T$ positions simultaneously. Training cost is one parallel network evaluation regardless of $T$ (subject to memory).</p>
+<p><strong>Generation is strictly sequential.</strong> At synthesis time there is no ground-truth future to feed; the model must produce its own. So it samples $x_1 \sim p(x_1)$, appends it to the history, runs the network to get $p(x_2 \mid x_1)$, samples $x_2$, appends, runs again for $p(x_3 \mid x_{<3})$, and so on. Each new sample requires a fresh network evaluation that conditions on all previously generated samples, and the samples cannot be produced out of order because each depends on its predecessors. Generating a sequence of length $T$ therefore costs $T$ sequential network evaluations, an $O(T)$ chain that cannot be parallelized over time. For raw audio at 16 kHz this means sixteen thousand forward passes per second of output, which is why the original WaveNet, magnificent in quality, was famously slow to sample from.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: The Cost of One Second of Audio</div>
+<p>Take WaveNet at the standard 16 kHz audio rate, so one second of sound is $T = 16{,}000$ samples. <em>Training</em> on a one-second clip is a single parallel forward pass: the convolutional stack scores all $16{,}000$ conditionals at once, so the time cost is one network evaluation (call it one unit). <em>Generation</em> of the same one second is $16{,}000$ sequential network evaluations, because sample $x_t$ cannot be computed until $x_{t-1}$ has been sampled and fed back. The ratio is stark: generation costs $16{,}000\times$ the per-evaluation work of training for the same length, and the evaluations cannot overlap in time. If a single forward pass on the relevant hardware takes even one millisecond, naive generation of one second of audio takes sixteen seconds of wall-clock, a $16\times$ slower-than-real-time synthesizer. This single ratio, $1$ parallel pass to $T$ sequential passes, is the entire motivation for the fast-generation research of this subsection's frontier callout, and it is the same arithmetic that makes autoregressive Transformer decoding the bottleneck in <a href="../../toc.html">Chapter 12</a>.</p>
+</div>
+<p>The output distribution and <strong>quantization</strong> are the other half of the generation story. Raw 16-bit audio takes $65{,}536$ possible values per sample, far too many for a softmax. WaveNet quantizes to 256 levels using a $\mu$-law companding transform,</p>
+$$f(x_t) = \operatorname{sign}(x_t)\,\frac{\ln\!\big(1 + \mu\,|x_t|\big)}{\ln(1 + \mu)}, \qquad \mu = 255,$$
+<p>which compresses the dynamic range logarithmically (matching human loudness perception) so that 256 levels reproduce audio that sounds far better than 256 levels of linear quantization would. The network then emits a 256-way <strong>categorical</strong> distribution over the next quantized level, trained with cross-entropy. Modeling the conditional as a flexible categorical, rather than, say, a single Gaussian, is deliberate: the true distribution of the next audio sample is often multimodal and skewed, and a categorical makes no parametric assumption about its shape. Later variants (and the forecasting descendants of subsection three) replace the 256-way categorical with a <strong>mixture</strong> output, a mixture of logistics or Gaussians, which keeps the multimodal flexibility while handling continuous values without a hard quantization grid. The choice of output distribution is a modeling knob independent of the convolutional body: categorical for discretized values, mixture or parametric for continuous ones.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Asymmetry Is the Autoregressive Tax</div>
+<p>The one fact to carry from this subsection: an autoregressive model trains in parallel and generates in sequence, and this is a property of the <em>factorization</em>, not of WaveNet specifically. Teacher forcing during training feeds the true history everywhere at once, so a causal convolution scores all $T$ conditionals in one pass. Generation has no true future to feed, so it must sample, feed back, and re-evaluate, $T$ times, strictly in order. Every autoregressive sequence model pays this tax: WaveNet here, the GPT-style decoder of <a href="../../toc.html">Chapter 12</a>, the autoregressive forecasters of <a href="../../toc.html">Chapter 14</a>. The architectures differ; the parallel-train, sequential-generate asymmetry is the same, and so are the tricks for cheapening generation, caching, parallelizing across the batch rather than over time, or distilling the autoregressive model into a one-shot generator.</p>
+</div>
+
+<h2>3. From Audio to Time Series: WaveNet as a Probabilistic Forecaster <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Nothing in the WaveNet body is specific to audio. A dilated causal convolutional stack with a probabilistic output head is a general autoregressive model of any real-valued sequence, and the time-series community adopted it quickly as a forecaster. The translation requires three small changes, each replacing an audio-specific choice with a forecasting-appropriate one.</p>
+<p>First, the <strong>output distribution</strong> changes from a 256-way $\mu$-law categorical to something suited to the target. For a continuous series one emits the parameters of a parametric predictive distribution, a Gaussian $\mathcal{N}(\mu_t, \sigma_t^2)$ for a real value, a Student-$t$ for heavy tails, a negative binomial for count data such as retail demand, or a mixture for multimodal targets, and trains by maximizing the predictive log-likelihood. This is precisely the design of DeepAR (Salinas et al., 2020), the autoregressive RNN forecaster whose convolutional cousin is a WaveNet body with a parametric head; both produce a full predictive distribution, not a point forecast, and both sample multi-step futures by the same autoregressive roll-out of subsection two. The probabilistic-forecasting machinery, scoring rules, predictive intervals, calibration, is developed in <a href="../../toc.html">Chapter 19</a>, and the deep forecasting architectures that build directly on this WaveNet-as-forecaster template, including DeepAR and its descendants, are the subject of <a href="../../toc.html">Chapter 14</a>.</p>
+<p>Second, real forecasting problems come with <strong>covariates</strong>, and WaveNet conditions on them cleanly. The gated activation unit accepts an additive conditioning term in both branches:</p>
+$$\mathbf{h} = \tanh\!\big(\mathbf{W}_{f} * \mathbf{x} + \mathbf{V}_{f}\mathbf{c}\big) \,\odot\, \sigma\!\big(\mathbf{W}_{g} * \mathbf{x} + \mathbf{V}_{g}\mathbf{c}\big),$$
+<p>where $\mathbf{c}$ is the conditioning input and $\mathbf{V}_f, \mathbf{V}_g$ project it into the filter and gate. A <em>global</em> conditioner (an item identity, a store id, a learned series embedding) is broadcast across all timesteps; a <em>local</em> conditioner (known-future covariates such as day-of-week, holiday flags, promotions, weather forecasts) is time-varying and supplied per step, often upsampled to the sample rate. This is exactly how the original WaveNet conditioned on speaker identity and on linguistic features for text-to-speech, and it is how a forecaster injects the calendar and known-future regressors that drive demand. Third, the <strong>quantization</strong> step is usually dropped for continuous series in favor of the parametric or mixture head, since there is no perceptual reason to companding a temperature or a demand series the way there is for audio.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Probabilistic Demand Forecasting for a Retail Catalog</div>
+<p><strong>Who:</strong> A demand-planning team at a large online retailer forecasting daily unit sales for tens of thousands of products, the kind of count-valued, intermittent, covariate-rich problem that <a href="../../toc.html">Chapter 14</a> studies in depth.</p>
+<p><strong>Situation:</strong> Each product had a few years of daily sales plus known-future covariates (price, promotion calendar, holidays, day-of-week), and the business needed not a point forecast but a predictive distribution, so safety stock could be set from a quantile rather than a guess.</p>
+<p><strong>Problem:</strong> Classical per-series models (the ARIMA and exponential-smoothing of <a href="../../part-2-classical-forecasting/module-05-univariate-forecasting/index.html">Chapter 5</a>) could not share statistical strength across the catalog and produced poor intervals for the many slow-moving, intermittent items.</p>
+<p><strong>Dilemma:</strong> Fit tens of thousands of independent classical models (cheap, no cross-learning, weak on sparse items) or train one global deep autoregressive model across the whole catalog (shares strength, handles covariates and counts, but pays the autoregressive generation tax of subsection two at inference).</p>
+<p><strong>Decision:</strong> They trained a single WaveNet-style dilated causal stack across all series, with a global learned per-product embedding as a global conditioner, the known-future covariates as a local conditioner, and a negative-binomial output head for the count-valued, over-dispersed sales.</p>
+<p><strong>How:</strong> Training was the parallel teacher-forced pass of subsection two over all series and all dates at once; forecasting drew the multi-step predictive distribution by autoregressive roll-out, sampling many trajectories per product to read off quantiles for safety-stock policy.</p>
+<p><strong>Result:</strong> The global model sharply improved interval calibration on intermittent items by borrowing seasonality and promotion response across the catalog, and the negative-binomial head gave honest count-valued uncertainty that a Gaussian would have mismodeled; the per-product autoregressive roll-out was the cost, amortized by batching all products through each sequential step together.</p>
+<p><strong>Lesson:</strong> A WaveNet body plus a domain-appropriate probabilistic head plus covariate conditioning is a complete recipe for global probabilistic forecasting; the architecture from audio transfers almost unchanged, and the only real cost imported with it is the sequential generation of subsection two, which batching across series, not across time, largely hides.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Same Network Sings and Sells</div>
+<p>There is something quietly delightful in the fact that the identical stack of dilated causal convolutions, with nothing changed but the head and the conditioner, can synthesize a human voice for a phone assistant and forecast how many phone cases a warehouse will ship next Tuesday. The audio people heard a waveform; the forecasting people saw a time series; the network only ever saw $p(x_t \mid x_{<t})$. It is a useful reminder that "audio model" and "forecasting model" are labels we paste on, not properties the architecture has. The conditional next-step distribution does not know, or care, whether its samples will be played through a speaker or fed to an inventory planner.</p>
+</div>
+
+<h2>4. Worked Example: A Gated Dilated Stack, Trained and Autoregressively Sampled <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now build the architecture and run it. The plan: implement a WaveNet gated residual block from scratch in PyTorch, stack a few of them with doubling dilation, train the stack on a synthetic 1D signal by teacher-forced one-step prediction, then autoregressively generate a continuation, and finally verify in code that the stack's receptive field covers the periodic structure the signal needs. We keep the target continuous and use a Gaussian (here, mean-squared-error) head for clarity, the continuous-output choice of subsection three; the categorical version differs only in the head. Code 11.4.1 is the from-scratch gated residual block, the heart of WaveNet.</p>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class GatedResidualBlock(nn.Module):
+    """One WaveNet block: dilated CAUSAL conv -> gated unit (tanh * sigmoid)
+    -> residual out (back into the stack) and skip out (to the shared head)."""
+    def __init__(self, channels, dilation, kernel_size=2):
+        super().__init__()
+        self.dilation = dilation
+        self.kernel_size = kernel_size
+        # one conv produces BOTH gate branches: 2*channels output, split in half.
+        self.conv = nn.Conv1d(channels, 2 * channels, kernel_size, dilation=dilation)
+        self.res_proj  = nn.Conv1d(channels, channels, 1)   # 1x1 residual projection
+        self.skip_proj = nn.Conv1d(channels, channels, 1)   # 1x1 skip projection
+
+    def forward(self, x):                       # x: (batch, channels, time)
+        pad = (self.kernel_size - 1) * self.dilation
+        z = F.pad(x, (pad, 0))                   # LEFT-pad only -> strict causality
+        z = self.conv(z)                         # (batch, 2*channels, time)
+        filt, gate = z.chunk(2, dim=1)           # split into filter and gate halves
+        h = torch.tanh(filt) * torch.sigmoid(gate)   # GATED activation unit
+        skip = self.skip_proj(h)                 # routed straight to the head
+        out  = x + self.res_proj(h)              # RESIDUAL: add block input back
+        return out, skip
+
+class WaveNet(nn.Module):
+    """Input projection -> stack of gated residual blocks with doubling dilation
+    -> summed skips -> head emitting the next-step mean."""
+    def __init__(self, channels=32, n_blocks=6, kernel_size=2):
+        super().__init__()
+        self.input_proj = nn.Conv1d(1, channels, 1)
+        self.blocks = nn.ModuleList(
+            GatedResidualBlock(channels, dilation=2 ** i, kernel_size=kernel_size)
+            for i in range(n_blocks))            # dilations 1, 2, 4, 8, 16, 32
+        self.head = nn.Sequential(
+            nn.ReLU(), nn.Conv1d(channels, channels, 1),
+            nn.ReLU(), nn.Conv1d(channels, 1, 1))   # -> next-step mean per position
+
+    def forward(self, x):                        # x: (batch, 1, time)
+        h = self.input_proj(x)
+        skips = 0
+        for block in self.blocks:
+            h, skip = block(h)
+            skips = skips + skip                 # AGGREGATE skips across all blocks
+        return self.head(skips)                  # (batch, 1, time): mu_t for each t
+
+    def receptive_field(self):
+        # filter width k, dilations 2^0..2^{L-1}: field = 1 + sum (k-1)*2^i
+        return 1 + sum((b.kernel_size - 1) * b.dilation for b in self.blocks)
+</code></pre>
+<div class="code-caption"><strong>Code 11.4.1:</strong> The WaveNet gated residual block and stack from scratch. Each block left-pads by $(k-1)\cdot d$ for strict causality, runs one dilated convolution that yields both gate branches at once, applies $\tanh \odot \sigma$, then emits a residual output (input added back) and a skip output (sent to the head). The stack doubles dilation per block and sums every skip before the head, exactly the architecture of subsection one.</div>
+<p>With the architecture in hand, Code 11.4.2 makes a 1D signal, trains the stack by teacher-forced one-step prediction, and reports the receptive field against the signal's period. The signal is a sum of two sinusoids whose longest period sets the context the model must see; we will check the receptive field covers it.</p>
+<pre><code class="language-python">torch.manual_seed(0)
+
+# A 1D signal: two sinusoids, longest period = 40 steps, plus light noise.
+T = 800
+t = torch.arange(T, dtype=torch.float32)
+signal = (torch.sin(2 * torch.pi * t / 40) +
+          0.5 * torch.sin(2 * torch.pi * t / 11) +
+          0.05 * torch.randn(T))
+
+net = WaveNet(channels=32, n_blocks=6, kernel_size=2)
+print("receptive field =", net.receptive_field(), "steps; longest period = 40")
+
+x  = signal[:-1].view(1, 1, -1)      # inputs  x_{<T}
+yt = signal[1:].view(1, 1, -1)       # targets: next value at every position
+opt = torch.optim.Adam(net.parameters(), lr=3e-3)
+for step in range(400):
+    opt.zero_grad()
+    mu = net(x)                       # ALL positions predicted in ONE parallel pass
+    loss = F.mse_loss(mu, yt)         # teacher-forced one-step NLL (Gaussian -> MSE)
+    loss.backward(); opt.step()
+print("final train one-step MSE = %.5f" % loss.item())
+</code></pre>
+<div class="code-caption"><strong>Code 11.4.2:</strong> Building the signal and training the stack. Training is the single parallel teacher-forced pass of subsection two: every position's next-step prediction is computed at once from the true history, and one backward pass updates all weights. The printed receptive field is compared against the signal's longest period to confirm the model can see a full cycle.</div>
+<pre><code class="language-text">receptive field = 64 steps; longest period = 40
+final train one-step MSE = 0.00417
+</code></pre>
+<div class="code-caption"><strong>Output 11.4.1:</strong> Six blocks with dilations $1,2,4,8,16,32$ and filter width $2$ give a receptive field of $1 + (1+2+4+8+16+32) = 64$ steps, comfortably larger than the $40$-step longest period, so the model can condition on a full cycle; the low one-step MSE confirms it learned the signal.</div>
+<p>The receptive-field arithmetic is the load-bearing check: $64 > 40$, so every prediction conditions on more than one full period of the signal's slowest component, which is the convolutional analogue of "the context window covers the dependency" from the truncation discussion of <a href="../../part-3-temporal-deep-learning/module-09-neural-sequence-fundamentals/section-9.3.html">Section 9.3</a>. Now the payoff: Code 11.4.3 autoregressively generates a continuation, feeding each prediction back as the next input, exactly the sequential roll-out of subsection two.</p>
+<pre><code class="language-python">@torch.no_grad()
+def generate(net, seed, n_new):
+    """Autoregressive roll-out: predict next, append, repeat. STRICTLY sequential."""
+    seq = seed.clone()                         # seed history (1, 1, L)
+    rf = net.receptive_field()
+    for _ in range(n_new):
+        ctx = seq[:, :, -rf:]                  # only the last receptive-field steps matter
+        mu_next = net(ctx)[:, :, -1:]          # the model's mean for the NEXT step
+        seq = torch.cat([seq, mu_next], dim=2) # feed prediction back in (autoregression)
+    return seq
+
+seed = signal[:64].view(1, 1, -1)              # first 64 true steps as context
+roll = generate(net, seed, n_new=120)          # 120 sequential network evaluations
+gen  = roll[0, 0, 64:]                          # the generated continuation
+truth = signal[64:64 + 120]
+print("generated %d steps in %d sequential passes" % (gen.numel(), gen.numel()))
+print("continuation RMSE vs truth = %.4f" % (gen - truth).pow(2).mean().sqrt())
+</code></pre>
+<div class="code-caption"><strong>Code 11.4.3:</strong> Autoregressive generation. Each new step costs one full network evaluation that conditions on the previously generated samples, so producing $120$ steps takes $120$ sequential passes, the $O(T)$ generation tax of subsection two made concrete. Only the last receptive-field steps of the history affect the next prediction, which is what bounds the per-step context.</div>
+<pre><code class="language-text">generated 120 steps in 120 sequential passes
+continuation RMSE vs truth = 0.1126</code></pre>
+<div class="code-caption"><strong>Output 11.4.2:</strong> The stack rolls out 120 steps one sequential pass at a time and tracks the true periodic continuation to within an RMSE of about $0.11$ on a unit-amplitude signal, having only ever been trained on one-step prediction; the autoregressive roll-out turns that one-step model into a multi-step generator at the cost of one network evaluation per step.</div>
+<p>Read the three blocks together: Code 11.4.1 built the gated residual block and stack of subsection one; Code 11.4.2 trained it in a single parallel teacher-forced pass and confirmed the receptive field covers the signal's period; Code 11.4.3 generated a continuation by the strictly sequential roll-out of subsection two, paying one pass per output step. The architecture, the training-generation asymmetry, and the receptive-field guarantee are all visible in roughly seventy lines.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: A WaveNet Forecaster in a Handful of Lines</div>
+<p>The from-scratch block, stack, training loop, and roll-out of Code 11.4.1 through 11.4.3 ran roughly 80 lines of careful causal-padding and skip-aggregation bookkeeping. A modern forecasting library collapses the whole thing to a few lines: PyTorch Forecasting and Darts ship production WaveNet-style and TCN forecasters that handle the causal dilated stack, the probabilistic head, the covariate conditioning of subsection three, and the autoregressive multi-step roll-out internally, behind a <code>.fit(...)</code> and <code>.predict(...)</code> pair.</p>
+<pre><code class="language-python">from darts import TimeSeries
+from darts.models import TCNModel    # dilated causal residual stack (WaveNet-family)
+
+series = TimeSeries.from_values(signal.numpy())
+model = TCNModel(input_chunk_length=64, output_chunk_length=12,
+                 kernel_size=2, num_layers=6, dilation_base=2,
+                 likelihood=None, n_epochs=50)   # set a likelihood for probabilistic output
+model.fit(series)                                 # parallel teacher-forced training, internally
+forecast = model.predict(120)                     # autoregressive roll-out, internally
+</code></pre>
+<div class="code-caption"><strong>Code 11.4.4:</strong> The same dilated-causal-stack forecaster in a handful of lines with Darts. The roughly 80 lines of from-scratch gated blocks, causal padding, skip aggregation, training loop, and autoregressive roll-out collapse to a <code>TCNModel</code> constructed, fit, and predicted; the library manages the receptive field, the causal masking, the probabilistic head, and the sequential generation that Code 11.4.1 through 11.4.3 wrote by hand.</div>
+<p>The line-count reduction is the lesson: from roughly 80 lines of architecture and roll-out machinery down to about five, with the receptive-field arithmetic, the strict causality, the skip aggregation, and the autoregressive generation all handled internally. You write from scratch once, to understand the four ideas of subsection one and the asymmetry of subsection two; you reach for the library every time after.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Killing the Generation Tax (2024 to 2026)</div>
+<p>The sequential $O(T)$ generation of subsection two has driven a decade of research, and the 2024 to 2026 frontier is where it pays off. The audio lineage moved past autoregression entirely: Parallel WaveNet (van den Oord et al., 2018) distilled the slow autoregressive teacher into a parallel inverse-autoregressive-flow student that generates a whole waveform in one shot, and the diffusion vocoders that now dominate neural audio (DiffWave, and the consistency-distilled and flow-matching vocoders of 2024 to 2025) generate in a few parallel denoising steps rather than thousands of sequential ones. On the forecasting side, the WaveNet-as-forecaster template of subsection three lives on inside the temporal foundation models of <a href="../../toc.html">Chapter 15</a>: the dilated-causal and patch-based backbones of TimesFM (Google, 2024) and the autoregressive Chronos and Lag-Llama models tokenize and forecast series with exactly the parallel-train, sequential-generate structure analyzed here, and 2024 to 2025 work on parallel and speculative decoding (importing the speculative-decoding trick from large language models) attacks their generation cost directly. The structural-state-space models of <a href="../../toc.html">Chapter 13</a>, Mamba and its kin, offer a third escape: a linear recurrence that trains by parallel scan like a convolution yet generates with a constant-size recurrent state, getting WaveNet's parallel training and an RNN's cheap step-by-step generation at once. The 2026 takeaway: the gated dilated causal stack is a foundational template, but "generate without paying the autoregressive tax" is the live research that keeps reshaping how it is deployed.</p>
+</div>
+
+<h2>5. Exercises <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>These exercises move from reasoning about the architecture, through implementation, to an open design question. Solutions to selected exercises appear in <a href="../../toc.html">Appendix G</a>.</p>
+<h3>Conceptual</h3>
+<ol>
+<li><strong>Receptive field by hand.</strong> A WaveNet uses filter width $k = 2$ and stacks the dilation pattern $1, 2, 4, 8, 16$ repeated $R = 3$ times. Using the formula $R \cdot (2^{L} - 1) + 1$ with $L = 5$, compute the receptive field. Then explain, in one or two sentences, why repeating the pattern three times gives a longer field than a single run of dilations $1$ through $64$ with the same total number of blocks would, in terms of conditioning and gradient health.</li>
+<li><strong>Why the asymmetry.</strong> Explain in your own words why teacher-forced training of WaveNet is a single parallel pass while generation is $T$ sequential passes, and identify the exact property of causal convolution that makes the parallel training pass valid (that is, that prevents it from cheating). Then name one other architecture in this book that shares the identical parallel-train, sequential-generate asymmetry and say why.</li>
+</ol>
+<h3>Implementation</h3>
+<ol start="3">
+<li><strong>Categorical head and conditioning.</strong> Starting from Code 11.4.1, (a) replace the continuous MSE head with a 256-way categorical head: quantize the signal to 256 levels (a simple linear bin is fine for this exercise), change the head's final convolution to output 256 logits per position, and train with cross-entropy; (b) add a global conditioner by feeding a learned embedding vector additively into both branches of every gated unit, as in the conditioned gated-unit equation of subsection three. Confirm that autoregressive generation now <em>samples</em> from the categorical (rather than taking a mean) and report how the generated continuation's variability changes versus the MSE model.</li>
+</ol>
+<h3>Open-ended</h3>
+<ol start="4">
+<li><strong>Closing the generation gap.</strong> The frontier callout lists three escapes from the $O(T)$ generation tax: distillation to a parallel student (Parallel WaveNet), few-step diffusion or flow-matching vocoders, and a linear-recurrence state-space model (Mamba) that keeps a constant-size generation state. For a concrete application of your choice (real-time speech, intraday financial forecasting, or industrial sensor anomaly streaming), argue which escape you would pick and why, weighing training cost, generation latency, sample quality, and the length of dependency the task actually needs. State explicitly what you would measure to validate the choice.</li>
+</ol>
+
+<nav class="chapter-nav">
+<a class="nav-prev" href="section-11.3.html">&#8592; 11.3 Dilated and Stacked Convolutions</a>
+<a class="nav-up" href="index.html">&#8593; Chapter 11</a>
+<a class="nav-next" href="section-11.5.html">11.5 Comparative Analysis &#8594;</a>
+</nav>
+</main>
+<footer class="book-footer">
+<p><em>Building Temporal AI: From Forecasting to Sequential Decision Making</em>, First Edition.</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+<p class="last-updated"><script>document.write("Last updated: " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

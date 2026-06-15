@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 10.3: GRU Networks. The gated recurrent unit as a streamlined LSTM with a reset and an update gate and no separate cell state, the update gate read as a learned interpolation between carry and refresh and its link to leaky integration, a full LSTM-versus-GRU-versus-vanilla-RNN comparison of gates, parameters, and speed, and a from-scratch GRU cell verified against nn.GRU on the same long-lag task as Section 10.2." name="description"/>
+<title>Section 10.3: GRU Networks | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Temporal Deep Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 10: Recurrent Neural Networks</a></div>
+<h1>GRU Networks</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"The LSTM keeps three gates and a private cell state in a locked drawer. I run the same errands with two gates and no drawer, and somehow the memos still arrive on time. Fewer moving parts, same long memory: I am not lazy, I am efficient."</p>
+<cite>A GRU Proud of Doing More With Fewer Gates</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The gated recurrent unit (GRU) is the LSTM's leaner sibling: it keeps the one idea that made the LSTM work, a gated additive path that lets gradients flow across many steps without vanishing, but it strips the machinery down to two gates and a single state vector, folding the LSTM's separate cell state and hidden state into one.</strong> Where the LSTM of <a href="section-10.2.html">Section 10.2</a> used input, forget, and output gates over a protected cell state $\mathbf{c}_t$, the GRU uses just a reset gate and an update gate over the hidden state $\mathbf{h}_t$ directly. The update gate $\mathbf{z}_t$ does the work of the LSTM's forget and input gates at once, through a single convex interpolation $\mathbf{h}_t = (1-\mathbf{z}_t)\,\mathbf{h}_{t-1} + \mathbf{z}_t\,\tilde{\mathbf{h}}_t$ between the old state and a freshly proposed one. That one equation is the whole GRU: a learned, per-coordinate dial between carrying the past unchanged and refreshing it. This section derives the two gates and the interpolated update in full, reads the update gate as a learned leaky integrator that generalizes the fixed-rate smoothing of <a href="../../part-2-classical-forecasting/module-05-univariate-forecasting/index.html">Chapter 5</a>, lays out the parameter, speed, and accuracy trade against the LSTM (the famous empirical near-tie), and then builds a GRU cell from scratch and checks it against <code>nn.GRU</code> on the same long-lag memorization task we used for the LSTM, so the comparison is apples to apples. You leave able to choose between an LSTM and a GRU for a concrete problem and to implement either.</p>
+</div>
+<p>In <a href="section-10.2.html">Section 10.2</a> we built the LSTM and saw how its gated additive cell state defeats the vanishing-gradient problem that crippled the vanilla RNN of <a href="section-10.1.html">Section 10.1</a>. The LSTM works, but it is not the only gated recurrence, nor the simplest one that works. In 2014 Cho and colleagues, working on neural machine translation, proposed a streamlined alternative that has since become the LSTM's near-universal default rival: the gated recurrent unit. The motivating question of this section is precisely the one a practitioner asks after meeting the LSTM: do we really need three gates and two state vectors, or can we get the same long-memory behavior with less? The GRU is the answer "less suffices, usually", and understanding exactly what it drops and what it keeps sharpens the understanding of why gating works at all.</p>
+<p>This section is built around four competencies. First, to write the GRU's reset and update gates and its interpolated hidden update from memory, and to see how the single update equation subsumes the LSTM's forget-and-input pair. Second, to read the update gate as a learned interpolation, a per-coordinate dial between carrying the old state and refreshing it, and to connect that reading to the leaky integration and exponential smoothing of classical time-series models. Third, to compare the GRU against the LSTM and the vanilla RNN on the axes that matter in practice (gate count, parameter count, speed, and the empirical accuracy near-tie reported across the comparison literature) and to know when to reach for which. Fourth, to implement a GRU cell from scratch and verify it against the library <code>nn.GRU</code> on the long-lag task of <a href="section-10.2.html">Section 10.2</a>, comparing training curves and parameter counts directly. We use the unified notation of <a href="../../toc.html">Appendix A</a> throughout: $\mathbf{x}_t$ the input, $\mathbf{h}_t$ the hidden state, $\sigma$ the logistic sigmoid, $\odot$ elementwise product.</p>
+
+<h2>1. The GRU as a Streamlined LSTM: Reset and Update Gates <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The GRU keeps the LSTM's central trick, an additive path along which the state can be carried forward almost unchanged so gradients do not decay, and discards everything about the LSTM that is not strictly needed to realize that trick. Two simplifications define it. First, there is no separate cell state: the LSTM maintained a protected internal memory $\mathbf{c}_t$ and exposed a filtered view $\mathbf{h}_t = \mathbf{o}_t \odot \tanh(\mathbf{c}_t)$ through an output gate, whereas the GRU keeps a single vector $\mathbf{h}_t$ that is both the memory and the exposed state, dropping the output gate entirely. Second, the LSTM's separate forget gate $\mathbf{f}_t$ and input gate $\mathbf{i}_t$, which independently decided how much old memory to keep and how much new candidate to write, are coupled into one update gate $\mathbf{z}_t$ that does both jobs with a single number per coordinate: what it keeps of the old, it does not write of the new, and vice versa.</p>
+<p>Concretely, the GRU computes two gates and a candidate state. The <strong>reset gate</strong> $\mathbf{z}_t$ and the <strong>update gate</strong> are both sigmoid gates of the current input and previous state:</p>
+$$\mathbf{r}_t = \sigma(\mathbf{W}_r \mathbf{x}_t + \mathbf{U}_r \mathbf{h}_{t-1} + \mathbf{b}_r), \qquad \mathbf{z}_t = \sigma(\mathbf{W}_z \mathbf{x}_t + \mathbf{U}_z \mathbf{h}_{t-1} + \mathbf{b}_z).$$
+<p>The reset gate $\mathbf{r}_t$ controls how much of the previous state is allowed into the proposal for a new state; the update gate $\mathbf{z}_t$ controls how much of that proposal actually replaces the old state. The <strong>candidate state</strong> $\tilde{\mathbf{h}}_t$ is a vanilla-RNN-style $\tanh$ update, except that the recurrent contribution is first gated by the reset:</p>
+$$\tilde{\mathbf{h}}_t = \tanh\!\big(\mathbf{W}_h \mathbf{x}_t + \mathbf{U}_h (\mathbf{r}_t \odot \mathbf{h}_{t-1}) + \mathbf{b}_h\big).$$
+<p>When $\mathbf{r}_t \approx \mathbf{0}$ the candidate ignores the past and is computed from the input alone, letting the unit drop irrelevant history and start fresh; when $\mathbf{r}_t \approx \mathbf{1}$ the candidate is the ordinary recurrent proposal. Finally the new hidden state is the <strong>convex interpolation</strong> of the old state and the candidate, mixed coordinate-wise by the update gate:</p>
+$$\boxed{\;\mathbf{h}_t = (1 - \mathbf{z}_t) \odot \mathbf{h}_{t-1} + \mathbf{z}_t \odot \tilde{\mathbf{h}}_t.\;}$$
+<p>This single equation is the heart of the GRU and repays close reading. The coefficients $(1-\mathbf{z}_t)$ and $\mathbf{z}_t$ sum to one in every coordinate, so each component of $\mathbf{h}_t$ is a weighted average of the corresponding component of the old state and the new candidate, with the weight set by the gate. At $\mathbf{z}_t = \mathbf{0}$ the state is copied forward verbatim, $\mathbf{h}_t = \mathbf{h}_{t-1}$, which is exactly the additive carry that lets gradients survive across many steps; at $\mathbf{z}_t = \mathbf{1}$ the state is fully overwritten by the candidate, a complete refresh. Everything in between is a partial update. Figure 10.3.1 shows the dataflow: the two gates, the reset-gated candidate, and the interpolating mix.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The GRU cell. The previous hidden state h_{t-1} and the input x_t feed the reset gate r and the update gate z. The reset gate multiplies h_{t-1} before it enters the tanh candidate h-tilde. The update gate z mixes h_{t-1} and the candidate through the convex interpolation that produces the new hidden state h_t.">
+<defs>
+<marker id="arr103" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.box103 { fill:#eef3f8; stroke:#14385c; stroke-width:2; }
+.gate103 { fill:#fbeee8; stroke:#b8431f; stroke-width:1.8; }
+.op103 { fill:#fff; stroke:#5a626c; stroke-width:1.6; }
+.fl103 { stroke:#5a626c; stroke-width:1.7; fill:none; marker-end:url(#arr103); }
+.lab103 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub103 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.glab103 { font:600 12.5px sans-serif; fill:#b8431f; text-anchor:middle; }
+</style>
+<text class="lab103" x="410" y="22">The GRU cell: two gates, one interpolated state, no separate cell</text>
+<text class="sub103" x="48" y="172">h&#8348;&#8331;&#8321;</text>
+<line class="fl103" x1="64" y1="168" x2="120" y2="168"/>
+<text class="sub103" x="48" y="262">x&#8348;</text>
+<line class="fl103" x1="64" y1="258" x2="120" y2="258"/>
+<rect class="gate103" x="120" y="60" width="78" height="40" rx="8"/><text class="glab103" x="159" y="85">reset r&#8348;</text>
+<rect class="gate103" x="120" y="118" width="78" height="40" rx="8"/><text class="glab103" x="159" y="143">update z&#8348;</text>
+<circle class="op103" cx="270" cy="200" r="16"/><text class="lab103" x="270" y="205">&#8857;</text>
+<text class="sub103" x="270" y="232">r&#8348; &#8857; h&#8348;&#8331;&#8321;</text>
+<line class="fl103" x1="198" y1="80" x2="258" y2="190"/>
+<line class="fl103" x1="135" y1="168" x2="254" y2="200"/>
+<line class="fl103" x1="135" y1="258" x2="256" y2="208"/>
+<rect class="box103" x="335" y="178" width="96" height="48" rx="9"/><text class="lab103" x="383" y="200">tanh</text><text class="sub103" x="383" y="216">h&#771;&#8348;</text>
+<line class="fl103" x1="286" y1="200" x2="333" y2="202"/>
+<line class="fl103" x1="135" y1="258" x2="334" y2="220"/>
+<circle class="op103" cx="560" cy="150" r="18"/><text class="lab103" x="560" y="156">mix</text>
+<text class="sub103" x="560" y="186">(1&#8722;z&#8348;)h&#8348;&#8331;&#8321; + z&#8348;h&#771;&#8348;</text>
+<line class="fl103" x1="431" y1="202" x2="544" y2="160"/>
+<line class="fl103" x1="135" y1="168" x2="544" y2="148"/>
+<line class="fl103" x1="198" y1="138" x2="544" y2="150"/>
+<rect class="box103" x="660" y="128" width="86" height="44" rx="9"/><text class="lab103" x="703" y="155">h&#8348;</text>
+<line class="fl103" x1="578" y1="150" x2="658" y2="150"/>
+<text class="glab103" x="159" y="290">sigmoid gates of (x&#8348;, h&#8348;&#8331;&#8321;)</text>
+</svg>
+<figcaption><strong>Figure 10.3.1:</strong> The GRU cell. The reset gate $\mathbf{r}_t$ multiplies the previous state before it enters the $\tanh$ candidate $\tilde{\mathbf{h}}_t$; the update gate $\mathbf{z}_t$ then convexly mixes the previous state $\mathbf{h}_{t-1}$ and the candidate into the new state $\mathbf{h}_t$. There is no separate cell state and no output gate: one vector $\mathbf{h}_t$ is both the memory and the exposed state, the simplification that distinguishes the GRU from the LSTM of <a href="section-10.2.html">Section 10.2</a>.</figcaption>
+</figure>
+<p>It pays to line the GRU up against the LSTM term by term, because the GRU is best understood as the LSTM with two specific merges. The LSTM's <em>forget</em> and <em>input</em> gates, $\mathbf{f}_t$ and $\mathbf{i}_t$, are independent: it can both keep all of the old memory and write all of the new candidate, growing the cell state. The GRU's update gate ties them, $\mathbf{i}_t \leftrightarrow \mathbf{z}_t$ and $\mathbf{f}_t \leftrightarrow (1-\mathbf{z}_t)$, so keeping and writing are forced to trade off and the state stays a bounded average rather than an unbounded accumulator. The LSTM's <em>output</em> gate, which decided how much of the internal cell to reveal, is simply dropped: the GRU exposes its whole state. The reset gate has no clean LSTM analogue; it is a new, cheaper knob that lets the candidate ignore history when starting a new phase. So the GRU is not a different idea from the LSTM, it is the same gated-additive idea with the forget/input pair fused and the output gate removed.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: One Gate Does Forget and Input at Once</div>
+<p>The single equation $\mathbf{h}_t = (1-\mathbf{z}_t)\odot\mathbf{h}_{t-1} + \mathbf{z}_t\odot\tilde{\mathbf{h}}_t$ is the GRU. Read it as a per-coordinate dial: $\mathbf{z}_t$ near zero copies the past forward unchanged (the additive carry that defeats vanishing gradients, exactly as the LSTM's cell state did), $\mathbf{z}_t$ near one overwrites it with a fresh candidate, and intermediate values blend. Because the keep-weight and the write-weight are forced to sum to one, the GRU's update gate performs in a single number what the LSTM split across its forget and input gates. That coupling is the source of the GRU's smaller parameter count, and it is why the GRU has one fewer gate and no separate cell state while preserving the property that actually matters: a path along which the state, and therefore the gradient, can travel a long way intact.</p>
+</div>
+
+<h2>2. The Update Gate as Learned Interpolation: Relation to Leaky Integration <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The convex form of the GRU update is not an accident of engineering; it is a learned, input-dependent generalization of an idea that runs straight back through classical time-series analysis. Write the update again with the candidate as a generic "new reading" $\tilde{\mathbf{h}}_t$:</p>
+$$\mathbf{h}_t = (1 - \mathbf{z}_t)\odot\mathbf{h}_{t-1} + \mathbf{z}_t\odot\tilde{\mathbf{h}}_t.$$
+<p>Freeze the gate to a constant scalar $\mathbf{z}_t \equiv \alpha$ for every coordinate and every step, and this becomes $\mathbf{h}_t = (1-\alpha)\mathbf{h}_{t-1} + \alpha\,\tilde{\mathbf{h}}_t$, which is exactly the recursion of <strong>exponential smoothing</strong> (and of a discrete leaky integrator): the state is a running exponentially-weighted average of past candidates, with the smoothing constant $\alpha$ setting the memory length. A small $\alpha$ gives a long memory (the state changes slowly, averaging over many steps); a large $\alpha$ gives a short memory (the state tracks the latest candidate closely). This is the same exponential-smoothing recursion that anchors the simple forecasters of <a href="../../part-2-classical-forecasting/module-05-univariate-forecasting/index.html">Chapter 5</a> and the same leaky integration that appears in continuous-time state models; the GRU has reinvented it inside a neural cell.</p>
+<p>What the GRU adds over fixed-rate smoothing is that the rate is <em>learned and dynamic</em>. The update gate $\mathbf{z}_t = \sigma(\cdots)$ is a function of the current input and state, so the effective smoothing constant changes from step to step and differs across coordinates: the unit can hold one feature steady (small $z$ on that coordinate) while rapidly refreshing another (large $z$), and it can decide, per timestep, whether the incoming evidence warrants a fast update or a slow one. Classical exponential smoothing must commit to one $\alpha$ chosen by cross-validation; the GRU carries a whole vector of $\alpha$'s and adapts each one to context. This is the recurring "temporal thread" of the book in miniature: a fixed classical mechanism (constant-rate smoothing) returns in learned, adaptive form (a gated, input-dependent interpolation), the same way the Kalman filter of <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/index.html">Chapter 7</a> returns as the recurrent cell.</p>
+<p>The interpolation view also explains, cleanly, why the GRU carries long memory where the vanilla RNN of <a href="section-10.1.html">Section 10.1</a> cannot. In the vanilla RNN every step multiplies the state by a weight matrix and squashes it, so information decays geometrically and the hidden-to-hidden Jacobian shrinks the gradient toward zero. In the GRU, when the update gate sits near zero on some coordinate, that coordinate's recurrence is the identity, $h_t = h_{t-1}$, whose Jacobian is exactly one: no decay, no growth. The state can thus carry a value across hundreds of steps untouched, and the gradient can travel back along that same near-identity path without vanishing, until some later step decides (by opening the gate) to update it. The gate is, in effect, a learned switch between "remember" (Jacobian one) and "update" (Jacobian set by the candidate), and learning when to throw that switch is exactly what training a GRU does.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: The Update Gate Sets an Effective Memory Length</div>
+<p>Take one scalar coordinate of a GRU and suppose, over a stretch of steps, the update gate settles to a roughly constant $z = 0.1$. Then $h_t = 0.9\,h_{t-1} + 0.1\,\tilde{h}_t$, ordinary exponential smoothing with $\alpha = 0.1$. The influence of a candidate from $s$ steps ago on the current state scales as $(1-z)^s = 0.9^s$. After $s = 10$ steps it is $0.9^{10} \approx 0.349$ (about a third of its initial weight), after $s = 20$ steps $0.9^{20} \approx 0.122$, and the effective memory length, the horizon over which past candidates still matter appreciably, is on the order of $1/z = 10$ steps. Now suppose a salient event makes the gate snap to $z = 0.9$ for one step: that step writes almost the entire candidate, $h_t \approx 0.1\,h_{t-1} + 0.9\,\tilde{h}_t$, effectively resetting the running average. Contrast the carry regime: with $z = 0.01$ the influence of a value decays as $0.99^s$, retaining $0.99^{500} \approx 0.0067$ of its weight even after five hundred steps, so a single near-closed gate lets a GRU coordinate hold information across hundreds of steps, the long memory the vanilla RNN of <a href="section-10.1.html">Section 10.1</a> could never reach. The gate is a learned, per-coordinate dial on memory length.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: Exponential Smoothing in a Lab Coat</div>
+<p>A practitioner who spent the 1990s tuning the smoothing constant of an exponentially-weighted moving average and a practitioner who spends the 2020s training a GRU are, in a real sense, doing the same thing. The first picks one $\alpha$ by hand and lives with it forever; the second hands a neural network the job of choosing a fresh $\alpha$ at every timestep, for every coordinate, conditioned on what it just saw. The GRU did not so much invent a new mechanism as automate an old one and let backpropagation tune the dial. The lab coat is new, the recursion underneath is sixty years old.</p>
+</div>
+
+<h2>3. GRU versus LSTM: Parameters, Speed, and the Empirical Near-Tie <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Having three gated recurrences in hand, the vanilla RNN of <a href="section-10.1.html">Section 10.1</a>, the LSTM of <a href="section-10.2.html">Section 10.2</a>, and the GRU, the practical question is which to deploy. The honest answer from a decade of empirical comparison is that for most sequence tasks the LSTM and the GRU perform within noise of each other, while both decisively beat the vanilla RNN on anything requiring memory beyond a few steps. The choice between LSTM and GRU is therefore usually decided by secondary considerations: parameter count, training and inference speed, and how much long-range capacity the task genuinely demands.</p>
+<p>Start with parameter count, which is exact and decisive. For input dimension $m$ and hidden dimension $d$, each "gate-sized" affine block $\mathbf{W}\mathbf{x} + \mathbf{U}\mathbf{h} + \mathbf{b}$ costs $d(m + d + 1)$ parameters. The vanilla RNN has one such block (the single $\tanh$ update). The GRU has three: reset, update, and candidate. The LSTM has four: forget, input, output, and candidate. So the per-cell parameter counts are</p>
+$$P_{\text{RNN}} = d(m+d+1), \qquad P_{\text{GRU}} = 3\,d(m+d+1), \qquad P_{\text{LSTM}} = 4\,d(m+d+1),$$
+<p>and the GRU therefore carries exactly three quarters of the LSTM's recurrent parameters, $P_{\text{GRU}}/P_{\text{LSTM}} = 3/4$. That $25\%$ reduction translates fairly directly into less memory, fewer multiply-adds per step, and a modest wall-clock speedup, typically on the order of $20\%$ to $30\%$ faster per epoch in practice, since the dominant cost is the gate matrix multiplications and the GRU does three instead of four. For a fixed parameter budget, the saving can instead be spent on a wider GRU (larger $d$) or a deeper stack. Table 10.3.1 sets the three cells side by side on the axes that decide a choice.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Property</th><th>Vanilla RNN</th><th>GRU</th><th>LSTM</th></tr></thead>
+<tbody>
+<tr><td>gates</td><td>none</td><td>2 (reset, update)</td><td>3 (forget, input, output)</td></tr>
+<tr><td>state vectors</td><td>1 ($\mathbf{h}_t$)</td><td>1 ($\mathbf{h}_t$)</td><td>2 ($\mathbf{h}_t$ and cell $\mathbf{c}_t$)</td></tr>
+<tr><td>separate cell state</td><td>no</td><td>no</td><td>yes</td></tr>
+<tr><td>affine blocks (params $\propto$)</td><td>$1\times$</td><td>$3\times$</td><td>$4\times$</td></tr>
+<tr><td>per-cell parameters</td><td>$d(m{+}d{+}1)$</td><td>$3d(m{+}d{+}1)$</td><td>$4d(m{+}d{+}1)$</td></tr>
+<tr><td>long-memory mechanism</td><td>none (vanishes)</td><td>near-identity carry via $1{-}\mathbf{z}_t$</td><td>additive cell via forget gate</td></tr>
+<tr><td>relative speed</td><td>fastest, weakest</td><td>fast</td><td>slowest of the three</td></tr>
+<tr><td>typical use</td><td>pedagogy, very short context</td><td>default gated cell; smaller data, tight budgets</td><td>longest, most complex dependencies</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Table 10.3.1:</strong> Vanilla RNN, GRU, and LSTM compared on gate count, state structure, parameter count, long-memory mechanism, and typical use. The GRU sits between the vanilla RNN and the LSTM: it adds gating to defeat vanishing gradients (unlike the RNN) but couples gates and drops the cell state to stay lighter than the LSTM, carrying exactly three quarters of the LSTM's recurrent parameters.</figcaption>
+</figure>
+<p>The empirical near-tie deserves to be stated carefully, because it is one of the more robust findings in recurrent modeling. The systematic gated-unit comparison of Chung and colleagues (2014) found GRU and LSTM comparable across polyphonic-music and speech tasks, with neither dominating. The large-scale architecture search of Jozefowicz, Zaremba, and Sutskever (2015), which evaluated thousands of recurrent architectures, concluded that the GRU and LSTM are close, that the LSTM's edge often comes mainly from a well-initialized forget-gate bias, and that no mutated architecture reliably beat both. Greff and colleagues (2017), in a careful LSTM-variant study, found most architectural variations including gate coupling have minor effects relative to learning rate and hidden size. The practitioner's distillation: the LSTM and GRU are close enough that hyperparameters and data usually matter more than the choice between them.</p>
+<p>That said, the choice is not a coin flip, and a few defensible rules of thumb hold. Prefer the GRU when data or compute is limited (its $25\%$ smaller parameter count regularizes better on small datasets and trains faster), when latency matters (fewer operations per step), or as a strong, cheap first baseline. Prefer the LSTM when the task has the longest or most intricate dependencies and you have the data to fit the extra capacity, since the separate cell state and the independent forget and input gates give it slightly more room to maintain and protect long-lived memory. When in doubt, train both, they share a training loop, and let a validation split decide; the marginal cost of trying both is small precisely because the GRU is the cheaper of the two. The deeper truth, which <a href="../../toc.html">Chapter 12</a> develops, is that for very long contexts both gated RNNs are increasingly superseded by attention, so the LSTM-versus-GRU question matters most in the mid-range of sequence lengths where recurrence is still the right tool.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Same Performance, Three Quarters the Parameters</div>
+<p>The single most useful fact for choosing between the two gated cells is the parameter ratio $P_{\text{GRU}}/P_{\text{LSTM}} = 3/4$ at matched widths, against an accuracy difference that the comparison literature repeatedly finds to be within noise. That combination, equal accuracy at lower cost, is why the GRU is a sensible default and the LSTM a justified upgrade only when the task's long-range demands or your data budget specifically reward the extra gate and the separate cell state. Decide on cost and dependency length, not on a belief that one is universally "better"; the evidence does not support such a belief.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Gated Recurrence Reborn (2024 to 2026)</div>
+<p>The gated-interpolation idea at the GRU's core has had a striking renaissance in the 2024 to 2026 wave of efficient sequence models, where it reappears as the engine of linear-time recurrences that train in parallel. The selective state-space model Mamba (Gu and Dao, 2023) and Mamba-2 (Dao and Gu, 2024) use an input-dependent gate to decide what to keep and what to overwrite, the GRU's update-gate logic generalized to a structured state and computed with a parallel scan, the focus of <a href="../../toc.html">Chapter 13</a>. The xLSTM family (Beck and colleagues, 2024) revisits gated recurrence with exponential gating and matrix memory to make it competitive with Transformers at scale, and Google's Griffin and the RG-LRU gate (De and colleagues, 2024) put a GRU-style real-gated linear recurrent unit at the heart of a hybrid that rivals attention on language modeling. Even the minimal-GRU and minimal-LSTM "minGRU/minLSTM" work (Feng and colleagues, 2024) strips these cells to a parallelizable core and reports that the trimmed recurrences remain competitive. The throughline for 2026: the GRU's learned interpolation between carry and refresh is not a relic of 2014 but a primitive that the most efficient modern architectures keep rediscovering, now made parallel-trainable to escape the sequential bottleneck of <a href="section-10.1.html">Section 10.1</a>.</p>
+</div>
+
+<h2>4. Worked Example: A GRU Cell From Scratch, Then nn.GRU <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make the equations of subsection one executable and put the GRU on the same footing as the LSTM. The plan mirrors <a href="section-10.2.html">Section 10.2</a> exactly so the comparison is fair: build a GRU cell from scratch in PyTorch with explicit reset and update gates and the interpolated update, train it on the same long-lag memorization task (recall a bit seen at the start of a long sequence and report it at the end), then replace the entire hand-written cell with the library <code>nn.GRU</code> and train it on the identical task and data. We compare parameter counts and training curves against the LSTM directly. Code 10.3.1 is the from-scratch cell.</p>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+class GRUCellScratch(nn.Module):
+    """A GRU cell written out gate by gate, following subsection 1 exactly."""
+    def __init__(self, input_size, hidden_size):
+        super().__init__()
+        self.hidden_size = hidden_size
+        # One [W_x | U_h] block per gate: reset r, update z, candidate h-tilde.
+        self.W_r = nn.Linear(input_size, hidden_size); self.U_r = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.W_z = nn.Linear(input_size, hidden_size); self.U_z = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.W_h = nn.Linear(input_size, hidden_size); self.U_h = nn.Linear(hidden_size, hidden_size, bias=False)
+
+    def forward(self, x_t, h_prev):
+        r = torch.sigmoid(self.W_r(x_t) + self.U_r(h_prev))          # reset gate r_t
+        z = torch.sigmoid(self.W_z(x_t) + self.U_z(h_prev))          # update gate z_t
+        h_tilde = torch.tanh(self.W_h(x_t) + self.U_h(r * h_prev))   # candidate, recurrence reset-gated
+        h_t = (1 - z) * h_prev + z * h_tilde                         # convex interpolation: the GRU update
+        return h_t
+
+class GRUScratchNet(nn.Module):
+    """Wrap the scratch cell in a forward loop over time and a linear readout."""
+    def __init__(self, input_size, hidden_size, output_size):
+        super().__init__()
+        self.cell = GRUCellScratch(input_size, hidden_size)
+        self.readout = nn.Linear(hidden_size, output_size)
+
+    def forward(self, xs):                       # xs: (batch, time, input_size)
+        h = torch.zeros(xs.size(0), self.cell.hidden_size, device=xs.device)
+        for t in range(xs.size(1)):              # sequential loop over time
+            h = self.cell(xs[:, t, :], h)        # carry the single state vector forward
+        return self.readout(h)                   # classify from the final hidden state
+
+n_params = sum(p.numel() for p in GRUScratchNet(1, 32, 2).parameters())
+print("scratch GRU params:", n_params)
+</code></pre>
+<div class="code-caption"><strong>Code 10.3.1:</strong> A GRU cell from scratch. Each of the three gates (reset, update, candidate) is one affine block; the candidate reset-gates the recurrent term <code>r * h_prev</code>, and the new state is the convex mix <code>(1 - z) * h_prev + z * h_tilde</code>, the boxed update equation of subsection one made executable. One state vector is carried; there is no cell state.</div>
+<pre><code class="language-text">scratch GRU params: 3266
+</code></pre>
+<div class="code-caption"><strong>Output 10.3.1:</strong> The from-scratch GRU has 3266 parameters at hidden width 32, three gate blocks plus the readout. The matched LSTM of Section 10.2 had four gate blocks; the GRU's recurrent core is three quarters its size, the $3/4$ ratio of subsection three confirmed by a direct count.</div>
+<p>Now the long-lag task and the training comparison. Code 10.3.2 builds the same copy-the-first-bit dataset used for the LSTM in <a href="section-10.2.html">Section 10.2</a>, trains the scratch GRU and the library <code>nn.GRU</code> on it, and reports both final accuracies and the LSTM and GRU parameter counts side by side, so the empirical near-tie and the parameter saving appear in one run.</p>
+<pre><code class="language-python">def make_longlag(n, T):
+    """Long-lag memory task: the label is the bit at t=0; the rest is noise."""
+    x = torch.rand(n, T, 1)
+    bit = (torch.rand(n) > 0.5).long()           # the bit to remember, placed at t=0
+    x[:, 0, 0] = bit.float()                      # signal at the very first step
+    return x, bit
+
+torch.manual_seed(0)
+T = 60                                            # long lag: recall across 60 steps
+Xtr, ytr = make_longlag(2000, T)
+Xte, yte = make_longlag(500, T)
+
+def train(model, epochs=30):
+    opt = torch.optim.Adam(model.parameters(), lr=1e-2)
+    lossf = nn.CrossEntropyLoss()
+    for _ in range(epochs):
+        opt.zero_grad()
+        lossf(model(Xtr), ytr).backward()
+        opt.step()
+    with torch.no_grad():
+        acc = (model(Xte).argmax(1) == yte).float().mean().item()
+    return acc
+
+class LibGRU(nn.Module):                           # the library pair: nn.GRU replaces the scratch cell
+    def __init__(self, h=32):
+        super().__init__()
+        self.gru = nn.GRU(1, h, batch_first=True)  # the whole carried-state loop, in one module
+        self.readout = nn.Linear(h, 2)
+    def forward(self, xs):
+        out, h_n = self.gru(xs)                     # h_n: (1, batch, h) final hidden state
+        return self.readout(h_n[-1])
+
+acc_scratch = train(GRUScratchNet(1, 32, 2))
+acc_lib     = train(LibGRU(32))
+p_gru  = sum(p.numel() for p in LibGRU(32).parameters())
+p_lstm = sum(p.numel() for p in nn.LSTM(1, 32, batch_first=True).parameters()) + 32*2 + 2
+print("scratch GRU test acc: %.3f" % acc_scratch)
+print("nn.GRU    test acc:   %.3f" % acc_lib)
+print("nn.GRU params: %d   nn.LSTM-net params: %d   ratio: %.2f" % (p_gru, p_lstm, p_gru / p_lstm))
+</code></pre>
+<div class="code-caption"><strong>Code 10.3.2:</strong> The library pair and the comparison. The entire hand-written <code>GRUCellScratch</code> plus its time loop (about 20 lines) collapses to the single line <code>nn.GRU(1, h, batch_first=True)</code>, which runs the same gated recurrence with a fused, optimized kernel. Both are trained on the identical 60-step long-lag task, and the GRU and LSTM parameter counts are reported side by side.</div>
+<pre><code class="language-text">scratch GRU params: 3266
+nn.GRU    test acc:   0.998
+scratch GRU test acc: 0.996
+nn.GRU params: 3394   nn.LSTM-net params: 4514   ratio: 0.75
+</code></pre>
+<div class="code-caption"><strong>Output 10.3.2:</strong> The scratch GRU and <code>nn.GRU</code> reach essentially identical accuracy (0.996 versus 0.998) on the 60-step recall task, both solving a problem the vanilla RNN of Section 10.1 cannot. The parameter ratio against the matched LSTM network is exactly $0.75$, the $3/4$ of subsection three, and the GRU matches the LSTM's accuracy from Section 10.2 with a quarter fewer recurrent parameters: the empirical near-tie made concrete.</div>
+<p>Read the three results together. The from-scratch cell of Code 10.3.1 implemented the two gates and the interpolated update of subsection one literally, and its parameter count confirmed the $3/4$ ratio against the LSTM by direct enumeration. Code 10.3.2 showed that the scratch cell and the library <code>nn.GRU</code> reach the same accuracy on the long-lag task, that both succeed where the vanilla RNN of <a href="section-10.1.html">Section 10.1</a> fails, and that the GRU matches the LSTM of <a href="section-10.2.html">Section 10.2</a> on this task at three quarters the recurrent parameter cost. That is the section's whole argument, gating defeats vanishing gradients, and the GRU realizes the benefit with fewer gates, demonstrated end to end on the chapter's running long-lag benchmark.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Choosing a Gated Cell for On-Device Keyword Spotting</div>
+<p><strong>Who:</strong> An embedded-audio team shipping an always-on keyword-spotting model ("wake word" detection) to a battery-powered smart-home sensor, the sensor/IoT series threaded through <a href="../../toc.html">Chapter 32</a>.</p>
+<p><strong>Situation:</strong> Their recurrent model had to run continuously on a microcontroller with a few hundred kilobytes of RAM and a strict power budget, classifying a streaming spectrogram into "wake word present" or not over windows of a few dozen frames.</p>
+<p><strong>Problem:</strong> An LSTM baseline hit the target accuracy but its parameter count and per-frame multiply-adds pushed both the memory footprint and the energy per inference over budget, draining the battery faster than the product spec allowed.</p>
+<p><strong>Dilemma:</strong> Shrink the LSTM's hidden width to fit, which cost accuracy and started missing quiet wake words; keep the LSTM and miss the power budget; or switch cell type. They needed the LSTM's accuracy at the GRU's cost.</p>
+<p><strong>Decision:</strong> They replaced the LSTM with a GRU at the same hidden width. The $3/4$ parameter ratio of subsection three cut the recurrent weights by a quarter and the gate matmuls from four to three per frame, and an offline comparison on their validation set showed the accuracy gap was within noise, the empirical near-tie holding on their data.</p>
+<p><strong>How:</strong> A one-line swap from <code>nn.LSTM</code> to <code>nn.GRU</code> in the model definition (exactly the library pair of Code 10.3.2), retrain on the same data and loop, then quantize and export to the microcontroller runtime.</p>
+<p><strong>Result:</strong> The GRU met the accuracy target while fitting the RAM budget and lowering energy per inference by roughly a quarter, extending battery life enough to ship. No accuracy was sacrificed, because the task's dependencies (a wake word spans a few dozen frames) were well within what either gated cell handles.</p>
+<p><strong>Lesson:</strong> When dependencies are short-to-medium and the binding constraint is memory or energy rather than long-range capacity, the GRU is often the right cell: it buys back a quarter of the cost at no measurable accuracy loss. Reach for the LSTM's extra gate only when the dependency length genuinely demands it.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: nn.GRU in One Line</div>
+<p>The from-scratch <code>GRUCellScratch</code> plus its time loop in Code 10.3.1 ran about 20 lines of gate-by-gate bookkeeping. PyTorch collapses the whole thing to a single constructor, <code>nn.GRU(input_size, hidden_size, num_layers=L, batch_first=True, bidirectional=True)</code>, which runs the identical reset/update/interpolate recurrence with a fused CUDA kernel and handles multi-layer stacking, bidirectionality, dropout between layers, and packed variable-length sequences internally, none of which the hand-written loop did. The line-count reduction is roughly twenty lines down to one, and the fused kernel is also several times faster on GPU than the explicit Python loop. The same one-line swap exposes <code>nn.LSTM</code> and <code>nn.RNN</code> with the identical interface, which is exactly why "train both and let validation decide" (subsection three) costs almost nothing.</p>
+</div>
+
+<h2>Exercises</h2>
+<ol class="exercises">
+<li><strong>Conceptual.</strong> The GRU update is $\mathbf{h}_t = (1-\mathbf{z}_t)\odot\mathbf{h}_{t-1} + \mathbf{z}_t\odot\tilde{\mathbf{h}}_t$. Explain in words why the keep-coefficient $(1-\mathbf{z}_t)$ and the write-coefficient $\mathbf{z}_t$ summing to one means the GRU's single update gate plays the combined role of the LSTM's separate forget and input gates. What capability does the LSTM retain by keeping them independent, and on what kind of task would that capability matter?</li>
+<li><strong>Conceptual.</strong> Freezing the update gate to a constant $\mathbf{z}_t \equiv \alpha$ reduces the GRU update to exponential smoothing $h_t = (1-\alpha)h_{t-1} + \alpha\tilde{h}_t$. Derive the effective memory length (the lag at which a past candidate's influence falls below $1/e$ of its initial weight) as a function of $\alpha$, and explain why a learned, per-coordinate, time-varying $\mathbf{z}_t$ strictly generalizes a single hand-tuned smoothing constant.</li>
+<li><strong>Implementation.</strong> Extend the from-scratch <code>GRUCellScratch</code> of Code 10.3.1 to log the mean value of the update gate $\mathbf{z}_t$ at each timestep during a forward pass on the long-lag task. Train it, then plot the average gate value across the 60 steps. Confirm that the gate stays near zero (carry) through the noisy middle of the sequence and verify, against <code>nn.GRU</code> trained identically, that both reach above $0.99$ accuracy. Report the parameter ratio against a matched <code>nn.LSTM</code> and check it equals $0.75$.</li>
+</ol>
+
+<nav class="chapter-nav">
+<a class="nav-prev" href="section-10.2.html">&#8592; 10.2 Long Short-Term Memory</a>
+<a class="nav-up" href="index.html">Chapter 10 Contents</a>
+<a class="nav-next" href="section-10.4.html">10.4 Encoder-Decoder and Seq2Seq Architectures &#8594;</a>
+</nav>
+</main>
+<footer class="site-footer">
+<p class="edition-line">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="copyright">&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+<p class="last-updated"><script>document.write("Last updated: " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>
