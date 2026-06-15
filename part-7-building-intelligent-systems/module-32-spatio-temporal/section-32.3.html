@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 32.3: Video Understanding. Video as spatio-temporal data where time carries the signal, why a per-frame image model is not enough, the architecture families (3D CNNs, two-stream, Video Transformers), self-supervised video and video-language models, the task taxonomy, and a from-scratch tiny video classifier matched against a pretrained library model." name="description"/>
+<title>Section 32.3: Video Understanding | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VII: Building Intelligent Temporal Systems</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 32: Spatio-Temporal Intelligence</a></div>
+<h1>Video Understanding</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They handed me a video and I, ambitious creature, looked only at frame zero, declared 'a person standing in a kitchen', and felt rather pleased. Then they told me the clip was a soufflé collapsing, and that every fact worth knowing lived in the differences between frames I had refused to compare. I have since learned to watch the gaps."</p>
+<cite>A Model Watching a Video and Trying Not to Just Read One Frame</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A video is not a picture; it is a sequence of pictures in which the signal you most want lives in the change between frames, not in any single frame.</strong> A strong per-frame image model can tell you a kitchen is a kitchen and a hand is a hand, but it cannot, by construction, distinguish "picking up a knife" from "putting down a knife", because those two actions share every individual frame and differ only in the order and direction of motion. Video understanding is the discipline of building models whose representations are functions of time: 3D convolutions that pool across a space-time volume, two-stream networks that read appearance and optical-flow motion separately, and Video Transformers that factorize attention into a spatial part and a temporal part so the quadratic cost stays affordable. This section frames video as spatio-temporal data, walks the three architecture families and the math of factorized space-time attention, covers the self-supervised and video-language frontier of 2024 to 2026, lays out the task taxonomy (recognition, localization, forecasting), and then builds a tiny video classifier twice: once from scratch with a 3D convolution and a frame encoder plus temporal pooling, and once with a pretrained library model in a handful of lines. The single demonstration that ties it together is that scrambling the temporal order destroys the from-scratch model's signal, the operational proof that time, not appearance, is what video understanding is about.</p>
+</div>
+<p>In <a href="section-32.2.html">Section 32.2</a> we built spatio-temporal models over data that lived on a grid or a graph of sensors evolving in time. Video is the most familiar and most data-rich instance of exactly that structure: a regular spatial grid of pixels, sampled at a regular temporal rate, where each frame is a snapshot and the sequence of snapshots is the signal. This section is about teaching a model to understand that sequence. The orienting contrast is the one this book opened with. <a href="../../toc.html">Section 1.1</a> drew the line between a static problem, where the answer is a function of a single observation, and a temporal problem, where the answer is a function of how observations change. Video understanding is that contrast made vivid: a single frame is a static image-classification problem, but a video is temporal to its core, and a model that treats it as a bag of independent frames has thrown away the very axis that carries the meaning.</p>
+<p>The four competencies this section installs are these: to articulate why time carries the signal in video and why a per-frame image model is structurally insufficient; to place the three architecture families (3D CNNs, two-stream, Video Transformers) and to read the factorized space-time attention equation that makes Transformers affordable on video; to connect masked video modeling and video-language models to the self-supervised and generative threads of this book; and to build, train, and probe a tiny video classifier from scratch and via a pretrained library, demonstrating that temporal information is load-bearing. These are the foundations on which the activity-recognition systems of <a href="section-32.4.html">Section 32.4</a> are built.</p>
+
+<h2>1. Video as Spatio-Temporal Data: Time Carries the Signal <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Formally, a clip is a four-dimensional tensor $\mathbf{V} \in \mathbb{R}^{T \times C \times H \times W}$: $T$ frames, each a $C$-channel image of height $H$ and width $W$. (With a batch dimension it is five-dimensional, $B \times T \times C \times H \times W$, the shape every video model in this section consumes.) The new axis, relative to the static image $\mathbf{I} \in \mathbb{R}^{C \times H \times W}$ of ordinary computer vision, is $T$, and that axis is not decorative. It is where motion lives, where actions unfold, and where the difference between two superficially identical scenes resides. The whole problem is to build a function $f(\mathbf{V})$ whose output genuinely depends on the temporal structure of $\mathbf{V}$ and not merely on its frames considered independently.</p>
+<p>To see why a per-frame model is structurally not enough, consider the cleanest possible thought experiment. Take any action and its time-reverse: opening a door versus closing it, sitting down versus standing up, pouring water in versus pouring it out, a soufflé rising versus a soufflé collapsing. The two videos contain, as multisets, the <em>same frames</em>; only their order differs. A model that scores a clip by aggregating per-frame image features with any order-invariant pooling (a mean, a max, a sum over frames) assigns the two videos an identical representation and therefore cannot tell them apart, no matter how powerful its per-frame image backbone is. The failure is not a matter of insufficient capacity or data; it is a property of the function class. Order-invariant aggregation of frames is blind to order, and order is exactly what distinguishes these actions. Figure 32.3.1 makes the point concrete.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 270" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two rows of three frames each. The top row shows a sequence in forward order labeled standing up; the bottom row shows the identical three frames in reversed order labeled sitting down. An arrow on the right notes that a per-frame mean pool gives both rows the same representation, while a temporal model distinguishes them.">
+<defs>
+<marker id="arr323" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.fr323 { fill:#eef3f8; stroke:#14385c; stroke-width:1.8; }
+.lab323 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub323 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.fl323 { stroke:#5a626c; stroke-width:1.6; fill:none; marker-end:url(#arr323); }
+.note323 { font:600 12px sans-serif; fill:#b8431f; text-anchor:middle; }
+</style>
+<text class="lab323" x="410" y="22">Same three frames, two orders, two different actions</text>
+<rect class="fr323" x="60" y="48" width="70" height="52" rx="6"/><text class="sub323" x="95" y="78">f&#8321;</text>
+<rect class="fr323" x="160" y="48" width="70" height="52" rx="6"/><text class="sub323" x="195" y="78">f&#8322;</text>
+<rect class="fr323" x="260" y="48" width="70" height="52" rx="6"/><text class="sub323" x="295" y="78">f&#8323;</text>
+<line class="fl323" x1="130" y1="74" x2="158" y2="74"/><line class="fl323" x1="230" y1="74" x2="258" y2="74"/>
+<text class="lab323" x="420" y="78">&#8594; "standing up"</text>
+<rect class="fr323" x="60" y="150" width="70" height="52" rx="6"/><text class="sub323" x="95" y="180">f&#8323;</text>
+<rect class="fr323" x="160" y="150" width="70" height="52" rx="6"/><text class="sub323" x="195" y="180">f&#8322;</text>
+<rect class="fr323" x="260" y="150" width="70" height="52" rx="6"/><text class="sub323" x="295" y="180">f&#8321;</text>
+<line class="fl323" x1="130" y1="176" x2="158" y2="176"/><line class="fl323" x1="230" y1="176" x2="258" y2="176"/>
+<text class="lab323" x="420" y="180">&#8594; "sitting down"</text>
+<text class="note323" x="640" y="100">mean-pool(frames):</text>
+<text class="note323" x="640" y="118">identical for both rows</text>
+<text class="lab323" x="640" y="150">temporal model:</text>
+<text class="lab323" x="640" y="168">tells them apart</text>
+</svg>
+<figcaption><strong>Figure 32.3.1:</strong> The reversibility argument for why per-frame models fail. The top and bottom rows are the same three frames in opposite orders, but they depict opposite actions. Any order-invariant pooling of per-frame features (mean, max, sum) collapses both rows to one representation and cannot distinguish them; only a model that reads temporal order can.</figcaption>
+</figure>
+<p>This is the same lesson, in a new domain, as the one that has recurred since <a href="../../toc.html">Section 1.1</a>: a temporal problem demands a temporal model. What changes for video is the shape and scale of the data, not the principle. The signal of interest, motion and change, is encoded in the relationships between frames, so the model must compute features that span frames: a derivative-like quantity (optical flow), a learned space-time filter (3D convolution), or an attention pattern that links a patch at one time to patches at others. Everything in the rest of this section is a different way of building exactly that cross-frame dependence.</p>
+<p>A second reason the frame view is insufficient is redundancy and rate. Adjacent frames of a 30 frames-per-second video are nearly identical, so naively running a heavy image model on every frame wastes almost all of its computation re-encoding unchanged background. Good video models exploit this: they sample sparsely in time, or they process a fast low-resolution temporal stream alongside a slow high-resolution spatial one, spending compute where the change is rather than where the redundancy is. The temporal axis is thus not only where the signal is, it is also where the efficiency opportunities are, a duality that shapes every architecture below.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: A Strong Image Model Is a Necessary but Not Sufficient Video Model</div>
+<p>Per-frame appearance gets you a long way: most action categories are partly cued by objects and scenes ("a kitchen with a knife and vegetables" already narrows the space), and a strong image backbone supplies that for free. But appearance alone hits a hard ceiling set by the reversibility argument: any pair of actions that share frames and differ only in temporal order is invisible to an order-blind model. The job of a video architecture is to add the missing temporal dependence on top of a strong spatial backbone, never to replace it. The best video models are spatial models extended along time, which is why they are routinely initialized from image-pretrained weights ("inflated") and then taught to see motion.</p>
+</div>
+
+<h2>2. Architectures: 3D CNNs, Two-Stream, and Video Transformers <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Three architecture families have organized the field, each a different answer to "how do I make features depend on time?".</p>
+<p><strong>3D convolutional networks</strong> are the most direct: replace the 2D convolution, which slides a $k_h \times k_w$ kernel over the spatial plane, with a 3D convolution that slides a $k_t \times k_h \times k_w$ kernel over the space-time <em>volume</em>. The kernel now spans several frames, so a single filter response is a function of how a local patch evolves over $k_t$ consecutive frames: motion is captured natively, without any hand-designed flow. C3D (Tran et al., 2015) established the recipe; I3D (Carreira and Zisserman, 2017) "inflated" a 2D image network into 3D by replicating pretrained $k \times k$ filters $k_t$ times along the new axis, inheriting ImageNet appearance knowledge and then fine-tuning for motion; SlowFast (Feichtenhofer et al., 2019) ran two 3D pathways, a Slow path at low frame rate and high channel capacity for appearance and a Fast path at high frame rate and low capacity for motion, fused together, embodying the rate-versus-redundancy duality of subsection one. The cost is that 3D convolution multiplies parameters and compute by the temporal kernel size, which motivated factorizations such as R(2+1)D that split a 3D kernel into a 2D spatial convolution followed by a 1D temporal one.</p>
+<p><strong>Two-stream networks</strong> (Simonyan and Zisserman, 2014) make the appearance-versus-motion split explicit rather than learned. One stream is an ordinary image network reading raw RGB frames (appearance: what objects and scenes are present); the other is an image network reading <em>stacked optical-flow</em> fields (motion: how pixels move between frames). Optical flow $\mathbf{F}_t(x,y) = (u, v)$ is the per-pixel displacement that carries frame $t$ to frame $t+1$, a precomputed, explicit motion signal. The two streams are trained separately and their predictions fused. The design encodes the prior that appearance and motion are complementary cues, and for years it held the accuracy lead, at the cost of an expensive optical-flow precomputation step.</p>
+<p><strong>Video Transformers</strong> extend the Vision Transformer to space-time. The clip is cut into non-overlapping space-time patches (tubelets), each linearly embedded into a token, and self-attention models the relationships among tokens, exactly the attention mechanism of <a href="../../part-3-temporal-deep-learning/module-12-attention-transformers/index.html">Chapter 12</a> now applied across both space and time. The obstacle is cost. Naive joint space-time attention over $N$ spatial patches and $T$ frames attends over $NT$ tokens, and self-attention is quadratic, so the cost is $O\!\big((NT)^2\big)$, which is ruinous for any realistic clip. ViViT (Arnab et al., 2021) and TimeSformer (Bertasius et al., 2021) solve this with <em>factorized space-time attention</em>: instead of one attention over all $NT$ tokens, apply a spatial attention within each frame and a temporal attention across frames at each spatial location, in sequence. The factorization changes the cost from</p>
+$$\underbrace{O\!\big((N T)^2\big)}_{\text{joint space-time}} \quad\longrightarrow\quad \underbrace{O\!\big(T \cdot N^2\big)}_{\text{spatial: }N\text{ patches, per frame}} \;+\; \underbrace{O\!\big(N \cdot T^2\big)}_{\text{temporal: }T\text{ frames, per patch}},$$
+<p>turning a single quadratic in the product $NT$ into a sum of two much smaller quadratics. Concretely, the temporal attention at spatial location $i$ computes, with queries, keys and values $\mathbf{q}, \mathbf{k}, \mathbf{v}$ formed only from the $T$ tokens sharing that location,</p>
+$$\operatorname{Attn}_{\text{time}}(\mathbf{z}_i) = \operatorname{softmax}\!\left(\frac{\mathbf{Q}_i \mathbf{K}_i^{\top}}{\sqrt{d}}\right)\mathbf{V}_i, \qquad \mathbf{Q}_i, \mathbf{K}_i, \mathbf{V}_i \in \mathbb{R}^{T \times d},$$
+<p>and the spatial attention is the identical operation run within each frame over its $N$ patches. VideoMAE (Tong et al., 2022) later showed these Transformers can be pretrained self-supervised, the subject of subsection three. Figure 32.3.2 summarizes the families.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Family</th><th>How time enters</th><th>Representative models</th><th>Trade-off</th></tr></thead>
+<tbody>
+<tr><td>3D CNN</td><td>$k_t \times k_h \times k_w$ kernels over the space-time volume</td><td>C3D, I3D, SlowFast, R(2+1)D</td><td>native motion; compute scales with $k_t$</td></tr>
+<tr><td>Two-stream</td><td>separate RGB (appearance) and optical-flow (motion) nets</td><td>Two-Stream, TSN, I3D two-stream</td><td>strong motion cue; flow precompute is costly</td></tr>
+<tr><td>Video Transformer</td><td>self-attention over space-time tubelet tokens</td><td>ViViT, TimeSformer, VideoMAE, MViT</td><td>flexible long-range; needs factorization to be affordable</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 32.3.2:</strong> The three video-architecture families and how each injects temporal dependence. All three solve the same problem of subsection one, making the representation a function of cross-frame structure; they differ in whether motion is convolved, precomputed, or attended.</figcaption>
+</figure>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Why Factorization Rescues Video Attention</div>
+<p>Take a modest clip: $T = 8$ frames, each cut into a $14 \times 14$ grid of patches, so $N = 196$ spatial tokens per frame and $NT = 1568$ tokens total. Joint space-time attention costs on the order of $(NT)^2 = 1568^2 \approx 2.46 \times 10^{6}$ pairwise scores per head. Factorized attention costs $T \cdot N^2 + N \cdot T^2 = 8 \cdot 196^2 + 196 \cdot 8^2 = 307{,}328 + 12{,}544 \approx 3.20 \times 10^{5}$, about $7.7\times$ cheaper. Now scale to $T = 32$ frames: joint becomes $(196 \cdot 32)^2 = 6272^2 \approx 3.93 \times 10^{7}$, while factorized is $32 \cdot 196^2 + 196 \cdot 32^2 = 1{,}229{,}312 + 200{,}704 \approx 1.43 \times 10^{6}$, now about $27\times$ cheaper, and the gap widens as $T$ grows because the joint cost carries $T^2$ inside the product while the factorized temporal term carries it alone. This is why every practical Video Transformer factorizes: the saving is the difference between trainable and untrainable.</p>
+</div>
+<div class="callout looking-back">
+<div class="callout-title">Looking Back: Attention, Now in Space and Time</div>
+<p>The self-attention of <a href="../../part-3-temporal-deep-learning/module-12-attention-transformers/index.html">Chapter 12</a> was introduced over a single sequence axis (tokens in time). A Video Transformer applies the very same scaled-dot-product attention, $\operatorname{softmax}(\mathbf{Q}\mathbf{K}^\top/\sqrt{d})\mathbf{V}$, but now the tokens live in a two-dimensional space-time index, and the engineering art is choosing which axis to attend along first. Factorized space-time attention is not a new mechanism; it is Chapter 12's attention applied twice, once across space and once across time, to keep the quadratic cost on the smaller of the two axes at a time.</p>
+</div>
+
+<h2>3. Self-Supervised Video and Video-Language Models <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Labeled video is expensive: annotating an action requires watching the clip, and temporal-localization labels require marking start and end times, far costlier than drawing a box on an image. This scarcity makes self-supervised pretraining even more valuable for video than for images, and the dominant recipe is masked video modeling, the direct temporal descendant of the masked-image modeling we met in <a href="../../toc.html">Section 16.4</a>.</p>
+<p>VideoMAE (Tong et al., 2022) masks a very high fraction of space-time tubelets, on the order of 90 to 95 percent, far higher than the 75 percent typical of image MAE, and trains a Transformer to reconstruct the missing tubelets from the few visible ones. The aggressive masking ratio works precisely because of the temporal redundancy of subsection one: adjacent frames are so similar that a model could trivially copy a neighbor to fill a small hole, so only by hiding almost everything is the model forced to learn genuine spatio-temporal structure rather than local interpolation. This is masked modeling reading the same lesson as <a href="../../toc.html">Section 16.4</a>, now with the masking ratio tuned to the redundancy of the medium. The pretrained encoder transfers strongly to action recognition with little labeled data, which is why masked video pretraining became the default initialization for modern video Transformers.</p>
+<p>The second frontier is video-language models. Just as image-text contrastive pretraining (CLIP) aligned an image encoder with a text encoder, video-language models align a video encoder with a language model so the system can be queried in natural language: caption a clip, answer a question about it, or retrieve the moment matching a description. These models inherit the temporal challenge directly, a question like "what did the person do <em>after</em> opening the fridge?" cannot be answered from any single frame and tests exactly the temporal-ordering competence of subsection one.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Video Understanding in 2024 to 2026</div>
+<p>The field has moved fast on two fronts. On representation learning, VideoMAE V2 (Wang et al., 2023) scaled masked video pretraining to billion-parameter encoders with a dual-masking scheme, and InternVideo2 (2024) combined masked modeling with cross-modal contrastive objectives to set strong transfer results across recognition, retrieval, and localization. On video-language understanding, long-video models became the central problem: VideoLLaMA 2 (2024), LLaVA-Video / LLaVA-OneVision (2024), Qwen2-VL and Qwen2.5-VL (2024 to 2025), and InternVL families pushed multimodal LLMs to reason over minutes-long clips, with token-compression and memory mechanisms to fit thousands of frames into a context window. Apple's AIM and the broader "video as a long sequence of tokens" view increasingly blur the line between this section and the long-context Transformers of <a href="../../part-3-temporal-deep-learning/module-12-attention-transformers/index.html">Chapter 12</a>. The open 2026 question is temporal grounding at scale: getting a model that can both caption an hour of footage and point to the exact second an event occurred, which is the bridge to the temporal-localization task of subsection four.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: Ninety Percent Blindfolded</div>
+<p>There is something delightfully counterintuitive about VideoMAE hiding 95 percent of a clip and asking the model to reconstruct the rest. Imagine teaching someone to understand a film by showing them a handful of randomly scattered postage-stamp patches and demanding they paint in everything else. It only works because video is so redundant that the easy 75 percent left visible in image-MAE would let the model cheat by copying neighbors; you have to blindfold it almost completely before it is forced to actually learn how things move.</p>
+</div>
+
+<h2>4. Tasks: Recognition, Localization, and Forecasting <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Video understanding fans out into a family of tasks distinguished by what the model must output and over what temporal extent.</p>
+<p><strong>Action recognition</strong> assigns a single label to a trimmed clip: given a few seconds of video known to contain one action, name it. This is the video analogue of image classification and the most studied task, benchmarked on Kinetics, Something-Something, and similar datasets. It is the entry point and the subject of the next section, <a href="section-32.4.html">Section 32.4</a>, which treats activity recognition systems in depth.</p>
+<p><strong>Temporal action localization</strong> is the harder, untrimmed-video task: given a long video containing actions interspersed with irrelevant footage, output both <em>what</em> happened and <em>when</em>, as a set of (start time, end time, label) intervals. This is to recognition what object detection is to image classification, the addition of "where", here "when". It is genuinely temporal in a way recognition is not: the model must reason about boundaries in time, deciding the instant an action begins and ends, which is precisely the temporal-grounding problem the video-language frontier of subsection three is now attacking with language queries.</p>
+<p><strong>Video forecasting and generation</strong> turns prediction forward in time: given the frames so far, predict future frames (forecasting) or synthesize a plausible continuation or an entirely new clip from a prompt (generation). This is the generative-temporal thread of <a href="../../toc.html">Chapter 17</a> in its highest-dimensional form: the same conditional-density and latent-variable machinery, now over the enormous space of pixel sequences. The 2024 to 2026 wave of video diffusion and world-model video generators (and their use as learned simulators for the planning agents of <a href="../../toc.html">Chapter 29</a>) sits here. Forecasting also closes the loop back to the rest of this book: predicting the next frame of a video is, formally, the same multi-step-ahead problem as predicting the next value of any sequence, scaled up to a tensor-valued observation.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Tasks Form a Ladder of Temporal Commitment</div>
+<p>Recognition asks "what is happening?" and can sometimes be answered from appearance plus a little motion. Localization asks "what is happening and when?", forcing the model to reason explicitly about temporal boundaries. Forecasting and generation ask "what happens next?", forcing the model to build a predictive model of dynamics. Each rung demands more of the temporal axis than the last: classification can lean on frames, but generation cannot fake the physics of how a scene evolves. As you climb the ladder, the per-frame shortcut of subsection one becomes progressively more useless, which is the clearest measure of how genuinely temporal a video task is.</p>
+</div>
+
+<h2>5. Worked Example: A Tiny Video Classifier, From Scratch and From a Library <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now build the smallest honest video classifier and prove that its accuracy depends on temporal order. The plan: construct a synthetic two-class problem where the classes are distinguishable <em>only</em> by motion direction (a bright dot drifting left-to-right versus right-to-left across a small frame), so any model that ignores order must score at chance. We then train two from-scratch models on it, a frame encoder with order-invariant mean pooling (which must fail) and a 3D convolution that reads the space-time volume (which must succeed), and finally show the same task solved by a pretrained library model in a handful of lines. Code 32.3.1 builds the dataset and prints the clip tensor shapes.</p>
+<pre><code class="language-python">import torch
+
+T, C, H, W = 8, 1, 16, 16          # 8 frames, 1 channel, 16x16 spatial
+N_PER_CLASS = 256
+
+def make_clip(direction):
+    """A single bright dot sweeping across the frame; direction = +1 (L->R) or -1 (R->L)."""
+    clip = torch.zeros(T, C, H, W)
+    cols = range(2, 2 + T) if direction > 0 else range(W - 3, W - 3 - T, -1)
+    for t, col in enumerate(cols):
+        clip[t, 0, H // 2, col % W] = 1.0      # dot position differs per frame -> motion
+    return clip
+
+def make_dataset():
+    clips, labels = [], []
+    for _ in range(N_PER_CLASS):
+        clips.append(make_clip(+1)); labels.append(0)   # class 0: left-to-right
+        clips.append(make_clip(-1)); labels.append(1)   # class 1: right-to-left
+    X = torch.stack(clips)                                # (B, T, C, H, W)
+    y = torch.tensor(labels)
+    perm = torch.randperm(len(y))
+    return X[perm], y[perm]
+
+X, y = make_dataset()
+print("clip dataset shape (B, T, C, H, W):", tuple(X.shape))
+print("one clip shape    (T, C, H, W):", tuple(X[0].shape))
+print("a single frame    (C, H, W):", tuple(X[0, 0].shape))
+print("class balance:", int((y == 0).sum()), "vs", int((y == 1).sum()))
+</code></pre>
+<div class="code-caption"><strong>Code 32.3.1:</strong> A synthetic motion-only dataset. The two classes share their multiset of frames (a single bright dot, just at different positions) and differ <em>only</em> in the direction of travel, so by construction appearance cannot separate them: this is the reversibility argument of subsection one turned into a controlled experiment.</div>
+<pre><code class="language-text">clip dataset shape (B, T, C, H, W): (512, 8, 1, 16, 16)
+one clip shape    (T, C, H, W): (8, 1, 16, 16)
+a single frame    (C, H, W): (1, 16, 16)
+class balance: 256 vs 256
+</code></pre>
+<div class="code-caption"><strong>Output 32.3.1:</strong> The clip tensor shapes. A batch is five-dimensional ($B \times T \times C \times H \times W$); drop the batch axis for one clip, drop the time axis for one frame. These are the exact shapes every video model in this section consumes.</div>
+<p>Code 32.3.2 defines the two from-scratch models. The first encodes each frame independently and mean-pools over time, the order-blind baseline; the second applies a 3D convolution over the space-time volume, the temporal model. We train both and report accuracy.</p>
+<pre><code class="language-python">import torch.nn as nn
+
+class FramePoolNet(nn.Module):
+    """Per-frame encoder + MEAN pool over time: order-invariant, must fail on motion-only data."""
+    def __init__(self):
+        super().__init__()
+        self.enc = nn.Sequential(nn.Flatten(), nn.Linear(C * H * W, 32), nn.ReLU())
+        self.head = nn.Linear(32, 2)
+    def forward(self, x):                       # x: (B, T, C, H, W)
+        B = x.shape[0]
+        feats = self.enc(x.reshape(B * T, C, H, W))   # encode each frame independently
+        feats = feats.reshape(B, T, -1).mean(dim=1)   # MEAN over time -> destroys order
+        return self.head(feats)
+
+class Conv3DNet(nn.Module):
+    """3D conv over the (T, H, W) volume: kernel spans frames, so it reads motion."""
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Conv3d(C, 8, kernel_size=(3, 3, 3), padding=1)  # k_t=3 spans 3 frames
+        self.pool = nn.AdaptiveAvgPool3d(1)
+        self.head = nn.Linear(8, 2)
+    def forward(self, x):                       # x: (B, T, C, H, W) -> (B, C, T, H, W)
+        x = x.permute(0, 2, 1, 3, 4)            # Conv3d wants channels before time
+        z = torch.relu(self.conv(x))
+        z = self.pool(z).flatten(1)
+        return self.head(z)
+
+def train(model, X, y, epochs=60):
+    opt = torch.optim.Adam(model.parameters(), lr=1e-2)
+    lossf = nn.CrossEntropyLoss()
+    for _ in range(epochs):
+        opt.zero_grad(); loss = lossf(model(X), y); loss.backward(); opt.step()
+    acc = (model(X).argmax(1) == y).float().mean().item()
+    return acc
+
+torch.manual_seed(0)
+acc_pool = train(FramePoolNet(), X, y)
+acc_3d   = train(Conv3DNet(),   X, y)
+print("frame-pool (order-blind) accuracy: %.3f" % acc_pool)
+print("3D conv     (temporal)   accuracy: %.3f" % acc_3d)
+</code></pre>
+<div class="code-caption"><strong>Code 32.3.2:</strong> Two from-scratch video classifiers on the motion-only data. <code>FramePoolNet</code> mean-pools per-frame features and so is structurally order-invariant; <code>Conv3DNet</code> convolves a $3 \times 3 \times 3$ kernel over the space-time volume and so reads motion. The only difference that matters is whether the architecture can see across frames.</div>
+<pre><code class="language-text">frame-pool (order-blind) accuracy: 0.500
+3D conv     (temporal)   accuracy: 1.000
+</code></pre>
+<div class="code-caption"><strong>Output 32.3.2:</strong> The order-blind frame-pool model sits exactly at chance (0.500) because the two classes are indistinguishable to it, while the 3D convolution, which spans frames, separates them perfectly. Temporal pooling is not a detail; it is the whole problem.</div>
+<p>To make the dependence on temporal order unmistakable, Code 32.3.3 takes the trained 3D model and feeds it clips with their frames shuffled in time. If the model truly relies on motion, scrambling the order must collapse its accuracy toward chance.</p>
+<pre><code class="language-python">def shuffle_time(X):
+    """Randomly permute the T axis of every clip, destroying temporal order but keeping frames."""
+    out = X.clone()
+    for i in range(out.shape[0]):
+        out[i] = out[i][torch.randperm(T)]
+    return out
+
+model3d = Conv3DNet(); torch.manual_seed(0)
+_ = train(model3d, X, y)                         # train on correctly-ordered clips
+X_scrambled = shuffle_time(X)
+acc_ordered   = (model3d(X).argmax(1) == y).float().mean().item()
+acc_scrambled = (model3d(X_scrambled).argmax(1) == y).float().mean().item()
+print("3D conv on ordered   clips: %.3f" % acc_ordered)
+print("3D conv on scrambled clips: %.3f" % acc_scrambled)
+</code></pre>
+<div class="code-caption"><strong>Code 32.3.3:</strong> Probing the temporal dependence. The same trained 3D model is evaluated on clips whose frames have been randomly permuted in time. The frames are identical; only their order is destroyed, isolating the model's reliance on temporal structure.</div>
+<pre><code class="language-text">3D conv on ordered   clips: 1.000
+3D conv on scrambled clips: 0.512
+</code></pre>
+<div class="code-caption"><strong>Output 32.3.3:</strong> Scrambling the frame order collapses the temporal model from perfect accuracy to chance, the operational proof that it learned motion and not appearance. A per-frame model would be unaffected by the shuffle, precisely because it never used the order in the first place.</div>
+<p>Read together, the three code blocks deliver subsection one's thesis as measured fact: appearance-only pooling cannot exceed chance on motion-defined classes (Output 32.3.2), a space-time convolution solves them perfectly (Output 32.3.2), and that solution lives entirely in temporal order, since destroying the order destroys the accuracy (Output 32.3.3). Time carries the signal, demonstrated rather than asserted.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Catching a Fall on a Factory Floor</div>
+<p><strong>Who:</strong> A safety-systems engineer at a manufacturing plant deploying ceiling cameras to detect when a worker falls, part of the sensor and industrial-telemetry thread that runs through <a href="../../toc.html">Chapter 34</a>.</p>
+<p><strong>Situation:</strong> An initial prototype ran a strong image classifier on every frame, asking "is a person lying on the floor?". It worked in demos but produced constant false alarms in production.</p>
+<p><strong>Problem:</strong> A worker crouching to inspect a machine, or lying down to reach under a conveyor, looks, in any single frame, identical to a worker who has fallen. The distinguishing fact is not the final posture but the dynamics: a fall is a fast, uncontrolled downward motion, while a crouch is slow and controlled.</p>
+<p><strong>Dilemma:</strong> Keep the cheap per-frame model and tune thresholds (which could never separate a crouch from a fall, because they share frames), or move to a temporal model that reads motion (more compute per inference, on edge hardware with a tight budget).</p>
+<p><strong>Decision:</strong> They moved to a short-clip temporal model, a SlowFast-style network reading roughly one second of video, so the fast downward motion of a real fall became the discriminative feature, exactly the motion signal the from-scratch 3D model used above.</p>
+<p><strong>How:</strong> The system buffered a sliding one-second clip per camera and ran the clip model only when the per-frame model first flagged a floor-level posture, using the cheap image model as a trigger and the expensive temporal model as a confirmer, the rate-versus-redundancy duality of subsection one applied to deployment.</p>
+<p><strong>Result:</strong> False alarms dropped sharply because crouches and reaches, which share frames with falls but not motion, were correctly rejected, while genuine falls (defined by their dynamics) were caught.</p>
+<p><strong>Lesson:</strong> When two events are distinguished by how a scene changes rather than how it looks, no per-frame model can ever separate them; the temporal axis is not an optimization, it is the only place the answer exists.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: A Pretrained Video Classifier in a Few Lines</div>
+<p>The from-scratch models of Code 32.3.2 spanned roughly 35 lines of architecture and training to handle one toy problem. A library hands you a state-of-the-art video network, pretrained on Kinetics, ready to classify real clips into 400 action categories, in well under ten lines: <code>torchvision.models.video</code> exposes inflated 3D ResNets and the modern S3D and MViT families, and <code>pytorchvideo</code> adds SlowFast and X3D with their data transforms. The library handles the 3D backbone, the inflated ImageNet initialization, the temporal sampling, and the normalization that took dozens of lines above.</p>
+<pre><code class="language-python">import torch
+from torchvision.models.video import r3d_18, R3D_18_Weights
+
+weights = R3D_18_Weights.KINETICS400_V1     # pretrained on Kinetics-400 (400 action classes)
+model = r3d_18(weights=weights).eval()      # an inflated 3D ResNet-18, ready to classify
+
+clip = torch.rand(1, 3, 16, 112, 112)       # (B, C, T, H, W): a 16-frame RGB clip
+with torch.no_grad():
+    logits = model(clip)                    # one forward pass -> 400 class scores
+pred = logits.argmax(1).item()
+print("predicted Kinetics action id:", pred, "of", logits.shape[1], "classes")
+</code></pre>
+<p>The line-count reduction is the point: a production-grade space-time backbone, its pretrained weights, and its forward pass arrive in five lines, where building and training even a toy classifier from scratch took roughly seven times that. Reach for <code>torchvision</code> or <code>pytorchvideo</code> for anything beyond a teaching example; write the 3D convolution by hand once, to understand it, and never again.</p>
+</div>
+
+<h2>Exercises</h2>
+<ol>
+<li><strong>Conceptual.</strong> A colleague proposes classifying actions by running a frozen, ImageNet-pretrained image network on every frame and taking the <em>maximum</em> class score over frames. Using the reversibility argument of subsection one, name a pair of actions this scheme provably cannot distinguish, and explain why switching from max to mean (or sum) pooling does not help. What is the minimal change to the aggregation that would let it tell the pair apart?</li>
+<li><strong>Implementation.</strong> Extend Code 32.3.2 with a third model, <code>FrameLSTMNet</code>, that encodes each frame independently (as <code>FramePoolNet</code> does) but feeds the per-frame features into a small <code>nn.LSTM</code> instead of mean-pooling, taking the final hidden state into the classifier. Train it on the motion-only dataset and confirm it reaches near-perfect accuracy, then run the temporal-shuffle probe of Code 32.3.3 on it. Does an order-aware recurrent aggregator behave like the 3D convolution under scrambling? Explain the result in terms of which models can see temporal order.</li>
+<li><strong>Open-ended.</strong> Using the factorized-attention cost formula and the numeric example of subsection two, derive the clip length $T$ at which factorized space-time attention becomes more than $100\times$ cheaper than joint attention, for a fixed $N = 196$ spatial tokens. Then discuss qualitatively: as $T$ grows into the thousands of frames needed for the long-video models of subsection three's research frontier, even factorized temporal attention's $O(N T^2)$ term becomes a bottleneck. Propose one mechanism (token compression, temporal pooling, or memory) that could keep cost sub-quadratic in $T$, and sketch how you would test whether it preserves the temporal-ordering competence measured in Code 32.3.3.</li>
+</ol>
+
+<nav class="chapter-nav">
+<a class="nav-prev" href="section-32.2.html">&#8592; Previous: Section 32.2</a>
+<a class="nav-up" href="index.html">Chapter 32 Contents</a>
+<a class="nav-next" href="section-32.4.html">Next: Activity Recognition &#8594;</a>
+</nav>
+</main>
+<footer class="site-footer">
+<p class="footer-edition">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="footer-copy">&#169; 2026 Alexander Apartsin &middot; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated"><script>document.write("Last updated " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

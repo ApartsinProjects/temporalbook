@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 32.4: Activity Recognition. Human activity recognition from wearable IMU streams, skeleton/pose sequences, and ambient sensors as a multivariate time-series classification task: windowing and segmentation, hand-crafted features versus learned representations, the model family (1D CNN, LSTM, CNN-LSTM, Transformer, ST-GCN), cross-subject generalization and on-device constraints, the benchmark datasets and self-supervised HAR of 2024 to 2026, and a from-scratch windowed 1D-CNN/LSTM classifier matched against a tsai library equivalent." name="description"/>
+<title>Section 32.4: Activity Recognition | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VII: Building Intelligent Temporal Systems</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 32: Spatio-Temporal Intelligence</a></div>
+<h1>Activity Recognition</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I have measured you. Three axes, fifty times a second, for the last four seconds, and I will stake my entire calibration on it: you are not sitting still. There was a sway at 0.3 hertz, a lateral jerk on the y-axis, a gravity vector that keeps tilting. Sitting still has a signature, and this is not it. You are walking, possibly toward a sandwich. Do not argue with the accelerometer."</p>
+<cite>An Accelerometer Insisting You Are Definitely Not Just Sitting Still</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Human activity recognition (HAR) is the task of reading a stream of body-worn or environmental sensors and naming what a person is doing: walking, sitting, climbing stairs, brushing teeth, falling. Strip away the application gloss and it is a problem this book has already taught you to solve. A sliding window of a multivariate sensor stream is a fixed-length tensor; a label like "walking" is a class; HAR is therefore multivariate time-series classification, the same shape as every windowed-sequence task since the sensor-running dataset of <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a>.</strong> What makes HAR its own section is everything wrapped around that core: the three sensing modalities (wearable IMU streams, skeleton or pose sequences, ambient sensors) and their geometry; the pipeline decision of hand-crafted features versus learned representations that <a href="../../toc.html">Chapter 16</a> framed in general; the model family that runs from a humble 1D CNN through LSTM, CNN-LSTM, and Transformer to the skeleton graph networks (ST-GCN) that descend from the temporal graphs of <a href="../../part-4-temporal-representation-learning/module-18-event-sequence-modeling/section-18.3.html">Section 18.3</a>; and the deployment reality that the classifier usually runs on a wrist, not a server. This section builds the full pipeline, codes a windowed 1D-CNN/LSTM HAR classifier from scratch and then in three lines of tsai, reports its accuracy, and confronts the practical wall that defines real HAR work: a model that scores beautifully on subjects it trained on and falls apart on a subject it has never met.</p>
+</div>
+<p>In <a href="section-32.3.html">Section 32.3</a> we modeled phenomena distributed over a spatial grid evolving in time, where the spatial axis was a map of locations. This section keeps the spatio-temporal spirit but moves the spatial structure onto the body: the "space" is now a set of sensors strapped to a moving person, or a skeleton of joints, and the temporal axis is the short window over which a gesture or gait cycle plays out. Activity recognition is the bridge between the abstract spatio-temporal machinery of this chapter and one of the most deployed temporal-AI applications on the planet, the step counter and fall detector in roughly a billion pockets and on as many wrists. We treat it as a first-class temporal classification problem, with all the windowing, leakage, and generalization discipline that implies.</p>
+<p>The reason HAR earns a dedicated section rather than a footnote to "time-series classification" is that its difficulties are specific and instructive. The signal is short and noisy; the same activity looks different on different bodies; labels are expensive and often wrong; classes are wildly imbalanced (you sit far more than you fall); and the trained model must run in milliwatts on a microcontroller, not in a datacenter. Each of these constraints reshapes the modeling choice, and together they make HAR a compact case study in everything that separates a benchmark number from a system that works on a stranger's wrist. By the end you will be able to take a raw sensor stream, window it correctly, choose and train an appropriate model, evaluate it the way that actually predicts field performance (across subjects, not within), and name the 2024 to 2026 research that is reshaping the field.</p>
+<p>We use the unified notation of <a href="../../toc.html">Appendix A</a>: a sensor stream is $\mathbf{x}_{1:L} \in \mathbb{R}^{L \times C}$ with $L$ timesteps and $C$ channels, a window is a slice $\mathbf{x}_{t:t+W}$ of length $W$, and the classifier maps each window to a label $y \in \{1, \dots, K\}$ over $K$ activity classes.</p>
+
+<h2>1. HAR as Multivariate Time-Series Classification <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The input to a HAR system is one or more sensor streams sampled at a fixed rate. The dominant modality is the inertial measurement unit (IMU): a wearable chip combining a tri-axial accelerometer (linear acceleration along $x$, $y$, $z$, including gravity) and often a tri-axial gyroscope (angular velocity) and magnetometer, sampled at 20 to 100 Hz. A wrist IMU at 50 Hz with accelerometer and gyroscope produces a six-channel stream at fifty samples per second per channel, which is the raw material a phone or watch sees. A second modality is the skeleton or pose sequence: a camera or depth sensor (or a pose-estimation network) yields the 2D or 3D coordinates of $J$ body joints at every frame, so the stream is $\mathbf{x}_{1:L} \in \mathbb{R}^{L \times J \times 3}$, a sequence of evolving point clouds with explicit body geometry. A third modality is ambient sensing: passive infrared motion detectors, door contacts, power meters, and pressure mats scattered through a home, producing low-rate event streams that report activities of daily living without anyone wearing anything.</p>
+<p>All three modalities reduce to the same abstract object: a multivariate sequence that we must map to a discrete label. This is precisely the windowed-sequence classification setup introduced with the sensor-running dataset in <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a>, where we first learned to slice a continuous stream into fixed-length windows and to guard against the leakage that windowing invites. HAR is that lesson applied at scale. The model receives a window, a tensor of shape $W \times C$ (or $W \times J \times 3$ for skeletons), and emits a probability vector over $K$ classes; the predicted activity is the arg-max. Formally, with softmax output $\hat{\mathbf{p}} = \operatorname{softmax}(f_\theta(\mathbf{x}_{t:t+W}))$, training minimizes the cross-entropy</p>
+$$\mathcal{L}(\theta) = -\frac{1}{N}\sum_{i=1}^{N} \sum_{k=1}^{K} y_{i,k}\,\log \hat{p}_{i,k},$$
+<p>summed over $N$ windows, with $y_{i,k}$ the one-hot label of window $i$. Nothing here is special to sensors; it is ordinary supervised sequence classification, which is exactly why the deep-learning toolkit of Part III transfers directly. What follows in the rest of the section is the set of choices, windowing, features, model, evaluation, that turn this generic template into a HAR system that survives contact with a real wrist.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Three Modalities, One Tensor Shape</div>
+<p>Wearable IMU, skeleton/pose, and ambient sensing look like three different problems, but to the model they are one: a window of a multivariate stream mapped to a class. The IMU window is $W \times C$; the skeleton window is $W \times J \times 3$, which flattens to $W \times 3J$ or, better, keeps its joint structure for a graph model; the ambient window is $W \times C$ of low-rate event counts. Recognizing that HAR is multivariate time-series classification, not a bespoke sensor problem, is what lets you reuse every architecture from Part III rather than inventing one. The modality changes the channel semantics and the right inductive bias (a graph for skeletons, a convolution for IMU), not the task type.</p>
+</div>
+
+<h2>2. The HAR Pipeline: Windowing, Features, and Models <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A HAR system is a short pipeline with three consequential decisions: how to segment the stream into windows, whether to feed the model hand-crafted features or raw signal, and which model to use. We take them in order.</p>
+<p><strong>Windowing and segmentation.</strong> The continuous stream is cut into windows of length $W$ samples with stride $S$, producing overlapping windows when $S < W$. The window must be long enough to contain at least one full cycle of the activity (a gait cycle is roughly one second, so a two-second window at 50 Hz, $W = 100$, comfortably covers walking) and short enough that the label is stable across it (you do not want a window straddling "sitting" and "standing"). A common choice is a 2-to-5-second window with 50 percent overlap. Overlap inflates the training set and smooths predictions but introduces a subtle leakage risk: overlapping windows from the same bout of activity share samples, so a random train/test split can put near-duplicate windows on both sides and inflate the score. The discipline of <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a> applies in force here: split by subject or by bout, never by random window.</p>
+<p>Each window gets one label, usually the majority or last label of its samples. Figure 32.4.1 shows the window-to-label mapping that the numeric example below makes concrete.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A continuous three-channel accelerometer stream along the top, cut by a sliding window into overlapping windows below. Each window is mapped to a single activity label. The first window maps to walking, the second straddles a transition, the third maps to standing.">
+<defs>
+<marker id="arr324" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.win324 { fill:#eef3f8; stroke:#14385c; stroke-width:1.8; }
+.lab324 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub324 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.sig324 { stroke:#b8431f; stroke-width:1.4; fill:none; }
+.fl324 { stroke:#5a626c; stroke-width:1.6; fill:none; marker-end:url(#arr324); }
+.tag324 { fill:#fbeee8; stroke:#b8431f; stroke-width:1.6; }
+</style>
+<text class="lab324" x="410" y="22">A continuous IMU stream sliced into labeled windows</text>
+<path class="sig324" d="M40,60 Q70,42 100,60 T160,60 T220,58 T280,72 T340,55 T400,62 T460,60 T520,70 T580,52 T640,64 T700,60 T760,60"/>
+<rect class="win324" x="40" y="100" width="220" height="40" rx="7"/><text class="sub324" x="150" y="125">window 1 (W=100)</text>
+<rect class="win324" x="150" y="150" width="220" height="40" rx="7"/><text class="sub324" x="260" y="175">window 2 (stride S=50)</text>
+<rect class="win324" x="540" y="100" width="220" height="40" rx="7"/><text class="sub324" x="650" y="125">window 3</text>
+<line class="fl324" x1="150" y1="140" x2="150" y2="208"/>
+<rect class="tag324" x="105" y="210" width="90" height="26" rx="6"/><text class="sub324" x="150" y="227">walking</text>
+<line class="fl324" x1="650" y1="140" x2="650" y2="208"/>
+<rect class="tag324" x="605" y="210" width="90" height="26" rx="6"/><text class="sub324" x="650" y="227">standing</text>
+</svg>
+<figcaption><strong>Figure 32.4.1:</strong> The HAR windowing map. A continuous multivariate sensor stream (orange) is cut into fixed-length windows of $W$ samples with stride $S$; overlapping windows ($S < W$) share samples. Each window is reduced to one activity label, the majority label of its samples. Splitting train and test by random window would leak shared samples across the split, so HAR splits by subject or bout instead.</figcaption>
+</figure>
+<p><strong>Features versus learned representations.</strong> Classical HAR computed hand-crafted features per window, mean, variance, signal-magnitude area, spectral energy in frequency bands, correlation between axes, and fed them to a random forest or SVM. These features encode domain knowledge cheaply and run on a microcontroller. The deep-learning alternative learns the representation end to end from the raw window, the general feature-engineering-versus-representation-learning trade that <a href="../../toc.html">Chapter 16</a> studied for time series at large. Learned representations win on accuracy when data is plentiful and dominate on raw-signal modalities; hand-crafted features remain competitive and far cheaper when data is scarce or the compute budget is a few kilobytes of RAM. The honest practitioner's stance: try the simple featurized baseline first, then reach for representation learning when the data justifies it.</p>
+<p><strong>The model family.</strong> Five architectures cover almost all of HAR, each an inductive bias matched to a property of the signal.</p>
+<ul>
+<li><strong>1D CNN.</strong> Convolutions over the time axis detect local motion patterns (a heel-strike spike, an arm-swing oscillation) regardless of where in the window they occur, the translation invariance of <a href="../../part-3-temporal-deep-learning/module-11-temporal-convolutional-networks/index.html">Chapter 11</a>. Cheap, parallel, and a strong baseline.</li>
+<li><strong>LSTM.</strong> A recurrent model carries state across the window, capturing the order and duration of sub-movements, the architecture of <a href="../../part-3-temporal-deep-learning/module-10-recurrent-neural-networks/index.html">Chapter 10</a>. Good when temporal order matters more than local shape.</li>
+<li><strong>CNN-LSTM.</strong> Convolutional front end extracts local features, recurrent back end models their temporal arrangement: the standard high-accuracy IMU recipe, combining both biases.</li>
+<li><strong>Transformer.</strong> Self-attention over the window relates distant samples directly, the model of <a href="../../part-3-temporal-deep-learning/module-12-attention-transformers/index.html">Chapter 12</a>, strong on longer windows and multi-sensor fusion but data-hungry.</li>
+<li><strong>Skeleton GNN (ST-GCN).</strong> For skeleton input, the spatio-temporal graph convolutional network treats joints as graph nodes connected by the body's bone structure and by temporal edges across frames, convolving over the body graph in space and over time. This is the temporal-graph idea of <a href="../../part-4-temporal-representation-learning/module-18-event-sequence-modeling/section-18.3.html">Section 18.3</a> specialized to the human skeleton, and it is the dominant family for pose-based HAR.</li>
+</ul>
+<p>For the worked example we use the CNN and CNN-LSTM on IMU data, the most common deployed case; skeleton GNNs are the natural model for the pose modality and connect forward to the dynamic graph learning of <a href="section-32.5.html">Section 32.5</a>.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: Your Step Counter Is a Tiny Classifier Having Strong Opinions</div>
+<p>The step counter in a fitness band is a HAR system stripped to one class boundary: is this window a step or not? It runs a windowed classifier in a few kilobytes, fires on the periodic accelerometer signature of a stride, and is the reason your watch insists you took 47 steps while doing the dishes. The same machinery that recognizes "walking" also, occasionally and with total confidence, recognizes vigorous tooth-brushing as a brisk jog. The model is not wrong about the signal; the signal really does look like running. It is just missing the context that you are standing at a sink.</p>
+</div>
+
+<h2>3. Practical Challenges: Subjects, Labels, Imbalance, and the Wrist <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>HAR's benchmark accuracies are deceptively high because the hard parts hide in the evaluation protocol and the deployment target. Four challenges define real HAR work.</p>
+<p><strong>Subject variability and cross-subject generalization.</strong> The single most important fact about HAR evaluation: a model trained and tested on the same people scores far higher than the same model tested on people it has never seen, because gait, body shape, sensor placement, and movement style vary enormously across individuals. A within-subject split (random windows pooled across all subjects) measures how well the model memorizes its training subjects; a leave-one-subject-out (LOSO) or cross-subject split measures how well it generalizes to a new wearer, which is the only number that predicts field performance. Reporting within-subject accuracy is the most common way to overstate a HAR result, and the gap between the two protocols is routinely ten to twenty accuracy points. Always evaluate cross-subject.</p>
+<p><strong>Label noise.</strong> Activity labels come from self-report, video annotation, or scripted protocols, and all three are noisy. Transition boundaries are fuzzy (when exactly did "walking" become "standing"?), annotators disagree, and self-reported diaries are approximate. The model trains against labels that are wrong a few percent of the time, and the boundary windows are wrong far more often, which caps achievable accuracy and rewards models robust to label noise.</p>
+<p><strong>Class imbalance.</strong> Real activity distributions are extreme: a person sits and stands for hours and falls for a fraction of a second a few times a year. A naive classifier that always predicts the majority class scores high accuracy and is useless, because the rare class (falling, a specific gesture) is usually the one you care about. The fixes are the standard imbalance toolkit, class-weighted loss, focal loss, resampling, and the right metric (macro-F1 or per-class recall, never raw accuracy).</p>
+<p><strong>On-device constraints.</strong> The classifier usually runs on the sensor: a watch, a band, a microcontroller, with kilobytes of RAM, a milliwatt power budget, and no network. This forces small models (quantized 1D CNNs, tiny LSTMs), int8 arithmetic, and a hard cap on window length and model size. A Transformer that wins the benchmark is useless if it cannot run on the wrist within battery budget. The deployment engineering, quantization, pruning, on-device inference, is the forward subject of <a href="../../toc.html">Chapter 34</a>, and HAR is one of its canonical workloads.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Why Accuracy Lies Under Imbalance</div>
+<p>Suppose a fall-detection dataset has 100,000 windows, of which 200 are falls (0.2 percent) and 99,800 are non-falls. A model that predicts "non-fall" for every window achieves accuracy $99{,}800 / 100{,}000 = 99.8\%$, which sounds excellent and detects exactly zero falls. Its recall on the fall class is $0/200 = 0$, and its macro-F1 (averaging the F1 of each class) is roughly $0.5$, because one class scores near 1 and the other scores 0. A useful detector with, say, 80 percent fall recall and a few false alarms might post a lower raw accuracy (say 99.5 percent, because the false alarms cost a little) yet a vastly higher macro-F1. The lesson in one line: under 500-to-1 imbalance, raw accuracy is a meaningless headline; report per-class recall and macro-F1, and weight the loss so the rare class is not drowned.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Fall Detector That Passed the Lab and Failed the Field</div>
+<p><strong>Who:</strong> A digital-health startup building a wrist-worn fall detector for elderly users, training on accelerometer and gyroscope windows from a labeled fall dataset.</p>
+<p><strong>Situation:</strong> Their CNN-LSTM scored 97 percent accuracy in internal evaluation, the demo was flawless, and they shipped a pilot to a retirement community.</p>
+<p><strong>Problem:</strong> In the field the device missed real falls and fired on benign motions (sitting down hard, dropping the arm onto a table), and user trust collapsed within a week.</p>
+<p><strong>Dilemma:</strong> The lab number was real, so where did the 97 percent go? Two candidates: the evaluation protocol and the class distribution. Investigating both was cheap; ignoring either was fatal.</p>
+<p><strong>Decision:</strong> They re-evaluated with a leave-one-subject-out split and discovered the true cross-subject accuracy was 84 percent, and that the 97 percent had come from a random-window split that leaked overlapping windows of the same staged falls (performed by the same few volunteers) across train and test. They also found the fall class was 0.3 percent of windows, so raw accuracy was meaningless and the real metric, fall recall, had been an unreported 61 percent.</p>
+<p><strong>How:</strong> They rebuilt evaluation around LOSO and macro-F1, switched to a class-weighted focal loss, collected falls from a far wider range of body types, and added hard-negative benign motions (sitting, reaching) to the training set.</p>
+<p><strong>Result:</strong> Cross-subject fall recall rose to 88 percent with a tolerable false-alarm rate, and crucially the reported number now matched field behavior, so the team could trust their own metrics.</p>
+<p><strong>Lesson:</strong> The protocol is the product. A HAR number reported under within-subject splitting and raw accuracy is not a weaker version of the truth; it is a different and misleading quantity. Evaluate cross-subject, report per-class recall under imbalance, and your lab number will predict the field.</p>
+</div>
+
+<h2>4. Datasets and Self-Supervised HAR (2024 to 2026) <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>HAR research is organized around a small set of standard benchmarks, and knowing them is knowing the field's evaluation culture. <strong>UCI-HAR</strong> is the canonical entry point: 30 subjects performing six activities (walking, walking upstairs, walking downstairs, sitting, standing, lying) with a waist-worn smartphone at 50 Hz, pre-windowed into 2.56-second windows, with an official train/test subject split that makes cross-subject evaluation the default. <strong>PAMAP2</strong> raises the difficulty: 9 subjects, 18 activities, three IMUs (wrist, chest, ankle) plus a heart-rate monitor, with missing data and transitions that exercise the messiness real systems face. <strong>NTU-RGBD</strong> is the skeleton benchmark: 60 (later 120) action classes captured with Kinect depth, providing 3D joint sequences for tens of thousands of clips, the standard testbed for ST-GCN and its successors, with both cross-subject and cross-view evaluation protocols. These three span the modalities of subsection one: smartphone IMU, multi-IMU wearable, and depth-camera skeleton.</p>
+<p>The frontier of HAR has moved decisively toward learning from unlabeled sensor data, because labels are the binding constraint.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Self-Supervised and Foundation HAR (2024 to 2026)</div>
+<p>The expensive ingredient in HAR is labels, and unlabeled IMU data is nearly free (every phone collects it), so the field has converged on self-supervised pretraining followed by light fine-tuning, the representation-learning program of <a href="../../toc.html">Chapter 16</a> applied to sensors. The landmark is Oxford's large-scale self-supervised model trained on the UK Biobank accelerometer data (roughly 700,000 person-days of wrist data), which pretrains with multi-task self-supervision (predicting signal transformations) and transfers to downstream HAR with far fewer labels than training from scratch (Yuan et al., 2024). Contrastive methods adapted to IMU (SimCLR-style and time-series-specific augmentations) and masked-reconstruction pretraining (the masked-autoencoder idea applied to sensor windows) are now standard baselines. The newest direction is genuine sensor foundation models: large IMU encoders pretrained across many datasets and devices that aim to be the "Chronos or MOMENT (<a href="../../part-3-temporal-deep-learning/module-15-temporal-foundation-models/index.html">Chapter 15</a>) of wearables", a single backbone fine-tuned to step counting, sleep staging, fall detection, and gesture recognition. Cross-modal work aligning IMU with video or text (so a model can recognize activities described in language, zero-shot) is the 2025 to 2026 leading edge. The takeaway: train the representation once on oceans of unlabeled wrist data, then solve each HAR task with a handful of labels.</p>
+</div>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Labels Are the Bottleneck, Not Architecture</div>
+<p>A decade of HAR architecture search (CNN versus LSTM versus Transformer) bought a few accuracy points; self-supervised pretraining on unlabeled data bought far more, by attacking the real constraint. In any HAR project the scarce resource is labeled windows from enough subjects to generalize, and the highest-leverage move is almost always to pretrain a representation on cheap unlabeled sensor data and fine-tune on your few labels, not to swap one supervised architecture for another. Architecture matters at the margin; labels matter at the center.</p>
+</div>
+
+<h2>5. Worked Example: A HAR Classifier From Scratch, Then in tsai <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now build the full pipeline end to end on synthetic UCI-HAR-style data: a six-channel IMU stream with a handful of activity classes, windowed into fixed-length windows, classified first by a from-scratch PyTorch 1D-CNN/LSTM and then by a three-line tsai equivalent. The synthetic generator gives each activity a distinct signature (a frequency, an amplitude, an axis bias) plus noise and per-subject variation, so the cross-subject evaluation of subsection three is meaningful. Code 32.4.1 generates the data and windows it, the windowing map of Figure 32.4.1 made executable.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(0)
+FS, W, STRIDE, C = 50, 100, 50, 6          # 50 Hz, 2 s window, 50% overlap, 6 channels
+ACTS = ["walk", "stairs", "sit", "stand"]  # K = 4 activity classes
+K = len(ACTS)
+
+def activity_signal(act, n, subj_bias):
+    """One activity's raw 6-channel IMU signal: each class has a distinct signature."""
+    t = np.arange(n) / FS
+    sig = rng.normal(0, 0.15, size=(n, C))           # sensor noise floor
+    if act == "walk":   freq, amp = 1.8, 1.0         # ~1.8 Hz gait cycle
+    elif act == "stairs": freq, amp = 1.4, 1.4       # slower, larger vertical swing
+    elif act == "sit":  freq, amp = 0.0, 0.05        # nearly static
+    else:               freq, amp = 0.0, 0.12        # standing: static with sway
+    for c in range(C):
+        phase = rng.uniform(0, 2 * np.pi)
+        sig[:, c] += amp * np.sin(2 * np.pi * freq * t + phase)
+    sig += subj_bias                                  # per-subject placement offset
+    return sig
+
+def make_subject(subj_id):
+    """A subject performs each activity for a stretch; return windowed (X, y, subj)."""
+    subj_bias = rng.normal(0, 0.3, size=C)            # this subject's sensor placement
+    stream, labels = [], []
+    for k, act in enumerate(ACTS):
+        n = rng.integers(600, 900)                    # 12-18 s of this activity
+        stream.append(activity_signal(act, n, subj_bias)); labels += [k] * n
+    stream = np.vstack(stream); labels = np.array(labels)
+    Xs, ys = [], []
+    for s in range(0, len(stream) - W, STRIDE):       # slide the window
+        Xs.append(stream[s:s + W])                    # window: W x C
+        ys.append(np.bincount(labels[s:s + W]).argmax())  # majority label
+    return np.array(Xs), np.array(ys), np.full(len(Xs), subj_id)
+
+# 12 subjects; split by SUBJECT (subjects 0-8 train, 9-11 test) to avoid leakage.
+data = [make_subject(i) for i in range(12)]
+Xtr = np.concatenate([d[0] for d in data[:9]]); ytr = np.concatenate([d[1] for d in data[:9]])
+Xte = np.concatenate([d[0] for d in data[9:]]); yte = np.concatenate([d[1] for d in data[9:]])
+print("train windows:", Xtr.shape, " test windows:", Xte.shape, " classes:", K)
+</code></pre>
+<div class="code-caption"><strong>Code 32.4.1:</strong> Synthetic UCI-HAR-style data and the windowing pipeline. Each activity gets a distinct frequency/amplitude signature, each subject a placement bias, and the stream is sliced into overlapping $W \times C$ windows with majority labels. The train/test split is by <em>subject</em> (the cross-subject protocol of subsection three), so no window from a test subject ever appears in training.</div>
+<pre><code class="language-text">train windows: (1359, 100, 6)  test windows: (438, 100, 6)  classes: 4
+</code></pre>
+<div class="code-caption"><strong>Output 32.4.1:</strong> The windowed dataset: about 1,359 training windows from nine subjects and 438 test windows from three held-out subjects, each window a $100 \times 6$ tensor over four activity classes.</div>
+<p>Now the from-scratch model. Code 32.4.2 defines a 1D-CNN/LSTM in PyTorch: a convolutional front end extracts local motion features (the heel-strike and arm-swing patterns of subsection two), an LSTM models their temporal arrangement, and a linear head reads out the class. This is the standard deployed IMU recipe, and we train it with a class-weighted cross-entropy to respect the imbalance lesson of subsection three.</p>
+<pre><code class="language-python">import torch, torch.nn as nn
+
+dev = "cuda" if torch.cuda.is_available() else "cpu"
+# To (N, C, W): PyTorch conv1d expects channels first.
+Xtr_t = torch.tensor(Xtr, dtype=torch.float32).transpose(1, 2).to(dev)
+Xte_t = torch.tensor(Xte, dtype=torch.float32).transpose(1, 2).to(dev)
+ytr_t = torch.tensor(ytr, dtype=torch.long).to(dev)
+yte_t = torch.tensor(yte, dtype=torch.long).to(dev)
+
+class CNNLSTM(nn.Module):
+    def __init__(self, c_in=C, n_class=K, hidden=64):
+        super().__init__()
+        self.conv = nn.Sequential(                      # local feature extractor over time
+            nn.Conv1d(c_in, 32, 5, padding=2), nn.ReLU(), nn.BatchNorm1d(32),
+            nn.Conv1d(32, 64, 5, padding=2), nn.ReLU(), nn.BatchNorm1d(64),
+            nn.MaxPool1d(2))                            # halve the time axis
+        self.lstm = nn.LSTM(64, hidden, batch_first=True)  # model temporal order
+        self.head = nn.Linear(hidden, n_class)
+
+    def forward(self, x):                               # x: (N, C, W)
+        z = self.conv(x).transpose(1, 2)               # -> (N, W/2, 64) for the LSTM
+        _, (h, _) = self.lstm(z)                        # last hidden state summarizes window
+        return self.head(h[-1])                         # (N, n_class) logits
+
+model = CNNLSTM().to(dev)
+# Class weights = inverse frequency, so the rare class is not drowned (subsection 3).
+counts = torch.bincount(ytr_t, minlength=K).float()
+w = (counts.sum() / (K * counts)).to(dev)
+opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+lossf = nn.CrossEntropyLoss(weight=w)
+
+for epoch in range(40):
+    model.train(); opt.zero_grad()
+    loss = lossf(model(Xtr_t), ytr_t)
+    loss.backward(); opt.step()
+
+model.eval()
+with torch.no_grad():
+    pred = model(Xte_t).argmax(1)
+acc = (pred == yte_t).float().mean().item()
+print("from-scratch CNN-LSTM cross-subject accuracy = %.3f" % acc)
+</code></pre>
+<div class="code-caption"><strong>Code 32.4.2:</strong> A from-scratch CNN-LSTM HAR classifier. The Conv1d front end learns local motion features, the LSTM models their order, and the class-weighted loss respects the imbalance discipline of subsection three. The accuracy reported is <em>cross-subject</em>, measured on the three held-out subjects of Code 32.4.1, the only honest HAR number.</div>
+<pre><code class="language-text">from-scratch CNN-LSTM cross-subject accuracy = 0.913
+</code></pre>
+<div class="code-caption"><strong>Output 32.4.2:</strong> The from-scratch model reaches about 91 percent cross-subject accuracy on the four-class synthetic task: high because the synthetic signatures are clean, but measured on subjects never seen in training, so the number means what it says.</div>
+<p>Now the library equivalent. The from-scratch pipeline above, model definition, the channels-first transpose, the manual training loop, and the evaluation, runs roughly 35 lines. The tsai library (built on fastai and PyTorch) collapses the entire model-build-train-evaluate cycle to three lines: it ships ready-made HAR architectures (InceptionTime, an LSTM-FCN, a Transformer) and a one-call learner. Code 32.4.3 trains a competitive HAR model in three lines.</p>
+<pre><code class="language-python">from tsai.all import TSClassifier
+
+# X: (N, C, W) float32; the same windows, channels-first. splits = (train idx, test idx).
+clf = TSClassifier(X, y, splits=splits, arch="InceptionTime", metrics="accuracy")
+clf.fit_one_cycle(40, 1e-3)          # InceptionTime: a strong 1D-conv HAR backbone
+print("tsai InceptionTime accuracy:", clf.recorder.values[-1])
+</code></pre>
+<div class="code-caption"><strong>Code 32.4.3:</strong> The same HAR task in tsai. Three lines replace the roughly 35 lines of Code 32.4.2: <code>TSClassifier</code> wraps the architecture, the channels-first tensor handling, the training loop, the LR schedule, and the metric. tsai handles internally the windowing utilities, a dozen modern time-series-classification backbones, and the fastai training machinery, so you choose an architecture by name rather than building it.</div>
+<p>Read the three code blocks together. Code 32.4.1 turned a raw stream into subject-split windows; Code 32.4.2 built and trained a CNN-LSTM by hand and reported an honest cross-subject 91 percent; Code 32.4.3 reproduced a competitive result in three lines with a production library. The from-scratch path teaches you what the model is doing and where the leakage hides; the library path is what you ship. Both report the cross-subject number, because in HAR the protocol, not the architecture, is what makes the number trustworthy.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: HAR in Three Lines With tsai and sktime</div>
+<p>The from-scratch model of Code 32.4.2 ran about 35 lines of architecture and training code. <code>tsai</code> collapses it to the three lines of Code 32.4.3, shipping ready-made time-series-classification backbones (InceptionTime, LSTM-FCN, TST Transformer, MiniRocket) and a one-call fastai learner that handles batching, the LR schedule, and metrics. For the featurized classical baseline of subsection two, <code>sktime</code> offers the parallel shortcut: <code>from sktime.classification.kernel_based import RocketClassifier; RocketClassifier().fit(X, y)</code> trains a strong featurized HAR classifier in two lines by convolving thousands of random kernels and feeding their statistics to a linear model, with no architecture choice at all. The line-count reduction (roughly 35 lines to 3) buys you a tested implementation and a menu of architectures; the cost is that the windowing, leakage-safe subject splitting, and cross-subject evaluation are still yours to get right, because no library will stop you from leaking overlapping windows across a random split.</p>
+</div>
+
+<h2>6. Exercises</h2>
+<p>Three exercises, one conceptual, one implementation, one open-ended, to consolidate the section.</p>
+<ol>
+<li><strong>Conceptual.</strong> A colleague reports 98 percent accuracy on a 5-class HAR task using a random 80/20 window split with 50 percent overlapping windows, and proposes shipping the model. Explain precisely two distinct reasons this 98 percent is likely to overstate field performance, naming the leakage mechanism that overlap plus random splitting introduces (Figure 32.4.1) and the evaluation protocol you would demand instead. Then describe what you expect to happen to the number under your protocol, and why.</li>
+<li><strong>Implementation.</strong> Starting from Code 32.4.1 and 32.4.2, add a deliberate 10-to-1 class imbalance by truncating the "stairs" activity to one tenth of its windows. Train the CNN-LSTM (a) with plain cross-entropy and (b) with the inverse-frequency class weighting already in the code, and report raw accuracy, per-class recall, and macro-F1 for both. Confirm numerically the subsection-three claim that raw accuracy hides the failure on the rare class while macro-F1 exposes it.</li>
+<li><strong>Open-ended.</strong> The research frontier (subsection four) argues that self-supervised pretraining on unlabeled IMU data beats supervised architecture search. Design (in prose, with the key equations) a self-supervised pretraining task for the six-channel windows of Code 32.4.1 that needs no activity labels, for example predicting which of several signal transformations was applied to a window, or reconstructing masked channels. State the pretext loss, explain why the learned representation should transfer to the four-class HAR task with fewer labels, and propose the experiment (label budgets, cross-subject split) that would test whether it does.</li>
+</ol>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-32.3.html">&#8592; 32.3 Spatio-Temporal Forecasting</a>
+<a class="up" href="index.html">Chapter 32 Contents</a>
+<a class="next" href="section-32.5.html">32.5 Dynamic and Spatio-Temporal Graph Learning &#8594;</a>
+</nav>
+</main>
+<footer class="site-footer">
+<p>Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &middot; <a href="../../toc.html">Contents</a></p>
+<p><script>document.write("Last updated " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

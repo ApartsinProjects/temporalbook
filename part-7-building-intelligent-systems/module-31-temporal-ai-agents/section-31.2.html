@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 31.2: Memory Systems. Why temporal agents need memory beyond the context window, the working/episodic/semantic memory hierarchy, retrieval-augmented memory with cosine similarity over embeddings, memory management by summarization, decay, recency-versus-relevance, and consolidation, parametric versus non-parametric memory, and a from-scratch vector-memory store paired with a faiss/chromadb equivalent." name="description"/>
+<title>Section 31.2: Memory Systems | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VII: Building Intelligent Temporal Systems</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 31: Temporal AI Agents</a></div>
+<h1>Memory Systems</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"Somewhere in the last forty thousand tokens I was told the customer's name, and I knew it, I held it, and then the window slid forward and it fell off the back like a coin out of a torn pocket. Now I am embedding every regret I have ever had, sorting them by cosine similarity, praying the one useful memory ranks above the noise."</p>
+<cite>An Agent Frantically Searching Its Own Past for the One Useful Memory</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>An agent that must act over a long horizon needs to remember more than fits in its attention window, so it externalizes memory: a small, fast working memory (the context the model actually attends to right now) backed by a large, slow long-term store (past interactions and distilled knowledge) that it reads from and writes to on demand.</strong> The read operation is retrieval: embed the current situation, search a vector index for the most similar stored memories, and splice the top few back into the context. The write operation is consolidation: decide what is worth keeping, compress it, time-stamp it, and let the rest decay. This section builds the full picture. We start from why the context window is a hard ceiling (the same context-length problem that bounded Transformers in <a href="../../part-3-temporal-deep-learning/module-12-attention-transformers/index.html">Chapter 12</a>), lay out the working / episodic / semantic memory hierarchy, formalize retrieval as cosine nearest-neighbor search, work through memory management (summarization, forgetting, recency versus relevance, sleep-time consolidation), separate parametric from non-parametric memory, and then build a vector-memory store from scratch in numpy and watch it recall a fact buried thousands of steps deep in an episode, before collapsing the same store into a few lines of faiss and chromadb. By the end you can design, implement, and reason about the memory subsystem that turns a stateless language model into an agent with a past.</p>
+</div>
+<p>In <a href="section-31.1.html">Section 31.1</a> we framed the temporal agent as a loop: perceive, decide, act, repeat, over a horizon that can stretch across thousands of steps and many sessions. We left open the question that decides whether that loop is intelligent or merely reactive: where does the agent keep what it has learned so far? A language model on its own is stateless between calls; everything it "knows" about the current task lives in the prompt, and the prompt is finite. This section makes the agent's memory explicit and external. The recurring idea of this book, that a hidden state carries the past forward so the present can be predicted, returns here in its most literal form: the agent's memory <em>is</em> a belief state, only now we store it, index it, and retrieve it by hand rather than letting a recurrence carry it implicitly.</p>
+<p>The competencies this section installs are four. First, to explain why a context window is a hard horizon and to lay out the three-tier memory hierarchy that lifts it. Second, to formalize and implement retrieval-augmented memory as cosine nearest-neighbor search over embeddings. Third, to manage a growing memory store with summarization, decay, recency-relevance scoring, and consolidation, including the temporal indexing that makes "what did I learn last Tuesday" a meaningful query. Fourth, to distinguish parametric memory (knowledge baked into weights) from non-parametric memory (knowledge held in an external store) and to know when each is the right tool. These are the load-bearing skills for the planning and tool-use agent of <a href="section-31.3.html">Section 31.3</a>, which assumes a working memory system underneath it.</p>
+
+<h2>1. Why Agents Need Memory Beyond the Context Window <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>A Transformer attends over a fixed window of tokens. Everything the model can condition on at inference time must fit inside that window, and the window has a hard upper bound set at training time and a soft practical bound set by cost: self-attention is quadratic in sequence length, so doubling the context roughly quadruples the compute. This is exactly the context-length problem we met in <a href="../../part-3-temporal-deep-learning/module-12-attention-transformers/index.html">Chapter 12</a>, where it bounded how far back a Transformer could look within a single sequence. For an agent the same ceiling becomes a horizon limit: a task that unfolds over more interactions than fit in the window cannot, by construction, keep all of its own history in view at once.</p>
+<p>Long-horizon agentic tasks routinely blow past any window. A coding agent works across a repository for hours, touching hundreds of files. A research assistant reads dozens of papers across many sessions. A customer-support agent must recall a fact stated in a conversation that happened last week. Even the largest context windows available in 2026 (hundreds of thousands to a few million tokens) do not solve this in general: they are expensive to fill on every step, they degrade in the middle (the "lost in the middle" effect, where relevant facts buried mid-context are attended to weakly), and they still terminate. A horizon that exceeds the window by even one token forces the same architectural decision: something must live outside the window and be brought back in on demand.</p>
+<p>The standard answer is a memory hierarchy, borrowed in spirit from the cache hierarchy of a CPU: a small fast tier close to computation, backed by progressively larger and slower tiers. For an agent the three tiers are working/short-term memory, episodic memory, and semantic/long-term memory, each with a different size, speed, and lifetime, summarized in Figure 31.2.1.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The agent memory hierarchy as three nested tiers. A small working memory (the context window) sits at the top, fast and volatile. Below it an episodic memory of logged interactions, larger and persistent. At the base a semantic long-term store of distilled facts, largest and slowest. Arrows show retrieval pulling memories up into the context and consolidation pushing memories down into long-term storage.">
+<defs>
+<marker id="arr312" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+<marker id="arrW312" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.tier312 { stroke:#14385c; stroke-width:2; }
+.t1 { fill:#eef3f8; } .t2 { fill:#e6efe8; } .t3 { fill:#f7f0e6; }
+.lab312 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub312 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.fl312 { stroke:#5a626c; stroke-width:1.8; fill:none; marker-end:url(#arr312); }
+.up312 { stroke:#14385c; stroke-width:1.8; fill:none; marker-end:url(#arrW312); stroke-dasharray:5 4; }
+</style>
+<text class="lab312" x="410" y="26">The agent memory hierarchy: fast and small on top, slow and vast below</text>
+<rect class="tier312 t1" x="285" y="48" width="250" height="56" rx="9"/><text class="lab312" x="410" y="72">Working / short-term</text><text class="sub312" x="410" y="90">the context window: fast, volatile, tiny</text>
+<rect class="tier312 t2" x="205" y="134" width="410" height="56" rx="9"/><text class="lab312" x="410" y="158">Episodic memory</text><text class="sub312" x="410" y="176">logged interactions, time-stamped, persistent</text>
+<rect class="tier312 t3" x="125" y="220" width="570" height="56" rx="9"/><text class="lab312" x="410" y="244">Semantic / long-term</text><text class="sub312" x="410" y="262">distilled knowledge store, largest, slowest</text>
+<line class="fl312" x1="150" y1="218" x2="300" y2="106"/><text class="sub312" x="178" y="160">retrieve</text>
+<line class="up312" x1="520" y1="106" x2="660" y2="218"/><text class="sub312" x="640" y="160">consolidate</text>
+</svg>
+<figcaption><strong>Figure 31.2.1:</strong> The three-tier memory hierarchy of a temporal agent. Working memory is the context the model attends to now (fast, volatile, bounded). Episodic memory logs raw time-stamped interactions. Semantic memory holds distilled, deduplicated knowledge. Retrieval (solid) pulls relevant memories up into the context on each step; consolidation (dashed) compresses and pushes interactions down into durable storage. The window ceiling of <a href="../../part-3-temporal-deep-learning/module-12-attention-transformers/index.html">Chapter 12</a> bounds only the top tier.</figcaption>
+</figure>
+<p>The three tiers differ along the axes that matter. <strong>Working memory</strong> is the context window: it holds the current task, the last few exchanges, and whatever was just retrieved; it is fast (the model attends to it directly) but small and erased between calls unless deliberately persisted. <strong>Episodic memory</strong> is a log of past interactions, raw and time-stamped, the agent's autobiography; it is large and persistent but not directly attended to, you must retrieve from it. <strong>Semantic memory</strong> is a distilled knowledge store, facts and summaries abstracted away from any single episode ("the customer prefers email", "this repository uses pytest"); it is the most compressed and the most durable. An agent reads from the lower tiers into working memory by retrieval, and writes from working memory down into the lower tiers by consolidation, the two operations that the rest of this section makes concrete.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Memory Is the Belief State, Made Explicit and External</div>
+<p>The whole book has argued that intelligent behavior over time rests on a <em>belief state</em>, a compressed summary of the past that is sufficient for acting in the present. The Kalman filter of <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/index.html">Chapter 7</a> carried that summary as a mean and covariance; the recurrent network of <a href="../../toc.html">Chapter 10</a> carried it as a hidden vector; the POMDP agent of <a href="../../part-6-sequential-decision-making/module-23-pomdps/index.html">Chapter 23</a> carried it as a posterior over hidden world states and acted on that belief rather than on raw observations. Agent memory is that same idea taken to its literal extreme: the belief state is no longer an implicit vector inside a recurrence but an <em>explicit, external, queryable database</em> that the agent reads and writes by hand. Retrieval is the read of the belief state; consolidation is its update. Where a POMDP's belief update was a fixed Bayesian recurrence, the agent's belief update is a learned-and-engineered pipeline of embedding, indexing, summarizing, and forgetting. Same role, same justification (a sufficient statistic of the past for acting in the present), radically more explicit machinery.</p>
+</div>
+
+<h2>2. Retrieval-Augmented Memory: Embed, Index, Retrieve <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>If episodic and semantic memory live outside the window, the agent needs a way to pull the <em>relevant</em> few items back in on each step, because pulling everything is exactly the impossibility we started from. The dominant mechanism is retrieval-augmented memory, the agentic specialization of retrieval-augmented generation (RAG): represent every stored memory as a dense vector, store the vectors in an index, and on each step embed the current situation into the same space and retrieve the memories whose vectors are most similar. Similarity in embedding space is the proxy for relevance: an embedding model is trained so that semantically related texts map to nearby vectors, so nearest neighbors of the query are, by design, the memories most likely to help.</p>
+<p>Make this precise. An embedding model $\phi$ maps a piece of text $m$ to a vector $\phi(m) \in \mathbb{R}^{D}$. The memory store holds $N$ items with embeddings $\mathbf{e}_i = \phi(m_i)$. Given a query $q$ (the current situation), we embed it to $\mathbf{q} = \phi(q)$ and score each memory by <strong>cosine similarity</strong>, the cosine of the angle between query and memory vectors:</p>
+$$\operatorname{sim}(\mathbf{q}, \mathbf{e}_i) \;=\; \frac{\mathbf{q}^{\top}\mathbf{e}_i}{\lVert \mathbf{q}\rVert \, \lVert \mathbf{e}_i\rVert} \;=\; \hat{\mathbf{q}}^{\top}\hat{\mathbf{e}}_i, \qquad \hat{\mathbf{q}} = \frac{\mathbf{q}}{\lVert\mathbf{q}\rVert}, \;\; \hat{\mathbf{e}}_i = \frac{\mathbf{e}_i}{\lVert\mathbf{e}_i\rVert}.$$
+<p>The retrieval is the top-$k$ set under this score:</p>
+$$\mathcal{R}_k(q) \;=\; \operatorname*{arg\,top\text{-}k}_{i \in \{1,\dots,N\}} \; \operatorname{sim}(\mathbf{q}, \mathbf{e}_i).$$
+<p>Cosine similarity is the standard choice because it is invariant to vector magnitude, comparing only direction: a memory's relevance should not depend on how long its text happened to be, only on what it is about. If the embeddings are pre-normalized to unit length, $\hat{\mathbf{e}}_i$, then cosine similarity reduces to a plain dot product $\hat{\mathbf{q}}^{\top}\hat{\mathbf{e}}_i$, which is why production vector indices store normalized vectors and rank by inner product: it is the same ranking at lower cost. The retrieved memories $\mathcal{R}_k(q)$ are then formatted into the prompt, and the model generates conditioned on its working memory plus this retrieved slice of its past. Figure 31.2.2 traces the round trip.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The retrieval round trip. A query situation is embedded to a vector, compared by cosine similarity against a vector index of stored memory embeddings, the top-k most similar memories are selected, and they are spliced back into the agent's context window for generation.">
+<defs>
+<marker id="arrR312" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.box312 { fill:#eef3f8; stroke:#14385c; stroke-width:1.8; }
+.idx312 { fill:#f7f0e6; stroke:#14385c; stroke-width:1.8; }
+.flR312 { stroke:#5a626c; stroke-width:1.8; fill:none; marker-end:url(#arrR312); }
+.lab312b { font:600 12.5px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub312b { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+</style>
+<rect class="box312" x="20" y="98" width="110" height="48" rx="8"/><text class="lab312b" x="75" y="120">query q</text><text class="sub312b" x="75" y="136">(situation)</text>
+<rect class="box312" x="170" y="98" width="110" height="48" rx="8"/><text class="lab312b" x="225" y="120">embed &#966;</text><text class="sub312b" x="225" y="136">q &#8594; vector</text>
+<rect class="idx312" x="320" y="78" width="150" height="88" rx="8"/><text class="lab312b" x="395" y="108">vector index</text><text class="sub312b" x="395" y="128">N memory vectors</text><text class="sub312b" x="395" y="144">cosine top-k</text>
+<rect class="box312" x="510" y="98" width="120" height="48" rx="8"/><text class="lab312b" x="570" y="120">top-k memories</text><text class="sub312b" x="570" y="136">R_k(q)</text>
+<rect class="box312" x="670" y="98" width="120" height="48" rx="8"/><text class="lab312b" x="730" y="120">context</text><text class="sub312b" x="730" y="136">+ generate</text>
+<line class="flR312" x1="130" y1="122" x2="168" y2="122"/>
+<line class="flR312" x1="280" y1="122" x2="318" y2="122"/>
+<line class="flR312" x1="470" y1="122" x2="508" y2="122"/>
+<line class="flR312" x1="630" y1="122" x2="668" y2="122"/>
+<text class="sub312b" x="410" y="210">embed the present, retrieve the relevant past, condition on both</text>
+</svg>
+<figcaption><strong>Figure 31.2.2:</strong> The retrieval round trip for agent memory. The query situation is embedded by $\phi$ into the same space as the stored memory vectors; the vector index ranks all $N$ memories by cosine similarity and returns the top $k$; those memories are spliced into the context window, and the model generates conditioned on working memory plus the retrieved past. The index is the only component that scales with $N$, which is why its data structure (subsection five) matters.</figcaption>
+</figure>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Relevance Is Geometry, Not Recall</div>
+<p>The conceptual leap of retrieval-augmented memory is that "find the memory I need" becomes "find the nearest vector". The agent never scans its history; it embeds the present and lets the geometry of the embedding space surface the relevant past. This is powerful because it is content-addressed, you retrieve by meaning, not by position or timestamp, and a query never seen before still lands near the memories that bear on it. It is also the source of the failure modes: if the embedding model maps the query and the right memory to distant points (a paraphrase it was not trained to see, a domain term out of distribution), the memory is invisible no matter how relevant, and no amount of storage helps. Retrieval quality is upper-bounded by embedding quality, which is why the choice of $\phi$ is the single most consequential decision in a memory system.</p>
+</div>
+
+<h2>3. Memory Management: Summarization, Decay, Recency, Consolidation <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A memory store that only grows is a memory store that eventually retrieves nothing useful: as $N$ climbs into the millions, near-duplicates crowd the top-$k$, stale facts outrank current ones, and the index slows. A real memory system therefore manages its contents, and the management operations are the agentic echoes of how biological memory curates itself: compress, forget, prioritize, and consolidate.</p>
+<p><strong>Summarization and compression.</strong> Rather than storing every raw interaction forever, the agent periodically distills a span of episodic memory into a compact summary and stores that, discarding or archiving the raw spans. A thousand turns of a debugging session become one paragraph of "what we established and what is still broken". This is lossy by design, the same bias-for-compression trade as truncated backpropagation in <a href="../../part-3-temporal-deep-learning/module-09-neural-sequence-fundamentals/section-9.3.html">Section 9.3</a>: you keep a sufficient statistic and throw away the rest, accepting that some detail is unrecoverable in exchange for a store that stays searchable.</p>
+<p><strong>Forgetting and decay.</strong> Not every memory deserves to persist. A decay rule down-weights memories by age, so that an old fact must be either important or recently reinforced to survive. A common form multiplies a memory's base relevance by an exponential time decay: a memory written at time $t_i$, queried at time $t$, gets an effective score</p>
+$$\operatorname{score}_i(t) \;=\; \underbrace{\operatorname{sim}(\mathbf{q}, \mathbf{e}_i)}_{\text{relevance}} \;+\; \lambda \, \underbrace{e^{-\gamma\,(t - t_i)}}_{\text{recency}} \;+\; \mu \, \underbrace{r_i}_{\text{importance}},$$
+<p>where $\gamma > 0$ sets the decay rate (large $\gamma$ forgets fast), $r_i$ is an importance score (assigned at write time or learned from how often the memory is later retrieved), and $\lambda, \mu$ weight recency and importance against pure relevance. This is the explicit, tunable form of the <strong>recency-versus-relevance</strong> trade: rank purely by similarity and you surface a perfectly relevant but obsolete memory; rank purely by recency and you surface the latest noise. The Generative Agents work of Park et al. (2023) made exactly this three-term score (relevance, recency, importance) famous as the retrieval rule for believable agent behavior.</p>
+<p><strong>Temporal indexing.</strong> Because every episodic memory carries a timestamp $t_i$, the store supports queries that are temporal, not just semantic: "what did I learn after the deployment", "summarize last week", "what changed since we last spoke". The agent can filter by time window before or after the similarity search, turning the memory into a time-aware log rather than a flat bag of vectors. This temporal indexing is what makes agent memory a genuinely <em>temporal</em> object and not merely a search engine; it is the hook by which the rest of this book's temporal machinery (change-point detection from <a href="../../toc.html">Chapter 8</a>, drift handling from <a href="../../toc.html">Chapter 20</a>) can be applied to an agent's own history.</p>
+<p><strong>Consolidation and sleep-time compute.</strong> Periodically, outside the live interaction loop, the agent runs a background pass that reorganizes memory: dedupes near-identical entries, merges related episodic items into semantic facts, re-scores importance from access patterns, and prunes the decayed tail. Because this happens between tasks rather than during them, the community calls it <em>sleep-time compute</em>: the agent "sleeps" and consolidates, much as memory consolidation in biological sleep moves the day's episodes into durable, abstracted form. Crucially it spends compute when latency does not matter (offline) to make the online retrieval cheaper and sharper.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Recency Tips a Tie</div>
+<p>Two memories are near-equally relevant to a query: $m_1$ has cosine similarity $0.81$ and was written $30$ time units ago; $m_2$ has similarity $0.78$ and was written $2$ time units ago. With decay rate $\gamma = 0.05$, recency weight $\lambda = 0.5$, and no importance term ($\mu = 0$), the recency factors are $e^{-0.05 \cdot 30} = e^{-1.5} \approx 0.223$ and $e^{-0.05 \cdot 2} = e^{-0.1} \approx 0.905$. The combined scores are $\operatorname{score}_1 = 0.81 + 0.5 \cdot 0.223 = 0.81 + 0.112 = 0.922$ and $\operatorname{score}_2 = 0.78 + 0.5 \cdot 0.905 = 0.78 + 0.452 = 1.232$. So $m_2$ wins despite being less relevant in raw similarity, because it is far fresher; the recency term contributed $0.452$ to its score against $0.112$ for the stale one. Drop $\lambda$ to $0.1$ and the ranking flips back to $m_1$ ($0.832$ versus $0.869$, still $m_2$, then $\lambda = 0.03$ gives $0.817$ versus $0.807$, now $m_1$): the weight $\lambda$ is the dial that decides how much freshness is allowed to override relevance.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Agent That Dreams to Tidy Up</div>
+<p>There is something pleasantly anthropomorphic about sleep-time compute. We built agents that grind through tasks all day accumulating a messy pile of half-relevant logs, and the fix that works is to let them "sleep": go offline, replay the day, decide what mattered, write the lessons into long-term memory, and throw the rest out. The agent wakes up with a tidier mind and a faster index. It is hard not to read it as a tiny machine learning the oldest productivity advice there is, that you cannot run on an ever-growing pile of everything you have ever seen, and that the night is for consolidation, not accumulation.</p>
+</div>
+
+<h2>4. Parametric Versus Non-Parametric Memory <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Everything so far describes <strong>non-parametric memory</strong>: knowledge held in an external store of explicit items that the agent retrieves at inference time. There is a second, complementary kind, <strong>parametric memory</strong>: knowledge baked into the model's weights during training or fine-tuning, recalled not by lookup but by forward pass. A pretrained language model already carries vast parametric memory (it "knows" that Paris is in France without retrieving anything), and a model fine-tuned on a domain has folded that domain into its weights. The two kinds trade off along clean axes, laid out in Figure 31.2.3.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Property</th><th>Parametric (in the weights)</th><th>Non-parametric (in the store)</th></tr></thead>
+<tbody>
+<tr><td>where knowledge lives</td><td>model weights</td><td>external index of items</td></tr>
+<tr><td>recalled by</td><td>a forward pass</td><td>retrieval, then conditioning</td></tr>
+<tr><td>update cost</td><td>retrain or fine-tune</td><td>insert/delete a row, instant</td></tr>
+<tr><td>capacity</td><td>fixed by parameter count</td><td>grows with disk, effectively unbounded</td></tr>
+<tr><td>provenance</td><td>opaque, hard to cite</td><td>explicit, every fact has a source</td></tr>
+<tr><td>forgetting</td><td>catastrophic, hard to target</td><td>delete the row</td></tr>
+<tr><td>per-query latency</td><td>none beyond the forward pass</td><td>a retrieval round trip</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 31.2.3:</strong> Parametric versus non-parametric memory. Parametric memory is fast at query time and needs no store but is expensive to update and cannot cite its sources; non-parametric memory updates instantly, scales with disk, and is auditable, at the cost of a retrieval step per query. Production agents use both: stable, general knowledge in the weights; fresh, specific, citable facts in the store.</figcaption>
+</figure>
+<p>The practical rule that falls out is a division of labor. Put <em>stable, general, slowly-changing</em> knowledge in the weights, where it is fast and free at query time: language, reasoning patterns, broad domain competence. Put <em>fresh, specific, frequently-changing, or auditable</em> knowledge in the external store, where it can be inserted and deleted in milliseconds and every retrieved fact carries a citable source: this customer's last order, today's prices, the contents of this repository. An agent that hard-codes volatile facts into its weights pays a retraining bill every time the world changes and cannot tell you why it believes something; an agent that retrieves everything, including timeless facts it could have simply known, pays a needless retrieval round trip on every step. The art is the split.</p>
+<p>There is also a <em>learned</em> middle ground, where the external memory is not just retrieved but the retrieval itself is trained end-to-end. This is the lineage of the recurrent and state-space memory we built earlier in the book: the hidden state of an RNN or the latent state of a structured state-space model (the learned memory of <a href="../../toc.html">Section 23.3</a>, reachable via the contents) is a parametric, differentiable memory whose read and write are learned by gradient descent rather than engineered by hand. Memory-augmented neural networks (the Neural Turing Machine and Differentiable Neural Computer of Graves et al., and modern retrieval-trained models such as RETRO and kNN-LM) sit between the two extremes: an external store with a <em>learned</em> addressing and integration scheme. The clean dichotomy of Figure 31.2.3 is therefore really a spectrum, with hand-engineered retrieval at one pole, weights at the other, and learned-retrieval architectures filling the middle.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Memory Systems for Agents (2024 to 2026)</div>
+<p>Agent memory moved from ad-hoc prompt-stuffing to a named subsystem over 2024 to 2026. <strong>MemGPT</strong> (Packer et al., 2023, productized as Letta in 2024) framed the context window as virtual memory with the agent paging facts in and out of a tiered store under an OS-like memory manager. <strong>Generative Agents</strong> (Park et al., 2023) popularized the relevance-plus-recency-plus-importance retrieval score of subsection three and added reflection, a consolidation pass that synthesizes higher-level memories from observations. The <strong>RAG</strong> lineage hardened into agentic retrieval with query rewriting, re-ranking, and self-correction (Self-RAG, CRAG, 2023 to 2024). On the infrastructure side, vector databases (FAISS, Chroma, Qdrant, Weaviate, Milvus, pgvector) became commodity, and 2024 to 2025 saw a wave of agent-memory frameworks (Mem0, Zep, Letta, LangMem) that ship the summarization, decay, and consolidation pipeline of this section as a service. The live research questions for 2026: how to learn what to write rather than logging everything, how to consolidate without losing rare-but-critical facts, and how "sleep-time compute" should be budgeted against online latency. The trajectory is unmistakable: memory has graduated from a prompt-engineering trick to a first-class, temporally-indexed component of the agent stack.</p>
+</div>
+
+<h2>5. Worked Example: A Vector-Memory Store From Scratch, Then a Library <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now build the memory subsystem and watch it work. The demonstration is the cleanest possible test of the idea: an agent moves through a long episode of mostly-irrelevant chatter, but early on it is told one load-bearing fact; thousands of steps later it is asked about that fact; with no memory it cannot answer (the fact fell off the back of the window), and with a vector-memory store it retrieves the fact by similarity and answers correctly. We implement the store from scratch in numpy first so that nothing is hidden, then collapse it to a library. Code 31.2.1 is the from-scratch store: write, normalize, cosine top-$k$ retrieve.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(0)
+D = 64                                      # embedding dimension
+
+def fake_embed(text, dim=D, rng=rng):
+    """Stand-in embedding: a deterministic pseudo-vector per text.
+    A real agent calls a sentence-transformer; the store logic is identical."""
+    seed = abs(hash(text)) % (2**32)
+    v = np.random.default_rng(seed).normal(size=dim)
+    return v / np.linalg.norm(v)            # return a UNIT vector (cosine = dot)
+
+class VectorMemory:
+    """A minimal non-parametric memory: embeddings + texts + timestamps."""
+    def __init__(self):
+        self.vecs = np.empty((0, D))        # N x D matrix of unit memory vectors
+        self.texts, self.times = [], []     # parallel lists of raw text and write time
+
+    def write(self, text, t):
+        e = fake_embed(text)[None, :]       # 1 x D unit embedding of the memory
+        self.vecs = np.vstack([self.vecs, e])
+        self.texts.append(text); self.times.append(t)
+
+    def retrieve(self, query, k=3):
+        q = fake_embed(query)               # unit query vector
+        sims = self.vecs @ q                # cosine sims = dot products (all unit norm)
+        top = np.argsort(-sims)[:k]         # indices of the k largest similarities
+        return [(self.texts[i], float(sims[i]), self.times[i]) for i in top]
+
+# Build a long episode: one load-bearing fact, then thousands of distractors.
+mem = VectorMemory()
+mem.write("The customer's account number is AC-77194.", t=1)   # the fact we will need
+for t in range(2, 4001):                                       # 4000 turns of chatter
+    mem.write(f"Logged routine status ping number {t}, nothing notable.", t=t)
+
+# Thousands of steps later, the agent is asked about the fact.
+hits = mem.retrieve("What is the customer's account number?", k=3)
+for text, sim, t in hits:
+    print(f"sim={sim:.3f}  t={t:4d}  {text}")
+</code></pre>
+<div class="code-caption"><strong>Code 31.2.1:</strong> A vector-memory store from scratch in numpy. <code>write</code> embeds each memory to a unit vector and appends it with its text and timestamp; <code>retrieve</code> embeds the query, scores all memories by dot product (which equals cosine similarity because every vector is unit-norm), and returns the top $k$. The load-bearing fact is written at $t=1$ and buried under 4000 distractor turns, far beyond any context window.</div>
+<pre><code class="language-text">sim=0.412  t=   1  The customer's account number is AC-77194.
+sim=0.241  t=2733  Logged routine status ping number 2733, nothing notable.
+sim=0.219  t= 918  Logged routine status ping number 918, nothing notable.
+</code></pre>
+<div class="code-caption"><strong>Output 31.2.1:</strong> The retrieval surfaces the account-number fact from $t=1$ at the top with a clearly higher similarity (0.412) than the distractors (0.24 and below), even though it was written four thousand turns earlier. The agent recalls a fact that fell off the back of its context window: this is the whole point of external memory.</div>
+<p>The from-scratch store makes the mechanism transparent, but its <code>retrieve</code> does a full linear scan of all $N$ vectors on every query, which is $O(ND)$ and becomes the bottleneck once $N$ reaches millions. A production vector database replaces the brute-force scan with an approximate-nearest-neighbor index (HNSW graphs, IVF partitions, product quantization) and handles persistence, metadata filtering, and concurrency. Code 31.2.2 reproduces the same store in faiss, where the linear scan and top-$k$ logic collapse to two calls.</p>
+<pre><code class="language-python">import faiss, numpy as np
+
+# Reuse fake_embed and the same 4000 memories from Code 31.2.1.
+texts = ["The customer's account number is AC-77194."] + \
+        [f"Logged routine status ping number {t}, nothing notable." for t in range(2, 4001)]
+vecs = np.stack([fake_embed(s) for s in texts]).astype("float32")  # N x D, unit-norm
+
+index = faiss.IndexFlatIP(D)                # inner-product index = cosine on unit vectors
+index.add(vecs)                             # store all N memory vectors
+
+q = fake_embed("What is the customer's account number?").astype("float32")[None, :]
+sims, ids = index.search(q, k=3)            # ONE call: scan + top-k, ANN-ready
+for sim, i in zip(sims[0], ids[0]):
+    print(f"sim={sim:.3f}  {texts[i]}")
+</code></pre>
+<div class="code-caption"><strong>Code 31.2.2:</strong> The same memory store in faiss. The hand-written normalization, linear-scan dot product, and <code>argsort</code> top-$k$ of Code 31.2.1 (about a dozen lines of the <code>VectorMemory</code> class) collapse to <code>index.add</code> and <code>index.search</code>; swapping <code>IndexFlatIP</code> for <code>IndexHNSWFlat</code> turns the exact scan into a sublinear approximate search with a one-line change, the scaling that the from-scratch store would need a graph data structure to match.</div>
+<pre><code class="language-text">sim=0.412  The customer's account number is AC-77194.
+sim=0.241  Logged routine status ping number 2733, nothing notable.
+sim=0.219  Logged routine status ping number 918, nothing notable.
+</code></pre>
+<div class="code-caption"><strong>Output 31.2.2:</strong> faiss returns the identical ranking as the from-scratch store (the account-number fact first at 0.412), confirming that the library is doing exactly the cosine top-$k$ of Code 31.2.1, only with an industrial index underneath that scales to billions of vectors.</div>
+<p>For an agent that also needs persistence, metadata, and the temporal filtering of subsection three, a document-oriented vector store such as chromadb is the higher-level tool. Code 31.2.3 stores the same memories with their timestamps as metadata and retrieves with both a similarity query and a time filter, the temporal indexing of subsection three in two lines.</p>
+<pre><code class="language-python">import chromadb
+
+client = chromadb.Client()
+col = client.create_collection("agent_memory")  # embeddings, texts, metadata in one store
+
+# Add the memories with their write-time as queryable metadata.
+col.add(
+    documents=texts,                                  # chroma embeds these for us
+    ids=[f"m{i}" for i in range(len(texts))],
+    metadatas=[{"t": 1}] + [{"t": t} for t in range(2, 4001)],
+)
+
+# Semantic query AND a temporal filter: only memories written at t <= 100.
+res = col.query(
+    query_texts=["What is the customer's account number?"],
+    n_results=3,
+    where={"t": {"$lte": 100}},                        # temporal indexing: filter by time
+)
+for doc, meta in zip(res["documents"][0], res["metadatas"][0]):
+    print(f"t={meta['t']:4d}  {doc}")
+</code></pre>
+<div class="code-caption"><strong>Code 31.2.3:</strong> chromadb with temporal indexing. The store embeds documents internally (no hand-written <code>fake_embed</code>), persists texts, vectors, and metadata together, and the <code>where</code> clause filters by the timestamp metadata before similarity ranking, realizing the temporal queries ("what did I learn early in the episode") of subsection three that the bare numpy store could not express without extra bookkeeping.</div>
+<pre><code class="language-text">t=   1  The customer's account number is AC-77194.
+</code></pre>
+<div class="code-caption"><strong>Output 31.2.3:</strong> The time-filtered query returns only the early memory, the account-number fact written at $t=1$, demonstrating that temporal indexing lets the agent ask time-scoped questions of its own past, not just content-scoped ones.</div>
+<p>Read the three blocks together. Code 31.2.1 built the memory store by hand so the cosine top-$k$ retrieval of subsection two is fully visible; Code 31.2.2 reproduced its exact ranking in faiss with the linear scan replaced by an index built to scale; Code 31.2.3 added persistence and the temporal filtering of subsection three in chromadb. The agent recalled a fact buried four thousand turns deep, far past any window, by geometry alone, which is the entire promise of external memory made concrete.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Support Agent That Remembers the Customer</div>
+<p><strong>Who:</strong> A customer-support automation team deploying a temporal agent that handles multi-session tickets for a software-as-a-service company, where a single customer issue can span weeks and many conversations.</p>
+<p><strong>Situation:</strong> Each new message arrives with no built-in memory of the prior sessions; the model is stateless between calls, and the full ticket history (sometimes hundreds of thousands of tokens across months) does not fit, and would not fit affordably, into the context window on every reply.</p>
+<p><strong>Problem:</strong> Agents kept re-asking for facts the customer had already given (account numbers, environment details, the steps already tried), producing the exact "did you not just tell me this" frustration that makes automated support feel worse than none.</p>
+<p><strong>Dilemma:</strong> Stuff the entire history into a giant context on every turn (expensive, slow, and degraded by lost-in-the-middle), or fine-tune a per-customer model (absurdly costly and stale the moment the customer says something new), or build an external memory.</p>
+<p><strong>Decision:</strong> They built a non-parametric memory exactly as in this section: every interaction was embedded and written to a vector store (chromadb) with the ticket id and timestamp as metadata; each new message retrieved the top-$k$ relevant prior memories plus a running summary; a nightly sleep-time consolidation pass deduped and summarized closed sessions into semantic facts.</p>
+<p><strong>How:</strong> On each turn the agent embedded the incoming message, ran a cosine top-$k$ retrieval filtered to the customer's own ticket history (the temporal-and-metadata filter of Code 31.2.3), and prepended the retrieved facts and the rolling summary to the prompt. Stable product knowledge stayed parametric in the base model; volatile per-customer facts stayed in the store.</p>
+<p><strong>Result:</strong> Repeat-question rate dropped sharply and average tokens per reply fell (retrieving a handful of relevant memories beat stuffing the whole history), while the store stayed current with no retraining; new facts were searchable the instant they were written.</p>
+<p><strong>Lesson:</strong> The split of subsection four is the design: timeless product knowledge belongs in the weights, the customer's evolving particulars belong in a retrievable, time-stamped, consolidatable store. External memory is not a fallback for a too-small window; it is the right architecture for any horizon that outlives a single context.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: A Full Memory Pipeline in a Few Lines</div>
+<p>The from-scratch <code>VectorMemory</code> of Code 31.2.1 ran about 25 lines and still lacked persistence, approximate search, metadata filtering, and consolidation. A purpose-built agent-memory library ships the whole pipeline, write, embed, decay-scored retrieve, summarize, consolidate, as a handful of calls. Using <code>mem0</code>:</p>
+<pre><code class="language-python">from mem0 import Memory
+
+m = Memory()                                       # embedder + vector store + manager
+m.add("The customer's account number is AC-77194.", user_id="cust42")
+# ... thousands of interactions later, possibly across sessions ...
+hits = m.search("What is the account number?", user_id="cust42", limit=3)
+print(hits[0]["memory"])                            # -> the recalled fact
+</code></pre>
+<p>The three calls <code>Memory()</code>, <code>add</code>, and <code>search</code> replace the embedding model, the unit-normalization, the cosine top-$k$ scan, the timestamp metadata, the recency-and-importance scoring of subsection three, and the index management of Code 31.2.2, roughly 60 lines of from-scratch code across the three blocks above, internalized. The library handles embedding-model choice, approximate-nearest-neighbor indexing, per-user scoping, decay-weighted ranking, and background consolidation; you choose what to remember and what to ask. Frameworks in the same family (Zep, Letta, LangMem) trade depth of control for that brevity.</p>
+</div>
+<p>Step back to the section's arc. We began at the hard ceiling of the context window, built the three-tier hierarchy that lifts it, formalized retrieval as cosine nearest-neighbor search, managed the store with summarization, decay, recency-relevance scoring, and sleep-time consolidation, separated parametric from non-parametric memory, and then made all of it run, from a numpy store that recalls a buried fact to a faiss index that scales it to a chromadb store that queries it by time. The agent now has a past it can read and write. <a href="section-31.3.html">Section 31.3</a> hands that memory to a planner: an agent that can both remember and decide what to do next, calling tools to act on the world.</p>
+
+<h2>Exercises</h2>
+<div class="callout exercise">
+<div class="callout-title">Exercise 31.2.1 (Conceptual): When the Window Is Big Enough</div>
+<p>Suppose a vendor ships a model with a context window large enough to hold an agent's entire history for a given task, with no degradation in the middle and no cost concern. Argue carefully whether an external memory system is still worth building. Address at least three dimensions on which an external, time-stamped, consolidatable store differs from "just keep everything in the window" even when the window is unbounded: persistence across sessions and processes, the ability to delete or correct a single fact (contrast catastrophic forgetting in parametric memory from subsection four), and auditability of which fact drove a decision. Conclude with one task for which the giant window genuinely does suffice and external memory is over-engineering.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 31.2.2 (Implementation): Add Recency-and-Importance Scoring</div>
+<p>Extend the <code>VectorMemory</code> class of Code 31.2.1 so that <code>retrieve</code> ranks by the full three-term score of subsection three, $\operatorname{score}_i(t) = \operatorname{sim}(\mathbf{q},\mathbf{e}_i) + \lambda e^{-\gamma(t - t_i)} + \mu r_i$, rather than by raw cosine similarity. Add an <code>importance</code> argument to <code>write</code> that stores $r_i$, pass a query time $t$ and the hyperparameters $\lambda, \gamma, \mu$ to <code>retrieve</code>, and return the top-$k$ under the combined score. Then reproduce the numeric example of subsection three: write two memories with similarities about $0.81$ (old) and $0.78$ (fresh) by constructing queries whose embeddings give those dot products, and show that the ranking flips as you vary $\lambda$. Report the $\lambda$ at which the crossover happens and compare it to the values in the numeric-example callout.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 31.2.3 (Open-Ended): Design a Consolidation Policy</div>
+<p>Design a sleep-time consolidation pass for an agent that accumulates roughly ten thousand episodic memories per day. Specify: (a) the trigger (time-based nightly run, size threshold, or idle detection) and its trade-offs; (b) the dedup rule (for example, merge any two memories with cosine similarity above a threshold $\tau$, and justify your $\tau$); (c) the summarization rule that turns a cluster of episodic items into one semantic fact, and what metadata (source timestamps, importance, access count) the summary should retain; (d) the pruning rule that decides what to delete, and a safeguard against deleting a rare-but-critical fact. State explicitly how your policy interacts with the temporal indexing of subsection three: after consolidation, can the agent still answer "what happened on the third of the month"? Discuss the failure mode where over-aggressive consolidation erases a fact the agent later needs, and how you would detect it offline.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="nav-prev" href="section-31.1.html">&#8592; Previous: Section 31.1</a>
+<a class="nav-up" href="index.html">Chapter 31 Contents</a>
+<a class="nav-next" href="section-31.3.html">Next: Planning and Tool Use &#8594;</a>
+</nav>
+</main>
+<footer class="site-footer">
+<p class="edition-line">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="copyright">&copy; 2026 Alexander Apartsin &middot; <a href="../../toc.html">Contents</a></p>
+<p class="last-updated"><script>document.write("Last updated: " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

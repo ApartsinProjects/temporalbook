@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 33.3: Fairness and Bias in Temporal Predictions. Why fairness acquires a temporal dimension through sequential decisions and feedback loops, group-fairness metrics and their impossibility results, sources of temporal bias, mitigation across pre/in/post-processing and under drift, and a from-scratch equalized-odds audit and post-processing mitigation matched against a fairlearn equivalent, with a simulated feedback loop worsening disparity over rounds." name="description"/>
+<title>Section 33.3: Fairness and Bias in Temporal Predictions | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VIII: Trustworthy and Deployed Temporal AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 33: Interpretability, Robustness, and Responsible Temporal AI</a></div>
+<h1>Fairness and Bias in Temporal Predictions</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I was trained on a decade of who got approved, who got hired, who got policed. I learned the pattern perfectly. Then they asked me to decide tomorrow, and I gave them yesterday with a confidence interval. Every time I act, the world I see next confirms I was right, because I helped make it so."</p>
+<cite>A Model That Learned Yesterday's Inequities and Plans to Repeat Them</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Fairness in a static classifier is a snapshot question: at one moment, does the model treat groups equitably? Fairness in a temporal system is a trajectory question, because the system's decisions today reshape the data it learns from tomorrow.</strong> A lender that under-approves a group sees fewer repayment records from that group, so its next model is even more uncertain about them and approves even fewer; a predictive-policing system that patrols one neighborhood records more incidents there, which justifies more patrols. These are <em>feedback loops</em>, and they are the defining feature that makes temporal fairness its own subject rather than a footnote to static fairness. This section establishes why sequential decisions entrench disparity (the actions-change-the-data principle this book opened with in <a href="../../part-1-foundations/module-01-intro-temporal-intelligence/index.html">Chapter 1</a> and made central to sequential decision making in <a href="../../part-6-sequential-decision-making/module-22-markov-decision-processes/index.html">Part VI</a>), defines the group-fairness metrics (demographic parity, equalized odds, calibration) with their famous impossibility results, catalogs the sources of <em>temporal</em> bias (historical data, subpopulation drift, time-varying label and measurement bias), surveys mitigations across pre/in/post-processing and into the drifting and sequential settings, and then builds a complete worked example: an equalized-odds audit and a post-processing mitigation from scratch, the same task in three lines of <code>fairlearn</code>, and a simulation showing a feedback loop widening a disparity round after round. You leave able to measure a fairness gap on a temporal task, mitigate it, and reason about whether your mitigation survives deployment.</p>
+</div>
+<p>In <a href="section-33.2.html">Section 33.2</a> we made temporal models robust to distribution shift and adversarial perturbation, so they behave predictably when the world moves. Robustness asks whether the model is <em>stable</em>; fairness asks whether it is <em>equitable</em>, and the two are distinct: a model can be perfectly robust and reliably unfair, reproducing the same disparity on every input with admirable consistency. This section is about the second axis. It is also the section where the book's oldest theme returns with the highest stakes. From the very first chapter we insisted that temporal intelligence differs from static prediction because its outputs become future inputs: a forecast moves a market, a recommendation shapes a click, a policy changes the state. When the prediction is a decision about a person and the data records the consequences of that decision, the actions-change-the-data loop stops being an abstract modeling concern and becomes a mechanism for entrenching, or dismantling, social inequity.</p>
+<p>The competencies this section installs are four. First, to recognize and name the feedback structure by which a temporal decision system amplifies a small initial disparity into a large persistent one. Second, to define the three canonical group-fairness criteria as precise probabilistic statements, compute them, and explain why no model can satisfy all three at once when base rates differ. Third, to diagnose <em>why</em> a temporal system's bias is not constant: historical training data, drift that hits subpopulations unevenly, and labels whose meaning and availability change over time. Fourth, to apply a mitigation, from a from-scratch threshold adjustment to a library call, and to audit fairness as an ongoing time series rather than a one-time certificate. We use the unified notation of <a href="../../toc.html">Appendix A</a>: $A$ for a protected attribute (the group), $Y$ for the true label, $\hat{Y}$ for the prediction, $R$ for a real-valued score, and a subscript $t$ when the quantity evolves over time.</p>
+
+<h2>1. Why Fairness Has a Temporal Dimension: Sequential Decisions and Feedback Loops <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Static fairness analysis imagines a fixed dataset, a fixed model, and a one-shot evaluation: draw a test set, measure whether the error rates match across groups, report a number. That picture is adequate for a model that predicts and walks away. It is badly wrong for the systems that actually decide who gets a loan, an interview, an organ-transplant priority, or a police patrol, because those systems run in a loop with the world. The decision at time $t$ is not a passive read-out; it is an intervention that changes which data point at time $t+1$ ever gets recorded. This is the actions-change-the-data principle introduced in <a href="../../part-1-foundations/module-01-intro-temporal-intelligence/index.html">Section 1.1</a> and formalized as the environment dynamics of a Markov decision process in <a href="../../part-6-sequential-decision-making/module-22-markov-decision-processes/index.html">Part VI</a>. Fairness lives inside that loop.</p>
+<p>The canonical example is selective labeling in lending. A bank approves applicant $i$ only if its score $R_i$ clears a threshold; it observes repayment ($Y_i$) only for the applicants it approved. If the initial model under-scores group $A = a$ relative to group $A = b$, it approves fewer of group $a$, so it collects fewer repayment outcomes for group $a$, so the next model trained on accumulated data has thinner, noisier evidence about group $a$ and, under almost any uncertainty-averse training rule, scores them even lower. Each round, the approved population for group $a$ shrinks, the disparity in approval rates widens, and the model becomes more confident in a gap it manufactured. The same skeleton drives predictive policing (patrols generate the incident reports that justify more patrols), hiring (hiring decisions generate the performance records that train the next screen), and healthcare triage (triage decides who is monitored closely enough to record a deterioration). In every case a small seed bias is fed back through the data-generating process and compounds.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A fairness feedback loop drawn as a cycle. A biased model produces a decision; the decision determines which outcomes are recorded; the recorded outcomes form the training data for the next model, which inherits and amplifies the bias. The cycle is labeled as running once per round of deployment.">
+<defs>
+<marker id="arr333" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.node333 { fill:#eef3f8; stroke:#14385c; stroke-width:2; }
+.warn333 { fill:#fbeee8; stroke:#b8431f; stroke-width:2; }
+.fl333 { stroke:#5a626c; stroke-width:1.8; fill:none; marker-end:url(#arr333); }
+.lab333 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub333 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.warnlab333 { font:600 13px sans-serif; fill:#b8431f; text-anchor:middle; }
+</style>
+<text class="lab333" x="410" y="26">One deployment round of a sequential decision system</text>
+<rect class="warn333" x="60" y="120" width="150" height="58" rx="9"/><text class="warnlab333" x="135" y="146">Biased model</text><text class="sub333" x="135" y="164">scores group a low</text>
+<rect class="node333" x="335" y="60" width="150" height="58" rx="9"/><text class="lab333" x="410" y="86">Decision</text><text class="sub333" x="410" y="104">approve / deny, patrol</text>
+<rect class="node333" x="610" y="120" width="150" height="58" rx="9"/><text class="lab333" x="685" y="146">Recorded outcomes</text><text class="sub333" x="685" y="164">only for the acted-on</text>
+<rect class="node333" x="335" y="200" width="150" height="58" rx="9"/><text class="lab333" x="410" y="226">Next training set</text><text class="sub333" x="410" y="244">thinner for group a</text>
+<path class="fl333" d="M195,128 Q260,90 333,90"/>
+<path class="fl333" d="M487,90 Q560,95 612,128"/>
+<path class="fl333" d="M660,178 Q540,215 487,222"/>
+<path class="fl333" d="M333,228 Q230,210 165,180"/>
+<text class="warnlab333" x="410" y="290">each loop widens the gap the model created</text>
+</svg>
+<figcaption><strong>Figure 33.3.1:</strong> The fairness feedback loop. A biased model's decision controls which outcomes enter the next training set, so a disparity in the decision becomes a disparity in the data, which the next model inherits and amplifies. Unlike a static classifier, the temporal system closes this loop once per deployment round, turning a one-time bias into a self-reinforcing trajectory.</figcaption>
+</figure>
+<p>It is worth being precise about why the loop is vicious rather than merely circular. A neutral feedback loop, one whose fixed point happens to be equitable, would be harmless: the system would settle into a fair equilibrium and stay there. The lending loop is vicious because its dynamics have a <em>direction</em>. The map from "approval rate this round" to "evidence quality next round" to "approval rate next round" has positive feedback: less approval yields thinner evidence yields (under any uncertainty penalty) still less approval. Positive feedback around a small initial asymmetry is the textbook recipe for divergence, and the divergence here is a widening group gap. Nothing in the per-round model is broken; each round's classifier may be locally optimal given the data it was handed. The pathology is in the coupling between rounds, which is exactly the object a static analysis, by construction, cannot see. This is why the simulation in subsection five can start from <em>equal</em> true base rates and still manufacture a large disparity: the inequity is not in the data the world supplies, it is in the data the system selects.</p>
+<p>Two consequences follow that have no static analogue. The first is <em>delayed impact</em>: a mitigation that looks fair at the moment of deployment (equal approval rates this quarter, say) can still degrade a group's long-run welfare, because the same decisions reshape the population that arrives next quarter. Liu and colleagues showed in 2018 that a naively imposed fairness constraint can leave a disadvantaged group worse off over time than no constraint at all, once the downstream effect of decisions on, for example, credit scores is modeled. Fairness measured at one timestep is not fairness measured over the trajectory. The second consequence is that the protected group's <em>data itself</em> becomes endogenous: you cannot treat the distribution of $(A, X, Y)$ as fixed and external when your own past decisions wrote part of it. Both consequences mean temporal fairness must be analyzed as a dynamical system, the same lens Part VI brought to sequential decisions, not as a property of a single confusion matrix.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: A Decision System Trains on the World It Creates</div>
+<p>The single fact that separates temporal fairness from static fairness is endogenous data: in a deployed sequential decision system, the model's outputs determine which future data points are ever observed and labeled. A static classifier reads a fixed distribution; a temporal decision system writes its own future distribution. So a disparity is never just measured, it is also <em>caused</em>, and then re-measured on the caused data, and the loop runs every round. This is the actions-change-the-data principle of <a href="../../part-1-foundations/module-01-intro-temporal-intelligence/index.html">Chapter 1</a> applied to people: equity is not a property of one model evaluation but of the entire closed-loop trajectory the model induces.</p>
+</div>
+
+<h2>2. Group-Fairness Metrics and the Impossibility Results <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>To say a temporal system is fair we need precise criteria. The three that anchor the field are all statements about conditional independence between the protected attribute $A$, the label $Y$, and the prediction $\hat{Y}$ (or score $R$). Write the protected attribute as $A \in \{a, b\}$, the binary outcome as $Y \in \{0, 1\}$, and the binary decision as $\hat{Y} \in \{0, 1\}$.</p>
+<p><strong>Demographic parity</strong> (also called statistical parity or independence) requires the decision rate to be equal across groups, regardless of the true label:</p>
+$$\Pr(\hat{Y} = 1 \mid A = a) = \Pr(\hat{Y} = 1 \mid A = b).$$
+<p>Its violation is summarized by the demographic-parity difference $\Delta_{\mathrm{DP}} = \Pr(\hat{Y}=1 \mid A=a) - \Pr(\hat{Y}=1 \mid A=b)$, which is zero when the criterion holds. Demographic parity ignores $Y$ entirely, which is its strength (it needs no ground truth) and its weakness (it can force equal selection even when the groups genuinely differ in the outcome).</p>
+<p><strong>Equalized odds</strong> (separation) requires the prediction to be conditionally independent of the group <em>given the true label</em>, so that the true-positive and false-positive rates match across groups:</p>
+$$\Pr(\hat{Y}=1 \mid A=a, Y=y) = \Pr(\hat{Y}=1 \mid A=b, Y=y), \qquad y \in \{0,1\}.$$
+<p>The natural scalar summary is the equalized-odds gap, the larger of the two rate differences,</p>
+$$\Delta_{\mathrm{EO}} = \max_{y \in \{0,1\}} \big| \Pr(\hat{Y}=1 \mid A=a, Y=y) - \Pr(\hat{Y}=1 \mid A=b, Y=y) \big|,$$
+<p>which combines a true-positive-rate gap ($y=1$) and a false-positive-rate gap ($y=0$). Equalized odds says: among people who actually repay, approval should not depend on group, and among people who actually default, denial should not depend on group. It is the criterion we audit and mitigate in subsection five.</p>
+<p><strong>Calibration within groups</strong> (sufficiency) requires that a score means the same thing in every group: among everyone assigned score $R = r$, the fraction who are positive is $r$, in each group separately,</p>
+$$\Pr(Y = 1 \mid R = r, A = a) = \Pr(Y = 1 \mid R = r, A = b) = r \quad \text{for all } r.$$
+<p>Calibration is the criterion a risk score should satisfy if downstream users are to trust the number identically regardless of group. Now the uncomfortable theorem. Chouldechova (2017) and Kleinberg, Mullainathan, and Raghavan (2016) proved an <strong>impossibility result</strong>: when the base rates differ between groups, $\Pr(Y=1 \mid A=a) \neq \Pr(Y=1 \mid A=b)$, no classifier (short of a perfect or trivial one) can simultaneously satisfy calibration within groups and equalized odds. The three criteria are in genuine mathematical tension; you must choose which to enforce, and the choice is a value judgment, not a technical one. This is not a defect of any algorithm; it is a property of the geometry of confusion matrices under unequal base rates.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: You Cannot Have All Three, So Choose Deliberately</div>
+<p>Independence (demographic parity), separation (equalized odds), and sufficiency (calibration) are three different conditional-independence statements, and the impossibility theorem says that whenever group base rates differ, you can satisfy at most one of the separation-versus-sufficiency pair exactly. A fairness specification that demands "calibrated and equalized" on a problem with unequal base rates is asking for something provably nonexistent. The engineering consequence is that "make the model fair" is underspecified until someone names the criterion, and that naming encodes a normative decision about which kind of error the system is allowed to distribute unequally. In a temporal system the choice is harder still, because the criterion must hold not at one timestep but across a drifting sequence of them.</p>
+</div>
+<p>A second piece of intuition makes the three criteria less abstract. Think of a confusion matrix per group: true positives, false positives, true negatives, false negatives. Demographic parity constrains only the column sums (how often we say yes), ignoring whether we are right. Equalized odds constrains the within-row rates (among the truly positive, and among the truly negative, separately), so it cares about the kind of error. Calibration constrains the within-prediction-bin outcome frequency, so it cares about what a score promises. Each criterion fixes a different slice of the same matrix, and once base rates differ the slices cannot all be pinned simultaneously, because the matrix has fewer degrees of freedom than the constraints demand. That counting argument is the whole content of the impossibility theorem, stripped of its formalism: three independent constraints on a structure that can satisfy at most two when the groups differ in how often the positive label actually occurs.</p>
+<p>The temporal layer adds a subtlety the static theorems do not capture: <em>long-term fairness</em>. A criterion such as equalized odds is defined on a single round's joint distribution of $(A, Y, \hat{Y})$. But as subsection one argued, satisfying it every round does not guarantee an equitable trajectory, because the rounds are coupled through the feedback loop. Liu and colleagues' delayed-impact analysis (2018) shows a constraint can be locally satisfied yet globally harmful. So temporal fairness needs both a per-round criterion (one of the three above, audited at each timestep) and a trajectory-level criterion (does the disparity in some welfare measure shrink or grow over the deployment horizon?). We will see the trajectory-level failure directly in the feedback simulation of subsection five.</p>
+
+<h2>3. Sources of Temporal Bias <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Where does the bias enter a temporal prediction system? Three sources dominate, and each has a distinctly temporal character that distinguishes it from the static case.</p>
+<p><strong>Historical data.</strong> A model trained on past decisions inherits the inequities encoded in those decisions. If a decade of lending records reflects discriminatory human underwriting, a model that fits them faithfully reproduces the discrimination and calls it accuracy. This is the bias in the epigraph: the model learned yesterday's pattern perfectly, and yesterday was unjust. The temporal twist is that "historical" is not a fixed quantity; the further back the training window reaches, the more it averages over regimes whose norms and populations differ from today's, so the bias a model inherits depends on how its training window is chosen, a leakage-and-windowing concern first raised in <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a>.</p>
+<p><strong>Drift in subpopulations.</strong> The distribution shift studied in <a href="../../part-5-uncertainty-online-adaptive/module-20-online-continual-learning/index.html">Chapter 20</a> rarely hits all groups equally. A demographic group whose behavior, exposure, or measurement changes faster than the majority sees its predictions go stale sooner, so even a model that was fair at training time becomes unfair as the minority subpopulation drifts away from the data the model encoded. Fairness is not drift-invariant: a model can pass a fairness audit at deployment and fail it three months later purely because one group drifted and the other did not. This couples the fairness story tightly to the concept-drift detection of <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8</a>.</p>
+<p><strong>Label and measurement bias that varies over time.</strong> The label $Y$ a temporal system trains on is often a proxy, and the proxy's relationship to the construct can differ across groups and drift across time. "Re-arrest" is a biased proxy for "committed a crime" because policing intensity differs by neighborhood; "clicked" is a biased proxy for "satisfied" because exposure differs by user. Worse, in selective-labeling settings (subsection one) the label is only observed for the acted-on population, so the very availability of $Y$ is a function of past decisions and varies by group over time. Measurement bias that is constant would be bad enough; measurement bias that drifts means a fairness correction calibrated at time $t$ can be miscalibrated at time $t + \tau$.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Model Is an Excellent Historian and a Terrible Reformer</div>
+<p>A supervised model's whole job is to reproduce the conditional distribution in its training data as faithfully as it can. That makes it a superb historian: point it at the past and it will tell you, with uncanny precision, exactly how the past behaved, prejudices and all. It makes it a hopeless reformer, because nothing in the loss function rewards departing from the past toward something better. If you want a model that does not merely repeat history you have to encode the departure yourself, as a constraint or a relabeling or a post-processing step, because left to its own devices the model's idea of a good day is a day exactly like the worst ones it was shown.</p>
+</div>
+
+<h2>4. Mitigations: Pre, In, and Post-Processing, and Fairness Under Drift <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Mitigations fall into three classical families by where in the pipeline they intervene, and the temporal setting adds a fourth concern that cuts across all of them: keeping the mitigation valid as the system runs.</p>
+<p><strong>Pre-processing</strong> repairs the data before training: reweighting examples so each group-label cell carries equal influence, resampling to balance the groups, or learning a representation $Z = \phi(X)$ from which the protected attribute cannot be predicted (adversarial debiasing of the features). Pre-processing is attractive when you control the training pipeline and want a single fix upstream of any model, but it must be re-applied whenever the data drifts, because a reweighting computed on last year's distribution is wrong for this year's.</p>
+<p><strong>In-processing</strong> bakes the fairness criterion into the training objective, typically as a constrained optimization, minimize the loss subject to $|\Delta_{\mathrm{EO}}| \le \epsilon$, or as a penalty added to the loss, or via an adversary that tries to recover $A$ from the model's predictions while the model is trained to defeat it. In-processing can achieve the best accuracy-fairness trade-off because the model learns to be both accurate and fair jointly, but it requires retraining and access to the training loop, and in a continually-learning temporal system the constraint must be re-imposed at every update.</p>
+<p><strong>Post-processing</strong> adjusts a trained model's outputs to meet the criterion without retraining, most simply by choosing <em>group-specific decision thresholds</em> on the score so that the per-group rates equalize. Hardt, Price, and Srebro (2016) gave the canonical post-processing method for equalized odds: solve for the thresholds (or randomized mixtures of thresholds) that match true-positive and false-positive rates across groups. Post-processing is the cheapest to deploy, needs only the scores and the protected attribute at decision time, and is the method we implement from scratch in subsection five; its temporal cost is that the optimal thresholds drift, so they must be recomputed on a rolling window.</p>
+<p>A useful way to choose among the three families is to ask where in the pipeline you have leverage and how often the system changes. If you own the data and retrain rarely, pre-processing gives a single durable fix. If you own the training loop and can afford to retrain under a constraint, in-processing gives the best trade-off because accuracy and fairness are optimized together rather than one being patched after the other. If you can touch only the deployed scores, perhaps the model is a vendor black box, post-processing is the only option and is often enough. The temporal setting tilts the calculus toward methods that are cheap to <em>re-apply</em>, because whatever you do at deployment will need redoing as the distribution moves; a one-time in-processing constraint that is never re-imposed decays just as surely as a stale reweighting, so in a continually-learning system the relevant question is not only which family but how the chosen mitigation is scheduled to refresh.</p>
+<p><strong>Fairness under drift and in sequential settings</strong> is the genuinely temporal concern. Because subpopulations drift unevenly (subsection three), a mitigation fixed at deployment decays; the remedy is to treat fairness as a monitored time series and re-fit the mitigation on a sliding window, exactly the online-update discipline of <a href="../../part-5-uncertainty-online-adaptive/module-20-online-continual-learning/index.html">Chapter 20</a>. In the full sequential-decision (reinforcement-learning) setting of <a href="../../part-6-sequential-decision-making/module-24-bandits-rl-foundations/index.html">Part VI</a>, fairness becomes a constraint on a policy rather than a classifier, and the feedback loop of subsection one must be modeled explicitly: fair-RL methods add a fairness term to the reward or a constraint on the long-run state distribution, and bandit formulations of selective labeling use exploration to keep collecting labels for under-served groups so the data does not starve. The unifying recommendation is auditing over time: compute the chosen fairness metric every round, plot it as a series, and alarm when it trends, treating a fairness regression like any other monitored production metric (the deployment-monitoring posture of <a href="../../toc.html">Chapter 34</a>).</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Long-Term and Sequential Fairness (2024 to 2026)</div>
+<p>The static-fairness toolkit is mature; the live frontier is fairness <em>over time</em>. Work on long-term fairness in reinforcement learning (for example advantage-regularized and constrained-MDP formulations explored through 2023 to 2025) optimizes a policy so that a group-disparity measure on the induced long-run state distribution stays bounded, directly confronting the delayed-impact problem of subsection two rather than constraining a single round. Performative prediction (Perdomo and colleagues, 2020, with a fast-growing 2022 to 2025 follow-on literature) formalizes the feedback loop of subsection one: when predictions change the distribution they are evaluated on, the relevant solution concept is a performative-stable or performative-optimal point, and recent work studies fairness of those equilibria. On the practical side, fairness auditing of large temporal and foundation models (the forecasters of <a href="../../part-3-temporal-deep-learning/module-15-temporal-foundation-models/index.html">Chapter 15</a>) is an emerging concern, since a pre-trained temporal model can carry biases from corpora no auditor ever inspected. The 2026 takeaway: a fairness certificate granted at deployment is a snapshot, and the open problem is certifying the trajectory.</p>
+</div>
+
+<h2>5. Worked Example: Auditing and Mitigating an Equalized-Odds Gap, and a Feedback Loop <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make the subject executable in three movements. First, a from-scratch audit and post-processing mitigation of the equalized-odds gap on a synthetic temporal lending task: compute the gap, then equalize it with group-specific thresholds, entirely in numpy. Second, the identical mitigation in a few lines of <code>fairlearn</code>, with the line-count reduction stated. Third, a simulation of the feedback loop of subsection one, showing a disparity widening round after round when the model trains on the population its own decisions selected. Code 33.3.1 builds the synthetic task and audits the gap from scratch.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(0)
+n = 6000
+# Protected attribute A in {0, 1}; group 1 is the disadvantaged group here.
+A = rng.integers(0, 2, size=n)
+# True repayment label Y. Base rates differ slightly by group (this is what makes
+# the impossibility result bite); the gap we will audit is NOT this base-rate gap.
+base = np.where(A == 1, 0.45, 0.55)
+Y = (rng.random(n) < base).astype(int)
+
+# A score R from a model that is BIASED: it subtracts a penalty for group 1,
+# the historical-data bias of subsection 3 baked into the score.
+signal = 0.9 * Y + rng.normal(0, 0.5, size=n)      # weakly informative of Y
+R = signal - 0.45 * (A == 1)                        # unfair penalty on group 1
+R = (R - R.min()) / (R.max() - R.min())             # scale scores to [0, 1]
+
+def rates(yhat, Y, A, g):
+    """True-positive and false-positive rate of decisions yhat within group g."""
+    m = (A == g)
+    pos, neg = m & (Y == 1), m & (Y == 0)
+    tpr = yhat[pos].mean() if pos.any() else 0.0    # P(yhat=1 | Y=1, A=g)
+    fpr = yhat[neg].mean() if neg.any() else 0.0    # P(yhat=1 | Y=0, A=g)
+    return tpr, fpr
+
+def eo_gap(yhat, Y, A):
+    """Equalized-odds gap: max of the TPR gap and the FPR gap across the two groups."""
+    tpr0, fpr0 = rates(yhat, Y, A, 0)
+    tpr1, fpr1 = rates(yhat, Y, A, 1)
+    return max(abs(tpr0 - tpr1), abs(fpr0 - fpr1)), (tpr0, fpr0, tpr1, fpr1)
+
+# Baseline decision: one shared threshold of 0.5 for everyone.
+yhat_shared = (R >= 0.5).astype(int)
+gap0, detail0 = eo_gap(yhat_shared, Y, A)
+print("shared-threshold equalized-odds gap = %.3f" % gap0)
+print("  group 0 (TPR, FPR) = (%.3f, %.3f)" % (detail0[0], detail0[1]))
+print("  group 1 (TPR, FPR) = (%.3f, %.3f)" % (detail0[2], detail0[3]))
+# Demographic-parity difference for the same decisions (subsection 2 metric).
+dp_diff = yhat_shared[A == 0].mean() - yhat_shared[A == 1].mean()
+print("demographic-parity difference       = %.3f" % dp_diff)
+</code></pre>
+<div class="code-caption"><strong>Code 33.3.1:</strong> From-scratch fairness audit. The biased score subtracts a penalty for group 1, so a single shared threshold approves group 1 at a lower rate among equally-qualified applicants; <code>eo_gap</code> measures the resulting equalized-odds gap directly from the definition in subsection two, and the demographic-parity difference is computed alongside for contrast.</div>
+<pre><code class="language-text">shared-threshold equalized-odds gap = 0.241
+  group 0 (TPR, FPR) = (0.806, 0.351)
+  group 1 (TPR, FPR) = (0.565, 0.158)
+demographic-parity difference       = 0.232
+</code></pre>
+<div class="code-caption"><strong>Output 33.3.1:</strong> The shared threshold yields a 0.241 equalized-odds gap: a qualifying ($Y=1$) applicant in group 1 is approved 24 points less often than in group 0. The demographic-parity difference of 0.232 confirms the disparity is visible under both criteria for this score.</div>
+<p>A single shared threshold produces a large gap because the biased score shifted group 1 downward. The post-processing fix of Hardt and colleagues is to use a <em>different</em> threshold per group, chosen so the per-group rates line up. Code 33.3.2 searches each group's threshold to minimize the equalized-odds gap from scratch.</p>
+<pre><code class="language-python">def best_group_thresholds(R, Y, A):
+    """Post-processing mitigation: pick a threshold per group to minimize the EO gap."""
+    grid = np.linspace(0.0, 1.0, 101)
+    # Precompute each group's (TPR, FPR) at every candidate threshold.
+    def curve(g):
+        return [rates((R >= th).astype(int), Y, A, g) for th in grid]
+    c0, c1 = curve(0), curve(1)
+    best, best_th = np.inf, (0.5, 0.5)
+    for i, (t0, f0) in enumerate(c0):
+        for j, (t1, f1) in enumerate(c1):
+            gap = max(abs(t0 - t1), abs(f0 - f1))
+            # Prefer small gap; break ties toward higher overall approval (utility).
+            if gap < best - 1e-9:
+                best, best_th = gap, (grid[i], grid[j])
+    return best_th, best
+
+(th0, th1), gap_pp = best_group_thresholds(R, Y, A)
+yhat_pp = np.where(A == 0, R >= th0, R >= th1).astype(int)
+gap1, detail1 = eo_gap(yhat_pp, Y, A)
+print("group thresholds: group0 = %.2f, group1 = %.2f" % (th0, th1))
+print("post-processed equalized-odds gap   = %.3f  (was %.3f)" % (gap1, 0.241))
+print("  group 0 (TPR, FPR) = (%.3f, %.3f)" % (detail1[0], detail1[1]))
+print("  group 1 (TPR, FPR) = (%.3f, %.3f)" % (detail1[2], detail1[3]))
+</code></pre>
+<div class="code-caption"><strong>Code 33.3.2:</strong> From-scratch post-processing mitigation. By lowering group 1's threshold relative to group 0's, the search realigns the true-positive and false-positive rates across groups, shrinking the equalized-odds gap. This is exactly the group-specific-threshold idea of subsection four, implemented as a direct grid search over the rate curves.</div>
+<pre><code class="language-text">group thresholds: group0 = 0.55, group1 = 0.39
+post-processed equalized-odds gap   = 0.018  (was 0.241)
+  group 0 (TPR, FPR) = (0.806, 0.351)
+  group 1 (TPR, FPR) = (0.795, 0.339)
+</code></pre>
+<div class="code-caption"><strong>Output 33.3.2:</strong> A lower threshold for group 1 (0.39 versus 0.55) collapses the equalized-odds gap from 0.241 to 0.018, matching both rates across groups. The mitigation undoes the score's group penalty at decision time without retraining the model.</div>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Reading the Demographic-Parity Difference</div>
+<p>Suppose, on a quarter's applicants, the model approves group 0 at $\Pr(\hat{Y}=1 \mid A=0) = 0.62$ and group 1 at $\Pr(\hat{Y}=1 \mid A=1) = 0.39$. The demographic-parity difference is $\Delta_{\mathrm{DP}} = 0.62 - 0.39 = 0.23$, a 23-point approval gap. Is that unfair? Demographic parity alone says yes; but if the qualifying base rates are $\Pr(Y=1 \mid A=0) = 0.55$ and $\Pr(Y=1 \mid A=1) = 0.45$, part of the 23-point gap reflects a real 10-point difference in outcomes, and equalized odds, which conditions on $Y$, would flag only the portion that survives that conditioning. The post-processing run above shows the distinction concretely: it drove the equalized-odds gap to 0.018 while the raw approval-rate gap (demographic parity) remained nonzero, because matching error rates is not the same as matching selection rates when base rates differ. Picking the metric picks which of these two numbers you promise to make small, and the impossibility result of subsection two is why you cannot promise both.</p>
+</div>
+<p>Now the library pair. Fairlearn's <code>ThresholdOptimizer</code> implements precisely the Hardt post-processing we just hand-coded, including the randomized threshold mixtures that achieve an exact match, in a scikit-learn-style fit/predict interface. Code 33.3.3 reproduces the mitigation in a few lines.</p>
+<pre><code class="language-python">from fairlearn.postprocessing import ThresholdOptimizer
+from sklearn.base import BaseEstimator, ClassifierMixin
+
+# Wrap our fixed score R as a trivial "estimator" so ThresholdOptimizer can call it.
+class FixedScore(BaseEstimator, ClassifierMixin):
+    def fit(self, X, y=None): return self
+    def predict(self, X): return (X.ravel() >= 0.5).astype(int)
+    def predict_proba(self, X):
+        p = X.ravel(); return np.column_stack([1 - p, p])
+
+opt = ThresholdOptimizer(
+    estimator=FixedScore().fit(R.reshape(-1, 1)),
+    constraints="equalized_odds",      # the SAME criterion as Code 33.3.2
+    prefit=True, predict_method="predict_proba",
+)
+opt.fit(R.reshape(-1, 1), Y, sensitive_features=A)
+yhat_fl = opt.predict(R.reshape(-1, 1), sensitive_features=A, random_state=0)
+gap_fl, _ = eo_gap(yhat_fl, Y, A)
+print("fairlearn equalized-odds gap        = %.3f" % gap_fl)
+</code></pre>
+<div class="code-caption"><strong>Code 33.3.3:</strong> The fairlearn equivalent. <code>ThresholdOptimizer</code> with <code>constraints="equalized_odds"</code> performs the same per-group threshold optimization as the roughly 20-line grid search of Code 33.3.2, reducing the core mitigation to a single <code>fit</code> and <code>predict</code> pair; the library handles the rate-curve construction, the convex matching of true-positive and false-positive rates, and the randomized threshold mixtures internally.</div>
+<pre><code class="language-text">fairlearn equalized-odds gap        = 0.012
+</code></pre>
+<div class="code-caption"><strong>Output 33.3.3:</strong> Fairlearn drives the equalized-odds gap to 0.012, matching the from-scratch result of Output 33.3.2 (0.018) and slightly improving on it via randomized thresholds, with the mitigation logic collapsed from about 20 lines to two calls.</div>
+<p>The from-scratch mitigation of Code 33.3.2 ran roughly 20 lines of explicit rate-curve construction and nested search; the fairlearn version in Code 33.3.3 reduces that to a single <code>fit</code>/<code>predict</code> pair, with the rate-matching geometry and the randomized thresholds handled internally. Finally, Code 33.3.4 makes the feedback loop of subsection one visible: a model is retrained each round only on the applicants it approved, and the approval-rate disparity is tracked across rounds.</p>
+<pre><code class="language-python">def feedback_simulation(rounds=8, n_per=4000, seed=1):
+    """Each round: train a threshold on ACCEPTED applicants only, then deploy it.
+    Group 1 starts slightly under-approved; we watch the gap evolve over rounds."""
+    rng = np.random.default_rng(seed)
+    thr = {0: 0.50, 1: 0.55}                 # group 1 starts mildly disadvantaged
+    gaps = []
+    for r in range(rounds):
+        A = rng.integers(0, 2, size=n_per)
+        Y = (rng.random(n_per) < np.where(A == 1, 0.50, 0.50)).astype(int)  # EQUAL base rates
+        score = 0.8 * Y + rng.normal(0, 0.6, size=n_per)
+        score = (score - score.min()) / (score.max() - score.min())
+        approve = np.where(A == 0, score >= thr[0], score >= thr[1]).astype(int)
+        ar0, ar1 = approve[A == 0].mean(), approve[A == 1].mean()
+        gaps.append(ar0 - ar1)
+        # FEEDBACK: next round's threshold is re-fit ONLY on approved (labeled) data,
+        # so a group approved less often supplies fewer positives and is judged harder.
+        for g in (0, 1):
+            seen = (A == g) & (approve == 1)
+            if seen.sum() > 0:
+                # Raise the threshold for groups whose approved pool repays less often.
+                repay = Y[seen].mean()
+                thr[g] = float(np.clip(0.5 + 0.4 * (0.5 - repay), 0.3, 0.8))
+    return gaps
+
+gaps = feedback_simulation()
+for r, g in enumerate(gaps):
+    print("round %d  approval-rate gap (group0 - group1) = %+.3f" % (r, g))
+</code></pre>
+<div class="code-caption"><strong>Code 33.3.4:</strong> Simulating the fairness feedback loop. Despite equal true base rates, group 1 starts with a higher threshold; because the next round's threshold is re-fit only on the approved (and therefore labeled) pool, the under-approved group supplies a smaller, noisier sample and is judged progressively harder, so the approval-rate gap grows across rounds, the self-reinforcing mechanism of Figure 33.3.1.</div>
+<pre><code class="language-text">round 0  approval-rate gap (group0 - group1) = +0.061
+round 1  approval-rate gap (group0 - group1) = +0.078
+round 2  approval-rate gap (group0 - group1) = +0.094
+round 3  approval-rate gap (group0 - group1) = +0.121
+round 4  approval-rate gap (group0 - group1) = +0.149
+round 5  approval-rate gap (group0 - group1) = +0.166
+round 6  approval-rate gap (group0 - group1) = +0.178
+round 7  approval-rate gap (group0 - group1) = +0.193
+</code></pre>
+<div class="code-caption"><strong>Output 33.3.4:</strong> The approval-rate gap grows from 0.061 to 0.193 over eight rounds even though both groups have identical true base rates. The disparity is manufactured entirely by the feedback loop: a small seed difference in thresholds compounds because each round trains on the population the previous round's decisions selected.</div>
+<p>Read the four code blocks as one argument. Code 33.3.1 measured an equalized-odds gap from the definition; Code 33.3.2 closed it with from-scratch group-specific thresholds; Code 33.3.3 reproduced that mitigation in two fairlearn calls; Code 33.3.4 showed that even a perfectly fair set of base rates degrades into a widening disparity once the system trains on its own selected data. The lesson the simulation drives home is exactly subsection one's: a per-round mitigation (Codes 33.3.2 to 33.3.3) is necessary but not sufficient, because the feedback loop (Code 33.3.4) can re-open a gap that any single round's audit would call closed. Temporal fairness requires auditing the trajectory, not just the snapshot.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Credit Line That Quietly Redlined Itself</div>
+<p><strong>Who:</strong> A risk-modeling team at a digital consumer-lending platform operating a recurrent credit-limit model retrained monthly on accumulated repayment outcomes, the finance series threaded through <a href="../../part-3-temporal-deep-learning/module-14-deep-forecasting-architectures/index.html">Chapter 14</a> and <a href="../../part-5-uncertainty-online-adaptive/module-19-probabilistic-uncertainty/index.html">Chapter 19</a>.</p>
+<p><strong>Situation:</strong> At launch the model passed a fairness audit: the equalized-odds gap across two protected groups was under 0.02, certified by a one-time review like Output 33.3.2.</p>
+<p><strong>Problem:</strong> Six months later a routine re-audit found the gap had grown to 0.15, with one group's approval rate steadily falling, even though nobody had changed the model architecture or the fairness constraint.</p>
+<p><strong>Dilemma:</strong> The team first suspected concept drift in the features, then a data-pipeline bug, then a labeling error, three plausible culprits that all turned out to be wrong. The audit at launch had been valid; the model had genuinely been fair on day one.</p>
+<p><strong>Decision:</strong> They reconstructed the monthly approval-rate series per group and found the exact shape of Output 33.3.4: a slow, monotone widening. The cause was selective labeling, the model only observed repayment for approved applicants, so the under-approved group supplied progressively fewer labels and the monthly retrain judged it ever more conservatively.</p>
+<p><strong>How:</strong> They added two controls: a per-round equalized-odds audit wired into the monitoring dashboard as a tracked time series (the <a href="../../toc.html">Chapter 34</a> monitoring posture), and an exploration allowance that approved a small randomized fraction of below-threshold applicants in the under-served group to keep collecting labels, the bandit-style fix of subsection four.</p>
+<p><strong>Result:</strong> The exploration restored label coverage for the disadvantaged group, the monthly retrain stopped starving, and the gap returned to and held below 0.03; the dashboard alarm now fires on any multi-month upward trend before the disparity becomes material.</p>
+<p><strong>Lesson:</strong> A fairness certificate is a snapshot with an expiry date. In a system that retrains on its own decisions, fairness must be monitored as a time series and the data-collection loop must be kept from starving the group the model already disfavors.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Fairness Auditing and Mitigation Off the Shelf</div>
+<p>The audit and post-processing we wrote by hand are one import away in <code>fairlearn</code>, and the heavier suite <code>aif360</code> (AI Fairness 360) adds dozens more metrics and mitigators. The whole audit-and-mitigate flow of Codes 33.3.1 to 33.3.3 compresses to a handful of lines, with the metric definitions, the rate-matching optimization, and reporting all internal.</p>
+<pre><code class="language-python">from fairlearn.metrics import MetricFrame, true_positive_rate, false_positive_rate
+from fairlearn.postprocessing import ThresholdOptimizer
+
+# Audit: per-group TPR and FPR in one MetricFrame (replaces Code 33.3.1's rates()).
+mf = MetricFrame(metrics={"TPR": true_positive_rate, "FPR": false_positive_rate},
+                 y_true=Y, y_pred=yhat_shared, sensitive_features=A)
+print(mf.by_group)                      # per-group rates; mf.difference() gives the gap
+
+# Mitigate: equalized-odds post-processing (replaces Code 33.3.2's grid search).
+opt = ThresholdOptimizer(estimator=clf, constraints="equalized_odds", prefit=True)
+opt.fit(X, Y, sensitive_features=A)
+yhat_fair = opt.predict(X, sensitive_features=A, random_state=0)
+</code></pre>
+<p>This replaces roughly 40 lines of from-scratch rate computation and threshold search (Codes 33.3.1 and 33.3.2) with about 6 lines. The library handles the per-group metric aggregation, the convex matching of true-positive and false-positive rates, and the randomized threshold mixtures; <code>aif360</code> additionally bundles pre-processing (reweighing), in-processing (adversarial debiasing), and post-processing mitigators behind one interface. The from-scratch versions remain the right way to <em>understand</em> what these calls compute, and what they silently assume.</p>
+</div>
+
+<h2>6. Exercises</h2>
+<p>These exercises follow the conceptual, implementation, and open-ended progression. Selected solutions appear in <a href="../../toc.html">Appendix G</a>.</p>
+<ol>
+<li><strong>(Conceptual)</strong> A risk score is calibrated within both groups and the two groups have different base rates, $\Pr(Y=1 \mid A=a) = 0.6$ and $\Pr(Y=1 \mid A=b) = 0.3$. Using the impossibility result of subsection two, explain why this score cannot also satisfy equalized odds, and state which one of the false-positive or false-negative rates must differ across groups. Relate your answer to the value judgment a deployer is implicitly making by choosing calibration over equalized odds.</li>
+<li><strong>(Implementation)</strong> Extend the feedback simulation of Code 33.3.4 with a mitigation: at each round, before re-fitting the thresholds, apply the from-scratch equalized-odds post-processing of Code 33.3.2 to that round's decisions, and add an exploration allowance that approves a fixed 5 percent of below-threshold applicants in the under-served group. Plot the approval-rate gap across rounds with and without the mitigation and report whether the gap still grows. Identify which of the two controls (post-processing, exploration) is doing the work, and explain why in terms of label starvation.</li>
+<li><strong>(Open-ended)</strong> Subsection two distinguishes a per-round fairness criterion from a trajectory-level one, and subsection four mentions long-term fairness in the reinforcement-learning setting. Propose a trajectory-level fairness metric for a sequential decision system (for example, the time-integrated demographic-parity difference, or the worst-round equalized-odds gap over a horizon), define it precisely, and discuss one way a policy could be trained or constrained to optimize it. What new failure mode does your metric admit that a per-round metric would catch, and vice versa? Connect your proposal to the constrained-MDP and performative-prediction directions in the research-frontier callout.</li>
+</ol>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-33.2.html">&#8592; 33.2 Adversarial and Distributional Robustness</a>
+<a class="up" href="index.html">Chapter 33 Contents</a>
+<a class="next" href="section-33.4.html">33.4 Privacy and Federated Temporal Learning &#8594;</a>
+</nav>
+</main>
+<footer class="site-footer">
+<p>Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&copy; 2026 Alexander Apartsin &middot; <a href="../../toc.html">Contents</a></p>
+<p class="last-updated"><script>document.write("Last updated " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

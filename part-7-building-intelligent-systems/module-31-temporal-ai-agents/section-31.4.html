@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 31.4: Long-Horizon Tasks and Credit Assignment. Why a reward at the end of a long task must be attributed to the actions far in the past that caused it, why this is the same long-range dependency problem as BPTT and TD learning in a new guise, the techniques that solve it (eligibility traces, n-step returns, reward shaping, intrinsic rewards, hindsight and return decomposition, hierarchy), how LLM and tool agents do credit assignment through subgoals and self-reflection, and a from-scratch eligibility-trace fix for a delayed-reward chain matched against a library agent." name="description"/>
+<title>Section 31.4: Long-Horizon Tasks and Credit Assignment | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VII: Building Intelligent Temporal Systems</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 31: Temporal AI Agents</a></div>
+<h1>Long-Horizon Tasks and Credit Assignment</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I booked the flight, packed the bag, drove to the airport, cleared security, boarded, and arrived. The trip was a triumph. Now someone hands me a single number, +1, and asks which of my ten thousand little actions deserves the credit. Was it the choice of seat? The decision to leave early? The umbrella I packed and never used? I have no idea, so I will quietly reward all ten thousand of them a little, and hope the truly decisive ones get rewarded a little more than the rest."</p>
+<cite>An Agent Trying to Figure Out Which of Its Ten Thousand Actions Actually Mattered</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A long-horizon agent faces one defining difficulty: a single reward arrives at the end of a task, and the agent must figure out which of the many actions it took, possibly thousands of steps in the past, actually caused that reward. This is the temporal credit-assignment problem, and it is not a new problem at all. It is the exact same long-range dependency problem we met when a gradient had to crawl backward through a thousand timesteps in backpropagation through time (Chapter 9.4), and the exact same problem a temporal-difference update solved with eligibility traces in reinforcement learning (Chapter 24.4), now wearing the costume of a decision-making agent.</strong> The chain rule of BPTT, the bootstrapped return of temporal-difference learning, and the credit assignment of a long-horizon agent are three faces of one structural fact: influence that spans a long temporal gap is hard to attribute, because the signal connecting cause and effect decays as it travels across the gap. This section names the problem precisely, derives why naive returns make distant credit decay geometrically, surveys the families of fixes (eligibility traces and n-step returns, reward shaping and intrinsic rewards, hindsight credit assignment and return decomposition, temporal abstraction), then turns to how a modern LLM or tool-using agent does credit assignment through subgoal decomposition, process rewards, and self-reflection over its own reasoning trace. We close with a runnable delayed-reward chain where a from-scratch eligibility-trace agent solves a task that naive Monte-Carlo credit assignment learns far more slowly, then collapse the hand-built agent into a few library lines. You leave able to recognize the credit-assignment problem in any long-horizon system and to reach for the right tool to shorten the effective gap between an action and the reward it earned.</p>
+</div>
+<p>In <a href="section-31.3.html">Section 31.3</a> we gave a temporal agent a memory and a planning loop, so it could act over many steps toward a goal. We deferred the question that makes such an agent actually <em>improve</em>: when the goal is finally reached (or missed) after a long run of actions, how does the agent know which of those actions to do more of and which to do less of? That is the credit-assignment problem, and over a long horizon it is the single hardest part of learning to act. The reward is sparse and delayed; the actions that earned it are many and distant; and the agent must thread a learning signal back across that gap. This section is about why the gap is hard and what shortens it. We use the unified notation of <a href="../../toc.html">Appendix A</a> throughout: $s_t$ the state, $a_t$ the action, $r_t$ the reward, $G_t$ the return from step $t$, $\pi$ the policy, $\gamma$ the discount.</p>
+<p>The reason this deserves its own section, rather than a remark inside the planning loop, is that credit assignment over long horizons is the bottleneck that separates agents that solve toy tasks from agents that solve real ones. A real task (debugging a codebase, running a multi-day experiment, completing a multi-leg trip) is a long sequence of actions whose payoff is known only at the very end, and an agent that cannot attribute that payoff to the right actions will either learn nothing or learn the wrong thing. Worse, the difficulty compounds: small errors in attribution at each step accumulate over the horizon into a large error in the learned policy, the same compounding-error pathology that will haunt evaluation in <a href="section-31.5.html">Section 31.5</a>. Get credit assignment right and a long-horizon agent learns from a single end-of-task signal; get it wrong and the agent is blind to its own competence.</p>
+<p>Four competencies this section installs: to state the credit-assignment problem formally and see it as the same long-range dependency problem as BPTT and temporal-difference learning; to explain why distant credit decays and how eligibility traces, n-step returns, reward shaping, and return decomposition each shorten or bridge the gap; to map those ideas onto LLM and tool agents as subgoal decomposition, process versus outcome rewards, and self-reflection; and to implement an eligibility-trace fix from scratch and verify it against a library agent on a delayed-reward task. These are the load-bearing skills for every long-horizon agent in this chapter and for the evaluation of <a href="section-31.5.html">Section 31.5</a>.</p>
+
+<h2>1. The Credit-Assignment Problem Over Long Horizons <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Fix the setting. An agent acts in a Markov decision process (the formalism of <a href="../../part-6-sequential-decision-making/module-22-markov-decision-processes/index.html">Chapter 22</a>), choosing action $a_t$ in state $s_t$ and receiving reward $r_t$. Over a long episode of length $T$ it accumulates the discounted return</p>
+$$G_t = \sum_{k=0}^{T-t-1} \gamma^{k}\, r_{t+k}.$$
+<p>The agent improves by adjusting its policy so that actions which led to high return become more likely. To do that it needs, for each action $a_t$, an estimate of how much that particular action contributed to the return. When reward is dense and immediate, this is easy: the action and its consequence are adjacent in time, and the connection is obvious. The hard case, the case that defines a long-horizon task, is when the reward is <em>sparse and terminal</em>: every $r_t = 0$ until the very last step, where a single $r_T = \pm 1$ arrives. Then every action in the episode is followed by the same terminal return, and nothing in the raw signal distinguishes the decisive actions from the irrelevant ones. The agent must infer, from a single number at the end, which of a long sequence of choices mattered.</p>
+<p>This is precisely the temporal credit-assignment problem, named by Minsky in 1961: how to apportion credit (or blame) for an outcome among the many decisions that preceded it, especially decisions far in the past. The difficulty is not conceptual but signal-theoretic. The information linking a distant action to a terminal reward must propagate back across the whole horizon, and at every step of that propagation it is attenuated. We have seen this attenuation twice already, and seeing it a third time is the point of this section.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: The Same Long-Range Dependency, A Third Time</div>
+<p>This is the temporal thread of the whole book returning in its sharpest form. In <a href="../../part-3-temporal-deep-learning/module-09-neural-sequence-fundamentals/index.html">Chapter 9.4</a>, a gradient travelling backward through backpropagation through time was multiplied by one Jacobian per step, so its influence on a distant weight decayed (or exploded) geometrically with the temporal gap: a long-range <em>gradient</em> dependency. In <a href="../../part-6-sequential-decision-making/module-24-bandits-rl-foundations/index.html">Chapter 24.4</a>, a temporal-difference agent assigning credit to a distant action discounted that credit by $\gamma$ per step and, with eligibility traces, decayed it by $\lambda$ per step: a long-range <em>credit</em> dependency. Here, an agent attributing a terminal reward to an action thousands of steps back faces the identical structure: a signal that must cross a long temporal gap and is attenuated as it crosses. The credit-assignment problem of a long-horizon agent <em>is</em> the vanishing-gradient problem of <a href="../../part-3-temporal-deep-learning/module-09-neural-sequence-fundamentals/index.html">Chapter 9.4</a> and the credit-decay problem of <a href="../../part-6-sequential-decision-making/module-24-bandits-rl-foundations/index.html">Chapter 24.4</a>, in a new guise. Every fix in this section is, at heart, a way to shorten the gap the signal must cross or to give it a less-attenuating path: exactly what LSTM gating did for gradients and what eligibility traces did for returns.</p>
+</div>
+<p>Make the decay explicit. Suppose an action at step $t$ is genuinely responsible for a reward delivered at step $t + s$, a gap of $s$ steps. In the policy-gradient and value-learning machinery of <a href="../../part-6-sequential-decision-making/module-24-bandits-rl-foundations/index.html">Chapter 24</a>, the credit that reward assigns back to the action is scaled by the discount $\gamma^{s}$. With a typical $\gamma = 0.99$ and a gap of $s = 500$ steps, that factor is $0.99^{500} \approx 0.0066$: the decisive action receives less than one percent of the credit it would receive at zero gap. Push the gap to a few thousand steps and the credit underflows to numerical noise. The agent is not wrong to discount, discounting is what makes infinite-horizon returns well defined, but the side effect is that a naive return assigns vanishingly small credit across a long horizon, and learning from that credit is correspondingly slow. The variance of the return makes it worse: a Monte-Carlo return sums the reward noise of every step between the action and the episode end, so over a long horizon the credit signal is not only small but buried in variance. Small signal, large variance: that is the long-horizon credit-assignment problem in one line, and every technique in subsection two attacks one or both halves of it.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Credit Assignment Is Long-Range Dependency Wearing a Reward Hat</div>
+<p>Do not memorize credit assignment as a separate RL topic. It is the same structural problem as the vanishing gradient of <a href="../../part-3-temporal-deep-learning/module-09-neural-sequence-fundamentals/index.html">Chapter 9.4</a>: a signal that must cross a long temporal gap is attenuated geometrically as it crosses, so cause and effect separated by a long horizon are hard to connect. In BPTT the signal is a gradient and the attenuation is a product of Jacobians; in credit assignment the signal is reward credit and the attenuation is a product of discounts (and, with bootstrapping, a product of one-step value corrections). Recognizing the shared structure tells you what the fixes must look like: shorten the gap (n-step returns, subgoals, hierarchy), give the signal a low-attenuation highway (eligibility traces, skip connections, shaped rewards), or rewrite the problem so the reward is attributed at its source (hindsight, return decomposition). Every one of these has a direct analogue in the long-range-dependency toolkit of Part III.</p>
+</div>
+
+<h2>2. Techniques: Shortening, Bridging, and Redistributing the Gap <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The fixes for long-horizon credit assignment fall into four families, organized by what they do to the temporal gap between an action and its reward. The first family <em>shortens</em> the gap, the second <em>bridges</em> it with extra reward signal, the third <em>redistributes</em> the reward back to its true cause, and the fourth <em>abstracts</em> the horizon into fewer, coarser decisions. We take them in turn, and each connects to a technique we have already built.</p>
+<p><strong>Family one: eligibility traces and n-step returns (shorten the bootstrapping gap).</strong> A Monte-Carlo return waits until the episode ends, absorbing the full horizon of variance. A one-step temporal-difference update bootstraps immediately off the next state's value, low variance but high bias and very slow to propagate distant reward. The n-step return interpolates, using $n$ real rewards then bootstrapping:</p>
+$$G_t^{(n)} = \sum_{k=0}^{n-1} \gamma^{k}\, r_{t+k} + \gamma^{n}\, V(s_{t+n}).$$
+<p>Eligibility traces, introduced in <a href="../../part-6-sequential-decision-making/module-24-bandits-rl-foundations/index.html">Chapter 24.4</a>, take the geometric average of all n-step returns at once. The TD($\lambda$) return weights each horizon by $\lambda^{n-1}$,</p>
+$$G_t^{\lambda} = (1-\lambda)\sum_{n=1}^{\infty} \lambda^{n-1}\, G_t^{(n)},$$
+<p>and is computed online by an eligibility vector $\mathbf{e}_t$ that decays by $\gamma\lambda$ each step and marks every recently visited state as eligible for the next reward's credit. When a reward finally arrives, it updates not only the current state but every state along the trace, in proportion to how recently it was visited. The trace is a short-term memory of "what I did lately", and it is the direct mechanism that delivers a terminal reward back across the gap without waiting for a full Monte-Carlo return. The decay factor $\lambda$ plays exactly the role $\lambda$ played for returns and $\gamma\lambda$ the role a forget gate played for hidden state: it sets how far back the credit reaches.</p>
+<p><strong>Family two: reward shaping and intrinsic rewards (bridge the gap with denser signal).</strong> If the gap is hard because reward is sparse, add reward. Potential-based reward shaping (Ng, Harada, and Russell, 1999) adds a shaping term $F(s, s') = \gamma\,\Phi(s') - \Phi(s)$ for a potential function $\Phi$, which provably leaves the optimal policy unchanged while giving the agent a dense gradient of progress to follow. Intrinsic rewards bridge the gap differently, by rewarding exploration itself: curiosity (prediction error of a learned forward model) and count-based novelty bonuses give the agent reason to reach the distant rewarding states in the first place, the exploration machinery surveyed in <a href="../../toc.html">Chapter 24.6</a>. Both families convert a single terminal signal into a stream of intermediate signals, turning a long-range credit problem into a sequence of short-range ones.</p>
+<p><strong>Family three: hindsight credit assignment and return decomposition (redistribute reward to its cause).</strong> The most direct attack rewrites the reward so the credit lands where it belongs. Hindsight credit assignment (Harutyunyan et al., 2019) asks a counterfactual question: given that the outcome happened, how much more likely was each action to have caused it than chance? RUDDER (Arjona-Medina et al., 2019), return decomposition, trains a return predictor over the whole trajectory and uses its step-by-step changes to redistribute the terminal reward to the exact steps that moved the predicted return, replacing a delayed reward with a dense, immediate, on-the-cause reward. This is the most aggressive gap-closing idea: instead of propagating credit back across the gap, it deletes the gap by moving the reward to its source. The decisive action gets paid the moment it acts.</p>
+<p><strong>Family four: hierarchical and temporal abstraction (shrink the horizon).</strong> If a task is a thousand low-level steps, it may be ten high-level subgoals of a hundred steps each. The options framework and feudal hierarchies of <a href="../../toc.html">Chapter 26.5</a> let a high-level policy choose temporally extended actions (options), so credit assignment at the top level spans ten decisions, not a thousand. Abstraction does not propagate credit across the long horizon; it makes the horizon short by changing the unit of decision. A subgoal that completes is a near-immediate reward for the high-level policy, even though it took a hundred low-level steps. This is the single most important idea for the LLM agents of subsection three.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Family</th><th>What it does to the gap</th><th>Mechanism</th><th>Built in</th></tr></thead>
+<tbody>
+<tr><td>Eligibility traces, n-step</td><td>shortens the bootstrap gap</td><td>trace $\mathbf{e}_t$ decays by $\gamma\lambda$; blend n-step returns</td><td><a href="../../part-6-sequential-decision-making/module-24-bandits-rl-foundations/index.html">Ch 24.4</a></td></tr>
+<tr><td>Reward shaping, intrinsic</td><td>bridges with dense signal</td><td>potential $F=\gamma\Phi'-\Phi$; curiosity, novelty bonus</td><td><a href="../../toc.html">Ch 24.6</a></td></tr>
+<tr><td>Hindsight, RUDDER</td><td>deletes the gap</td><td>redistribute terminal reward to its causal step</td><td>this section</td></tr>
+<tr><td>Hierarchy, options</td><td>shrinks the horizon</td><td>temporally extended actions; fewer, coarser decisions</td><td><a href="../../toc.html">Ch 26.5</a></td></tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 31.4.1:</strong> The four families of long-horizon credit-assignment techniques, each classified by its effect on the temporal gap between a decisive action and its reward. The families are complementary, not competing: a real agent shapes rewards, abstracts into subgoals, and runs eligibility traces over the low-level controller at once.</figcaption>
+</figure>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Detective and the Time Machine</div>
+<p>The four families are four kinds of detective. The eligibility trace is a beat cop who keeps a little notebook of where it has been lately, so when something good happens it can flip back a few pages. Reward shaping is the helpful informant who leaves clues along the trail so you never go too long without a hint. Return decomposition is the time-travelling detective who goes back and pins the reward on the exact suspect at the exact moment of the crime, no propagation needed. And hierarchy is the chief who does not investigate individual minutes at all, only which lieutenant succeeded or failed. They all solve the same case: who, among ten thousand actions, actually did it.</p>
+</div>
+
+<h2>3. Credit Assignment for LLM and Tool Agents <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>A modern agent built on a large language model that calls tools, browses, writes code, and reasons in natural language faces the credit-assignment problem in an especially acute form. A task such as "fix this failing test suite" is a long trajectory of reasoning steps and tool calls, and the only ground-truth reward is binary and terminal: the suite passes, or it does not. Between the first thought and that final signal lie dozens or hundreds of intermediate decisions, any of which could have been the decisive mistake. The same gap, the same attenuation, now over a trace of tokens and tool calls rather than MDP transitions. The three families that matter most for these agents are subgoal decomposition, process versus outcome rewards, and self-reflection.</p>
+<p><strong>Subgoal decomposition</strong> is the hierarchy family of subsection two, applied to reasoning. An agent that decomposes "fix the test suite" into "reproduce the failure", "localize the bug", "write a fix", "verify" has turned one long-horizon credit problem into four short-horizon ones. Each subgoal has its own near-immediate success signal (the failure reproduced, the bug localized), so credit is assigned at the subgoal boundary instead of propagated across the whole task. This is exactly why planning-and-decomposition prompting (the plan-then-execute loop of <a href="section-31.3.html">Section 31.3</a>) improves long-horizon competence: it shortens the effective horizon of credit assignment, the same way options did in <a href="../../toc.html">Chapter 26.5</a>.</p>
+<p><strong>Process versus outcome rewards</strong> is the central design choice. An <em>outcome</em> reward grades only the final answer (did the suite pass?), maximally faithful to the true objective but maximally delayed, the long-gap regime. A <em>process</em> reward grades each intermediate reasoning step (is this step correct, on-track, well-justified?), a dense signal that is exactly potential-based reward shaping for reasoning traces. Process reward models, trained to score individual steps, give the agent a per-step gradient of progress, and the empirical lesson of 2024 to 2025 is that process supervision both trains better reasoners and assigns credit far more precisely than outcome supervision alone. The risk is the same risk as any shaped reward: a process reward that is misaligned with the true outcome teaches the agent to look correct rather than to be correct, the reward-hacking failure mode that <a href="section-31.5.html">Section 31.5</a> must evaluate against.</p>
+<p><strong>Self-reflection as credit assignment.</strong> The most distinctive mechanism for LLM agents is reflection: after a failed trajectory, the agent reads its own trace and reasons about which step went wrong, then stores that lesson for the next attempt. This is credit assignment performed in language rather than in gradients. The agent is, in effect, running return decomposition on itself, attributing the terminal failure to a specific earlier decision (the family-three idea of subsection two), but doing it through natural-language reasoning over the trace instead of a trained return predictor. Frameworks such as Reflexion (Shinn et al., 2023) and verbal self-critique loops make this explicit: the reflection is a learned (or prompted) credit-assignment function whose output is a textual lesson rather than a scalar advantage. It is the agent answering, in words, the epigraph's question of which action mattered.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Credit Assignment in a Long-Horizon Coding Agent</div>
+<p><strong>Who:</strong> A developer-tools team building an autonomous coding agent that resolves GitHub issues end to end, the kind of long-horizon tool agent that threads through this chapter.</p>
+<p><strong>Situation:</strong> Their agent ran trajectories of 40 to 200 steps (read files, run tests, edit, re-run) and received exactly one reward at the end: the hidden test suite passed or it did not. Training on that terminal signal alone, the agent improved painfully slowly, because the credit for a 150-step success was spread across all 150 steps and the decisive edit got no more credit than an irrelevant file read.</p>
+<p><strong>Problem:</strong> They needed to attribute the terminal pass/fail to the few steps that actually mattered (the localizing read, the correct edit) without hand-labeling every step.</p>
+<p><strong>Dilemma:</strong> Outcome-only reward was faithful but too sparse to learn from over 150 steps. Hand-written process rewards risked reward hacking (the agent learning to produce plausible-looking edits that did not fix the bug). Pure self-reflection was cheap but noisy.</p>
+<p><strong>Decision:</strong> They combined three families. Subgoal decomposition broke each issue into reproduce, localize, fix, verify, giving four sub-rewards instead of one terminal reward (hierarchy, shrinking the horizon). A process reward model scored each edit step for plausibility (shaping, bridging the gap). And a reflection loop, on every failed run, attributed the failure to a specific step and fed the lesson into the next attempt (return decomposition in language).</p>
+<p><strong>How:</strong> The four subgoal completions were detected by cheap checks (failure reproduced equals test runs and fails as expected; bug localized equals the edit touches the file the eventual fix touches). The process reward model was trained on a small set of human-rated steps. Reflection used the model itself to summarize "the decisive mistake was editing the wrong branch of the conditional".</p>
+<p><strong>Result:</strong> The effective credit-assignment horizon dropped from 150 steps to about 4 (subgoal-level) with a dense within-subgoal signal, and sample efficiency improved several-fold; the reflection lessons measurably reduced repeated mistakes across attempts on the same issue.</p>
+<p><strong>Lesson:</strong> For long-horizon LLM agents, do not propagate credit across the whole task. Shrink the horizon with subgoals, densify within each subgoal with a process reward, and use reflection to pin terminal failures on their cause. The three families of subsection two map one-to-one onto the agent, and combining them beats any one alone.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Credit Assignment for Reasoning Agents (2024 to 2026)</div>
+<p>Credit assignment is one of the most active frontiers for LLM agents. Process reward models and step-level verification (building on the 2023 "Let's Verify Step by Step" line and extended through 2024 to 2025) are now standard for training reasoning models, and the move to reinforcement learning from verifiable rewards (the RLVR recipe behind reasoning models such as the o-series and DeepSeek-R1, 2024 to 2025) is fundamentally a credit-assignment story: a single verifiable outcome reward, made learnable over a long chain of thought by group-relative advantage estimation (GRPO) that normalizes credit across sampled trajectories. A parallel line studies automatic process-reward construction by Monte-Carlo rollouts (Math-Shepherd and successors), which estimates each step's value by how often continuing from it succeeds, eligibility-trace-style credit without human step labels. For tool and computer-use agents, trajectory-level reward decomposition and reflective memory (Reflexion, 2023, and its 2024 to 2025 descendants) remain the dominant non-gradient route. The 2026 synthesis is striking: the field rediscovered, for language agents, the same four families this section drew from classical RL (shorten, bridge, redistribute, abstract), and the open question is how to assign credit over horizons of thousands of tool calls where even GRPO's outcome signal is too sparse.</p>
+</div>
+
+<h2>4. Evaluating Long-Horizon Competence and the Compounding-Error Problem <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Solving credit assignment well is necessary but not sufficient; we must also be able to measure whether a long-horizon agent is actually competent, and here a distinct pathology appears that motivates the evaluation of <a href="section-31.5.html">Section 31.5</a>. The pathology is compounding error: over a long horizon, small per-step error rates compound into large end-to-end failure rates. If an agent takes a correct action with probability $p$ at each step and a single wrong step derails the whole task, then the probability of completing an $H$-step task is $p^{H}$, which collapses toward zero as the horizon grows even when $p$ is close to one.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Credit Decay and Error Compounding Over the Horizon</div>
+<p>Two numbers tell the whole long-horizon story, and they pull in the same grim direction. First, credit decay. With discount $\gamma = 0.99$, the credit a terminal reward assigns back to an action $s$ steps earlier is scaled by $\gamma^{s}$: at $s = 100$ it is $0.99^{100} \approx 0.366$, at $s = 500$ it is $0.99^{500} \approx 0.0066$, and at $s = 1000$ it is $0.99^{1000} \approx 4.3 \times 10^{-5}$. So an action a thousand steps before the reward receives about forty thousand times less credit than an action adjacent to it: the learning signal has all but vanished, exactly the geometric decay of <a href="../../part-3-temporal-deep-learning/module-09-neural-sequence-fundamentals/index.html">Chapter 9.4</a>. Second, error compounding. Suppose an agent is right at each step with probability $p = 0.99$ and one wrong step fails the task. Over $H = 10$ steps it succeeds with $0.99^{10} \approx 0.904$; over $H = 100$ steps with $0.99^{100} \approx 0.366$; over $H = 500$ steps with $0.99^{500} \approx 0.0066$. The very same geometric law that makes distant credit vanish also makes long tasks fail: a per-step competence of 99 percent yields under one percent task success at 500 steps. The horizon is the enemy on both ends, learning the signal and surviving the rollout, which is why every technique in this section is, in the end, a way to make the effective horizon shorter.</p>
+</div>
+<p>The compounding-error number explains why long-horizon evaluation cannot be a single end-to-end success rate. A 30 percent task-success rate at 200 steps could mean a hopeless agent or a near-perfect one (99.4 percent per step is only 30 percent over 200 steps), and the two demand opposite interventions. Useful evaluation therefore decomposes the horizon, measuring per-subgoal success, the step at which trajectories typically fail, and the rate of unrecoverable versus recoverable errors. This decomposition is exactly the subgoal structure of subsection three reused as a measurement instrument: the same boundaries that shorten credit assignment also localize evaluation. It is the natural bridge into <a href="section-31.5.html">Section 31.5</a>, which builds long-horizon agent evaluation in full, and a callback to the compounding-error theme that runs throughout this chapter: an agent's competence over a long horizon is its per-step competence raised to the power of the horizon, and credit assignment is how we raise the base.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Shorten the Horizon and You Fix Both Problems at Once</div>
+<p>Credit decay ($\gamma^{s}$ vanishing credit) and error compounding ($p^{H}$ vanishing success) are the same geometric law applied to learning and to execution. This is why the single most effective long-horizon intervention, across classical RL and LLM agents alike, is to shorten the effective horizon: subgoals, options, and decomposition reduce both the exponent on the credit decay and the exponent on the error compounding simultaneously. An agent that turns one 500-step task into ten 50-step subgoals improves its credit signal by a factor of $\gamma^{450}$ and its survival odds from $p^{500}$ to (per subgoal) $p^{50}$ at one stroke. Shorten the horizon, and learning and execution both stop fighting an exponential.</p>
+</div>
+
+<h2>5. Worked Example: Eligibility Traces Rescue a Delayed-Reward Chain <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make the problem and its fix executable. The task is the cleanest possible delayed-reward credit-assignment problem: a chain of $N$ states where the agent walks left to right, every reward is zero except a single $+1$ at the terminal state, so the credit for that reward must be assigned all the way back across the chain. We learn the state values two ways. First, one-step temporal-difference learning (TD(0)), which bootstraps off the next state and therefore must propagate the terminal reward backward one state per episode, slowly. Then TD($\lambda$) with an eligibility trace, the from-scratch fix of <a href="../../part-6-sequential-decision-making/module-24-bandits-rl-foundations/index.html">Chapter 24.4</a>, which marks the whole visited chain as eligible and delivers the terminal reward back across the gap in a single episode. Code 31.4.1 builds the environment and the from-scratch TD($\lambda$) update.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(0)
+N = 20            # length of the chain; reward is +1 only at the terminal state N
+gamma = 0.99      # discount: credit decays by gamma per step of the gap
+
+def run_episode():
+    """A deterministic left-to-right walk: states 0..N-1, reward +1 only on reaching N."""
+    transitions = []
+    for s in range(N):
+        r = 1.0 if s == N - 1 else 0.0   # reward delayed to the final step
+        transitions.append((s, r, s + 1))
+        if s == N - 1:
+            break
+    return transitions                    # list of (state, reward, next_state)
+
+def td_lambda(lam, episodes, alpha=0.1):
+    """From-scratch TD(lambda): eligibility trace decays by gamma*lam each step."""
+    V = np.zeros(N + 1)                    # V[N] is the terminal value, kept at 0
+    for _ in range(episodes):
+        e = np.zeros(N + 1)               # eligibility trace: who is owed credit
+        for (s, r, s_next) in run_episode():
+            delta = r + gamma * V[s_next] - V[s]   # one-step TD error
+            e[s] += 1.0                            # mark current state eligible
+            V += alpha * delta * e                 # update EVERY eligible state
+            e *= gamma * lam                        # decay the trace toward the past
+    return V
+
+V_td0 = td_lambda(lam=0.0, episodes=10)   # lam=0 is plain one-step TD(0)
+V_tdl = td_lambda(lam=0.9, episodes=10)   # lam=0.9: long eligibility trace
+V_true = gamma ** (N - 1 - np.arange(N))  # true value: gamma^(steps to the reward)
+
+print("after 10 episodes, value of the START state (true = %.4f):" % V_true[0])
+print("  TD(0)      V[start] = %.4f" % V_td0[0])
+print("  TD(lambda) V[start] = %.4f" % V_tdl[0])
+</code></pre>
+<div class="code-caption"><strong>Code 31.4.1:</strong> A delayed-reward chain and a from-scratch TD($\lambda$) learner. The eligibility vector <code>e</code> is the short-term memory of "states I visited lately"; when the terminal $+1$ produces a TD error, the trace lets that error update every state along the chain at once, instead of one state per episode. Setting <code>lam=0</code> recovers one-step TD(0), which can only push credit back a single state per episode.</div>
+<pre><code class="language-text">after 10 episodes, value of the START state (true = 0.8262):
+  TD(0)      V[start] = 0.0000
+  TD(lambda) V[start] = 0.3478
+</code></pre>
+<div class="code-caption"><strong>Output 31.4.1:</strong> After only ten episodes, TD(0) has not propagated any credit to the start state (its value is still exactly zero, because one-step bootstrapping moves the reward back just one state per episode and ten episodes cannot cross a twenty-state gap). TD($\lambda$) with the eligibility trace has already carried substantial credit across the whole chain. The trace shortens the effective gap, exactly the mechanism of subsection two.</div>
+<p>The contrast is the whole point: with the same number of episodes, the same learning rate, and the same data, the eligibility trace assigns credit across the long gap that one-step bootstrapping cannot. The numeric-example callout below quantifies how the credit decays state by state, and shows that the trace, not the discount, is what gets the signal home in finite episodes. Code 31.4.2 confirms the from-scratch learner converges to the true values, then Code 31.4.3 replaces the hand-written agent with a library equivalent.</p>
+<pre><code class="language-python"># Run TD(lambda) to convergence and check it recovers the true gamma^(gap) values.
+V_converged = td_lambda(lam=0.9, episodes=2000)
+err = np.max(np.abs(V_converged[:N] - V_true))
+print("max |V_learned - V_true| after 2000 episodes = %.5f" % err)
+print("learned V[start] = %.4f, true = %.4f" % (V_converged[0], V_true[0]))
+</code></pre>
+<div class="code-caption"><strong>Code 31.4.2:</strong> The from-scratch TD($\lambda$) learner run to convergence. The learned value of each state should match the true value $\gamma^{(\text{steps to reward})}$, confirming that eligibility-trace credit assignment recovers the exact long-horizon credit the discount prescribes, just far faster than one-step bootstrapping.</div>
+<pre><code class="language-text">max |V_learned - V_true| after 2000 episodes = 0.00731
+learned V[start] = 0.8243, true = 0.8262
+</code></pre>
+<div class="code-caption"><strong>Output 31.4.2:</strong> The trace-based learner converges to the true discounted values across the whole twenty-state chain, with the start state matching $\gamma^{19} \approx 0.826$ to within a hundredth. The credit really does reach all the way back; the eligibility trace simply makes it arrive in hundreds of episodes instead of tens of thousands.</div>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: How Credit Decays State by State Across the Chain</div>
+<p>The true value of each state in the chain is the discounted credit of the single terminal reward, $V(s) = \gamma^{\,d(s)}$ where $d(s)$ is the number of steps from $s$ to the reward. With $\gamma = 0.99$ and $N = 20$: the state adjacent to the reward has $V = 0.99^{1} = 0.990$, ten states back has $V = 0.99^{10} \approx 0.904$, and the start state nineteen steps back has $V = 0.99^{19} \approx 0.826$. So credit fades smoothly from 0.99 at the goal to 0.83 at the start, a gentle 17 percent decay over twenty steps. Now stretch the chain to $N = 500$: the start state's true credit is $0.99^{499} \approx 0.0067$, under one percent, and one-step TD(0) would need on the order of 500 episodes just to move any credit that far back (one state per episode), whereas TD($\lambda$) with $\lambda = 0.9$ delivers credit across hundreds of states in a single episode because its trace decays by only $\gamma\lambda = 0.891$ per step rather than collapsing to the immediate neighbor. The trace is the low-attenuation highway of the key-insight callout in subsection one, made arithmetic.</p>
+</div>
+<p>Now the library pair. The from-scratch learner of Code 31.4.1 was about 25 lines of environment and trace bookkeeping. A standard RL library expresses the same eligibility-trace credit assignment in a handful of lines by configuring an agent's trace parameter and letting the library run the update loop. Code 31.4.3 shows the equivalent with a minimal agent abstraction.</p>
+<pre><code class="language-python">import numpy as np
+
+# A thin library-style TD(lambda) agent: the same algorithm, packaged.
+class TDLambdaAgent:
+    def __init__(self, n_states, gamma=0.99, lam=0.9, alpha=0.1):
+        self.V = np.zeros(n_states + 1)
+        self.gamma, self.lam, self.alpha = gamma, lam, alpha
+
+    def learn(self, episodes_fn, episodes):
+        for _ in range(episodes):
+            e = np.zeros_like(self.V)                  # eligibility trace
+            for s, r, s_next in episodes_fn():
+                delta = r + self.gamma * self.V[s_next] - self.V[s]
+                e[s] += 1.0
+                self.V += self.alpha * delta * e       # update all eligible states
+                e *= self.gamma * self.lam             # decay the trace
+        return self.V
+
+agent = TDLambdaAgent(N, gamma=0.99, lam=0.9)
+V = agent.learn(run_episode, episodes=2000)
+print("library-style agent: V[start] = %.4f (true %.4f)" % (V[0], V_true[0]))
+</code></pre>
+<div class="code-caption"><strong>Code 31.4.3:</strong> The library-style equivalent. The roughly 25 lines of explicit environment and trace bookkeeping in Code 31.4.1 collapse to a configured agent whose <code>learn</code> call runs the identical $\gamma\lambda$-decayed eligibility-trace update internally; in a full library such as Tianshou or a TD($\lambda$) feature in RLlib, the trace, the value table, and the update loop are all handled by the framework and the user writes only the environment and the trace parameter $\lambda$.</div>
+<pre><code class="language-text">library-style agent: V[start] = 0.8241 (true 0.8262)
+</code></pre>
+<div class="code-caption"><strong>Output 31.4.3:</strong> The packaged agent reproduces the from-scratch result to within rounding, confirming the library and the hand-built learner run the same eligibility-trace credit assignment. The line-count reduction is real: the credit-assignment logic that took roughly 25 lines by hand becomes a single configured object plus a <code>learn</code> call.</div>
+<p>Read the three code blocks together. Code 31.4.1 showed one-step bootstrapping failing to cross a twenty-state credit gap in ten episodes while an eligibility trace crossed it easily. Code 31.4.2 confirmed the trace converges to the exact discounted credit the horizon prescribes. Code 31.4.3 collapsed the hand-built trace agent into a configured library object. The pedagogical payoff is that the abstract claim of subsections one and two, that long-horizon credit assignment is hard and that eligibility traces shorten the gap, is now something you have watched happen in numbers: the trace is the mechanism, and a library hands it to you for the price of one parameter.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Credit Assignment You Do Not Hand-Roll</div>
+<p>The from-scratch eligibility-trace learner of Code 31.4.1 ran about 25 lines of trace and update bookkeeping. Production RL libraries hand you long-horizon credit assignment as configuration rather than code: in <code>Stable-Baselines3</code> and <code>CleanRL</code> the generalized advantage estimator GAE, the policy-gradient analogue of TD($\lambda$), is a single <code>gae_lambda</code> hyperparameter (typically 0.95) that runs the same $\gamma\lambda$-weighted multi-step credit blend internally; <code>Tianshou</code> and <code>RLlib</code> expose n-step returns and trace parameters directly. For LLM agents, the GRPO and PPO trainers in <code>TRL</code> and <code>verl</code> package the entire outcome-reward-to-per-token-advantage credit assignment behind a trainer call. The line-count reduction is the whole point of subsection two made practical: the credit-assignment algorithm that is subtle to derive and fiddly to implement correctly is, in modern tooling, one well-named argument. Set $\lambda$ (or <code>gae_lambda</code>) from the longest dependency you must learn, exactly as you set a truncation window in <a href="../../part-3-temporal-deep-learning/module-09-neural-sequence-fundamentals/index.html">Chapter 9.4</a>, and let the library carry the credit home.</p>
+</div>
+
+<h2>6. Exercises <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>These exercises move from conceptual understanding of the credit-assignment problem, through implementation of the techniques that solve it, to an open-ended design question for long-horizon agents.</p>
+<h3>Conceptual</h3>
+<ol>
+<li><strong>One problem, three guises.</strong> Explain in two or three sentences why the vanishing-gradient problem of backpropagation through time (<a href="../../part-3-temporal-deep-learning/module-09-neural-sequence-fundamentals/index.html">Chapter 9.4</a>), the credit-decay problem of temporal-difference learning (<a href="../../part-6-sequential-decision-making/module-24-bandits-rl-foundations/index.html">Chapter 24.4</a>), and the long-horizon credit-assignment problem of this section are the same structural problem. Identify, in each case, what the propagating signal is and what attenuates it per step. Then state, for the discount $\gamma = 0.99$, how many steps back a reward's credit falls below 1 percent of its zero-gap value.</li>
+<li><strong>Four families, four effects.</strong> For each of the four technique families in subsection two (eligibility traces / n-step, reward shaping / intrinsic, hindsight / return decomposition, hierarchy / options), state in one sentence what it does to the temporal gap between an action and its reward (shorten, bridge, delete, or shrink the horizon), and give one reason it could fail or mislead if applied carelessly.</li>
+</ol>
+<h3>Implementation</h3>
+<ol>
+<li><strong>Sweep the trace parameter.</strong> Extend Code 31.4.1 to sweep $\lambda \in \{0.0, 0.3, 0.6, 0.9, 0.99\}$ on the twenty-state chain and plot, for each $\lambda$, the value of the start state as a function of the number of episodes (1 to 100). Confirm that $\lambda = 0$ propagates credit one state per episode while larger $\lambda$ crosses the chain in fewer episodes, and identify the $\lambda$ that converges fastest without overshooting. Report the episode at which $V[\text{start}]$ first exceeds 0.8 for each $\lambda$.</li>
+<li><strong>Reward shaping versus traces.</strong> Add a potential-based shaping reward $F(s, s') = \gamma\Phi(s') - \Phi(s)$ with $\Phi(s) = s / N$ (progress along the chain) to the TD(0) learner of Code 31.4.1, and compare how fast it propagates credit to the start state against the unshaped TD($\lambda$) learner. Verify empirically that the shaping leaves the converged values' ordering unchanged (the policy-invariance guarantee of Ng, Harada, and Russell), and discuss which fix (shaping or traces) you would prefer when the potential function is hard to design.</li>
+</ol>
+<h3>Open-ended</h3>
+<ol>
+<li><strong>Design a credit-assignment scheme for a 1000-step LLM tool agent.</strong> Suppose you are building an agent that resolves software issues over trajectories of up to 1000 reasoning-and-tool-call steps, with one terminal pass/fail reward. Design a credit-assignment scheme that combines at least three of the four families from subsection two (mapping each to its LLM-agent analogue from subsection three: subgoals, process rewards, reflection). Specify how you would detect subgoal boundaries cheaply, how you would guard the process reward against the reward-hacking failure mode flagged in subsection three and in <a href="section-31.5.html">Section 31.5</a>, and how you would measure whether your scheme actually shortened the effective credit-assignment horizon. Estimate, using the compounding-error arithmetic of subsection four, the per-subgoal success rate you would need for an acceptable end-to-end task success rate.</li>
+</ol>
+
+<nav class="chapter-nav">
+<a class="nav-prev" href="section-31.3.html">&#8592; 31.3 Agent Memory and Planning</a>
+<a class="nav-up" href="index.html">Chapter 31 Contents</a>
+<a class="nav-next" href="section-31.5.html">31.5 Agent Evaluation &#8594;</a>
+</nav>
+</main>
+<footer class="site-footer">
+<p class="edition-line">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="copyright">&copy; 2026 Alexander Apartsin &middot; <a href="../../toc.html">Contents</a></p>
+<p class="last-updated"><script>document.write("Last updated: " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 33.4: Privacy and Federated Temporal Learning. Why time series are uniquely re-identifying, differential privacy and DP-SGD for temporal models, the extra cost of correlated time steps in privacy accounting, federated learning with FedAvg and secure aggregation under non-IID temporal data, synthetic data and membership inference, and a from-scratch DP-SGD plus a FedAvg round matched against Opacus and Flower." name="description"/>
+<title>Section 33.4: Privacy and Federated Temporal Learning | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VIII: Trustworthy and Deployed Temporal AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 33: Interpretability, Robustness, and Responsible Temporal AI</a></div>
+<h1>Privacy and Federated Temporal Learning</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I was trained on a million calendars and I swore an oath: I would learn that people commute and sleep and pay rent, but never that <em>you</em> left for the clinic at 7:14 last Tuesday. Then someone queried me carefully, and I realized I had been keeping your Tuesday in a back pocket the whole time. Differential privacy is the noise I add so that even I cannot find it again."</p>
+<cite>A Model That Promised Never to Memorize Your Tuesday</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Temporal data is among the most re-identifying data that exists: a trajectory of where you were, a stream of your heart rate, a tape of your transactions is a near-unique fingerprint, and aggregating or coarsening it does not erase the fingerprint the way intuition suggests. A model trained on such data can memorize individual sequences and leak them through its predictions, so protecting temporal AI is not an afterthought but a design constraint.</strong> This section gives you the two pillars that make temporal learning privacy-preserving and the one place each pillar cracks under the weight of <em>time</em>. Differential privacy (DP) supplies a formal, composable guarantee that a model's output is nearly unchanged whether or not any one person's data was used; DP-SGD enforces it during training by clipping per-example gradients and adding calibrated Gaussian noise, and we will see that correlated time steps quietly weaken the naive privacy accounting unless we account at the right granularity. Federated learning (FL) supplies the complementary guarantee that raw series never leave the device or hospital that owns them; FedAvg trains a shared model from local updates, secure aggregation hides each update, and non-stationary, non-IID temporal data makes the averaging genuinely hard. We close with synthetic data as a third tool and the membership-inference attacks that test all of them, then build DP-SGD and a federated round from scratch and reproduce both with Opacus and Flower, measuring the accuracy you pay for privacy. You leave able to state an $(\varepsilon, \delta)$ guarantee, train a temporal model that satisfies it, and reason about what time does to both promises.</p>
+</div>
+<p>In <a href="section-33.3.html">Section 33.3</a> we hardened temporal models against adversarial and distributional perturbations, asking whether a model behaves sensibly when its <em>inputs</em> are attacked. This section asks the opposite question: whether a model protects the people whose data formed its <em>training set</em>. The two are the trustworthiness coin's two faces, robustness guarding the model from the world and privacy guarding the world from the model. The data we worry about is the same data that has run through this entire book. The mobility traces of <a href="../../part-7-building-intelligent-systems/module-32-spatio-temporal/section-32.1.html">Section 32.1</a>, the irregularly sampled clinical vitals that thread from <a href="../../toc.html">Chapter 2</a> through <a href="../../toc.html">Chapter 13</a>, and the high-frequency financial tapes of <a href="../../toc.html">Chapter 5</a> are exactly the streams that are most valuable to model and most dangerous to expose. We use the unified notation of <a href="../../toc.html">Appendix A</a>: $\mathbf{x}_{1:T}$ a series, $\mathcal{D}$ a dataset of series, $\mathcal{M}$ a randomized training mechanism, and $\varepsilon, \delta$ the privacy parameters defined below.</p>
+<p>Why does temporal data warrant its own privacy treatment rather than the generic tabular machinery? Because time multiplies identifiability in two directions at once. Across the sequence, the <em>pattern</em> of values is identifying even when no single value is: four hourly locations pin most people uniquely, as the mobility literature established. And within the learning algorithm, the <em>correlation</em> between adjacent time steps means a single person contributes many statistically dependent records, so a privacy budget computed as if those records were independent is optimistic, sometimes badly so. The first fact is why we cannot rely on aggregation; the second is why we cannot reuse tabular DP accounting unchanged. Both are handled below.</p>
+<p>The competencies this section installs are four. To explain, with a concrete re-identification example, why temporal data resists anonymization. To state the $(\varepsilon, \delta)$ differential-privacy guarantee precisely and to implement DP-SGD, clipping and noising per-example gradients while tracking a privacy budget. To run a federated round with FedAvg and to name what secure aggregation and non-IID temporal data add to the picture. And to position synthetic data and membership inference as the audit around all of it. Each competency is paired with runnable code and a from-scratch-then-library demonstration.</p>
+
+<h2>1. Why Temporal Data Is Especially Privacy-Sensitive <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Start from the uncomfortable empirical fact that anchors this whole section: a human trajectory is almost a fingerprint. The landmark study of de Montjoye and colleagues on fifteen months of mobility for one and a half million people found that just four spatio-temporal points, four times you were at a place at an hour, uniquely identify ninety-five percent of individuals, and that coarsening the spatial and temporal resolution barely helps because human movement is so individual. This is the mobility thread we opened in <a href="../../part-7-building-intelligent-systems/module-32-spatio-temporal/section-32.1.html">Section 32.1</a> returning with a warning attached: the very structure that makes a trajectory <em>predictable</em>, its regularity and individuality, is what makes it <em>identifying</em>. The same holds for the clinical running dataset of this book (the irregular vitals reachable from the <a href="../../toc.html">contents</a>): a short window of heart rate, blood pressure, and their timing is a biometric signature, and credit-card tapes are no better, four transactions reidentify ninety percent of shoppers in the companion financial study.</p>
+<p>The practical consequence is that the standard privacy reflex, "aggregate it and it is safe", fails on time series. Aggregation removes identity from a single snapshot but not from a <em>pattern across snapshots</em>. A daily total hides which minute you were home; a sequence of daily totals reveals your weekday-versus-weekend rhythm, your vacations, the week you were ill. Time turns a set of weak signals into a strong one because the joint distribution over many steps is far more specific than any marginal. Releasing aggregates also invites <em>differencing attacks</em>: if yesterday's and today's cumulative counts differ by one and you know one person joined, you have isolated that person's contribution. Privacy for temporal data must therefore be a property of the <em>release mechanism</em>, not a property of any one number it emits, which is exactly the shift differential privacy formalizes.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: A Pattern Is More Identifying Than Any of Its Values</div>
+<p>The privacy danger in a time series lives in the <em>joint</em> distribution over steps, not in the marginals. Any single hourly location, vital sign, or transaction may be common to millions; the ordered sequence of them is shared by almost no one. This is why blurring individual values (coarser bins, rounded amounts, added per-value noise) buys far less privacy for sequences than for static records, and why a defense must bound the influence of a whole person's whole sequence on the released model. The unit of protection is the person-trajectory, not the data point.</p>
+</div>
+<p>A second time-specific subtlety determines how we will account for privacy in subsection two. When we ask "how much can one person change the model?", the answer depends on how much of the data one person owns. In a tabular dataset each person is typically one row, so bounding the influence of one row bounds the influence of one person. In a temporal dataset one person may own an entire long sequence, dozens or thousands of correlated steps, and if our algorithm treats each step as an independent record, it will under-count that person's footprint and over-state the privacy it provides. The fix, <em>user-level</em> (or sequence-level) privacy rather than record-level, runs through everything below: we will clip and account at the granularity of the person, not the step.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Netflix Prize and the Talkative Timestamp</div>
+<p>When Netflix released one hundred thousand "anonymized" rating histories for its 2006 prize, Narayanan and Shmatikov re-identified specific subscribers by matching the <em>timing and ratings</em> of a handful of movies against public IMDb reviews. The lesson generalizes far past film ratings: a sparse, timestamped behavioral sequence is a join key into the rest of someone's life. Stripping names is to time-series anonymization what locking the front door is to a house with the windows open.</p>
+</div>
+
+<h2>2. Differential Privacy and DP-SGD for Temporal Models <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Differential privacy gives the formal guarantee that subsection one argued we need: a promise about the <em>mechanism</em>, robust to any side information an attacker holds. A randomized mechanism $\mathcal{M}$ is $(\varepsilon, \delta)$-differentially private if for every pair of datasets $\mathcal{D}, \mathcal{D}'$ that differ by the addition or removal of one person's data (<em>adjacent</em> datasets) and for every set of outcomes $S$,</p>
+$$\Pr[\mathcal{M}(\mathcal{D}) \in S] \;\le\; e^{\varepsilon}\,\Pr[\mathcal{M}(\mathcal{D}') \in S] \;+\; \delta.$$
+<p>Read it as a likelihood-ratio bound: whatever the mechanism outputs, that output was almost as likely to occur with your data absent as present, so an observer learns almost nothing specific to you. The parameter $\varepsilon$ is the privacy <em>loss</em> (smaller is stronger; $\varepsilon \approx 1$ is strong, $\varepsilon \approx 8$ is weak but common), and $\delta$ is a small probability (typically $\delta \ll 1/N$ for $N$ people) that the clean $e^\varepsilon$ bound fails. The definition's two superpowers are <em>composition</em>, the $\varepsilon$ of a sequence of mechanisms adds (and modern accountants do far better than naive addition), and <em>post-processing immunity</em>, anything you compute from a private output stays private. Both are what let us privatize an iterative training loop.</p>
+<p>The workhorse mechanism adds Gaussian noise calibrated to a function's <em>sensitivity</em>, the most one person can change it. For a vector-valued query $f$ with $L_2$-sensitivity $\Delta_2 f = \max_{\mathcal{D} \sim \mathcal{D}'} \lVert f(\mathcal{D}) - f(\mathcal{D}') \rVert_2$, the Gaussian mechanism $f(\mathcal{D}) + \mathcal{N}(0, \sigma^2 \mathbf{I})$ satisfies $(\varepsilon, \delta)$-DP when the noise multiplier obeys</p>
+$$\sigma \;\ge\; \frac{\Delta_2 f \,\sqrt{2 \ln(1.25/\delta)}}{\varepsilon}.$$
+<p>This single inequality is the engine of DP-SGD (Abadi et al., 2016), which makes stochastic gradient descent private by controlling the sensitivity of each update and then noising it. Two operations per step do the work. First, <em>per-example gradient clipping</em>: compute the gradient $\mathbf{g}_i$ for each example (or, for temporal data, each <em>person's sequence</em>) and rescale it to norm at most a clipping bound $C$, $\bar{\mathbf{g}}_i = \mathbf{g}_i / \max(1, \lVert \mathbf{g}_i \rVert_2 / C)$, which forces the per-person sensitivity to be exactly $C$. Second, <em>noise addition</em>: sum the clipped gradients, add Gaussian noise of standard deviation $\sigma C$, and average,</p>
+$$\tilde{\mathbf{g}} \;=\; \frac{1}{B}\left( \sum_{i \in \text{batch}} \bar{\mathbf{g}}_i \;+\; \mathcal{N}\!\left(0,\, \sigma^2 C^2 \mathbf{I}\right) \right).$$
+<p>The clipping guarantees a known sensitivity regardless of the data; the noise hides any one clipped gradient inside it; and a privacy <em>accountant</em> (the moments accountant, or today's tighter Renyi-DP and PRV accountants) composes the per-step costs over all training iterations into a single $(\varepsilon, \delta)$ for the finished model. The privacy-utility trade-off is now visible as three knobs: larger $C$ admits bigger gradients but demands more noise, larger $\sigma$ buys smaller $\varepsilon$ at the cost of noisier updates, and more steps spend more budget. Strong privacy is simply noisier, slower training, and the empirical accuracy gap it opens is the cost we measure in subsection five.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: The Noise Scale for a Target Epsilon</div>
+<p>Suppose we want a single noised gradient release to satisfy $(\varepsilon, \delta) = (1.0,\, 10^{-5})$ with clipping bound $C = 1.0$, so the sensitivity is $\Delta_2 = C = 1$. The Gaussian-mechanism rule gives the noise standard deviation $\sigma \ge \Delta_2 \sqrt{2 \ln(1.25/\delta)} / \varepsilon$. Compute the log: $1.25/\delta = 1.25 \times 10^{5} = 125000$, and $\ln(125000) \approx 11.74$, so $2 \ln(1.25/\delta) \approx 23.47$ and $\sqrt{23.47} \approx 4.84$. Thus $\sigma \ge 1 \cdot 4.84 / 1.0 = 4.84$: each gradient coordinate gets noise of standard deviation almost five times the clipping bound for a <em>single</em> release. Tighten the budget to $\varepsilon = 0.5$ and the noise doubles to $\sigma \approx 9.69$; loosen to $\varepsilon = 4.0$ and it falls to $\sigma \approx 1.21$. Over many training steps the accountant lets each step use a far smaller per-step noise because the total budget is shared and amplified by subsampling, but the inverse law $\sigma \propto 1/\varepsilon$ is the shape of every privacy-utility curve you will draw: halving the budget doubles the noise.</p>
+</div>
+<p>Now the time-specific crack, the one tabular treatments never mention. DP-SGD's accounting assumes that the unit whose presence we hide, the <em>adjacency</em> in the definition, matches the unit we clip. If we naively treat each time step (or each fixed-length window) as a separate training example and clip per window, we are providing <em>record-level</em> privacy: we hide one window, not one person. But a person owns many correlated windows, so hiding one of their windows leaves their footprint in all the others, and the real protection for the person is far weaker than the reported $\varepsilon$. Correlated time steps thus weaken naive privacy accounting in a precise sense: the effective number of independent contributions per person is smaller than the record count, and event-level (per-step) DP does not compose into the user-level DP we actually want. The remedy is to make the clipping unit the whole person-sequence, summing each person's per-step gradients into one vector and clipping <em>that</em> to $C$ before noising. Then the sensitivity bound matches person-level adjacency and the accountant's $\varepsilon$ means what we want it to mean. For streaming releases where the same person reappears over time, the stronger frameworks are user-level DP and DP under continual observation (the binary-tree mechanism), which we flag as the frontier below.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: User-Level and Streaming DP for Sequences (2024 to 2026)</div>
+<p>The gap between record-level and user-level privacy for temporal data is one of the most active corners of private learning. Recent work on <em>user-level DP-SGD</em> formalizes clipping and accounting per user rather than per example and shows that with enough examples per user the utility cost of upgrading from record-level to user-level guarantees shrinks substantially (Charles et al. and related 2023 to 2024 results). For <em>streaming</em> releases, where a model or statistic is published repeatedly as new steps arrive, DP under continual observation and matrix-factorization mechanisms (the DP-FTRL line that Google deployed for federated next-word prediction, 2021 to 2024) give far tighter budgets than naively composing one release per time step, by correlating the noise across releases through a tree or a learned factorization. On the accounting side, PRV and connect-the-dots accountants have largely replaced the original moments accountant, giving $\varepsilon$ estimates close to the true optimum. The 2026 practitioner's stance: for any model that sees a person's data more than once, ask "record-level or user-level?" before quoting an $\varepsilon$, and prefer a streaming accountant over per-release composition.</p>
+</div>
+
+<h2>3. Federated Learning: Training Without Centralizing the Series <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Differential privacy bounds what a released model reveals; it says nothing about <em>where the raw data sits during training</em>. Federated learning attacks that second axis: it trains a shared model across many devices or institutions <em>without</em> ever pooling their raw series in one place. The data stays on the phone, in the hospital, behind the bank's firewall, which matters for temporal data both because the series are sensitive (subsection one) and because regulation and bandwidth often forbid centralizing them at all. The canonical algorithm is <em>federated averaging</em> (FedAvg, McMahan et al., 2017). A central server holds the global model parameters $\boldsymbol{\theta}$; each round it sends $\boldsymbol{\theta}$ to a sample of clients, each client $k$ runs a few epochs of local SGD on its own data to produce $\boldsymbol{\theta}_k$, and the server averages the returned models, weighting by each client's number of examples $n_k$:</p>
+$$\boldsymbol{\theta} \;\leftarrow\; \sum_{k} \frac{n_k}{\sum_j n_j}\, \boldsymbol{\theta}_k.$$
+<p>Only model weights, never raw vitals or transactions, cross the network, and the local computation is ordinary temporal-model training of the kind built throughout Part III. Communication, not computation, is the scarce resource, which is why clients run multiple local steps per round rather than sending a gradient per step.</p>
+<p>Two problems separate the textbook formula from a deployable system, and both are sharper for temporal data. The first is that <em>the model updates themselves leak</em>: a single client's $\boldsymbol{\theta}_k$, or even its difference from $\boldsymbol{\theta}$, can be inverted to reconstruct training sequences (gradient-inversion attacks recover surprisingly faithful inputs). <em>Secure aggregation</em> closes this hole cryptographically: clients mask their updates with pairwise-cancelling random vectors so that the server can compute the <em>sum</em> $\sum_k \boldsymbol{\theta}_k$ but cannot read any individual $\boldsymbol{\theta}_k$, the masks cancelling only in aggregate. Pair secure aggregation with DP noise added to the sum and you get the strong combination deployed in practice: the server sees only a differentially private average it cannot decompose. The second problem is statistical and deeply temporal: client data is <em>non-IID and non-stationary</em>. Each hospital's patients, each phone-owner's typing, each bank's customers follow a different and drifting distribution, exactly the non-stationarity that <a href="../../toc.html">Chapter 20</a> studies, so the local optima pull in different directions and a plain average can converge slowly or to a poor compromise. This is why federated learning leans on personalization (a shared backbone with per-client heads) and on robust aggregation, and why the non-IID temporal setting remains an open research area rather than a solved one.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A federated round. A central server at the top sends the global model theta down to three clients (a hospital, a phone, a bank), each holding its own private time series. Each client trains locally and returns a masked model update. A secure-aggregation box sums the masked updates so the server sees only the differentially private average, never an individual update.">
+<defs>
+<marker id="arr334" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+<marker id="arrU334" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b8431f"/></marker>
+</defs>
+<style>
+.srv334 { fill:#eef3f8; stroke:#14385c; stroke-width:2; }
+.cli334 { fill:#f3f6f4; stroke:#1f6f43; stroke-width:1.8; }
+.agg334 { fill:#fbeee8; stroke:#b8431f; stroke-width:1.8; }
+.dn334 { stroke:#5a626c; stroke-width:1.8; fill:none; marker-end:url(#arr334); }
+.up334 { stroke:#b8431f; stroke-width:1.8; fill:none; marker-end:url(#arrU334); stroke-dasharray:5 4; }
+.lab334 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.cl334 { font:600 12px sans-serif; fill:#1f6f43; text-anchor:middle; }
+.sub334 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.gl334 { font:600 11px sans-serif; fill:#b8431f; text-anchor:middle; }
+</style>
+<text class="lab334" x="410" y="22">One federated round: weights go down, masked updates come up</text>
+<rect class="srv334" x="320" y="38" width="180" height="46" rx="9"/><text class="lab334" x="410" y="66">Server: global &#952;</text>
+<rect class="cli334" x="60" y="180" width="180" height="64" rx="9"/><text class="cl334" x="150" y="206">Hospital</text><text class="sub334" x="150" y="226">local vitals, trains &#952;&#8321;</text>
+<rect class="cli334" x="320" y="180" width="180" height="64" rx="9"/><text class="cl334" x="410" y="206">Phone</text><text class="sub334" x="410" y="226">local typing, trains &#952;&#8322;</text>
+<rect class="cli334" x="580" y="180" width="180" height="64" rx="9"/><text class="cl334" x="670" y="206">Bank</text><text class="sub334" x="670" y="226">local tape, trains &#952;&#8323;</text>
+<line class="dn334" x1="360" y1="86" x2="160" y2="178"/>
+<line class="dn334" x1="410" y1="86" x2="410" y2="178"/>
+<line class="dn334" x1="460" y1="86" x2="660" y2="178"/>
+<rect class="agg334" x="300" y="270" width="220" height="38" rx="8"/><text class="gl334" x="410" y="294">Secure aggregation + DP noise: sum only</text>
+<line class="up334" x1="150" y1="244" x2="300" y2="286"/>
+<line class="up334" x1="410" y1="244" x2="410" y2="270"/>
+<line class="up334" x1="670" y1="244" x2="520" y2="286"/>
+<line class="up334" x1="410" y1="270" x2="410" y2="86" stroke="#b8431f" stroke-width="1.4" fill="none" stroke-dasharray="2 3"/>
+</svg>
+<figcaption><strong>Figure 33.4.1:</strong> A single FedAvg round with secure aggregation. The server broadcasts the global model $\boldsymbol{\theta}$ to each client (gray, downward); each client trains locally on its own private series and returns a <em>masked</em> update (orange, upward); secure aggregation lets the server recover only the noised sum, never any one client's model. Raw vitals, keystrokes, and transactions never leave their owner.</figcaption>
+</figure>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Federation and Differential Privacy Solve Different Problems</div>
+<p>Federated learning controls <em>where the data lives</em>: the raw series never leaves the device. Differential privacy controls <em>what the model reveals</em>: even with full access to the released weights, an attacker learns almost nothing about any individual. Neither subsumes the other. A federated model trained without DP still leaks through its weights and updates; a DP model trained on centralized data still required pooling the raw data somewhere. Production systems for sensitive temporal data (federated next-word prediction, federated clinical models) combine all three layers: federation for data locality, secure aggregation to hide individual updates, and DP noise so the published model carries a formal guarantee.</p>
+</div>
+
+<h2>4. Synthetic Data and Membership-Inference Risk <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A third privacy strategy sidesteps both DP-SGD and federation: instead of protecting access to the real series, generate <em>synthetic</em> series that preserve the statistical structure useful for modeling while corresponding to no real person. The generative temporal models of <a href="../../part-4-temporal-representation-learning/module-17-generative-temporal-models/index.html">Section 17.5</a>, the GANs, diffusion models, and autoregressive samplers we built to <em>create</em> sequences, become privacy tools when their job is to produce a shareable surrogate dataset. A hospital can release synthetic vitals for a research challenge; a bank can publish synthetic transaction streams for a fraud-detection benchmark, and downstream users train on data that looks real in distribution but exposes no individual record. The appeal is that synthetic data composes freely with everything else: you can train any model on it, share it widely, and incur no per-query privacy cost.</p>
+<p>The catch, and the reason synthetic data is a tool and not a guarantee, is that generators can <em>memorize</em>. A model that overfits its training sequences will regenerate them, near-verbatim, and a released synthetic dataset that contains a real patient's actual trajectory has leaked it completely, with a false sense of safety attached. The instrument that detects this is the <em>membership-inference attack</em> (MIA): given a candidate sequence and access to the model (or the synthetic output), the attacker decides whether that sequence was in the training set, typically by exploiting that models are more confident, or assign higher likelihood, to data they were trained on. A model is privacy-leaky to the exact degree that an MIA succeeds above chance. Membership inference is therefore the universal audit of this section: it tests DP-SGD models (a correct $\varepsilon$ provably caps MIA success), federated models (whose updates can be probed), and synthetic generators (whether the synthetic set betrays its training trajectories) on a common footing. The clean way to get a synthetic dataset with a real guarantee is to train the generator itself under DP-SGD, so that the formal $(\varepsilon, \delta)$ bound passes, by post-processing immunity, to every sample it ever produces.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Generator That Plagiarized Its Patients</div>
+<p>An early enthusiastic team trained a sequence generator on hospital time series, declared the output "fully synthetic and therefore safe", and shipped it. A membership-inference probe then matched a striking fraction of the synthetic trajectories to specific real patients, the generator had quietly memorized and was reciting them back, comma for comma. Synthetic does not mean private any more than paraphrasing a diary makes it fiction; the only thing that makes synthetic data private is a generator that provably could not have memorized, which in practice means one trained with DP.</p>
+</div>
+
+<h2>5. Worked Example: DP-SGD and a Federated Round, From Scratch Then Library <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make subsections two and three executable on a small temporal model and measure the accuracy cost of privacy. The plan mirrors this book's house pattern: build the mechanism by hand so its arithmetic is transparent, then reproduce it with the production library in a few lines, and read off the line-count reduction and the utility cost. We use a tiny GRU classifier over short synthetic sequences so the code runs in seconds; the mechanisms are identical at any scale. Code 33.4.1 is from-scratch DP-SGD: per-example gradient clipping, Gaussian noise, and a running budget.</p>
+<pre><code class="language-python">import torch, torch.nn as nn, math
+
+torch.manual_seed(0)
+N, T, d_in, d_h, C = 256, 12, 3, 16, 1.0     # examples, len, in/hidden width, clip bound
+X = torch.randn(N, T, d_in)
+y = (X[:, :, 0].mean(1) &gt; 0).long()           # label: is the first channel's mean positive
+
+class GRUClf(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.rnn = nn.GRU(d_in, d_h, batch_first=True)
+        self.head = nn.Linear(d_h, 2)
+    def forward(self, x):
+        _, h = self.rnn(x)                    # h: (1, B, d_h) final hidden state
+        return self.head(h.squeeze(0))
+
+def per_example_grads(model, xb, yb):
+    """Compute one clipped gradient PER example (the sensitivity unit)."""
+    clipped = [torch.zeros_like(p) for p in model.parameters()]
+    for i in range(len(xb)):                  # one sequence = one person here
+        model.zero_grad()
+        loss = nn.functional.cross_entropy(model(xb[i:i+1]), yb[i:i+1])
+        loss.backward()
+        g = [p.grad.detach().clone() for p in model.parameters()]
+        norm = math.sqrt(sum((gi ** 2).sum().item() for gi in g))   # ||g_i||_2
+        scale = min(1.0, C / (norm + 1e-12))  # clip to norm &lt;= C: fixes sensitivity
+        for acc, gi in zip(clipped, g):
+            acc += gi * scale
+    return clipped
+
+def dp_sgd(sigma, epochs=30, lr=0.5, B=64):
+    """Train with DP-SGD; return test accuracy. sigma is the noise multiplier."""
+    model = GRUClf()
+    for _ in range(epochs):
+        idx = torch.randperm(N)[:B]           # Poisson-ish subsample (amplifies privacy)
+        cg = per_example_grads(model, X[idx], y[idx])
+        with torch.no_grad():
+            for p, g in zip(model.parameters(), cg):
+                noise = torch.randn_like(g) * sigma * C        # Gaussian, std = sigma*C
+                p -= lr * (g + noise) / B                       # noised, averaged update
+    with torch.no_grad():
+        acc = (model(X).argmax(1) == y).float().mean().item()
+    return acc
+
+def epsilon_for(sigma, delta=1e-5):
+    """Single-release Gaussian-mechanism epsilon for sensitivity C and this sigma."""
+    return C * math.sqrt(2 * math.log(1.25 / delta)) / sigma    # invert sigma >= ... rule
+
+for sigma in [0.0, 1.0, 4.84]:
+    acc = dp_sgd(sigma)
+    eps = float('inf') if sigma == 0 else epsilon_for(sigma)
+    print(f"sigma={sigma:&lt;4}  test_acc={acc:.3f}  per-step eps~={eps:.2f}")
+</code></pre>
+<div class="code-caption"><strong>Code 33.4.1:</strong> DP-SGD from scratch on a GRU classifier. The two privacy operations of subsection two are explicit: <code>per_example_grads</code> clips each example's gradient to norm $C$ (fixing the sensitivity), and <code>dp_sgd</code> adds Gaussian noise of standard deviation $\sigma C$ before averaging. The <code>epsilon_for</code> helper inverts the Gaussian-mechanism rule to report the per-release budget; a real accountant composes these across steps with subsampling amplification.</div>
+<pre><code class="language-text">sigma=0.0   test_acc=0.992  per-step eps~=inf
+sigma=1.0   test_acc=0.945  per-step eps~=4.84
+sigma=4.84  test_acc=0.797  per-step eps~=1.00
+</code></pre>
+<div class="code-caption"><strong>Output 33.4.1:</strong> The privacy-utility trade-off made concrete. No noise ($\sigma=0$, no privacy) reaches 0.992 accuracy; moderate noise ($\sigma=1$) costs a few points for a loose budget; the strong $\varepsilon \approx 1$ setting ($\sigma \approx 4.84$, matching the subsection-two numeric example) drops accuracy to 0.797. Halving the budget would roughly double the noise and widen the gap further.</div>
+<p>The same training would be reckless to hand-roll in production: the subtle parts are the privacy accountant and the efficient per-example gradients, both of which Opacus implements correctly. Code 33.4.2 reproduces DP-SGD with Opacus, which attaches to an ordinary optimizer and tracks a real Renyi-DP budget.</p>
+<pre><code class="language-python">from opacus import PrivacyEngine               # pip install opacus
+from torch.utils.data import TensorDataset, DataLoader
+
+model = GRUClf(); opt = torch.optim.SGD(model.parameters(), lr=0.5)
+loader = DataLoader(TensorDataset(X, y), batch_size=64, shuffle=True)
+
+privacy_engine = PrivacyEngine()
+model, opt, loader = privacy_engine.make_private(   # clipping + noise wired in here
+    module=model, optimizer=opt, data_loader=loader,
+    noise_multiplier=4.84, max_grad_norm=1.0)        # sigma and C, same as Code 33.4.1
+
+for _ in range(30):
+    for xb, yb in loader:
+        opt.zero_grad()
+        loss = nn.functional.cross_entropy(model(xb), yb)
+        loss.backward(); opt.step()                  # per-example clip + noise, internally
+eps = privacy_engine.get_epsilon(delta=1e-5)         # the composed, amplified budget
+print(f"opacus trained, accountant eps={eps:.2f} at delta=1e-5")
+</code></pre>
+<div class="code-caption"><strong>Code 33.4.2:</strong> The Opacus equivalent of Code 33.4.1. The roughly 25 lines of manual per-example clipping, noise injection, and budget bookkeeping collapse to one <code>make_private</code> call plus a normal training loop: Opacus computes per-sample gradients efficiently (vectorized, not the slow Python loop above), clips and noises them inside <code>opt.step()</code>, and the accountant returns the real composed $\varepsilon$ with subsampling amplification that our naive per-step number ignored.</div>
+<p>Now the federated pair. Code 33.4.3 runs one FedAvg round from scratch: split the data across three non-IID clients, train each locally, and average the models weighted by client size, exactly the formula of subsection three.</p>
+<pre><code class="language-python">import copy
+
+def local_train(global_model, xb, yb, epochs=5, lr=0.5):
+    """One client: copy the global model, train on LOCAL data only, return its weights."""
+    m = copy.deepcopy(global_model)
+    opt = torch.optim.SGD(m.parameters(), lr=lr)
+    for _ in range(epochs):
+        opt.zero_grad()
+        nn.functional.cross_entropy(m(xb), yb).backward()
+        opt.step()
+    return m.state_dict(), len(xb)               # weights + example count n_k
+
+# Non-IID split: client 0 mostly class 0, client 2 mostly class 1 (distribution shift)
+order = y.argsort()                              # group by label to force non-IID shards
+shards = [order[:90], order[90:170], order[170:]]
+global_model = GRUClf()
+
+updates = [local_train(global_model, X[s], y[s]) for s in shards]   # 3 clients train
+total = sum(n for _, n in updates)
+avg = copy.deepcopy(updates[0][0])
+for key in avg:                                  # FedAvg: size-weighted parameter average
+    avg[key] = sum(sd[key] * (n / total) for sd, n in updates)
+global_model.load_state_dict(avg)
+with torch.no_grad():
+    acc = (global_model(X).argmax(1) == y).float().mean().item()
+print(f"from-scratch FedAvg (1 round, 3 non-IID clients) acc={acc:.3f}")
+</code></pre>
+<div class="code-caption"><strong>Code 33.4.3:</strong> One FedAvg round from scratch with deliberately non-IID clients. Each client trains on its own shard and the server averages the returned <code>state_dict</code>s weighted by example count, the $\sum_k (n_k / \sum_j n_j)\,\boldsymbol{\theta}_k$ of subsection three. Sorting by label before sharding forces the non-IID, distribution-shifted setting that makes federated temporal learning hard; the raw <code>X</code> of each shard never leaves <code>local_train</code>.</div>
+<pre><code class="language-text">from-scratch FedAvg (1 round, 3 non-IID clients) acc=0.781
+</code></pre>
+<div class="code-caption"><strong>Output 33.4.3:</strong> After a single averaging round over three non-IID shards the global model reaches 0.781 accuracy; more rounds close the gap to centralized training, but the non-IID split visibly slows convergence relative to an IID one, the difficulty subsection three flagged.</div>
+<p>Flower turns this hand-rolled round into a real client-server system (network transport, client sampling, secure aggregation, pluggable strategies) without changing the model. Code 33.4.4 is the Flower equivalent: the same local training and FedAvg, expressed against the framework's interfaces.</p>
+<pre><code class="language-python">import flwr as fl                                # pip install flwr
+
+class Client(fl.client.NumPyClient):            # wrap ONE client's local training
+    def __init__(self, xb, yb):
+        self.model, self.xb, self.yb = GRUClf(), xb, yb
+    def get_parameters(self, config):
+        return [p.detach().numpy() for p in self.model.parameters()]
+    def set_parameters(self, params):
+        for p, w in zip(self.model.parameters(), params):
+            p.data = torch.tensor(w)
+    def fit(self, params, config):              # server calls this each round
+        self.set_parameters(params)
+        sd, n = local_train(self.model, self.xb, self.yb)   # reuse Code 33.4.3's trainer
+        self.model.load_state_dict(sd)
+        return self.get_parameters(config), n, {}
+
+# fl.simulation.start_simulation(client_fn=..., num_clients=3,
+#     strategy=fl.server.strategy.FedAvg())     # FedAvg server-side; swap for DP/secure-agg
+</code></pre>
+<div class="code-caption"><strong>Code 33.4.4:</strong> The Flower equivalent of Code 33.4.3. The manual broadcast, shard loop, and weighted averaging collapse into Flower's <code>NumPyClient</code> plus a one-line <code>FedAvg</code> strategy; the same framework supplies <code>DifferentialPrivacyServerSideFixedClipping</code> and secure-aggregation strategies, so combining federation with the DP of Code 33.4.1 is a strategy swap rather than a rewrite. The roughly 20 lines of orchestration in Code 33.4.3 become declarative client and strategy objects that also handle real network transport.</div>
+<p>Read the four blocks together as the section's thesis in code. Code 33.4.1 built DP-SGD by hand and Output 33.4.1 priced privacy: strong $\varepsilon \approx 1$ cost about twenty accuracy points on this toy task. Code 33.4.2 reproduced it with Opacus and a real accountant in a fraction of the lines. Code 33.4.3 ran FedAvg over non-IID temporal shards by hand, and Code 33.4.4 turned it into a deployable Flower system where DP and secure aggregation are strategy swaps. The pedagogical payoff is that neither mechanism is magic: DP-SGD is clip-then-noise with honest accounting, FedAvg is train-local-then-average, and the production libraries differ from the from-scratch versions mainly by correctness of the accountant and the realism of the transport, not by the core arithmetic you can now write yourself.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Privacy-Preserving Federated Vitals Forecaster</div>
+<p><strong>Who:</strong> A consortium of three hospitals jointly training a deterioration-risk forecaster on the irregular clinical vitals threaded through this book (<a href="../../toc.html">Chapter 13</a>), none of them legally permitted to share raw patient records across institutional boundaries.</p>
+<p><strong>Situation:</strong> Each hospital held a few thousand patient time series; pooling them would have built a far better model than any one site could train alone, but data-protection regulation and patient consent forbade centralizing the vitals.</p>
+<p><strong>Problem:</strong> They needed a shared model with a defensible, written privacy guarantee strong enough to satisfy an ethics board, not merely a promise that the data "stayed on premises".</p>
+<p><strong>Dilemma:</strong> Federated learning alone kept the raw vitals local but left the model updates invertible, and a gradient-inversion probe in a pilot reconstructed recognizable vital trajectories from a single hospital's update. Pure central DP was impossible because it required pooling. Aggressive DP noise to satisfy $\varepsilon \approx 1$ degraded the early-warning accuracy below the clinically useful threshold.</p>
+<p><strong>Decision:</strong> They combined all three layers of the section's key insight: FedAvg for data locality, secure aggregation so the server saw only the summed update, and user-level DP-SGD (clipping per patient, not per window, as subsection two demands) calibrated to a budget the board approved, settling on $\varepsilon \approx 4$ as the point where accuracy stayed clinically useful.</p>
+<p><strong>How:</strong> A Flower deployment with the secure-aggregation strategy and a server-side DP clipping strategy, each client running Opacus locally with per-patient gradient clipping; the privacy accountant produced the $\varepsilon$ certificate that accompanied the model into review.</p>
+<p><strong>Result:</strong> The federated model beat every single-site model, the gradient-inversion probe failed under secure aggregation, and the documented $(\varepsilon, \delta)$ bound cleared the ethics board, a model no single hospital could have built or been allowed to build alone.</p>
+<p><strong>Lesson:</strong> For sensitive temporal data the three protections are complementary, not alternatives: federation controls where the data lives, secure aggregation hides the individual update, and DP bounds what the published model reveals. Clip at the granularity of the person, and choose the $\varepsilon$ where utility and the review board meet.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Private and Federated Training in a Few Lines</div>
+<p>The from-scratch DP-SGD of Code 33.4.1 ran about 35 lines of clipping, noising, and budget bookkeeping, and the federated round of Code 33.4.3 about 20 lines of broadcast and averaging. <strong>Opacus</strong> collapses the privacy half to a single <code>PrivacyEngine().make_private(...)</code> call that wires correct per-sample clipping, Gaussian noise, and a Renyi-DP accountant into any optimizer, handling the vectorized per-sample gradients and subsampling amplification we glossed over. <strong>Flower</strong> collapses the federated half to a <code>NumPyClient</code> plus a <code>FedAvg</code> strategy, and supplies <code>DifferentialPrivacyServerSideFixedClipping</code> and secure-aggregation strategies so the full three-layer stack of the practical example is a few configuration objects rather than a cryptography project. The accountants (Google's <code>dp-accounting</code>, the PRV accountant) and TensorFlow Privacy round out the ecosystem. Reach for the library for the accountant above all: getting $\varepsilon$ right is the part you must not hand-roll.</p>
+</div>
+
+<h2>Exercises</h2>
+<ol class="exercises">
+<li><strong>(Conceptual.)</strong> Explain why providing record-level (per-window) differential privacy on a person's long sequence gives that person weaker protection than the reported $\varepsilon$ suggests. Describe how clipping per person-sequence instead of per window restores the intended user-level guarantee, and give one temporal scenario (for example a streaming model republished daily) where even user-level DP-SGD is insufficient and DP under continual observation is needed.</li>
+<li><strong>(Implementation.)</strong> Extend Code 33.4.3 to run twenty FedAvg rounds and plot global-model accuracy versus round for two data splits: an IID split (shuffle <code>y</code> before sharding) and the non-IID split shown. Confirm the non-IID curve converges more slowly and to a lower plateau, then add per-client DP noise (reuse the noising of Code 33.4.1 inside <code>local_train</code>) and report how much the privacy noise further slows convergence.</li>
+<li><strong>(Open-ended.)</strong> Train a small sequence generator (a GRU language model or the diffusion sampler of <a href="../../part-4-temporal-representation-learning/module-17-generative-temporal-models/index.html">Section 17.5</a>) on a temporal dataset twice, once normally and once under DP-SGD with Opacus, then implement a simple membership-inference attack (threshold on the model's per-sequence loss) against each. Report the attack's advantage over chance for both generators and discuss whether the DP $\varepsilon$ you trained at predicts the measured drop in attack success.</li>
+</ol>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-33.3.html">&#8592; Section 33.3: Adversarial Robustness and Distribution Shift</a>
+<a class="up" href="index.html">Chapter 33 Contents</a>
+<a class="next" href="section-33.5.html">Section 33.5: Ethics, Governance, and Auditing &#8594;</a>
+</nav>
+</main>
+<footer class="site-footer">
+<p class="edition-line">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="copyright">&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+<p class="last-updated"><script>document.write("Last updated " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

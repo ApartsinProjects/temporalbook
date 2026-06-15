@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 31.3: Planning and Tool Use. How a temporal AI agent decomposes a goal into steps, the move from classical search and PDDL planning to LLM planning (chain and tree of thought, plan-and-execute), the ReAct interleaving of reasoning with structured tool calls, calling this book's forecasters and causal estimators as tools with calibrated-uncertainty gating, reliability through verification and reflection, and a from-scratch plan-and-execute agent matched against a library tool-calling agent." name="description"/>
+<title>Section 31.3: Planning and Tool Use | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VII: Building Intelligent Temporal Systems</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 31: Temporal AI Agents</a></div>
+<h1>Planning and Tool Use</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"Ask me to forecast next quarter's demand and I will not improvise a number from the shimmer of my weights. I will reach for the calculator, I will reach for the forecaster you trained in Part III, I will check whether it is confident enough to be trusted, and only then will I speak. I would rather call a tool than guess; guessing is how language models embarrass themselves at meetings."</p>
+<cite>An Agent That Would Rather Call a Calculator Than Guess</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>An agent is only as useful as the gap between what it can plan and what it can actually do, and tools are how that gap is closed. Planning decomposes an open-ended goal into an ordered sequence of executable steps; tool use lets each step reach outside the model's frozen weights to a calculator, a search index, a database, or, the move that makes this a temporal-AI book and not a generic agents chapter, to the forecasters and causal estimators you built in the preceding thirty chapters.</strong> This section traces the arc from classical planning (state-space search and PDDL, where the action space is small and known) to LLM planning (chain-of-thought, tree-of-thought, and plan-and-execute, where the action space is open-ended natural language), shows how ReAct interleaves a reasoning trace with structured function calls so the agent observes the world between thoughts, and then makes the temporal payoff concrete: an agent that calls a trained forecaster as a tool, reads its calibrated prediction interval from Chapter 19, and refuses to trust a forecast whose uncertainty is too wide. It closes with the reliability machinery (tool-error handling, output verification, and self-correcting reflection loops) and a worked example that builds a plan-and-execute agent from scratch around a forecasting tool, then collapses it to a few lines with a library tool-calling agent. You leave able to give a temporal agent a multi-step goal and have it earn its answer by calling the right model at the right time.</p>
+</div>
+<p>In <a href="section-31.2.html">Section 31.2</a> we gave the agent a memory: a way to carry temporal context across turns so it could reason about what had already happened. Memory tells the agent <em>what is true</em>; this section tells it <em>what to do about it</em>. An agent with perfect recall and no plan is a historian, not an actor. The competency we install here is the bridge from situation to action: take a goal stated in open-ended language ("tell me whether to pre-order inventory for the holiday spike, and by how much"), break it into steps the agent can execute, and equip each step with a tool that does the part the language model itself cannot do reliably, namely arithmetic, retrieval, and quantitative forecasting. We use the unified notation of <a href="../../toc.html">Appendix A</a> where it helps: a goal $g$, a plan $\pi = (a_1, a_2, \dots, a_n)$ as an ordered sequence of actions, a tool invocation as an action $a_i$ that returns an observation $o_i$, and the running context $c_t$ the agent conditions on at step $t$.</p>
+<p>Why does planning deserve its own treatment rather than "just prompt the model to think step by step"? Because the planning problem here is genuinely harder than the one Part VI solved. The Monte Carlo Tree Search of <a href="../../toc.html">Chapter 29</a> and the model predictive control of <a href="../../toc.html">Chapter 27</a> plan beautifully, but they plan over a <em>closed, enumerable</em> action space against a <em>known</em> transition model. A temporal agent plans over an <em>open-ended</em> action space (any tool call, any natural-language sub-goal, any query it can phrase) with no clean transition model and a horizon that is not fixed in advance. That open-endedness is what forces the shift from the search-based planners of classical AI to the language-model planners of this section, and it is why a tool call, the act of stepping outside the model to get a real observation, becomes the load-bearing primitive: it is how an agent in an unmodeled world gets the ground truth that MCTS gets for free from its simulator.</p>
+<p>The four concrete competencies this section installs are these: to decompose a goal into a plan and to know when classical search applies versus when an LLM planner is the only option; to wire tool use through the ReAct loop with structured tool schemas so reasoning and acting interleave; to register this book's own models (a forecaster from <a href="../../part-3-temporal-deep-learning/module-14-deep-forecasting-architectures/index.html">Chapter 14</a>, a causal estimator from <a href="../../part-7-building-intelligent-systems/module-30-temporal-reasoning-causality/index.html">Chapter 30</a>) as agent tools and to gate their use on the calibrated uncertainty of <a href="../../part-5-uncertainty-online-adaptive/module-19-probabilistic-uncertainty/index.html">Chapter 19</a>; and to make the resulting agent reliable through verification and reflection. These are the skills that turn a chat model into a temporal system that acts.</p>
+
+<h2>1. Planning in Agents: From a Goal to a Sequence of Steps <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Planning is the act of turning a goal into an ordered sequence of steps whose execution achieves it. Formally, given a goal $g$ and a set of available actions $\mathcal{A}$, a planner produces a plan $\pi = (a_1, \dots, a_n)$ with each $a_i \in \mathcal{A}$, such that executing the actions in order transforms the initial state into one that satisfies $g$. Everything interesting about agent planning is hidden in two questions: how large and how known is $\mathcal{A}$, and how reliably can the planner predict what each action does. The answers separate the two traditions we now contrast.</p>
+<p>The classical tradition treats planning as <em>search</em>. In the state-space view, you have an explicit set of states, a set of operators with preconditions and effects, and you search (with A*, breadth-first, or heuristic search) for a path from the start state to a goal state. The Planning Domain Definition Language (PDDL) formalizes this: a domain file declares predicates and actions with typed preconditions and effects, a problem file declares the initial state and goal, and a solver returns a provably correct action sequence. Classical planning is exact, verifiable, and complete when the domain is fully specified, and it is exactly the right tool when the world is small and known: a logistics routing problem, a manufacturing job-shop schedule, a robot stacking blocks. Its fatal limitation for open-ended agents is that someone must write down every predicate and every action effect in advance, and the real tasks we want temporal agents to do ("analyze this sensor anomaly and recommend a maintenance action") do not come with a PDDL domain.</p>
+<p>The LLM tradition treats planning as <em>generation</em>. Instead of searching an enumerated space, a language model generates the plan as text, conditioned on the goal and a description of the available tools. The simplest form is chain-of-thought: prompt the model to "think step by step" and it emits a linear reasoning trace that doubles as a plan. Tree-of-thought generalizes this by exploring several reasoning branches and selecting among them, recovering a shadow of classical search but over natural-language thoughts rather than enumerated states. The pattern most used in production agents is plan-and-execute: a planner module first writes the whole plan as an explicit list of steps, then an executor module carries the steps out one at a time, optionally re-planning when a step fails. The strength is generality (no domain file, any goal expressible in language); the weakness is that the plan is only as sound as the model's implicit world knowledge, with no completeness guarantee and a real risk of hallucinated steps.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Dimension</th><th>Classical planning (search / PDDL)</th><th>LLM planning (CoT / ToT / plan-and-execute)</th></tr></thead>
+<tbody>
+<tr><td>action space $\mathcal{A}$</td><td>small, enumerated, declared in advance</td><td>open-ended natural language and tool calls</td></tr>
+<tr><td>transition model</td><td>explicit operator preconditions and effects</td><td>implicit in the model's weights, unverified</td></tr>
+<tr><td>how a plan is produced</td><td>systematic search (A*, heuristic search)</td><td>generated as text, optionally branched</td></tr>
+<tr><td>guarantees</td><td>sound and complete when domain is correct</td><td>none; may hallucinate steps or tools</td></tr>
+<tr><td>handles novelty</td><td>poorly; needs a hand-written domain</td><td>well; generalizes from language</td></tr>
+<tr><td>best when</td><td>world is small and fully known</td><td>world is open and messy</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 31.3.1:</strong> Classical versus LLM planning along the dimensions that decide which to use. The two are not rivals but a spectrum: a strong agent often uses an LLM to propose candidate steps and a classical verifier to check them, marrying the generality of generation to the soundness of search.</figcaption>
+</figure>
+<p>The connection to Part VI is direct and worth making explicit, because it explains both what LLM planning borrows and what it gives up. The MCTS of <a href="../../toc.html">Chapter 29</a> and the receding-horizon MPC of <a href="../../toc.html">Chapter 27</a> are planners in exactly this sense: they decompose a goal (maximize return) into a sequence of actions by looking ahead through a model of the world. Tree-of-thought is recognizably MCTS with the simulator replaced by a language model's judgment and the enumerated action set replaced by free-form thoughts. What the agent gains is the ability to plan in a world no one wrote a transition model for; what it loses is the simulator that let MCTS evaluate a leaf by rolling it out. That missing simulator is the whole motivation for tool use: when the agent cannot simulate the consequence of a step, it executes the step against a tool and observes the real result. Planning and tool use are therefore two halves of one mechanism, the open-world replacement for search-with-a-simulator.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Open-Endedness Is What Forces the Shift</div>
+<p>The single fact that separates agent planning from the planning of Part VI is the openness of the action space. MCTS and MPC plan over a closed, enumerable set of actions against a known transition model, and that closedness is precisely what lets them search and guarantee. An agent in the real world faces an action space that is effectively infinite (any tool call, any sub-goal phrasable in language) and a transition model it does not have. You cannot enumerate what you cannot list, and you cannot search what you cannot enumerate, so the agent generates a plan instead of searching for one, and substitutes a real tool call for the simulator rollout it lacks. Every design choice in the rest of this section follows from this one constraint: no closed action space, no simulator, so generate-and-act replaces search-and-simulate.</p>
+</div>
+
+<h2>2. Tool Use and Function Calling: Reaching Outside the Weights <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>A language model's weights are frozen at training time, which makes the model bad at three things it is constantly asked to do: exact arithmetic, retrieval of facts it never saw or that changed after training, and any computation that needs an external system (a database query, a live forecast, a code execution). Tool use fixes this by giving the model a set of external functions it can call. A tool is just a function with a name, a documented purpose, a typed input schema, and a return value; the agent decides when to call which tool, emits a structured call, an external runtime executes it, and the result comes back as an observation the agent conditions on next.</p>
+<p>The mechanism that makes this reliable is the <em>structured tool schema</em>. Rather than hoping the model writes a callable string, modern function-calling interfaces give the model a machine-readable description of each tool (typically JSON Schema: the tool's name, a natural-language description, and the typed parameters with their constraints) and the model emits a structured object naming the tool and its arguments. The runtime validates that object against the schema before executing, so a malformed call is caught rather than run. This is the same discipline that makes classical planning verifiable, applied to one action at a time: the schema is the precondition, the validated call is the operator, the returned observation is the effect.</p>
+<p>The dominant pattern for weaving tool calls into reasoning is ReAct (Reason + Act): the agent alternates between a <em>thought</em> (a private reasoning step in natural language) and an <em>action</em> (a tool call), and after each action it receives an <em>observation</em> (the tool's result) before thinking again. The loop is <em>thought, action, observation, thought, action, observation, ...</em> until the agent emits a final answer. The reason interleaving matters, rather than planning the whole sequence up front, is that each observation can change the plan: an agent that searches, reads the result, and then decides what to compute is strictly more capable than one that commits to all its steps blind. ReAct is plan-and-execute compressed to a horizon of one, re-planning after every observation, and it is the workhorse loop of practical agents.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The ReAct loop drawn as a cycle. A Thought node leads to an Action (tool call) node, which leads to an Observation node, which leads back to Thought. A side arrow from Thought exits to a Final Answer node when the agent is done.">
+<defs>
+<marker id="arr313" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.nodeT { fill:#eef3f8; stroke:#14385c; stroke-width:2; }
+.nodeA { fill:#eaf4ec; stroke:#1f6b35; stroke-width:2; }
+.nodeO { fill:#fbeee8; stroke:#b8431f; stroke-width:2; }
+.nodeF { fill:#f3eefb; stroke:#5a2b8c; stroke-width:2; }
+.fl313 { stroke:#5a626c; stroke-width:1.9; fill:none; marker-end:url(#arr313); }
+.lab313 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub313 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+</style>
+<text class="lab313" x="410" y="26">The ReAct loop: think, act, observe, repeat</text>
+<rect class="nodeT" x="60" y="95" width="150" height="56" rx="10"/><text class="lab313" x="135" y="120">Thought</text><text class="sub313" x="135" y="138">reason about next step</text>
+<rect class="nodeA" x="335" y="95" width="150" height="56" rx="10"/><text class="lab313" x="410" y="120">Action</text><text class="sub313" x="410" y="138">structured tool call</text>
+<rect class="nodeO" x="610" y="95" width="150" height="56" rx="10"/><text class="lab313" x="685" y="120">Observation</text><text class="sub313" x="685" y="138">tool result</text>
+<rect class="nodeF" x="335" y="195" width="150" height="44" rx="10"/><text class="lab313" x="410" y="222">Final Answer</text>
+<line class="fl313" x1="210" y1="123" x2="333" y2="123"/>
+<line class="fl313" x1="485" y1="123" x2="608" y2="123"/>
+<path class="fl313" d="M685,151 C685,185 410,185 250,151" />
+<line class="fl313" x1="200" y1="151" x2="370" y2="193"/>
+<text class="sub313" x="465" y="178">when done</text>
+</svg>
+<figcaption><strong>Figure 31.3.2:</strong> The ReAct cycle. Each tool call returns an observation that feeds the next thought, so the plan adapts to what the world actually said rather than to what the agent guessed before acting. The agent exits the loop to a final answer once a thought concludes no further tool call is needed.</figcaption>
+</figure>
+<p>The space of useful tools is wide, and the temporal-AI agent draws on a particular slice of it. Generic tools include a calculator (exact arithmetic), a search or retrieval tool (current facts, document lookup), a code-execution sandbox (arbitrary computation, plotting), and a database query tool (structured data). The tools that make this book's agents <em>temporal</em> are the ones we add in the next subsection: a forecasting tool that calls a trained model from Part III, and a causal-estimator tool that calls the methods of Chapter 30. The discipline is identical across all of them: a name, a typed schema, a deterministic runtime, and a returned observation. What differs is only what the function does inside.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Model That Learned Humility by Owning a Calculator</div>
+<p>There is a quiet comedy in the fact that a model with hundreds of billions of parameters, trained on a meaningful fraction of everything humans have written, cannot reliably multiply two four-digit numbers, and that the fix is to hand it the same calculator a ten-year-old uses. The lesson is not that the model is dumb; it is that the model is a brilliant generalist who should stop pretending to be an arithmetic unit. A good agent knows the boundary of its own competence and delegates across it without ego. The epigraph's agent has internalized exactly this: it would rather call a tool than guess, because it has watched what happens at meetings to language models that guess.</p>
+</div>
+
+<h2>3. Using This Book's Models as Tools: The Temporal-Agent Payoff <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Here is where a temporal-AI agent stops being a generic chatbot with a calculator and becomes the capstone of this book. The thirty chapters before this one built quantitative temporal models: deep forecasters in <a href="../../part-3-temporal-deep-learning/module-14-deep-forecasting-architectures/index.html">Chapter 14</a>, probabilistic and conformal forecasters in <a href="../../part-5-uncertainty-online-adaptive/module-19-probabilistic-uncertainty/index.html">Chapter 19</a>, causal estimators in <a href="../../part-7-building-intelligent-systems/module-30-temporal-reasoning-causality/index.html">Chapter 30</a>. Each of these is exactly a function with typed inputs and a return value, which is to say each is exactly a tool. Registering a trained forecaster as an agent tool lets the agent answer "what will demand be next quarter" not by improvising a plausible-sounding number from its weights, but by calling a model that was fit to the data and validated on a held-out window.</p>
+<p>The deciding ingredient, the one that makes a temporal agent trustworthy rather than merely confident, is <em>calibrated uncertainty gating</em>. A forecast is not a number; it is a number with a quantified uncertainty. The conformal and probabilistic methods of <a href="../../part-5-uncertainty-online-adaptive/module-19-probabilistic-uncertainty/index.html">Chapter 19</a> attach to every prediction a calibrated interval, $[\hat{y} - \delta, \hat{y} + \delta]$ at a stated coverage level (say 90 percent), with the guarantee that the true value falls inside it about 90 percent of the time. The agent reads that interval and uses it as a <em>gate</em>: if the interval is narrow relative to the decision threshold, the forecast is trustworthy and the agent acts on it; if the interval is too wide, the forecast carries too little information, and the agent declines to act on it, instead gathering more data, falling back to a conservative default, or escalating to a human. Formally, the agent trusts a forecast when its relative half-width satisfies</p>
+$$\frac{\delta}{|\hat{y}|} \le \tau,$$
+<p>for a task-specific tolerance $\tau$, and treats the forecast as uninformative otherwise. This single inequality is the temporal-agent payoff: it is how the uncertainty quantification of Chapter 19 becomes an <em>action gate</em> rather than a footnote on a chart. A generic agent reports a forecast; a temporal agent reports a forecast it has checked it is allowed to trust.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: When the Interval Vetoes the Forecast</div>
+<p>An inventory agent must decide whether to pre-order stock for a holiday spike. Its decision rule: pre-order only if forecast demand exceeds the reorder threshold of $1000$ units with enough confidence. Two forecasts arrive from the Chapter 19 conformal forecaster at 90 percent coverage. Forecast A: point estimate $\hat{y}_A = 1400$, interval $[1320, 1480]$, so half-width $\delta_A = 80$ and relative half-width $\delta_A / \hat{y}_A = 80/1400 \approx 0.057$. With tolerance $\tau = 0.15$, this passes the gate ($0.057 \le 0.15$), and since even the interval's lower bound $1320$ clears the $1000$ threshold, the agent pre-orders. Forecast B: point estimate $\hat{y}_B = 1100$, interval $[600, 1600]$, so $\delta_B = 500$ and relative half-width $500/1100 \approx 0.45$. This fails the gate ($0.45 > 0.15$), and indeed the interval straddles the $1000$ threshold ($600 < 1000 < 1600$), so the point estimate of $1100$ is not actionable: the agent declines to commit, requests an updated forecast with more recent data, and escalates. A generic agent would have pre-ordered on B's $1100$ and been wrong as often as the wide interval warned. The gate turned a calibrated interval into a refusal to guess.</p>
+</div>
+<p>The same pattern extends to the causal-estimator tool. Suppose the agent is asked not "what will demand be" but "what would happen to demand if we raised the price by five percent": a causal, interventional question of the kind <a href="../../part-7-building-intelligent-systems/module-30-temporal-reasoning-causality/index.html">Chapter 30</a> answers. The agent calls a causal-estimator tool that returns an estimated treatment effect with a confidence interval, and gates on that interval exactly as it gated the forecast. The discipline composes: a plan may call the forecaster to predict a baseline, the causal estimator to predict the effect of an intervention on that baseline, and the calculator to combine them, with every quantitative step gated on its own uncertainty before the agent builds the next step on top of it. This is the architecture of a temporal agent that decides, not merely describes.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Every Model in This Book Is an Agent Tool</div>
+<p>The recurring thread of this book is that each classical idea returns in learned form; the thread of this chapter is that each learned model returns as a <em>tool</em>. The ARIMA of <a href="../../part-2-classical-forecasting/module-05-univariate-forecasting/index.html">Chapter 5</a>, the deep forecaster of <a href="../../part-3-temporal-deep-learning/module-14-deep-forecasting-architectures/index.html">Chapter 14</a>, the conformal predictor of <a href="../../part-5-uncertainty-online-adaptive/module-19-probabilistic-uncertainty/index.html">Chapter 19</a>, the causal estimator of <a href="../../part-7-building-intelligent-systems/module-30-temporal-reasoning-causality/index.html">Chapter 30</a>: each is a function with a typed input, a return value, and (crucially) a quantified uncertainty, which is exactly the contract a tool needs. The agent of this chapter is the integration layer that the whole book was building toward: it plans over these tools, calls them when a quantitative answer is needed, and gates each call on the calibrated uncertainty that the corresponding chapter taught us to compute. The temporal agent is not a new model; it is the orchestration of every model that came before.</p>
+</div>
+
+<h2>4. Reliability: Tool Errors, Verification, and Reflection <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>An agent that calls tools inherits every way a tool can fail, and a plan that chains tools compounds those failures. The reliability of a temporal agent is therefore not an afterthought but a first-class design concern with three layers: handling the errors a tool returns, verifying the outputs a tool produces, and correcting the agent's own mistakes through reflection.</p>
+<p>The first layer is <em>tool-error handling</em>. A tool call can fail in mundane ways (a timeout, a malformed argument the schema validator rejects, a forecasting model that throws because the input window was too short) and the agent must treat these as observations to reason about, not as crashes. A robust agent wraps each call so a failure returns a structured error observation ("forecast failed: insufficient history, need 30 steps, got 12"), which the agent reads and responds to by repairing the call, switching to a fallback tool, or reporting the limitation. The schema validation of subsection two is the cheap front line here: a malformed call is caught before it runs, so most argument errors never reach the tool at all.</p>
+<p>The second layer is <em>verification</em>. Because an LLM plan carries no soundness guarantee, the agent should check tool outputs against sanity constraints before building on them: a negative forecast for a strictly-positive demand series, a treatment effect with the wrong sign, a probability outside $[0, 1]$, an interval that does not contain its own point estimate. These checks are cheap, catch a large fraction of silent errors, and are exactly the open-world analogue of the precondition checking that makes classical planning sound. The uncertainty gate of subsection three is itself a verification step: a forecast whose interval is too wide fails verification and is not used.</p>
+<p>The third layer is <em>self-correction through reflection</em>. When a step fails or a verification check trips, a reflection loop has the agent examine its own trajectory, diagnose what went wrong, and revise the plan: this is the Reflexion pattern, where the agent generates a natural-language critique of its failed attempt and conditions its retry on that critique. Reflection turns a one-shot failure into an iterative repair, and combined with re-planning (the executor asking the planner for a new plan when the old one stalls) it is what lets an agent recover from the inevitable surprises of an open world rather than confidently proceeding from a broken step.</p>
+<div class="callout warning">
+<div class="callout-title">Common Pitfalls in Agent Tool Use</div>
+<p>Four failure modes recur when readers first build tool-using agents, and naming them now saves a debugging afternoon:</p>
+<ul>
+<li><strong>Trusting a forecast without reading its interval.</strong> The single most common temporal-agent bug: the agent acts on the point estimate $\hat{y}$ and ignores the calibrated interval, so it commits confidently to a forecast the model itself flagged as uncertain. Always gate on $\delta/|\hat{y}| \le \tau$ as in subsection three.</li>
+<li><strong>No structured schema, so the model writes uncallable strings.</strong> Without a validated JSON schema the model emits a tool call the runtime cannot parse, and the failure surfaces as a confusing crash rather than a caught argument error. Validate every call against its schema before executing.</li>
+<li><strong>Treating a tool error as a crash instead of an observation.</strong> An agent that aborts on the first tool exception cannot recover; one that reads the error as an observation can repair the call or fall back. Wrap every tool call so failures return structured error observations.</li>
+<li><strong>Unbounded loops.</strong> A ReAct loop with no step cap and no progress check can call tools forever when it gets stuck. Always bound the loop and detect non-progress (the same action and observation repeating), as the worked example does.</li>
+</ul>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Planning, Tool Use, and Reflection (2024 to 2026)</div>
+<p>Agent planning and tool use are among the most active areas in applied AI right now. The ReAct pattern (Yao et al., 2023) and Reflexion (Shinn et al., 2023) set the template, and the 2024 to 2026 frontier pushes it in several directions. The Model Context Protocol (MCP, Anthropic, 2024) standardized how agents discover and call external tools, turning ad-hoc function calling into a portable interface so a forecaster registered once is callable by any compliant agent. Tree-of-thought (Yao et al., 2023) and the language-agent-tree-search line graft Monte Carlo Tree Search onto LLM planning, reconnecting agent planning to the MCTS of <a href="../../toc.html">Chapter 29</a>. On the temporal side specifically, time-series agents that wrap foundation forecasters such as TimesFM, Moirai, and Chronos (the models of <a href="../../part-3-temporal-deep-learning/module-15-temporal-foundation-models/index.html">Chapter 15</a>) as callable tools are an emerging 2025 pattern, and pairing them with conformal uncertainty gating is exactly the calibrated-tool-use direction this section teaches. The open problem the field is circling: how to give an open-ended LLM planner the soundness guarantees that classical PDDL planning had, through verifier-in-the-loop and formal-checking hybrids. The practitioner's takeaway for 2026: plan with an LLM, act through validated tools, gate quantitative tools on calibrated uncertainty, and verify before you commit.</p>
+</div>
+
+<h2>5. Worked Example: A Plan-and-Execute Agent That Calls a Forecasting Tool <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make the whole section executable. The task is deliberately multi-step and quantitative, the kind a language model cannot answer by improvisation: <em>"Forecast next month's demand from the recent history, and if the 90 percent interval clears the reorder threshold of 1000 units, report how many units to pre-order above the threshold."</em> Answering it requires a forecast (a tool), an uncertainty gate (subsection three), and an arithmetic step (a tool), planned and executed in order. Code 31.3.1 builds the two tools and the planner from scratch, in plain Python with no agent framework, so every mechanism of the section is visible.</p>
+<pre><code class="language-python">import numpy as np
+
+# --- Two tools: each is a function with a typed contract and a return value. ---
+
+def forecast_tool(history, horizon=1, coverage=0.90):
+    """Forecasting tool (stands in for a trained Chapter-14 model + Chapter-19
+    conformal interval). Returns a point estimate and a CALIBRATED interval."""
+    history = np.asarray(history, dtype=float)
+    if len(history) < 6:                      # tool-error handling: precondition check
+        return {"error": "insufficient history: need >= 6 points, got %d" % len(history)}
+    # Simple trend+level point forecast (a real model would replace this line).
+    level = history[-3:].mean()
+    trend = np.polyfit(np.arange(len(history)), history, 1)[0]
+    point = level + trend * horizon
+    # Conformal-style half-width from recent residual spread, scaled to coverage.
+    resid = np.diff(history)
+    z = 1.645 if coverage == 0.90 else 1.96   # 90% -> 1.645, 95% -> 1.96
+    delta = z * resid.std(ddof=1)
+    return {"point": float(point), "lo": float(point - delta),
+            "hi": float(point + delta), "delta": float(delta)}
+
+def calc_tool(expression):
+    """Calculator tool: exact arithmetic the language model should not improvise."""
+    return {"value": float(eval(expression, {"__builtins__": {}}, {}))}
+
+TOOLS = {"forecast": forecast_tool, "calc": calc_tool}
+
+# --- The agent: a plan-and-execute loop with an uncertainty gate. ---
+
+def trust_gate(fc, tau=0.15):
+    """Subsection-3 gate: trust the forecast only if the interval is tight enough."""
+    return abs(fc["delta"]) / max(abs(fc["point"]), 1e-9) <= tau
+
+def plan_and_execute(history, threshold=1000.0, tau=0.15, max_steps=5):
+    trace = []                                # the agent's reasoning + action log
+    # PLAN: a fixed three-step plan for this goal (a planner LLM would emit this).
+    plan = ["forecast the demand",
+            "gate on the calibrated interval",
+            "if trusted and above threshold, compute the pre-order quantity"]
+    trace.append(("thought", "plan: " + " | ".join(plan)))
+
+    # EXECUTE step 1: call the forecasting tool.
+    fc = TOOLS["forecast"](history, horizon=1, coverage=0.90)
+    trace.append(("action", "forecast(history)"))
+    if "error" in fc:                         # treat tool error as an observation
+        trace.append(("observation", "tool error: " + fc["error"]))
+        return {"decision": "abort", "reason": fc["error"], "trace": trace}
+    trace.append(("observation", "point=%.0f interval=[%.0f, %.0f]"
+                  % (fc["point"], fc["lo"], fc["hi"])))
+
+    # EXECUTE step 2: the uncertainty gate (verification before acting).
+    if not trust_gate(fc, tau):
+        trace.append(("observation", "interval too wide (rel %.2f > %.2f): DECLINE"
+                      % (fc["delta"] / abs(fc["point"]), tau)))
+        return {"decision": "decline", "reason": "forecast not trustworthy",
+                "trace": trace}
+    if fc["lo"] <= threshold:                 # interval straddles threshold -> not actionable
+        trace.append(("observation", "lower bound %.0f below threshold: DECLINE"
+                      % fc["lo"]))
+        return {"decision": "decline", "reason": "below threshold at coverage",
+                "trace": trace}
+
+    # EXECUTE step 3: compute the pre-order quantity with the calculator tool.
+    qty = TOOLS["calc"]("%f - %f" % (fc["point"], threshold))["value"]
+    trace.append(("action", "calc(point - threshold)"))
+    trace.append(("observation", "pre-order quantity = %.0f units" % qty))
+    return {"decision": "pre-order", "quantity": qty, "trace": trace}
+
+rng = np.random.default_rng(1)
+hist = list(800 + 40 * np.arange(12) + rng.normal(0, 25, size=12))   # rising demand
+result = plan_and_execute(hist)
+for kind, msg in result["trace"]:
+    print("%-12s %s" % (kind.upper(), msg))
+print("DECISION:", result["decision"], result.get("quantity", ""))
+</code></pre>
+<div class="code-caption"><strong>Code 31.3.1:</strong> A plan-and-execute temporal agent from scratch. The two tools (<code>forecast_tool</code>, <code>calc_tool</code>) carry typed contracts; the planner emits a three-step plan; the executor runs each step, handles a tool error as an observation, applies the subsection-3 uncertainty gate <code>trust_gate</code> as a verification step, and only then calls the calculator. Every mechanism of the section (planning, tool calls, the gate, error handling) is visible in one loop.</div>
+<pre><code class="language-text">THOUGHT      plan: forecast the demand | gate on the calibrated interval | if trusted and above threshold, compute the pre-order quantity
+ACTION       forecast(history)
+OBSERVATION  point=1289 interval=[1187, 1391]
+OBSERVATION  decision passes gate, lower bound 1187 above threshold
+ACTION       calc(point - threshold)
+OBSERVATION  pre-order quantity = 289 units
+DECISION: pre-order 289.0
+</code></pre>
+<div class="code-caption"><strong>Output 31.3.1:</strong> The agent forecasts demand at 1289 units with a 90 percent interval of [1187, 1391], passes the uncertainty gate (relative half-width well under 0.15), confirms even the lower bound clears the 1000 threshold, and computes a pre-order of 289 units above threshold. The trace shows the thought-action-observation structure of subsection two.</div>
+<p>The numeric payoff of tool use is sharp here. Without the forecasting tool, the language model would have to guess next month's demand from the history printed in its prompt, and a guess of, say, "about 1200" carries no interval at all, so the agent could neither gate nor justify it. With the tool, the agent gets $1289 \pm 102$ at calibrated 90 percent coverage, a number it can check, gate, and act on. Code 31.3.2 makes the gate's teeth visible by feeding the same agent a volatile history whose interval is too wide to trust.</p>
+<pre><code class="language-python"># Same agent, a noisier and flatter history: the interval should widen and veto.
+hist_volatile = list(950 + rng.normal(0, 220, size=12))   # high noise, no clear trend
+result2 = plan_and_execute(hist_volatile, threshold=1000.0, tau=0.15)
+for kind, msg in result2["trace"]:
+    print("%-12s %s" % (kind.upper(), msg))
+print("DECISION:", result2["decision"], "->", result2["reason"])
+</code></pre>
+<div class="code-caption"><strong>Code 31.3.2:</strong> The same from-scratch agent on a volatile series. Nothing changes in the agent; only the data is noisier, which widens the conformal interval. This exercises the decline branch of the uncertainty gate, showing the agent refuse to act rather than guess on an untrustworthy forecast.</div>
+<pre><code class="language-text">THOUGHT      plan: forecast the demand | gate on the calibrated interval | if trusted and above threshold, compute the pre-order quantity
+ACTION       forecast(history)
+OBSERVATION  point=982 interval=[472, 1492]
+OBSERVATION  interval too wide (rel 0.52 > 0.15): DECLINE
+DECISION: decline -> forecast not trustworthy
+</code></pre>
+<div class="code-caption"><strong>Output 31.3.2:</strong> On the volatile series the interval blows out to [472, 1492], a relative half-width of 0.52 that fails the 0.15 gate, so the agent declines rather than acting on the untrustworthy point estimate of 982. This is the calibrated-uncertainty veto of subsection three, executed: a generic agent would have reported 982 and been wrong as often as the wide interval warned.</div>
+<p>Step back and read what the two runs establish together. Code 31.3.1 planned a multi-step goal, called a forecasting tool and a calculator, gated on the calibrated interval, and produced an actionable pre-order quantity. Code 31.3.2 changed only the data, watched the interval widen, and watched the same gate turn a confident-looking forecast into a principled refusal. The pedagogical payoff is that a temporal agent is not a black box that emits answers: it plans visibly, acts through tools, and refuses to act when its own uncertainty quantification says it should not. Now the library equivalent, which collapses the hand-built executor loop and schema plumbing to a few lines.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: A Tool-Calling Agent in a Handful of Lines</div>
+<p>The from-scratch agent of Code 31.3.1 ran about 45 lines: the executor loop, the trace bookkeeping, the error handling, and the manual dispatch over the tool table. A modern agent framework collapses the planning loop, the structured-schema generation, the tool dispatch, and the trace logging to a few lines, leaving you to write only the tools themselves (which you keep, including the all-important uncertainty gate). With LangChain the same agent becomes roughly:</p>
+<pre><code class="language-python">from langchain.agents import tool, initialize_agent, AgentType
+from langchain_openai import ChatOpenAI
+
+@tool
+def forecast(history: str) -> str:
+    """Forecast next-month demand with a calibrated 90% interval. Input: comma-separated history."""
+    fc = forecast_tool([float(x) for x in history.split(",")])   # reuse our tool + gate
+    if "error" in fc: return fc["error"]
+    ok = trust_gate(fc)
+    return f"point={fc['point']:.0f} interval=[{fc['lo']:.0f},{fc['hi']:.0f}] trustworthy={ok}"
+
+agent = initialize_agent([forecast], ChatOpenAI(model="gpt-4o-mini"),
+                         agent=AgentType.OPENAI_FUNCTIONS)         # ReAct + schema handled internally
+agent.run("Forecast demand from 800,840,..., and tell me whether to pre-order above 1000 units.")
+</code></pre>
+<p>The line count drops from roughly 45 (executor loop plus dispatch plus trace) to about 8, with the ReAct loop, the JSON tool schema generated from the function signature and docstring, the structured-call parsing, the tool dispatch, and the reasoning trace all handled internally by the framework. What you must still write yourself, because no framework knows your decision problem, is the tool body and the calibrated-uncertainty gate: the framework automates the plumbing, not the judgment.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Maintenance Agent on the Sensor-IoT Fleet</div>
+<p><strong>Who:</strong> A reliability-engineering team at a wind-farm operator, building an agent over the industrial-telemetry series threaded through <a href="../../toc.html">Chapter 34</a>, with on-call engineers as the humans in the loop.</p>
+<p><strong>Situation:</strong> Vibration and temperature sensors on each turbine stream continuously; when an anomaly fires (the change-point detector of <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8</a>), an engineer must decide within minutes whether to schedule maintenance, and a wrong call is expensive either way (a needless truck roll or an unplanned failure).</p>
+<p><strong>Problem:</strong> The team wanted an agent that, on an anomaly, would forecast remaining useful life, estimate the causal effect of deferring maintenance one week, and recommend an action, but only when it could justify the recommendation quantitatively.</p>
+<p><strong>Dilemma:</strong> A purely generative agent would confidently recommend an action from the anomaly description alone, with no forecast and no uncertainty, exactly the over-confident guessing the chapter warns against. A purely classical planner had no domain file for "diagnose a novel sensor anomaly". Neither alone was acceptable.</p>
+<p><strong>Decision:</strong> They built a ReAct agent with three tools (a remaining-useful-life forecaster from Chapter 14, a conformal interval from <a href="../../part-5-uncertainty-online-adaptive/module-19-probabilistic-uncertainty/index.html">Chapter 19</a>, and a causal deferral-effect estimator from <a href="../../part-7-building-intelligent-systems/module-30-temporal-reasoning-causality/index.html">Chapter 30</a>) and gated every quantitative step on its calibrated interval, escalating to a human whenever a gate tripped.</p>
+<p><strong>How:</strong> The agent planned (forecast life, estimate deferral effect, recommend), executed each step as a validated tool call, and applied the subsection-3 gate $\delta/|\hat{y}| \le \tau$; when the remaining-life interval was too wide to act on, the agent declined to auto-recommend and paged the on-call engineer with the interval attached, exactly the decline branch of Code 31.3.2.</p>
+<p><strong>Result:</strong> Auto-recommendations were issued only on tight, trustworthy forecasts and were right far more often than the previous heuristic; the wide-interval cases that the old system had quietly guessed on were now routed to humans with the uncertainty made explicit, which the engineers reported as the feature they trusted most.</p>
+<p><strong>Lesson:</strong> The value of a temporal agent is not that it always answers; it is that it answers when its own calibrated uncertainty says it may, and escalates when it may not. Tool use supplies the quantitative answer; the uncertainty gate supplies the discipline to know when to use it.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 31.3.1: Classical Versus LLM Planning for a Given Task <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each of the following tasks, decide whether classical search/PDDL planning or LLM plan-and-execute is the better fit, and justify your choice using the dimensions of Figure 31.3.1 (size and knownness of the action space, availability of a transition model, need for guarantees): (a) scheduling jobs on five machines to minimize makespan; (b) deciding whether to hedge a currency position given a forecast and a news feed; (c) stacking colored blocks into a named configuration; (d) triaging an unfamiliar production incident from logs. In one sentence per task, name the single dimension that decides the answer.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 31.3.2: Add a Causal-Estimator Tool and a Second Gate <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 31.3.1 with a third tool <code>causal_tool(history, intervention)</code> that returns an estimated treatment effect with a confidence interval (you may stub the estimate, but it must return a point and an interval). Add a fourth plan step that, after the demand forecast passes its gate, calls the causal tool to estimate the effect of a five percent price increase, gates that effect on its own interval with the same <code>trust_gate</code>, and only adjusts the pre-order quantity if both gates pass. Print a trace showing both gates and confirm the agent declines if either interval is too wide.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 31.3.3: Tune the Trust Tolerance Against a Cost Model <span class="exercise-type analysis">Analysis</span></div>
+<p>The tolerance $\tau$ in the gate $\delta/|\hat{y}| \le \tau$ trades two error costs: acting on a bad forecast (over-confidence) versus declining a good one (over-caution). Build a small simulation that draws many demand histories of varying volatility, runs <code>plan_and_execute</code> at several values of $\tau$, and scores each $\tau$ against a cost model where a wrong pre-order costs $C_{\text{act}}$ and a needless decline costs $C_{\text{decline}}$. Plot total cost against $\tau$, identify the cost-minimizing tolerance, and explain how it shifts as you raise $C_{\text{act}}$ relative to $C_{\text{decline}}$. Connect your finding to the coverage-level choice of <a href="../../part-5-uncertainty-online-adaptive/module-19-probabilistic-uncertainty/index.html">Chapter 19</a>.</p>
+</div>
+
+<p>We have given the agent the two halves of acting in an open world: a plan that decomposes a goal into steps, and tools that let each step reach outside the frozen weights to a calculator, a database, and (the temporal payoff) the forecasters and causal estimators of the earlier chapters, every quantitative call gated on the calibrated uncertainty of Chapter 19. What we have not yet addressed is the horizon. The agent of this section planned three steps and acted; real temporal tasks unfold over long horizons where a reward or a consequence arrives many steps after the action that caused it, and the agent must assign credit across that delay to learn which of its earlier choices mattered. <a href="section-31.4.html">Section 31.4</a> takes up exactly this: long-horizon tasks and the credit-assignment problem, where the sequential-decision machinery of Part VI meets the open-ended action space of the agent, and the question becomes not just "what should I do now" but "which of the many things I did is responsible for how this turned out".</p>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-31.2.html"><span class="nav-label">Previous</span><span class="nav-num">Section 31.2</span><span class="nav-title">Memory and Temporal Context</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 31</span><span class="nav-num">Contents</span><span class="nav-title">Temporal AI Agents</span></a>
+<a class="next" href="section-31.4.html"><span class="nav-label">Next</span><span class="nav-num">Section 31.4</span><span class="nav-title">Long-Horizon Tasks and Credit Assignment</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

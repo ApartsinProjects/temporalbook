@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 32.2: Traffic Forecasting. Traffic as the canonical spatio-temporal forecasting benchmark: a graph of road sensors with readings over time. How to combine graph convolution over the road network with RNN, TCN, or attention temporal modeling; the landmark models DCRNN, STGCN, and Graph WaveNet; the METR-LA and PEMS benchmarks; and a from-scratch graph-conv-plus-GRU forecaster matched against a PyTorch-Geometric-Temporal DCRNN and A3TGCN." name="description"/>
+<title>Section 32.2: Traffic Forecasting | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VII: Building Intelligent Temporal Systems</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 32: Spatio-Temporal Intelligence</a></div>
+<h1>Traffic Forecasting</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I am bolted to a gantry above lane three, and all day I count cars. On my own I know one thing: how fast traffic is moving directly beneath me, right now. But I have learned to listen to my neighbors. When the sensor two miles upstream goes quiet and the one before it slows, I already know what is coming. I am predicting the jam three exits ahead, and I have not yet seen a single brake light."</p>
+<cite>A Sensor on a Highway Predicting the Jam Three Exits Ahead</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Traffic forecasting is the problem that turned spatio-temporal learning into a field. Picture a few hundred loop detectors embedded in a freeway network, each reporting average speed every five minutes. The readings are a time series at every sensor, but the sensors are not independent: congestion at one location propagates along the road graph to its neighbors with a delay set by travel time. The forecasting task, predict the next hour of speeds at every sensor given the last hour, is therefore neither pure time series (the sensors talk to each other) nor pure graph learning (each node is a signal that evolves). It is both at once, and the winning recipe is to factor the problem into two interacting halves: a SPATIAL model that mixes information across the road graph, and a TEMPORAL model that carries each node's history forward.</strong> Part II and Part III gave us the temporal half: ARIMA, the Kalman filter, the RNN, the TCN, attention. This chapter adds the spatial half, graph convolution over the sensor network, and shows how to braid the two into a single forecaster. We will derive the spatio-temporal graph convolution, survey the landmark models (DCRNN, STGCN, Graph WaveNet) and the learned-versus-given-graph debate, ground everything in the METR-LA and PEMS benchmarks with their sobering lesson that strong simple baselines are hard to beat, and finally build a graph-convolution-plus-GRU forecaster from scratch and then in three lines with PyTorch Geometric Temporal. You leave able to recognize, build, and critically evaluate a traffic forecaster, the canonical spatio-temporal system.</p>
+</div>
+<p>In <a href="section-32.1.html">Section 32.1</a> we framed spatio-temporal data in general: measurements indexed by both a location and a time, where neither axis can be ignored without losing the signal. This section makes that abstraction concrete on the benchmark that has driven the field for a decade. Traffic is the fruit-fly of spatio-temporal learning: the data are public and clean, the graph is real and interpretable (it is a road network), and the forecasting horizon (fifteen minutes to an hour ahead, network-wide) is both economically valuable and genuinely hard. Every architectural idea in this chapter was either invented on traffic data or validated there first.</p>
+<p>The temporal half of the problem is entirely familiar. Forecasting a single sensor's speed from its own past is the univariate forecasting of <a href="../../part-2-classical-forecasting/module-05-univariate-forecasting/index.html">Chapter 5</a>, and modeling the joint evolution of all sensors is the multivariate forecasting of <a href="../../part-2-classical-forecasting/module-06-multivariate-econometric/index.html">Chapter 6</a>. The deep-learning machinery for carrying a history forward, the RNN of <a href="../../part-3-temporal-deep-learning/module-10-recurrent-neural-networks/index.html">Chapter 10</a>, the temporal convolutional network of <a href="../../part-3-temporal-deep-learning/module-11-temporal-convolutional-networks/index.html">Chapter 11</a>, and attention from <a href="../../part-3-temporal-deep-learning/module-12-attention-transformers/index.html">Chapter 12</a>, all carry over without modification. The genuinely new ingredient, the thing this section is about, is the spatial coupling: the road graph that says sensor $i$ and sensor $j$ are connected and that congestion flows between them. We use the unified notation of <a href="../../toc.html">Appendix A</a>: $\mathbf{X}_t \in \mathbb{R}^{N \times F}$ is the signal at all $N$ sensors at time $t$ with $F$ features, $\mathbf{A}$ is the adjacency matrix of the road graph, and the forecast targets are the next $H$ steps $\mathbf{X}_{t+1}, \dots, \mathbf{X}_{t+H}$.</p>
+<p>Four competencies this section installs: to state traffic forecasting precisely as multi-step network-wide regression on a graph signal; to write a spatio-temporal block as the composition of a graph convolution and a temporal operator, and read the spatio-temporal graph convolution formula; to place the landmark models DCRNN, STGCN, and Graph WaveNet on a map of spatial-operator and temporal-operator choices, and explain when a learned graph beats a given one; and to implement a working forecaster both from scratch and with a library, evaluating it honestly against the simple baselines that the benchmark literature warns are surprisingly strong.</p>
+
+<h2>1. Traffic as the Canonical Spatio-Temporal Benchmark <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Strip a traffic forecasting problem to its data and you have three objects. First, a set of $N$ sensors (loop detectors, radar units, or probe-vehicle aggregators) at fixed locations on a road network. Second, a reading from each sensor at each time step, typically average speed or flow aggregated into five-minute bins, which stacks into a tensor $\mathbf{X} \in \mathbb{R}^{T \times N \times F}$ over $T$ time steps with $F$ features per sensor. Third, a graph $\mathcal{G} = (\mathcal{V}, \mathcal{E}, \mathbf{A})$ whose nodes are the sensors and whose weighted adjacency $\mathbf{A} \in \mathbb{R}^{N \times N}$ encodes road connectivity, usually built from driving distance along the network rather than straight-line distance, because congestion travels on roads, not as the crow flies.</p>
+<p>The task is multi-step, network-wide forecasting: given a window of the recent past $\mathbf{X}_{t-P+1:t}$ (say the last twelve five-minute steps, one hour), predict the next $H$ steps $\mathbf{X}_{t+1:t+H}$ (the next hour) at <em>every</em> sensor simultaneously. This is a sequence-to-sequence regression mapping a length-$P$ history of graph signals to a length-$H$ future of graph signals. It is the forecasting problem of <a href="../../part-2-classical-forecasting/module-05-univariate-forecasting/index.html">Part II</a> and the deep forecasting of <a href="../../part-3-temporal-deep-learning/module-14-deep-forecasting-architectures/index.html">Part III</a>, lifted from a single series (or a flat vector of series) to a signal living on a graph.</p>
+<p>Why is the graph indispensable rather than a decoration? Because traffic obeys a transport process with a finite propagation speed. A crash on a freeway does not raise travel times everywhere at once; a shockwave of congestion forms at the incident and moves <em>upstream</em> against the flow of traffic at a characteristic speed (roughly ten to twenty kilometers per hour for a stop-and-go wave), while the road downstream of the incident clears. A model that ignores the graph treats the sensors as $N$ unrelated series and must rediscover this coupling from data; a model that is handed the graph can route the upstream sensor's signal directly to the downstream forecaster with the right structural prior. The graph is the inductive bias that says "your neighbors' recent past is your near future."</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A short chain of five road sensors S1 to S5 along a freeway, connected left to right by directed road edges. A congestion shockwave originates at sensor S4 and propagates upstream to S3, S2, S1, illustrated by a wavefront arrow moving right to left, opposite the traffic flow which moves left to right.">
+<defs>
+<marker id="arr322" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+<marker id="arrW322" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b8431f"/></marker>
+</defs>
+<style>
+.sen322 { fill:#eef3f8; stroke:#14385c; stroke-width:2; }
+.jam322 { fill:#fbeee8; stroke:#b8431f; stroke-width:2.2; }
+.road322 { stroke:#5a626c; stroke-width:2; fill:none; marker-end:url(#arr322); }
+.wave322 { stroke:#b8431f; stroke-width:2; fill:none; marker-end:url(#arrW322); stroke-dasharray:5 4; }
+.lab322 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub322 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.wl322 { font:600 12px sans-serif; fill:#b8431f; text-anchor:middle; }
+</style>
+<text class="lab322" x="410" y="26">A freeway sensor chain: traffic flows one way, congestion propagates the other</text>
+<circle class="sen322" cx="110" cy="130" r="28"/><text class="lab322" x="110" y="135">S&#8321;</text>
+<circle class="sen322" cx="260" cy="130" r="28"/><text class="lab322" x="260" y="135">S&#8322;</text>
+<circle class="sen322" cx="410" cy="130" r="28"/><text class="lab322" x="410" y="135">S&#8323;</text>
+<circle class="jam322" cx="560" cy="130" r="28"/><text class="lab322" x="560" y="135">S&#8324;</text>
+<circle class="sen322" cx="710" cy="130" r="28"/><text class="lab322" x="710" y="135">S&#8325;</text>
+<line class="road322" x1="140" y1="130" x2="230" y2="130"/>
+<line class="road322" x1="290" y1="130" x2="380" y2="130"/>
+<line class="road322" x1="440" y1="130" x2="530" y2="130"/>
+<line class="road322" x1="590" y1="130" x2="680" y2="130"/>
+<text class="sub322" x="410" y="178">traffic flow (downstream)</text>
+<line class="wave322" x1="535" y1="92" x2="135" y2="92"/>
+<text class="wl322" x="335" y="80">congestion shockwave (upstream)</text>
+<text class="sub322" x="560" y="210">incident at S&#8324;</text>
+</svg>
+<figcaption><strong>Figure 32.2.1:</strong> The traffic graph in miniature. Five sensors line a freeway; road edges (gray) point downstream in the direction of travel. An incident at sensor $S_4$ launches a congestion shockwave (dashed orange) that moves upstream, slowing $S_3$, then $S_2$, then $S_1$ with a delay set by the wave speed. A graph-aware forecaster routes the upstream-arriving signal to predict each sensor's near future before its own readings change.</figcaption>
+</figure>
+<p>Two features of the traffic signal make it a demanding and instructive benchmark. It is strongly <em>periodic</em> (a daily commuting rhythm, a weekly weekday-weekend pattern) so any model must beat the trivial but strong baseline of "predict what happened at this time yesterday." And it is <em>non-stationary and bursty</em>: incidents, weather, and events produce sudden regime changes that the periodic component cannot anticipate, which is exactly where a spatially aware model earns its keep, because the incident is visible at a neighbor before it is visible locally. Holding both facts in mind, that a huge fraction of the signal is trivially periodic and the interesting fraction is spatially propagating, is the key to reading the benchmark results in subsection four honestly.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Traffic Forecasting Is Multivariate Forecasting With a Known Coupling Graph</div>
+<p>The cleanest way to place traffic forecasting in the arc of this book is this: it is the multivariate forecasting of <a href="../../part-2-classical-forecasting/module-06-multivariate-econometric/index.html">Chapter 6</a> where the cross-series coupling is not learned from a dense covariance matrix but <em>given</em> as a sparse road graph. A vector autoregression on $N$ sensors has $O(N^2)$ coupling parameters per lag and cannot scale to hundreds of sensors. The graph replaces that dense, unstructured coupling with a sparse, interpretable, distance-derived adjacency that encodes which sensors can physically influence which. Spatio-temporal models are, in this light, structured multivariate forecasters: the structure is the road network, and supplying it is what lets the model generalize from a manageable amount of data.</p>
+</div>
+
+<h2>2. The Architecture Pattern: Spatial Plus Temporal <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Almost every traffic forecaster, and almost every spatio-temporal model, follows one pattern: alternate or fuse a <strong>spatial operator</strong> that mixes information across the graph at a fixed time with a <strong>temporal operator</strong> that mixes information across time at a fixed node. The two operators are the two axes of the data, and a deep model is a stack of blocks each of which advances both axes. Understanding this factorization is the single most useful thing in the chapter, because once you see it, every named architecture becomes a choice of "which spatial operator" crossed with "which temporal operator."</p>
+<p>The spatial operator is a graph convolution. The simplest useful form is the one-hop graph convolution: replace each node's feature by a learned combination of its own feature and an aggregate of its neighbors' features. With the (symmetrically normalized) adjacency $\tilde{\mathbf{A}}$ and a node-feature matrix $\mathbf{X} \in \mathbb{R}^{N \times F}$, one graph-convolution layer is</p>
+$$\mathbf{H} = \sigma\!\big(\tilde{\mathbf{A}}\,\mathbf{X}\,\mathbf{\Theta}\big), \qquad \tilde{\mathbf{A}} = \mathbf{D}^{-1/2}(\mathbf{A} + \mathbf{I})\,\mathbf{D}^{-1/2},$$
+<p>where $\mathbf{\Theta} \in \mathbb{R}^{F \times F'}$ is a learned weight, $\mathbf{D}$ is the degree matrix of $\mathbf{A} + \mathbf{I}$, and $\sigma$ is a nonlinearity. The product $\tilde{\mathbf{A}}\mathbf{X}$ is the spatial mixing: row $i$ of the result is the degree-normalized average of node $i$ and its neighbors. Stacking $K$ such layers, or equivalently raising $\tilde{\mathbf{A}}$ to higher powers, lets information travel $K$ hops along the graph, which is how a sensor several exits away comes to influence a forecast.</p>
+<p>The temporal operator is anything from Part III. To make a single block that advances both axes, compose them. A <em>spatio-temporal graph convolution</em> at node $i$ and time $t$ aggregates over both the graph neighborhood $\mathcal{N}(i)$ and a temporal window of width $\Gamma$:</p>
+$$\mathbf{h}_{i,t} = \sigma\!\left( \sum_{\tau=0}^{\Gamma-1} \sum_{j \in \mathcal{N}(i) \cup \{i\}} \tilde{A}_{ij}\, \mathbf{x}_{j,\,t-\tau}\, \mathbf{\Theta}_{\tau} \right),$$
+<p>where $\mathbf{\Theta}_\tau \in \mathbb{R}^{F \times F'}$ is a per-lag weight (the temporal kernel) and $\tilde{A}_{ij}$ is the spatial weight. Read the formula as two nested sums: the inner sum over $j$ is the graph convolution (spatial mixing across neighbors at one lag), and the outer sum over $\tau$ is a temporal convolution (mixing across the last $\Gamma$ time steps), so a single block does both a one-hop spatial step and a $\Gamma$-tap temporal step. Different architectures realize this composition differently: STGCN stacks separate temporal-convolution and graph-convolution sublayers; DCRNN replaces the matrix multiplies inside a GRU with graph convolutions; Graph WaveNet pairs a dilated temporal convolution with a graph convolution on a learned adjacency. The skeleton is always spatial $\times$ temporal.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Choice</th><th>Spatial operator (across the graph)</th><th>Temporal operator (across time)</th></tr></thead>
+<tbody>
+<tr><td>simplest</td><td>one-hop graph conv $\tilde{\mathbf{A}}\mathbf{X}\mathbf{\Theta}$</td><td>a GRU or LSTM over each node</td></tr>
+<tr><td>DCRNN</td><td>diffusion conv (random-walk powers of $\mathbf{A}$)</td><td>GRU with graph-conv gates</td></tr>
+<tr><td>STGCN</td><td>Chebyshev / 1st-order graph conv</td><td>gated 1-D temporal convolution</td></tr>
+<tr><td>Graph WaveNet</td><td>graph conv on a <em>learned</em> adjacency</td><td>dilated causal TCN (WaveNet stack)</td></tr>
+<tr><td>attention-based (GMAN, ASTGCN)</td><td>spatial self-attention over nodes</td><td>temporal self-attention over steps</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 32.2.2:</strong> The spatio-temporal design space as a grid. Every landmark model is a pairing of a spatial operator (a way to mix across the road graph) with a temporal operator (a way to mix across time, drawn straight from Part III). Reading a new architecture reduces to locating it in this grid and noting any extra trick, such as Graph WaveNet learning its own adjacency rather than accepting the given one.</figcaption>
+</figure>
+<p>This factorization is the temporal-graph idea of <a href="../../part-4-temporal-representation-learning/module-18-event-sequence-modeling/index.html">Chapter 18.3</a> applied to a fixed graph with continuously valued node signals. There, the graph itself changed over time (edges appearing and vanishing as events occurred); here, the graph is static (roads do not move) and what evolves is the signal on the nodes. Both are instances of the same general object, a sequence of graph signals, and both are attacked by interleaving a graph operator with a temporal operator. The static-graph case is the gentler one and the right place to learn the pattern.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: One-Hop Spatial Aggregation by Hand</div>
+<p>Take the chain of Figure 32.2.1 restricted to three sensors $S_1 - S_2 - S_3$ in a line, with current speeds (in km/h) $\mathbf{x} = [60, 30, 58]^\top$: $S_2$ is congested, its neighbors are free-flowing. Use the row-normalized adjacency that averages each node with its neighbors. $S_2$ has two neighbors plus itself, so its aggregated value is $\tfrac{1}{3}(60 + 30 + 58) = 49.3$ km/h. End node $S_1$ has one neighbor plus itself: $\tfrac{1}{2}(60 + 30) = 45$ km/h. End node $S_3$: $\tfrac{1}{2}(58 + 30) = 44$ km/h. Notice what the single hop did: the congestion at $S_2$ (30) has bled outward, pulling its free-flowing neighbors down toward 44 to 45 while $S_2$ itself was pulled up toward 49. After one graph-convolution step every node "knows" that a slowdown is adjacent, the precise signal a forecaster needs to predict that $S_1$ and $S_3$ are about to slow. A second hop would spread the influence two sensors out, which is why depth in the spatial operator equals reach along the road.</p>
+</div>
+
+<h2>3. The Landmark Models: DCRNN, STGCN, Graph WaveNet <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Three models, all published between 2017 and 2019, defined the field and remain the baselines every new method must beat. Each is a specific point in the spatial-temporal grid of subsection two, and each contributed one durable idea.</p>
+<p><strong>DCRNN</strong> (Diffusion Convolutional Recurrent Neural Network, Li and colleagues, 2018) models the spatial axis as a <em>diffusion process</em>: it convolves the graph signal with random-walk transition matrices in both directions (downstream and upstream), capturing the directed, asymmetric way traffic propagates. Its temporal axis is a GRU (<a href="../../part-3-temporal-deep-learning/module-10-recurrent-neural-networks/index.html">Chapter 10</a>) in which every dense matrix multiply is replaced by this diffusion convolution, so the recurrence carries a graph-aware hidden state. The diffusion convolution of order $K$ is</p>
+$$\mathbf{Z} = \sum_{k=0}^{K-1}\Big( \theta_{k,1}\,(\mathbf{D}_O^{-1}\mathbf{A})^{k} + \theta_{k,2}\,(\mathbf{D}_I^{-1}\mathbf{A}^\top)^{k} \Big)\mathbf{X},$$
+<p>with $\mathbf{D}_O$ and $\mathbf{D}_I$ the out- and in-degree matrices, so the two terms model forward and backward diffusion separately. DCRNN's lasting lesson: directionality matters, and a sequence-to-sequence GRU with graph-convolutional gates is a strong, principled design.</p>
+<p><strong>STGCN</strong> (Spatio-Temporal Graph Convolutional Network, Yu and colleagues, 2018) drops recurrence entirely. It stacks "sandwich" blocks, each a gated 1-D temporal convolution, then a graph convolution, then another temporal convolution, so the whole model is convolutional in both axes and therefore fully parallel over time (the TCN advantage of <a href="../../part-3-temporal-deep-learning/module-11-temporal-convolutional-networks/index.html">Chapter 11</a>). It is faster to train than DCRNN and competitive in accuracy. Its lasting lesson: you do not need an RNN for the temporal axis; a temporal convolution is faster and often just as good.</p>
+<p><strong>Graph WaveNet</strong> (Wu and colleagues, 2019) introduced the most consequential idea of the three: the <em>adaptive adjacency matrix</em>. Rather than accept the distance-based graph as given, it learns a graph from data by parameterizing $\mathbf{A}_{\text{adp}} = \mathrm{softmax}(\mathrm{ReLU}(\mathbf{E}_1 \mathbf{E}_2^\top))$ from two learned node-embedding matrices $\mathbf{E}_1, \mathbf{E}_2$, and uses it alongside (or instead of) the given graph. Its temporal axis is a dilated causal convolution stack borrowed from WaveNet, giving a large receptive field cheaply. Its lasting lesson, and the central debate of the field, is that the physical road graph is not always the best graph for forecasting: a learned graph can discover couplings the distance metric misses (two sensors on parallel routes that substitute for each other, say) and frequently improves accuracy.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Learned Graphs Versus Given Graphs</div>
+<p>A <em>given</em> graph (built from road distance) encodes a strong, correct, interpretable prior and needs no data to estimate, which is invaluable when data are scarce. A <em>learned</em> graph (Graph WaveNet, AGCRN, MTGNN) is estimated jointly with the forecaster and can capture couplings the distance graph misses, but it adds $O(N^2)$ or $O(N \cdot d)$ parameters and risks overfitting on small networks. The empirically robust recipe is a hybrid: start from the given graph as a prior and let the model learn a residual adjacency on top, so the physics is respected and the data fills in what the physics omits. The lesson generalizes well beyond traffic: whenever you have a plausible structural prior, supplying it and learning a correction usually beats both "trust the prior blindly" and "learn everything from scratch."</p>
+</div>
+<p>Beyond these three, attention-based spatio-temporal Transformers (ASTGCN, GMAN, and the more recent STTN and PDFormer families) replace the fixed graph convolution with spatial self-attention, letting each node attend to every other node with data-dependent weights, and replace the temporal convolution with temporal self-attention. This is the Transformer of <a href="../../part-3-temporal-deep-learning/module-12-attention-transformers/index.html">Chapter 12</a> applied along both axes. Attention buys flexibility (the "graph" is recomputed per input, effectively a fully learned, input-dependent adjacency) at the cost of $O(N^2)$ attention over nodes, which is why these models often inject the road graph as an attention bias to keep the prior. The arc from DCRNN's fixed diffusion to GMAN's learned attention is the same arc the whole field of sequence modeling walked: from fixed structure to learned, data-dependent structure.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Graph That Was Not There</div>
+<p>One of the quietly funny results in the literature is that learned-adjacency models sometimes work best when their learned graph looks <em>nothing</em> like the road map. You hand the model a beautiful, GPS-accurate network topology, and it politely ignores most of it in favor of edges between sensors that are geographically far apart but statistically twinned (two on-ramps that always jam together because they feed the same stadium, for instance). The road graph is the truth about asphalt; the learned graph is the truth about traffic, and the two are related but not the same. It is a small humbling lesson that the obvious structure is not always the useful one.</p>
+</div>
+
+<h2>4. Datasets, Benchmarks, and the Strong-Baseline Lesson <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Two dataset families anchor essentially all traffic-forecasting research. <strong>METR-LA</strong> is 207 loop detectors on the Los Angeles freeways, four months of five-minute speed readings; its sibling <strong>PEMS-BAY</strong> is 325 sensors in the San Francisco Bay Area. The <strong>PEMS</strong> family (PEMS03, PEMS04, PEMS07, PEMS08) comes from the California Performance Measurement System and reports flow as well as speed across hundreds of sensors. The standard protocol forecasts the next twelve steps (one hour) from the previous twelve, and reports mean absolute error (MAE), root mean squared error (RMSE), and mean absolute percentage error (MAPE) at the 15-, 30-, and 60-minute horizons. These benchmarks, their splits, and the broader evaluation discipline are catalogued in <a href="../../toc.html">Appendix E</a>; the running sensor/IoT dataset of this book (introduced in <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a> and threaded through <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8</a>) is the same shape, a network of telemetry sensors over time.</p>
+<p>The single most important practical lesson from a decade of these benchmarks is sobering: <strong>strong simple baselines are hard to beat, and many reported gains are small or fragile.</strong> Because traffic is so strongly periodic, the "historical average" baseline (predict this sensor's average speed for this time-of-day and day-of-week) and a per-sensor ARIMA or a plain per-node LSTM are all formidable. Careful re-evaluations have repeatedly found that the headline improvement of a fancy spatio-temporal model over a well-tuned univariate baseline is often in the low single-digit percentages of MAE, and sometimes vanishes under a fair hyperparameter budget. The graph helps most at the longer horizons (45 to 60 minutes) and during the non-periodic, incident-driven episodes where a neighbor's signal genuinely carries information the local history does not.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Reading a Benchmark Table</div>
+<p>A typical METR-LA result table reports MAE at three horizons. Suppose the historical-average baseline scores MAE 4.16, a per-node LSTM scores 3.44, DCRNN scores 3.17, and Graph WaveNet scores 3.07 (all at the 60-minute horizon, in km/h-equivalent speed error). Read these numbers honestly. The jump from historical average (4.16) to <em>any</em> learned model (3.44) is large, about 17 percent, and that is mostly the temporal model doing its job. The further jump from the per-node LSTM (3.44) to the graph models (3.17, 3.07) is the contribution of the spatial graph: about 8 to 11 percent, real but far smaller than the temporal gain, and concentrated at the long horizon. The gap between the two graph models (3.17 vs 3.07, about 3 percent) is the kind of margin that careful re-evaluation sometimes erases. The takeaway: the temporal model is most of the win, the graph is a real but modest add-on, and tiny gaps between leaderboard entries deserve skepticism.</p>
+</div>
+<p>The honest framing, then, is not "graphs revolutionize traffic forecasting" but "graphs are a correct and useful inductive bias whose benefit is real, concentrated at long horizons and anomalous episodes, and frequently overstated by leaderboard culture." A practitioner should always implement the periodic and per-node baselines first, because they are cheap, strong, and the only fair yardstick against which a graph model's added complexity can be judged. This is the same discipline that <a href="../../part-2-classical-forecasting/module-05-univariate-forecasting/index.html">Chapter 5</a> urged for univariate forecasting, now enforced on the spatio-temporal frontier.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Spatio-Temporal Forecasting in 2024 to 2026</div>
+<p>Three currents define the recent frontier. First, the <em>simple-model backlash</em>: following the "are Transformers effective for time series?" critique, papers such as the STID family (2022) and subsequent linear and MLP-based spatio-temporal models have shown that a well-designed lightweight model with the right identity embeddings can match heavy graph Transformers on METR-LA and PEMS, sharpening the strong-baseline lesson of this subsection. Second, <em>spatio-temporal foundation models</em>: work in 2024 to 2025 (for example UniST, GPT-ST, and the pretrain-then-adapt line) trains a single model across many cities and sensor networks and transfers to unseen graphs with little or no fine-tuning, mirroring the temporal foundation models of <a href="../../part-3-temporal-deep-learning/module-15-temporal-foundation-models/index.html">Chapter 15</a>. Third, <em>continuous-time and physics-informed</em> approaches: spatio-temporal neural ODE and graph-ODE models (and PDE-informed variants that bake in the conservation-of-vehicles transport equation) handle irregular sampling and extrapolate incidents better, connecting to the continuous-time models of <a href="../../part-3-temporal-deep-learning/module-13-ssm-continuous-time/index.html">Chapter 13</a>. The live question for 2026: how much architecture does network-wide forecasting actually need, and where does a learned graph stop helping?</p>
+</div>
+
+<h2>5. Worked Example: A Spatio-Temporal Forecaster From Scratch and With a Library <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now build a working traffic forecaster two ways. First from scratch: a small <em>graph-convolution-plus-GRU</em> cell that does exactly the spatial-then-temporal composition of subsection two, trained on a synthetic five-sensor chain whose congestion propagates upstream just like Figure 32.2.1. Then with a library: the same job in a few lines using PyTorch Geometric Temporal, whose DCRNN and A3TGCN layers package the graph convolution, the recurrence, and the multi-step readout for us. We begin by generating the synthetic data and building the from-scratch model. Code 32.2.1 sets up a propagating-congestion sensor chain and a one-hop spatial graph convolution.</p>
+<pre><code class="language-python">import numpy as np
+import torch
+import torch.nn as nn
+
+torch.manual_seed(0); np.random.seed(0)
+N, P, H = 5, 12, 3          # 5 sensors, look back 12 steps, forecast 3 steps
+
+# Build the chain graph S1-S2-S3-S4-S5 and its symmetrically normalized adjacency.
+A = np.zeros((N, N))
+for i in range(N - 1):
+    A[i, i + 1] = A[i + 1, i] = 1.0          # undirected chain edges
+A_hat = A + np.eye(N)                          # add self-loops (A + I)
+deg = A_hat.sum(1)
+D_inv_sqrt = np.diag(1.0 / np.sqrt(deg))
+A_norm = torch.tensor(D_inv_sqrt @ A_hat @ D_inv_sqrt, dtype=torch.float32)  # D^-1/2 (A+I) D^-1/2
+
+def make_traffic(T=2000):
+    """Synthetic speeds: a daily sine plus congestion waves that travel upstream."""
+    t = np.arange(T)
+    base = 55 + 8 * np.sin(2 * np.pi * t / 96)            # daily commuting rhythm
+    speed = np.tile(base, (N, 1)).T.astype(np.float32)    # (T, N), identical baseline
+    for start in range(50, T - 30, 130):                  # inject incidents at S4 ...
+        for k in range(5):                                # ... propagating upstream S4->S0
+            node = 3 - k
+            if 0 <= node < N:
+                speed[start + k: start + k + 8, node] -= 22  # an 8-step slowdown
+    return np.clip(speed, 10, None)
+
+series = make_traffic()
+mu, sd = series.mean(), series.std()
+series_n = (series - mu) / sd                              # standardize for training
+
+class GraphConv(nn.Module):
+    """One-hop spatial mixing: H = A_norm X Theta, the spatial operator of subsection 2."""
+    def __init__(self, f_in, f_out):
+        super().__init__()
+        self.theta = nn.Linear(f_in, f_out)
+    def forward(self, x):                  # x: (batch, N, f_in)
+        return torch.relu(self.theta(A_norm @ x))   # A_norm @ x mixes each node with neighbors
+</code></pre>
+<div class="code-caption"><strong>Code 32.2.1:</strong> The synthetic propagating-congestion benchmark and the from-scratch spatial operator. <code>make_traffic</code> builds a five-sensor chain with a daily sine baseline and incidents that start at $S_4$ and crawl upstream one sensor per step, the controllable analogue of Figure 32.2.1. <code>GraphConv</code> implements the one-hop convolution $\tilde{\mathbf{A}}\mathbf{X}\mathbf{\Theta}$, the exact spatial mixing whose effect we computed by hand in the subsection-two numeric example.</div>
+<p>With the spatial operator in hand, we braid it with a GRU to form the spatio-temporal cell, then train it to forecast three steps ahead. Code 32.2.2 defines the from-scratch graph-conv-plus-GRU forecaster and runs the training loop.</p>
+<pre><code class="language-python">class GConvGRU(nn.Module):
+    """Spatial-then-temporal: graph-convolve each step, then a GRU carries node history."""
+    def __init__(self, hid=16):
+        super().__init__()
+        self.gc = GraphConv(1, hid)                 # spatial operator (one feature per sensor)
+        self.gru = nn.GRU(hid, hid, batch_first=True)  # temporal operator (Chapter 10)
+        self.head = nn.Linear(hid, H)               # multi-step readout: H future speeds
+    def forward(self, x):                           # x: (batch, P, N)
+        b, P_, N_ = x.shape
+        feats = []
+        for p in range(P_):                         # apply the graph conv at every time step
+            xp = x[:, p, :].unsqueeze(-1)           # (batch, N, 1)
+            feats.append(self.gc(xp))               # (batch, N, hid)  spatially mixed
+        seq = torch.stack(feats, 1)                 # (batch, P, N, hid)
+        seq = seq.permute(0, 2, 1, 3).reshape(b * N_, P_, -1)  # one GRU sequence per sensor
+        out, _ = self.gru(seq)                      # temporal pass over each node's history
+        return self.head(out[:, -1, :]).reshape(b, N_, H)      # (batch, N, H) forecasts
+
+def make_windows(s):
+    X, Y = [], []
+    for i in range(len(s) - P - H):
+        X.append(s[i:i + P]); Y.append(s[i + P:i + P + H])
+    return torch.tensor(np.array(X)), torch.tensor(np.array(Y)).permute(0, 2, 1)
+
+X, Y = make_windows(series_n)                       # X:(M,P,N)  Y:(M,N,H)
+ntr = int(0.8 * len(X)); model = GConvGRU()
+opt = torch.optim.Adam(model.parameters(), lr=1e-2)
+lossf = nn.L1Loss()                                 # MAE, the standard traffic metric
+for epoch in range(15):
+    model.train(); opt.zero_grad()
+    pred = model(X[:ntr])
+    loss = lossf(pred, Y[:ntr]); loss.backward(); opt.step()
+
+model.eval()
+with torch.no_grad():
+    test_mae = lossf(model(X[ntr:]), Y[ntr:]).item() * sd   # de-standardize to km/h
+print("from-scratch GConvGRU test MAE = %.3f km/h" % test_mae)
+</code></pre>
+<div class="code-caption"><strong>Code 32.2.2:</strong> The from-scratch spatio-temporal forecaster. Each block graph-convolves the signal at every time step (spatial), then runs a per-sensor GRU over the mixed history (temporal), then reads out three future speeds, the spatial-then-temporal pattern of subsection two made executable. The model is trained with MAE, the standard traffic metric, and evaluated on a held-out 20 percent of windows.</div>
+<pre><code class="language-text">from-scratch GConvGRU test MAE = 2.418 km/h</code></pre>
+<div class="code-caption"><strong>Output 32.2.1:</strong> The hand-built graph-conv-plus-GRU forecasts the next 15 minutes of network speeds to within about 2.4 km/h MAE, capturing both the daily rhythm and the upstream-propagating slowdowns because the graph convolution routes each incident to its downstream neighbor before that neighbor slows.</div>
+<p>The from-scratch model in Code 32.2.1 and 32.2.2 ran roughly 55 lines: the adjacency construction, the graph-convolution module, the GRU braiding, the windowing, and the training loop. A purpose-built library collapses all of it. PyTorch Geometric Temporal ships the landmark architectures of subsection three as single layers: its <code>DCRNN</code> is the diffusion-convolution GRU, and its <code>A3TGCN</code> is an attention-augmented graph-conv GRU that emits a multi-step forecast directly. Code 32.2.3 rebuilds the forecaster with A3TGCN.</p>
+<pre><code class="language-python">from torch_geometric_temporal.nn.recurrent import A3TGCN
+from torch_geometric.utils import dense_to_sparse
+
+edge_index, edge_weight = dense_to_sparse(torch.tensor(A, dtype=torch.float32))
+
+class LibForecaster(nn.Module):
+    """The whole spatial-plus-temporal stack in one layer: A3TGCN does graph conv + GRU + attn."""
+    def __init__(self, hid=16):
+        super().__init__()
+        self.recurrent = A3TGCN(in_channels=1, out_channels=hid, periods=P)  # spatio-temporal block
+        self.head = nn.Linear(hid, H)                                        # multi-step readout
+    def forward(self, x, ei, ew):          # x: (N, 1, P)  node features over the window
+        h = torch.relu(self.recurrent(x, ei, ew))   # (N, hid): graph-aware temporal embedding
+        return self.head(h)                          # (N, H): H-step forecast per sensor
+
+lib = LibForecaster()
+opt = torch.optim.Adam(lib.parameters(), lr=1e-2)
+Xl = X.permute(0, 2, 1).unsqueeze(2)        # (M, N, 1, P): PyG-Temporal node-feature layout
+for epoch in range(15):
+    lib.train(); opt.zero_grad()
+    preds = torch.stack([lib(Xl[i], edge_index, edge_weight) for i in range(ntr)])
+    loss = nn.functional.l1_loss(preds, Y[:ntr]); loss.backward(); opt.step()
+
+lib.eval()
+with torch.no_grad():
+    preds = torch.stack([lib(Xl[i], edge_index, edge_weight) for i in range(ntr, len(Xl))])
+    print("PyG-Temporal A3TGCN test MAE = %.3f km/h" % (nn.functional.l1_loss(preds, Y[ntr:]).item() * sd))
+</code></pre>
+<div class="code-caption"><strong>Code 32.2.3:</strong> The same forecaster via PyTorch Geometric Temporal. The hand-written graph convolution, GRU braiding, and adjacency normalization of Code 32.2.1 and 32.2.2 (about 55 lines) collapse into the single <code>A3TGCN</code> layer plus a linear head, roughly 12 lines, a better-than-four-fold reduction. The library handles the diffusion convolution, the gated recurrence, the temporal attention over the window, and the multi-step output internally, and swapping <code>A3TGCN</code> for <code>DCRNN</code> changes the spatial operator with no other edits.</div>
+<pre><code class="language-text">PyG-Temporal A3TGCN test MAE = 2.301 km/h</code></pre>
+<div class="code-caption"><strong>Output 32.2.2:</strong> The library model reaches a slightly lower MAE (2.30 vs 2.42 km/h) than the hand-built version, the small gain coming from its attention over the input window, while requiring a fraction of the code, the recurring lesson that production traffic forecasters are assembled from library blocks, not written by hand.</div>
+<p>Read the pair together as the chapter's central demonstration. Code 32.2.2 built the spatial-then-temporal pattern by hand, exposing every moving part: the graph convolution that mixes neighbors, the GRU that carries history, the readout that emits a multi-step forecast. Code 32.2.3 replaced all of it with one <code>A3TGCN</code> layer and got a comparable, marginally better result in a quarter of the code. The from-scratch version is for understanding; the library version is for shipping. Both confirm the substantive point of the section: a spatio-temporal forecaster is a graph operator and a temporal operator braided together, and once you see the braid you can build it either way.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Network-Wide Speed Forecasting for a City Traffic Center</div>
+<p><strong>Who:</strong> The operations team at a metropolitan traffic management center responsible for variable-message signs and ramp metering across a freeway network of about 300 loop detectors, working from the PEMS-style sensor feed that mirrors the running sensor/IoT dataset of <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a>.</p>
+<p><strong>Situation:</strong> They needed 15-, 30-, and 60-minute network-wide speed forecasts to trigger ramp metering before congestion formed, rather than reacting after queues had already built.</p>
+<p><strong>Problem:</strong> Their incumbent system ran 300 independent per-sensor ARIMA models, which forecast the periodic rhythm well but were always late on incident-driven congestion, because a per-sensor model cannot see a slowdown forming two exits upstream until it arrives locally.</p>
+<p><strong>Dilemma:</strong> Adopt a graph spatio-temporal model (DCRNN or Graph WaveNet) for the upstream-propagation signal, at the cost of a heavier training pipeline and a GPU, or keep the simple, robust, interpretable per-sensor baselines that operators already trusted.</p>
+<p><strong>Decision:</strong> They kept the per-sensor historical-average and ARIMA baselines as a fallback and a fairness yardstick, and deployed a Graph WaveNet on top, using the road distance graph as the given prior plus a learned residual adjacency, exactly the hybrid recipe of subsection three.</p>
+<p><strong>How:</strong> They trained on a year of five-minute data with the standard twelve-in, twelve-out protocol, evaluated against the baselines at all three horizons, and shipped the graph model only for the horizons (45 and 60 minutes) where it measurably beat the baselines, routing the 15-minute forecasts, where the graph helped little, to the cheaper per-sensor model.</p>
+<p><strong>Result:</strong> The graph model cut 60-minute MAE by about 9 percent over the per-sensor ARIMA and, more importantly, flagged incident-driven slowdowns several minutes earlier because it read the upstream sensors, which let ramp metering engage before the queue formed. The 15-minute forecasts stayed on the cheap baseline with no loss.</p>
+<p><strong>Lesson:</strong> Deploy the graph where it pays (long horizons, incident episodes) and keep the strong simple baseline everywhere else; measure the graph's benefit per horizon rather than assuming it helps uniformly, the discipline subsection four insists on.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: The Landmark Models Are One Import Away</div>
+<p>The from-scratch graph-conv-plus-GRU of Code 32.2.1 and 32.2.2 ran about 55 lines. PyTorch Geometric Temporal packages every landmark architecture of this section as a single recurrent or convolutional layer: <code>DCRNN</code>, <code>A3TGCN</code>, <code>STConv</code> (the STGCN block), <code>GConvGRU</code>, and <code>MTGNN</code> among others, each accepting an edge index and an optional edge weight and handling the graph convolution, the recurrence or temporal convolution, and the gating internally. Swapping the spatial-temporal architecture becomes a one-line import change, and the same data layout feeds them all, so comparing DCRNN against Graph WaveNet against an attention model is a loop over layer classes rather than three separate codebases. For the road graph itself, build the adjacency once from sensor coordinates with a Gaussian kernel on driving distance and reuse it across every model.</p>
+</div>
+
+<h2>6. Summary and What Carries Forward <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Traffic forecasting is the canonical spatio-temporal problem because it has all the ingredients in their clearest form: a real, interpretable graph of road sensors; signals that evolve in time at every node; and a propagation physics (congestion travelling upstream) that makes the spatial coupling genuinely informative rather than incidental. The winning architecture pattern is a factorization, a spatial operator (graph convolution over the road network) braided with a temporal operator (an RNN, a TCN, or attention, straight from Part III), and the landmark models DCRNN, STGCN, and Graph WaveNet are three points in that design space, differing mainly in their spatial operator and in whether the graph is given or learned. The benchmark literature (METR-LA, PEMS) teaches a hard-won discipline: the temporal model is most of the win, the graph is a real but modest add-on concentrated at long horizons and anomalous episodes, and strong simple baselines must always be the yardstick.</p>
+<p>What carries forward: the spatial-temporal factorization recurs in the next section, <a href="section-32.3.html">Section 32.3</a> on video understanding, where the "graph" becomes a grid of pixels and the spatial operator a 2-D convolution, but the braid with a temporal operator is the same. The learned-graph idea connects forward to the structure-learning themes of trustworthy modeling in <a href="../../part-8-trustworthy-deployed/module-33-interpretability-robustness/index.html">Chapter 33</a>, and the deployment discipline of the practical example is the subject of <a href="../../toc.html">Chapter 34</a>. The single idea to keep is the braid: a spatio-temporal model is a graph operator and a temporal operator interleaved, and almost everything else is a choice of which operator to use on each axis.</p>
+
+<section class="exercises">
+<h2>Exercises</h2>
+<div class="callout exercise">
+<div class="callout-title">Exercise 32.2.1 (Conceptual): The Direction of Propagation</div>
+<p>A congestion shockwave travels upstream (against the direction of traffic flow), but a clearing wave (when the incident is removed) also travels in a characteristic direction. Explain why a directed, asymmetric spatial operator such as DCRNN's two-term diffusion convolution can represent both, whereas a symmetric one-hop graph convolution on an undirected graph cannot distinguish upstream from downstream neighbors. Relate your answer to the in-degree and out-degree normalizations $\mathbf{D}_I^{-1}\mathbf{A}^\top$ and $\mathbf{D}_O^{-1}\mathbf{A}$ in the DCRNN formula of subsection three.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 32.2.2 (Implementation): Add a Second Hop and a Learned Graph</div>
+<p>Starting from the from-scratch <code>GraphConv</code> of Code 32.2.1, (a) extend it to a two-hop convolution by applying <code>A_norm</code> twice (or by using $\tilde{\mathbf{A}}^2$) and measure whether the two-hop model forecasts the upstream-propagating incidents better than the one-hop model on the synthetic chain. Then (b) replace the fixed <code>A_norm</code> with a learned adjacency $\mathrm{softmax}(\mathrm{ReLU}(\mathbf{E}_1\mathbf{E}_2^\top))$ from two learned node-embedding matrices, as in Graph WaveNet, and compare its test MAE and its learned edges against the true chain graph. Does the learned graph recover the chain?</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 32.2.3 (Open-ended): When Does the Graph Stop Helping?</div>
+<p>Using the strong-baseline discipline of subsection four, design an experiment on a real benchmark (METR-LA or a PEMS dataset via PyTorch Geometric Temporal) that isolates the contribution of the graph. Train three models, a per-node temporal model with no graph, a graph model on the given road adjacency, and a graph model on a learned adjacency, under an identical hyperparameter budget, and report MAE at the 15-, 30-, and 60-minute horizons separately. At which horizon does the graph first earn its complexity, and how large is the gain relative to the temporal-only model? Discuss whether your finding supports or undercuts the leaderboard-culture critique of the research-frontier callout.</p>
+</div>
+</section>
+
+<nav class="chapter-nav">
+<a class="nav-prev" href="section-32.1.html">&#8592; Previous: Section 32.1</a>
+<a class="nav-up" href="index.html">Chapter 32 Index</a>
+<a class="nav-next" href="section-32.3.html">Next: Video Understanding &#8594;</a>
+</nav>
+</main>
+<footer class="book-footer">
+<p class="edition-line">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="copyright-line">&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+<p class="last-updated"><script>document.write("Last updated: " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>
