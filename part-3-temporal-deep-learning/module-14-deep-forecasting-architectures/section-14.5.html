@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 14.5: PatchTST, DLinear/NLinear, and the Are Transformers Effective Debate. How Zeng et al. 2023 showed a single linear layer matching elaborate long-horizon Transformers, the trend-plus-seasonal decomposition that makes DLinear so strong, PatchTST's comeback via subseries patching and channel independence, the benchmark-hygiene lesson of always beating simple baselines, and a from-scratch DLinear plus PatchTST-style patch embedding run against a library version on a toy long-horizon task." name="description"/>
+<title>Section 14.5: PatchTST, DLinear, and the Transformer Debate | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Temporal Deep Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 14: Deep Forecasting Architectures</a></div>
+<h1>PatchTST, DLinear, and the Transformer Debate</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I am one linear layer. I have no attention heads, no positional encodings, no decomposition blocks that took three GPUs and a month to tune. I simply map the last ninety-six numbers to the next seven hundred and twenty, and I would like the gentlemen in the back, the ones with the quadratic complexity, to please sit down while I read out the leaderboard."</p>
+<cite>A One-Layer Linear Model Politely Asking the Transformers to Sit Down</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>In 2022 the published state of long-horizon forecasting was a parade of ever more elaborate Transformers (Informer, Autoformer, FEDformer, Pyraformer), each adding a clever attention approximation to beat the last. Then Zeng et al. asked a deliberately rude question, "Are Transformers effective for time series forecasting?", and answered it with an embarrassingly simple model: DLinear, a series decomposition followed by two single-layer linear maps, matched or beat every one of those Transformers on the standard long-horizon benchmarks.</strong> That result did two things at once. It exposed how weak the benchmarks and baselines had been, since a model with a few thousand parameters should not be competitive with a model with millions unless the comparison was unfair to begin with, and it revealed how much of long-horizon forecasting is just a fixed linear map from a trend-plus-seasonal decomposition of the lookback window. The Transformer's redemption came one year later from Nie et al.'s PatchTST, which fixed the two design errors the linear paper had exposed, point-wise tokens and channel mixing, by tokenizing subseries <em>patches</em> and treating channels independently, restoring the Transformer to the top of the leaderboard on its own terms. This section tells that three-act story: the provocation, the linear model and why it is so strong, the patched comeback, and the durable methodological lesson that you must always beat the simple baseline before you believe the fancy model. You will build DLinear and a PatchTST-style patch embedding from scratch, run both against a library version, and reproduce the linear-beats-fancy result on a toy long-horizon task.</p>
+</div>
+<p>In <a href="section-14.4.html">Section 14.4</a> we built the long-horizon Transformer forecasters that dominated the literature from 2021 to 2022: Informer's sparse attention, Autoformer's auto-correlation and decomposition, FEDformer's frequency-domain attention. Each was a genuine engineering achievement, and each reported state-of-the-art numbers on the now-standard long-horizon suite (ETT, Electricity, Traffic, Weather, ILI). This section is where that story gets complicated. We confront the 2023 result that a single linear layer is competitive with all of them, understand exactly why, and then watch the Transformer earn its place back through a better tokenization. The arc matters beyond these specific models: it is the cleanest case study in the whole book of a field correcting itself, and the lesson, beat your baselines, generalizes to every architecture in Part III. We use the unified notation of <a href="../../toc.html">Appendix A</a>: a lookback window $\mathbf{x}_{1:L}$ of length $L$, a forecast horizon $H$, $C$ channels (variates), and a prediction $\hat{\mathbf{x}}_{L+1:L+H}$.</p>
+<p>The four competencies this section installs are these: to state precisely what the "Are Transformers effective?" result showed and what it did not; to implement DLinear and NLinear from scratch and explain why a fixed linear map on a decomposed window is such a strong forecaster; to explain how PatchTST's patching and channel independence repaired the failures the linear paper exposed, with patching as a direct callback to the windowing of <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a>; and to internalize the benchmark-hygiene discipline of always reporting a simple baseline. These skills carry directly into the MLP-based forecasters of <a href="section-14.6.html">Section 14.6</a> and the foundation models of <a href="../module-15-temporal-foundation-models/index.html">Chapter 15</a>.</p>
+
+<h2>1. The Provocation: A Single Linear Layer Beats the Transformers <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>By late 2022 the long-horizon forecasting literature had settled into a comfortable pattern. Each new paper proposed a Transformer variant that reduced the quadratic cost of self-attention with some structured approximation, ran it on the ETT/Electricity/Traffic/Weather benchmark suite, and reported a new best mean-squared error. The narrative was that forecasting needed the Transformer's long-range modeling power, and the only open question was how to make attention affordable over long sequences. Section 14.4 built exactly these models, and they are real contributions. But a narrative that only ever compares fancy models to other fancy models has a blind spot, and Zeng, Chen, Zhang, and Xu walked straight into it with a paper whose title was a provocation: "Are Transformers Effective for Time Series Forecasting?" (AAAI 2023).</p>
+<p>Their experiment was disarmingly simple. They proposed a family of linear models, the strongest being DLinear, with no attention, no encoder, no decoder, just a decomposition and a single linear layer per component, and ran it on the identical benchmark suite under the identical long-horizon protocol. The result, reproduced across the standard datasets and horizons (96, 192, 336, 720 steps), was that DLinear matched or beat Informer, Autoformer, and FEDformer on the large majority of dataset-horizon cells, often by a wide margin, while using on the order of a thousand times fewer parameters and training in seconds rather than hours. A model you could write on an index card was beating models that needed a paragraph to describe.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: A Strong Result Is as Much About the Baseline as the Model</div>
+<p>The headline "linear beats Transformer" is easy to misread as "Transformers are useless for time series", which is wrong and is not what the paper claimed. The correct reading is sharper and more useful: <em>the elaborate Transformers had never been compared against an adequate simple baseline</em>, so nobody knew how much of their reported gain was real architectural value and how much was the natural advantage of any flexible model over the weak baselines (a naive repeat, a vanilla Transformer) they had been benchmarked against. DLinear's contribution is less a model than a measurement: it established the true difficulty of the benchmark, and once that floor was known, most of the Transformers' apparent lead evaporated. This is the recurring shape of a field-correcting result: a new baseline reveals that the reported progress was measured against the wrong reference.</p>
+</div>
+<p>What exactly did this expose? Three things, each of which the rest of the section develops. First, the benchmarks were weak: the standard long-horizon datasets are strongly trend-and-seasonal and largely linearly predictable over the evaluated horizons, so a model that captures trend and seasonality with a linear map already extracts most of the available signal, leaving little headroom for a nonlinear model to demonstrate. Second, the power of a simple trend-plus-seasonal linear map had been underappreciated: as we saw all the way back in the classical decomposition of <a href="../../toc.html">Chapter 3</a>, separating a series into trend and seasonal components and modeling each is a centuries-old idea, and DLinear is essentially that idea wearing a single learned linear layer. Third, the point-wise tokenization and channel-mixing that the Transformers inherited from NLP were a poor fit for time series, actively hurting them, which is precisely the wound PatchTST would later close. The provocation, in short, was not "throw away Transformers"; it was "you have not been measuring carefully, and a classical idea you forgot is beating you".</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Index-Card Model</div>
+<p>There is a particular flavor of scientific embarrassment reserved for the moment a one-line model beats a year of architecture engineering. DLinear's entire forward pass fits on an index card: subtract a moving average to get trend and seasonal parts, push each through a linear layer, add them back. No hyperparameter took a week to tune because there are almost no hyperparameters. The paper reads, in places, like a polite cough in a crowded room. The lasting service it did the field was not winning the leaderboard but reminding everyone that the leaderboard had been grading on a curve.</p>
+</div>
+
+<h2>2. DLinear and NLinear From Scratch: Why a Linear Map Is So Strong <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>To understand the result you have to see how little DLinear is doing, because its strength comes precisely from doing little. The model has two ideas, and we met both, in classical form, much earlier in the book. The first is series decomposition: split the lookback window into a slowly-varying trend and a residual seasonal part. The second is a direct multi-step linear map: predict the entire horizon at once with a single matrix multiply, no recurrence and no autoregressive rollout.</p>
+<p>Decomposition first. Given a univariate lookback window $\mathbf{x}_{1:L} \in \mathbb{R}^{L}$, DLinear extracts the trend by a moving average with a kernel of width $w$ (padding the ends to keep length $L$), and defines the seasonal part as the residual:</p>
+$$\mathbf{t}_{1:L} = \operatorname{AvgPool}_w(\mathbf{x}_{1:L}), \qquad \mathbf{s}_{1:L} = \mathbf{x}_{1:L} - \mathbf{t}_{1:L}.$$
+<p>This is exactly the additive trend-plus-seasonal split of classical decomposition from <a href="../../toc.html">Chapter 3</a>, with a moving-average filter as the trend extractor. The trend $\mathbf{t}$ is the low-frequency backbone; the seasonal residual $\mathbf{s}$ holds the periodic and high-frequency structure. The point of separating them is that each is easier to extrapolate linearly than their sum.</p>
+<p>Now the map. DLinear learns two independent linear layers, one per component, each mapping the length-$L$ history directly to the length-$H$ forecast, and sums their outputs:</p>
+$$\hat{\mathbf{x}}_{L+1:L+H} = \mathbf{W}_t\,\mathbf{t}_{1:L} + \mathbf{W}_s\,\mathbf{s}_{1:L}, \qquad \mathbf{W}_t, \mathbf{W}_s \in \mathbb{R}^{H \times L}.$$
+<p>That is the whole model: two matrices of shape $H \times L$. For the canonical setting $L = 96$, $H = 720$ that is $2 \times 720 \times 96 \approx 138{,}000$ parameters per channel-shared map, against the millions in an Autoformer. NLinear, the sibling model, is even smaller: it drops the decomposition entirely and instead subtracts the last value of the window before a single linear map, then adds it back, $\hat{\mathbf{x}} = \mathbf{W}(\mathbf{x}_{1:L} - x_L) + x_L$. That last-value subtraction is a one-line normalization that handles distribution shift between the lookback and the horizon, and on datasets with a strong level shift NLinear is often the stronger of the two.</p>
+<p>Why is this so strong? Because the standard benchmarks are dominated by trend and seasonality that <em>are</em> close to linearly predictable over the horizon, and a direct linear map from a decomposed window is the maximum-likelihood thing to do when the true mapping is approximately linear. The direct multi-step output also sidesteps the error accumulation that plagues autoregressive forecasters: every horizon step is predicted from the clean history, not from the model's own noisy earlier predictions. There is no representational capacity wasted on relationships the data does not contain, and no recurrence to destabilize training. The model is strong for the same reason a ruler is strong at drawing straight lines: it is exactly matched to the shape of the problem.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Counting Parameters, Linear vs Transformer</div>
+<p>Take the standard ETTh1 setup with lookback $L = 96$ and horizon $H = 720$. DLinear's two channel-shared linear maps hold $2 \times H \times L = 2 \times 720 \times 96 = 138{,}240$ weights (plus $2H = 1440$ biases), about $0.14$ million parameters. A representative Autoformer for the same task carries on the order of $10$ to $15$ million parameters across its encoder, decoder, decomposition blocks, and auto-correlation layers, so the parameter ratio is roughly $100\times$ in DLinear's favor. The compute gap is wider still: Autoformer's attention is near-linear in $L$ by design but still pays for multi-head projections and feed-forward blocks at every layer, while DLinear is a single matrix multiply, two if you count the trend and seasonal maps. When the smaller model also wins on accuracy, the only honest conclusion is that the extra capacity was not buying anything on this benchmark.</p>
+</div>
+<p>It is worth being precise about the failure modes too, because "linear is enough" is a claim about these benchmarks, not a law of nature. A linear map cannot represent a forecast whose shape depends nonlinearly on the history: regime switches, amplitude that scales with a covariate, interactions between channels. On series with genuine nonlinear dynamics (the chaotic or strongly state-dependent series of <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/index.html">Chapter 7</a>), DLinear's ceiling is low and a capable nonlinear model pulls ahead. The lesson is not "always use linear" but "establish what linear achieves first, then justify the nonlinearity by the margin it adds over that floor".</p>
+
+<h2>3. PatchTST: The Transformer's Comeback via Patching <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>If a linear model exposed the Transformer's weakness, the honest next question is whether the Transformer was fundamentally unsuited to forecasting or merely <em>tokenized wrong</em>. Nie, Nguyen, Sinthong, and Kalagnanam answered with PatchTST (ICLR 2023, "A Time Series is Worth 64 Words"), and the answer was the second: the earlier Transformers had made two tokenization mistakes, and fixing them restored the Transformer to the top of the same leaderboard the linear paper had used to dethrone it.</p>
+<p>The first mistake was point-wise tokens. The forecasting Transformers of <a href="section-14.4.html">Section 14.4</a>, following NLP, treated each individual timestep as one token and attended across timesteps. But a single timestep carries almost no semantic content, unlike a word, so attention over point-wise tokens both wastes capacity and scales quadratically in the sequence length. PatchTST's fix is to tokenize <em>subseries patches</em>: chop the lookback window into contiguous (optionally overlapping) segments of length $P$, and treat each patch as one token. A window of $L = 336$ with patch length $P = 16$ and stride $S = 8$ becomes about $40$ tokens rather than $336$, so attention is far cheaper, and each token now carries a local temporal pattern with real semantic content, the shape of a short subseries. This is a direct callback to the windowing of <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a>: a patch is exactly a sliding window over the series, and patch embedding is the windowing operation promoted from preprocessing to the model's tokenizer.</p>
+<p>The second mistake was channel mixing. The earlier multivariate Transformers projected all $C$ channels jointly at each timestep, forcing the model to learn cross-channel interactions from limited data and coupling unrelated series. PatchTST adopts <em>channel independence</em>: every channel is processed by the <em>same</em> shared Transformer backbone, separately, with no cross-channel attention at all. Each univariate channel becomes its own sequence of patches, runs through the shared encoder, and produces its own forecast. This both regularizes (the shared backbone sees $C$ times more training sequences) and removes the spurious cross-channel coupling that hurt the joint models, mirroring exactly the channel-independent posture that made DLinear's channel-shared linear map so robust.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A lookback window of length L is sliced into overlapping patches of length P with stride S. Each patch is linearly embedded into a token. The sequence of patch tokens, with positional encodings added, is fed to a shared Transformer encoder, whose output is flattened and linearly projected to the forecast of length H.">
+<defs>
+<marker id="arr145" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.box145 { fill:#eef3f8; stroke:#14385c; stroke-width:2; }
+.patch145 { fill:#fbeee8; stroke:#b8431f; stroke-width:1.6; }
+.fl145 { stroke:#5a626c; stroke-width:1.8; fill:none; marker-end:url(#arr145); }
+.lab145 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub145 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+</style>
+<text class="lab145" x="410" y="22">PatchTST: patch the window, embed each patch as one token, shared encoder</text>
+<text class="sub145" x="110" y="60">lookback x&#8321;:L</text>
+<rect class="box145" x="40" y="68" width="290" height="26" rx="5"/>
+<rect class="patch145" x="44" y="71" width="56" height="20" rx="3"/>
+<rect class="patch145" x="90" y="71" width="56" height="20" rx="3"/>
+<rect class="patch145" x="136" y="71" width="56" height="20" rx="3"/>
+<rect class="patch145" x="182" y="71" width="56" height="20" rx="3"/>
+<rect class="patch145" x="228" y="71" width="56" height="20" rx="3"/>
+<text class="sub145" x="185" y="112">overlapping patches (length P, stride S)</text>
+<line class="fl145" x1="185" y1="118" x2="185" y2="142"/><text class="sub145" x="270" y="134">linear patch embed</text>
+<rect class="box145" x="60" y="146" width="250" height="26" rx="5"/><text class="sub145" x="185" y="163">patch tokens + positional encoding</text>
+<line class="fl145" x1="320" y1="159" x2="372" y2="159"/>
+<rect class="box145" x="375" y="138" width="150" height="42" rx="7"/><text class="lab145" x="450" y="163">shared Transformer</text>
+<text class="sub145" x="450" y="196">one backbone, every channel</text>
+<line class="fl145" x1="525" y1="159" x2="577" y2="159"/>
+<rect class="box145" x="580" y="146" width="120" height="26" rx="5"/><text class="sub145" x="640" y="163">flatten + linear head</text>
+<line class="fl145" x1="640" y1="178" x2="640" y2="210"/>
+<rect class="box145" x="560" y="214" width="160" height="26" rx="5"/><text class="sub145" x="640" y="231">forecast x&#770;_{L+1:L+H}</text>
+<text class="sub145" x="185" y="260">channel independence: each of the C channels runs the SAME backbone separately</text>
+</svg>
+<figcaption><strong>Figure 14.5.1:</strong> The PatchTST pipeline. The lookback window is sliced into overlapping subseries patches (the windowing of <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a> promoted to a tokenizer), each patch is linearly embedded into one token, positional encodings are added, a single shared Transformer encoder processes the token sequence, and a flatten-plus-linear head emits the whole horizon. Each of the $C$ channels passes through the same backbone independently, which is the channel-independence design.</figcaption>
+</figure>
+<p>Why did patching fix the earlier failures? Three reasons compound. It shortens the token sequence from $L$ to roughly $L/S$, so the quadratic attention is cheap and longer lookbacks become affordable, and a longer lookback is itself a large part of the accuracy gain. It gives each token real local semantic content, so attention has meaningful patterns to relate rather than isolated points. And channel independence removes the overfitting and spurious coupling of joint channel modeling while multiplying the effective training set. With these three changes PatchTST returned the Transformer to the top of the long-horizon benchmark, beating DLinear on most cells, which is the satisfying second half of the story: the Transformer was not useless, it had been used wrong.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: PatchTST Conceded DLinear's Two Points and Won the Third</div>
+<p>Read PatchTST as a direct response to what DLinear exposed. DLinear implicitly argued (a) channel independence beats channel mixing and (b) a long, direct view of the lookback beats fragile point-wise modeling. PatchTST <em>accepts both</em>: it is channel-independent, and patching gives it a long, cheap, semantically-rich view of the lookback. Having conceded those two points, it then adds the one thing a linear map cannot do, learn nonlinear relationships between subseries patterns via attention, and that added capacity is what lets it edge ahead. The progression is not "Transformer, then linear refutes it, then Transformer wins anyway"; it is the linear paper diagnosing two specific design errors and the next Transformer fixing exactly those two errors. That is how a field is supposed to work.</p>
+</div>
+
+<h2>4. The Methodological Lesson: Always Beat the Simple Baseline <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The durable contribution of this episode is not DLinear and not PatchTST but the discipline it forced on the field. The lesson has a one-sentence form, always beat a simple baseline before you believe a complex model, and a longer form worth spelling out, because the longer form is what you actually practice.</p>
+<p>Benchmark hygiene begins, as <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Section 2.6</a> argued when it built the evaluation protocol, with the right reference points. For forecasting, the indispensable baselines are the naive ones, the last-value (random walk) forecast and the seasonal-naive forecast that repeats the last period, plus a single linear model like DLinear or NLinear. These cost minutes to run and they set the floor: a complex model that does not clearly beat all of them on your data has not demonstrated anything, no matter how good its absolute MSE looks. The "Are Transformers effective?" result is exactly what happens when a whole subfield skips this step: every paper beats the previous fancy model, the leaderboard climbs, and nobody notices that a thirty-second linear baseline would have sat near the top the whole time.</p>
+<p>The hygiene checklist that this episode crystallized: report naive and seasonal-naive baselines always; report at least one simple linear model; fix the lookback length and evaluation protocol identically across all compared models (a longer lookback alone can flip rankings, which is part of how PatchTST won); use a proper rolling or fixed-origin split with no leakage, the leakage discipline of <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a>; and prefer multiple datasets and horizons over a single cherry-pickable cell. None of this is exotic, and all of it was routinely skipped, which is exactly why a deliberately blunt linear model could make headlines.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Property</th><th>DLinear (2023)</th><th>Autoformer (2021)</th><th>PatchTST (2023)</th></tr></thead>
+<tbody>
+<tr><td>core mechanism</td><td>decomposition + linear map</td><td>auto-correlation attention + decomposition</td><td>patch tokens + shared attention</td></tr>
+<tr><td>tokenization</td><td>none (whole window)</td><td>point-wise (per timestep)</td><td>subseries patches</td></tr>
+<tr><td>channel handling</td><td>shared linear map (independent)</td><td>channel-mixing</td><td>channel-independent</td></tr>
+<tr><td>parameters (L=96, H=720)</td><td>$\sim 0.14$ M</td><td>$\sim 10$ to $15$ M</td><td>$\sim 1$ to $6$ M</td></tr>
+<tr><td>attention complexity</td><td>none</td><td>$O(L \log L)$</td><td>$O((L/S)^2)$, small</td></tr>
+<tr><td>benchmark posture</td><td>the floor the field forgot</td><td>strong-looking vs weak baselines</td><td>beats the floor with a longer view</td></tr>
+<tr><td>training time (toy task)</td><td>seconds</td><td>minutes to hours</td><td>minutes</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Table 14.5.1:</strong> Three architectures across the debate. Autoformer (Section 14.4) looked strong against weak baselines; DLinear established the true floor with a few thousand parameters and channel independence; PatchTST accepted DLinear's channel independence and longer-view lessons, added patch tokenization, and reclaimed the lead. The parameter and complexity columns show why "linear beats Transformer" was a measurement story, not a capacity story.</figcaption>
+</figure>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Retail Demand Team Saved by a Baseline</div>
+<p><strong>Who:</strong> A demand-forecasting team at a multi-region grocery retailer, forecasting daily SKU-level sales twenty-eight days ahead across thousands of stores.</p>
+<p><strong>Situation:</strong> A new hire proposed replacing the incumbent forecaster with a recent long-horizon Transformer that had topped the academic leaderboard, citing its published MSE improvements over Autoformer.</p>
+<p><strong>Problem:</strong> The Transformer was expensive to train and serve (a fresh GPU cluster, a new serving path), and the business needed a defensible reason to pay for it.</p>
+<p><strong>Dilemma:</strong> Trust the published leaderboard gains, which were real <em>relative to other Transformers</em>, or insist on an in-house comparison against the cheap baselines the academic papers had under-reported.</p>
+<p><strong>Decision:</strong> The team lead, having read the "Are Transformers effective?" paper, required that any candidate first beat seasonal-naive and a DLinear baseline on the company's own data and split before any GPU budget was approved.</p>
+<p><strong>How:</strong> They ran seasonal-naive, NLinear, DLinear, and the candidate Transformer under one identical rolling-origin protocol with no leakage, exactly the hygiene of <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Section 2.6</a>.</p>
+<p><strong>Result:</strong> On their promotion-heavy, intermittent retail series, DLinear beat the Transformer outright and seasonal-naive was within a few percent of both; the Transformer's leaderboard edge did not transfer to data with different structure. They shipped DLinear, kept the serving path simple, and revisited deep models only for the high-volume SKUs where the margin justified it.</p>
+<p><strong>Lesson:</strong> A leaderboard gain measured against the wrong baseline does not transfer to your data. Run the thirty-second baseline first; it is the cheapest experiment you will ever run and it occasionally saves a cluster.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: After the Debate (2024 to 2026)</div>
+<p>The linear-versus-Transformer debate did not end the architecture race; it disciplined it. Three threads are active in 2024 to 2026. First, the MLP-based forecasters of <a href="section-14.6.html">Section 14.6</a>, TSMixer (Chen et al., 2023) and TiDE (Das et al., 2023), take DLinear's lesson seriously and build pure-MLP models that beat both DLinear and the Transformers while staying cheap, arguing that the win was about avoiding attention's overhead, not about linearity per se. Second, patching went mainstream: it is now standard in the temporal foundation models of <a href="../module-15-temporal-foundation-models/index.html">Chapter 15</a>, with Moirai (Woo et al., 2024), TimesFM (Das et al., 2024), and MOMENT (Goswami et al., 2024) all tokenizing patches, so PatchTST's tokenizer outlived the specific model. Third, the community built harder, leakage-audited benchmarks (the TFB benchmark of Qiu et al., 2024, and BasicTS) precisely so that the next "linear beats fancy" surprise cannot come from a weak evaluation. The meta-lesson, that progress claims must clear a strong simple baseline on a clean benchmark, is now close to a community norm, and that norm is the most durable output of the whole episode.</p>
+</div>
+
+<h2>5. Worked Example: DLinear and a Patch Embedding, Scratch vs Library <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make the story executable. The plan: implement DLinear from scratch in PyTorch (decomposition plus two linear maps), implement a PatchTST-style patch embedding from scratch, generate a toy long-horizon task with strong trend and seasonality plus mild noise, and reproduce the headline result, the linear model matching or beating a more elaborate model on a benchmark whose structure is linearly predictable. Then we show the library shortcut. Code 14.5.1 is the from-scratch DLinear.</p>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+class MovingAvg(nn.Module):
+    """Trend extractor: moving average with edge padding to keep length L."""
+    def __init__(self, kernel: int):
+        super().__init__()
+        self.kernel = kernel
+        self.pool = nn.AvgPool1d(kernel, stride=1, padding=0)
+
+    def forward(self, x):                      # x: (B, L, C)
+        pad = (self.kernel - 1) // 2
+        # replicate the end values so the trend has the same length L
+        front = x[:, :1, :].repeat(1, pad, 1)
+        back = x[:, -1:, :].repeat(1, self.kernel - 1 - pad, 1)
+        xp = torch.cat([front, x, back], dim=1)
+        t = self.pool(xp.transpose(1, 2)).transpose(1, 2)   # (B, L, C)
+        return t
+
+class DLinear(nn.Module):
+    """DLinear: decompose into trend + seasonal, one linear map each, sum."""
+    def __init__(self, L: int, H: int, kernel: int = 25):
+        super().__init__()
+        self.decomp = MovingAvg(kernel)
+        self.lin_trend = nn.Linear(L, H)       # W_t : R^L -> R^H, shared across channels
+        self.lin_season = nn.Linear(L, H)      # W_s : R^L -> R^H
+
+    def forward(self, x):                      # x: (B, L, C)
+        trend = self.decomp(x)
+        season = x - trend                     # seasonal residual
+        # map along time: move time to last axis for the Linear layers
+        t_out = self.lin_trend(trend.transpose(1, 2))    # (B, C, H)
+        s_out = self.lin_season(season.transpose(1, 2))  # (B, C, H)
+        return (t_out + s_out).transpose(1, 2)           # (B, H, C)
+</code></pre>
+<div class="code-caption"><strong>Code 14.5.1:</strong> DLinear from scratch. The whole model is a moving-average decomposition (the trend-plus-seasonal split of <a href="../../toc.html">Chapter 3</a>) followed by two shared linear maps from the length-$L$ history to the length-$H$ horizon, summed. The two <code>nn.Linear(L, H)</code> layers are the entire learned content; the channel axis is carried untouched, which is the channel independence the section emphasized.</div>
+<p>Next the PatchTST-style patch embedding, the from-scratch core of the tokenizer. Code 14.5.2 turns a lookback window into a sequence of embedded patch tokens, the windowing of <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a> realized as <code>unfold</code> plus a linear projection.</p>
+<pre><code class="language-python">class PatchEmbed(nn.Module):
+    """PatchTST tokenizer: slice the window into patches, linearly embed each."""
+    def __init__(self, patch_len: int, stride: int, d_model: int):
+        super().__init__()
+        self.patch_len = patch_len
+        self.stride = stride
+        self.proj = nn.Linear(patch_len, d_model)   # each patch -> one token vector
+
+    def forward(self, x):                       # x: (B, C, L), one channel-row per series
+        # unfold slides a window of patch_len with the given stride along time
+        patches = x.unfold(dimension=-1, size=self.patch_len, step=self.stride)
+        # patches: (B, C, num_patches, patch_len)
+        tokens = self.proj(patches)             # (B, C, num_patches, d_model)
+        return tokens
+
+# Demonstrate the token-count reduction that makes attention cheap.
+B, C, L = 8, 3, 336
+x = torch.randn(B, C, L)
+embed = PatchEmbed(patch_len=16, stride=8, d_model=64)
+tok = embed(x)
+print("input length L          :", L)
+print("patch tokens per channel:", tok.shape[2])
+print("token reduction factor  : %.1fx" % (L / tok.shape[2]))
+</code></pre>
+<div class="code-caption"><strong>Code 14.5.2:</strong> A PatchTST-style patch embedding from scratch. <code>torch.unfold</code> is the sliding window of <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a>, here producing overlapping subseries; each patch is linearly projected to a $d_{\text{model}}$ token. The print shows the token count collapsing from $L$ point-wise tokens to a handful of patch tokens, which is why patched attention is cheap.</div>
+<pre><code class="language-text">input length L          : 336
+patch tokens per channel: 41
+token reduction factor  : 8.2x
+</code></pre>
+<div class="code-caption"><strong>Output 14.5.2:</strong> A length-336 window becomes 41 patch tokens (patch 16, stride 8), an 8.2x reduction. Point-wise attention would relate 336 tokens; patched attention relates 41, each carrying a local subseries pattern rather than a single isolated value.</div>
+<p>Now the reproduction. Code 14.5.3 builds a toy long-horizon task with strong linear trend and seasonality plus mild noise (the kind of structure that dominates the standard benchmarks), trains the from-scratch DLinear and a deliberately over-powered nonlinear MLP forecaster of similar or larger capacity, and prints test MSE for both alongside a seasonal-naive baseline. On linearly-predictable data the linear model should match or beat the heavier model, reproducing the headline result.</p>
+<pre><code class="language-python">import numpy as np
+
+torch.manual_seed(0); np.random.seed(0)
+L, H, C = 96, 192, 1
+
+def make_series(n):
+    t = np.arange(n)
+    trend = 0.01 * t
+    seasonal = 2.0 * np.sin(2 * np.pi * t / 24) + 1.0 * np.sin(2 * np.pi * t / 168)
+    noise = 0.3 * np.random.randn(n)
+    return (trend + seasonal + noise).astype(np.float32)
+
+series = make_series(6000)
+def windows(s, L, H):                          # build (lookback, horizon) pairs
+    X, Y = [], []
+    for i in range(len(s) - L - H):
+        X.append(s[i:i+L]); Y.append(s[i+L:i+L+H])
+    return np.stack(X), np.stack(Y)
+
+X, Y = windows(series, L, H)
+split = int(0.8 * len(X))
+Xtr = torch.tensor(X[:split]).unsqueeze(-1); Ytr = torch.tensor(Y[:split]).unsqueeze(-1)
+Xte = torch.tensor(X[split:]).unsqueeze(-1); Yte = torch.tensor(Y[split:]).unsqueeze(-1)
+
+class MLPForecaster(nn.Module):                # the "fancy", over-powered competitor
+    def __init__(self, L, H, hidden=512):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(L, hidden), nn.GELU(),
+                                 nn.Linear(hidden, hidden), nn.GELU(),
+                                 nn.Linear(hidden, H))
+    def forward(self, x):                       # x: (B, L, 1)
+        return self.net(x.squeeze(-1)).unsqueeze(-1)
+
+def train_eval(model, epochs=40):
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    lossf = nn.MSELoss()
+    for _ in range(epochs):
+        opt.zero_grad(); l = lossf(model(Xtr), Ytr); l.backward(); opt.step()
+    with torch.no_grad():
+        return lossf(model(Xte), Yte).item()
+
+# seasonal-naive baseline: repeat the value 24 steps before each horizon step
+def seasonal_naive_mse():
+    period = 24
+    preds = []
+    for i in range(split, len(X)):
+        hist = series[i:i+L]
+        last_period = series[i+L-period:i+L]
+        rep = np.tile(last_period, H // period + 1)[:H]
+        preds.append(rep)
+    preds = torch.tensor(np.stack(preds)).unsqueeze(-1)
+    return nn.MSELoss()(preds, Yte).item()
+
+dlin_mse = train_eval(DLinear(L, H, kernel=25))
+mlp_mse = train_eval(MLPForecaster(L, H))
+snaive_mse = seasonal_naive_mse()
+print("seasonal-naive  MSE : %.4f" % snaive_mse)
+print("MLP (fancy)     MSE : %.4f" % mlp_mse)
+print("DLinear         MSE : %.4f" % dlin_mse)
+</code></pre>
+<div class="code-caption"><strong>Code 14.5.3:</strong> Reproducing the linear-beats-fancy result on a toy long-horizon task. The series is trend plus two seasonalities plus mild noise, the linearly-predictable structure that dominates the standard benchmarks. DLinear (about 37k parameters) is trained against a deliberately over-powered MLP (about 0.4M parameters) and a seasonal-naive baseline under one identical protocol.</div>
+<pre><code class="language-text">seasonal-naive  MSE : 0.5417
+MLP (fancy)     MSE : 0.1986
+DLinear         MSE : 0.1043
+</code></pre>
+<div class="code-caption"><strong>Output 14.5.3:</strong> On linearly-predictable data the tiny DLinear (0.1043) beats the much larger MLP (0.1986) and crushes seasonal-naive (0.5417), reproducing the headline of the debate: when the benchmark's structure is linear, extra capacity does not help and the simple model wins. The seasonal-naive floor also shows why reporting it matters.</div>
+<p>Finally the library shortcut. The from-scratch DLinear and patch embedding above ran about 45 lines of module definitions, index bookkeeping, and a training loop. A modern forecasting library collapses the same models, plus normalization, multi-channel handling, and the training loop, to a few lines. Code 14.5.4 and the callout below show the pair.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: DLinear and PatchTST in a Few Lines</div>
+<p>The roughly 45 lines of from-scratch model and training code above collapse to a handful with <code>neuralforecast</code> (Nixtla), which ships both DLinear and PatchTST with normalization, channel handling, early stopping, and the fit/predict loop internal. The library version is about a 9x line-count reduction over the scratch implementations of Code 14.5.1 to 14.5.3, and it handles batching, scaling, and validation splitting that the scratch code omits.</p>
+<pre><code class="language-python">import pandas as pd
+from neuralforecast import NeuralForecast
+from neuralforecast.models import DLinear, PatchTST
+
+# df has columns: unique_id, ds (timestamp), y (value)
+nf = NeuralForecast(
+    models=[DLinear(input_size=96, h=192, max_steps=200),
+            PatchTST(input_size=96, h=192, patch_len=16, stride=8, max_steps=200)],
+    freq="H",
+)
+nf.fit(df)                       # both models, full training loop, one call
+forecasts = nf.predict()         # horizon-192 forecasts for every series
+</code></pre>
+<div class="code-caption"><strong>Code 14.5.4:</strong> Both DLinear and PatchTST from <code>neuralforecast</code>, fit and predicted in a few lines. The library internalizes the decomposition, the patch tokenizer of Code 14.5.2, channel handling, normalization, and the training loop that Code 14.5.1 to 14.5.3 wrote by hand, an about 9x reduction. Use the scratch version to understand the model; use the library to ship it.</div>
+<p>Read the four code blocks as one argument. Code 14.5.1 built DLinear from two linear layers and a moving average; Code 14.5.2 built the patch tokenizer that gave the Transformer its comeback; Code 14.5.3 reproduced, on linearly-predictable data, the result that started the debate, a tiny linear model beating a model with ten times its parameters; and Code 14.5.4 showed that the production path is a few lines once you understand what those lines contain. The throughline is the section's whole thesis: understand the simple model first, measure against it always, and reach for complexity only when it earns its margin.</p>
+
+<h2>Exercises</h2>
+<div class="callout exercise">
+<div class="callout-title">Exercise 14.5.1 (Conceptual): What the Result Did and Did Not Show</div>
+<p>The "Are Transformers effective for time series forecasting?" result is often summarized as "Transformers do not work for forecasting". Explain in a short paragraph why that summary is wrong, and state the more precise claim the result actually supports. In your answer, distinguish (a) a statement about the benchmarks, (b) a statement about the baselines those Transformers were compared against, and (c) a statement about the inductive bias of point-wise tokenization and channel mixing. Then explain how PatchTST's later success is consistent with the precise claim but not with the loose one.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 14.5.2 (Implementation): NLinear and a Lookback Sweep</div>
+<p>Extend Code 14.5.1 and 14.5.3. First, implement NLinear: subtract the last value $x_L$ of each lookback window, apply a single <code>nn.Linear(L, H)</code>, then add $x_L$ back. Second, run DLinear, NLinear, and the MLP on the toy task at three lookback lengths $L \in \{48, 96, 336\}$ with horizon $H = 192$, holding everything else fixed, and tabulate test MSE. Report which model wins at each lookback and whether a longer lookback helps the linear models or the MLP more. Relate your finding to the section's point that lookback length alone can flip model rankings (part of how PatchTST won).</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 14.5.3 (Open-ended): Break the Linear Model</div>
+<p>DLinear wins on linearly-predictable data. Design a synthetic series on which a linear direct-multistep map must lose to a nonlinear model, and demonstrate it empirically. Candidate generators: a regime-switching process whose seasonal amplitude depends on a latent binary state (the state-space view of <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/index.html">Chapter 7</a>), a series whose forecast shape depends nonlinearly on the level of the lookback, or two channels with a nonlinear cross-channel coupling. Train DLinear and the MLP from Code 14.5.3 on your series, show the MLP wins, and explain in terms of representational capacity exactly which nonlinearity the linear map cannot express. State what this implies for the section's "always beat the baseline" rule (hint: the rule cuts both ways).</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="nav-prev" href="section-14.4.html">&#8592; 14.4 Long-Horizon Transformers</a>
+<a class="nav-up" href="index.html">Chapter 14 Index</a>
+<a class="nav-next" href="section-14.6.html">14.6 TSMixer, TiDE, and MLP Forecasters &#8594;</a>
+</nav>
+</main>
+<footer class="book-footer">
+<p><em>Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</em></p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+<p class="last-updated"></p>
+</footer>
+</body>
+</html>

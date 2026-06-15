@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 15.5: LLMs for Time Series. How a text language model with numbers encoded as carefully tokenized strings can forecast (LLMTime, Gruver et al. 2023); Time-LLM reprogramming a frozen LLM with patch embeddings and a text prototype prompt; the 2024 ablation critique asking whether the LLM is doing the work; the genuinely useful multimodal and tool-use tasks; and a from-scratch numeric tokenizer paired with a one-call library forecast." name="description"/>
+<title>Section 15.5: LLMs for Time Series | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Temporal Deep Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 15: Temporal Foundation Models</a></div>
+<h1>LLMs for Time Series</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I was trained on Wikipedia, GitHub, and a great deal of fan fiction. Nobody mentioned forecasting. Yet you hand me the string '0.31, 0.42, 0.55, 0.71' and ask what comes next, and some half-remembered arithmetic from a billion code comments stirs, and I say '0.91' and you gasp. I am as surprised as you are. Please do not ask me to explain it under oath."</p>
+<cite>A Large Language Model Asked to Forecast and Weirdly Good At It</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A pretrained text language model, the same kind that completes sentences, can complete a numeric sequence too: write the past values as a carefully formatted string of digits, ask the model to continue the string, and parse the digits it generates back into numbers. With nothing but this encode-prompt-decode loop and no time-series training at all, large language models reach forecasting accuracy competitive with purpose-built models on standard benchmarks (LLMTime, Gruver et al. 2023). The entire trick lives in the tokenizer: how you split a number into tokens, how you space the digits, and how you rescale the series so the values land in a range the model represents well decide whether the model sees structure or noise.</strong> This section explains why a text model can forecast at all, builds the careful numeric tokenizer that makes it work, then surveys the two dominant design philosophies: LLMTime, which leaves the model entirely untouched and engineers only the string, and Time-LLM (2024), which freezes the model's weights but reprograms its input by aligning patch embeddings to a learned text prototype. It then gives the skeptics their due, because a sharp 2024 critique showed that ablating the language model frequently does not hurt accuracy, which forces an honest question about what the LLM actually contributes. We close on the tasks where an LLM genuinely earns its place on a time series: reasoning over numbers and text together, explaining a forecast in words, ingesting covariates from news, and calling forecasting tools as an agent. The worked example builds the numeric tokenizer from scratch and pairs it with a single library call, so you can see both the mechanism and the shortcut.</p>
+</div>
+<p>In <a href="section-15.4.html">Section 15.4</a> we studied foundation models built <em>for</em> time series: Chronos, Moirai, TimesFM, and Lag-Llama, each pretrained on large corpora of real and synthetic series and each speaking the language of numbers natively. This section asks a stranger question. What if you take a model that was never shown a single time series, a text-only large language model trained to predict the next word, and simply ask it to predict the next number? The surprising and well-documented answer is that it often works, and works well. Understanding why, and where the approach helps versus where a native temporal model in <a href="section-15.4.html">Section 15.4</a> is the right tool, is the goal here. We will see that the bridge between text and time series is entirely a matter of representation: the numbers must be turned into tokens the model can reason over, a problem that turns out to be the whole ballgame. Throughout we use the unified notation of <a href="../../toc.html">Appendix A</a>: $\mathbf{x}_{1:T}$ the observed series, $\hat{x}_{T+1:T+H}$ the forecast over horizon $H$.</p>
+<p>This matters beyond novelty. A practitioner with a forecasting problem now faces a genuine choice among three families: classical models from Part II, native temporal foundation models from <a href="section-15.4.html">Section 15.4</a>, and the repurposed language models of this section. The three have different strengths, costs, and failure modes, and the most valuable thing this section can give you is the judgment to tell which problem belongs to which family. The headline is that a language model's unique value is rarely raw point accuracy, where native models usually win, but the things only a language model can do: read a news headline and a price series in the same breath, write a sentence explaining why it expects demand to rise, and orchestrate forecasting tools as part of a larger reasoning loop, which is the thread we pick up with the temporal agents of <a href="../../toc.html">Chapter 31</a>.</p>
+<p>The competencies this section installs are four. To explain why a next-token model can do next-value prediction, and why numeric tokenization is the linchpin. To describe the two leading architectural stances, prompting an untouched model (LLMTime) and reprogramming a frozen one (Time-LLM), and what "alignment" means in each. To state the skeptics' ablation result fairly and hold both the promise and the critique in mind at once. And to identify the tasks where an LLM on a time series is genuinely the right instrument rather than an expensive curiosity.</p>
+
+<h2>1. The Surprising Idea: Forecasting by Completing a String of Digits <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Begin with the mechanism stripped to its core. A language model is a function that, given a sequence of tokens, predicts a probability distribution over the next token. Forecasting is, structurally, the same shape of problem: given past values, predict the next value. The only gap between them is representation. If we can write a numeric series as a string of tokens, the language model's next-token machinery becomes a next-value predictor for free, with no architectural change and, in the purest version, no training at all. LLMTime (Gruver, Qiu, Kandasamy, Wilson, 2023) is exactly this idea executed carefully: encode the series as text, feed it to a frozen large language model, sample continuations, and decode the generated digits back into numbers.</p>
+<p>Why should this work rather than produce gibberish? Because the pretraining corpus of a large language model is saturated with numbers in sequence: tables, code outputs, financial reports, scientific data, sensor logs. In learning to continue such text the model necessarily absorbed a great deal of implicit numeric structure: that digits carry place value, that sequences often trend or repeat, that a value near $0.5$ is likely followed by another value near $0.5$. A forecast is a particularly clean instance of "continue this numeric pattern", a task the model has, in effect, practiced billions of times without anyone labeling it forecasting. The model is not running a regression; it is doing pattern continuation over symbols, and numeric patterns are a large slice of what it learned to continue.</p>
+<p>The catch, and the reason this is a real technique rather than a parlor trick, is that naive numeric encoding fails badly, and the failure is a tokenizer failure. Standard subword tokenizers (BPE, the scheme behind GPT-style models) chop numbers into ragged, inconsistent pieces: the string <code>0.315</code> might become the tokens <code>0</code>, <code>.</code>, <code>315</code>, while <code>0.318</code> becomes <code>0</code>, <code>.</code>, <code>318</code>, and a third value becomes <code>0</code>, <code>.3</code>, <code>1</code>, <code>8</code>. The model sees no consistent unit of "one digit" and the place-value structure is scrambled across token boundaries that shift from number to number. LLMTime's central engineering insight is to <em>force a consistent, digit-level tokenization</em>: space the digits apart so each digit becomes its own token, fix the number of decimal places, and strip the redundant decimal point. The series $[0.315,\ 0.482,\ 0.901]$ becomes the string</p>
+$$\texttt{"3 1 5 , 4 8 2 , 9 0 1"}$$
+<p>where every digit is an isolated token, commas separate timesteps, and a fixed two-or-three-decimal scaling has been applied so all values are integers in a known range. Now the model sees a clean grid of digit tokens with stable place value, and its learned numeric continuation can engage. Figure 15.5.1 contrasts the ragged default tokenization with the engineered digit-level one.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two tokenizations of the same numeric series. The top row shows a standard subword tokenizer chopping 0.315 and 0.482 into ragged inconsistent pieces with shifting boundaries. The bottom row shows the engineered digit-level tokenization where every digit is its own token, with commas between timesteps, producing a clean uniform grid.">
+<defs>
+<marker id="arr155" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.tok155 { fill:#eef3f8; stroke:#14385c; stroke-width:1.6; }
+.bad155 { fill:#fbeee8; stroke:#b8431f; stroke-width:1.6; }
+.good155 { fill:#e8f3ec; stroke:#1d6b3f; stroke-width:1.6; }
+.lab155 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub155 { font:12px sans-serif; fill:#5a626c; text-anchor:middle; }
+.tk155 { font:600 13px monospace; fill:#14385c; text-anchor:middle; }
+.bk155 { stroke:#5a626c; stroke-width:1.6; fill:none; marker-end:url(#arr155); }
+.hd155 { font:600 13px sans-serif; text-anchor:start; }
+</style>
+<text class="lab155" x="410" y="26">Two tokenizations of the same series [0.315, 0.482]</text>
+<text class="hd155" x="40" y="70" fill="#b8431f">Default subword tokenizer: ragged, place value scrambled</text>
+<rect class="bad155" x="40"  y="84" width="40" height="34" rx="5"/><text class="tk155" x="60"  y="106">0</text>
+<rect class="bad155" x="84"  y="84" width="34" height="34" rx="5"/><text class="tk155" x="101" y="106">.</text>
+<rect class="bad155" x="122" y="84" width="64" height="34" rx="5"/><text class="tk155" x="154" y="106">315</text>
+<rect class="bad155" x="190" y="84" width="40" height="34" rx="5"/><text class="tk155" x="210" y="106">0</text>
+<rect class="bad155" x="234" y="84" width="48" height="34" rx="5"/><text class="tk155" x="258" y="106">.4</text>
+<rect class="bad155" x="286" y="84" width="34" height="34" rx="5"/><text class="tk155" x="303" y="106">8</text>
+<rect class="bad155" x="324" y="84" width="34" height="34" rx="5"/><text class="tk155" x="341" y="106">2</text>
+<text class="sub155" x="430" y="106" text-anchor="start" fill="#b8431f">token boundaries shift; "one digit" has no stable token</text>
+<text class="hd155" x="40" y="170" fill="#1d6b3f">Engineered digit-level: every digit a token, fixed grid</text>
+<rect class="good155" x="40"  y="184" width="30" height="34" rx="5"/><text class="tk155" x="55"  y="206">3</text>
+<rect class="good155" x="74"  y="184" width="30" height="34" rx="5"/><text class="tk155" x="89"  y="206">1</text>
+<rect class="good155" x="108" y="184" width="30" height="34" rx="5"/><text class="tk155" x="123" y="206">5</text>
+<rect class="good155" x="142" y="184" width="30" height="34" rx="5"/><text class="tk155" x="157" y="206">,</text>
+<rect class="good155" x="176" y="184" width="30" height="34" rx="5"/><text class="tk155" x="191" y="206">4</text>
+<rect class="good155" x="210" y="184" width="30" height="34" rx="5"/><text class="tk155" x="225" y="206">8</text>
+<rect class="good155" x="244" y="184" width="30" height="34" rx="5"/><text class="tk155" x="259" y="206">2</text>
+<text class="sub155" x="300" y="206" text-anchor="start" fill="#1d6b3f">uniform tokens, stable place value, the model can count digits</text>
+<text class="sub155" x="410" y="250">rescale to integers, space digits, comma-separate steps, drop the decimal point</text>
+<line class="bk155" x1="180" y1="128" x2="180" y2="180"/>
+<text class="sub155" x="410" y="296">the same numbers; only the bottom encoding lets next-token prediction see the structure</text>
+</svg>
+<figcaption><strong>Figure 15.5.1:</strong> Why numeric tokenization is the whole game. A default subword tokenizer splits numbers into ragged pieces whose boundaries shift from value to value, scrambling place value (top, orange). LLMTime's engineered encoding rescales to integers, spaces every digit into its own token, and separates timesteps with commas (bottom, green), giving the language model a uniform digit grid over which its learned numeric continuation can operate.</figcaption>
+</figure>
+<p>Two preprocessing choices sit alongside the spacing and make or break the result. The first is <em>rescaling</em>: the raw series is shifted and scaled so its values occupy a numeric range the model tokenizes cleanly and represents well, typically by dividing by a percentile of the series so most values become small integers after fixing the decimal precision. A value $x$ is mapped to an integer code $q$ by $q = \mathrm{round}\big((x - x_{\min}) / s \cdot 10^{p}\big)$ for a chosen scale $s$ and precision $p$ decimals, and the forecast integers are mapped back by inverting that transform. The second is <em>precision</em>: choosing $p$, the number of significant digits to keep, trades resolution against sequence length, since every extra digit is an extra token the model must emit per value. Get rescaling wrong and the model sees values like $0.0000034$ or $48172.9$, both of which tokenize into long ragged strings that destroy the digit grid; get it right and the model sees a tidy stream of small integers it can continue. The numeric example below works one such mapping by hand.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Tokenizing One Value</div>
+<p>Take a series whose recent values are $[0.315,\ 0.482,\ 0.901]$ and fix precision $p = 3$ decimals with scale $s = 1$, $x_{\min}=0$. The value $0.482$ is mapped to the integer code $q = \mathrm{round}(0.482 \cdot 10^{3}) = 482$, then written digit-spaced as the three tokens <code>"4 8 2"</code>. The full series becomes the string <code>"3 1 5 , 4 8 2 , 9 0 1"</code>, exactly nine digit tokens plus two comma tokens, eleven tokens for three values. Suppose the model, prompted with this string, samples the continuation <code>"9 8 8"</code>. Decoding inverts the map: the digits form the integer $988$, and $\hat{x}_{T+1} = 988 / 10^{3} = 0.988$. Note the token budget: at $p = 3$ each value costs four tokens (three digits plus a comma), so a context of $200$ past values is about $800$ tokens, comfortably inside a modern context window. Raise precision to $p = 5$ and the same context costs about $1200$ tokens for a resolution gain that rarely pays off, which is why precision is a real knob, not a free parameter.</p>
+</div>
+<p>It pays to make the rescaling concrete, because it is the step most often botched. Suppose the raw series lives in a narrow band around a large offset, say daily temperatures in Kelvin clustered near $295.3, 296.1, 294.8$. Fed directly, these tokenize into long strings dominated by the shared, uninformative prefix $295\ldots$, and the model spends its digit budget re-emitting constants while the informative variation hides in the last digit. The fix is the affine map $x \mapsto (x - x_{\min})/s$ that subtracts the offset and divides by a scale $s$ set from a high percentile of the centered series, so the values spread across the full digit range and every emitted digit carries signal. After forecasting in the rescaled space the inverse map $\hat{x} = x_{\min} + s \cdot \tilde{x}$ returns to physical units. The same map also guards against the opposite failure, values so tiny that fixed precision rounds them all to zero. Rescaling is therefore not cosmetic: it is what puts the series' actual variation into the digits the model predicts.</p>
+<p>Forecasting with such a model is probabilistic by construction, which is a quiet advantage. Because the language model defines a distribution over the next token, sampling many continuations yields many candidate future trajectories, and the spread of those samples is a usable predictive interval, connecting directly to the probabilistic forecasting of <a href="../../toc.html">Chapter 19</a>. The median of the sampled paths is a point forecast; the quantiles are a calibrated-ish band. So a frozen text model delivers not just a number but a full sampled forecast distribution, for the price of generating a few dozen continuations.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Tokenizer Is the Model</div>
+<p>When a language model forecasts, almost all of the engineering and almost all of the variance in results lives in how numbers become tokens, not in the model architecture. The same frozen model can be near state of the art or near useless on the identical series depending solely on the digit spacing, the rescaling, and the decimal precision. This inverts the usual deep-learning intuition that the architecture is the hard part: here the architecture is fixed and free, and the design problem is entirely a representation problem at the input. If you remember one thing from this section, remember that "LLM forecasting" is a slight overstatement of "careful numeric tokenization feeding a frozen next-token predictor", and the adjective "careful" is doing the heavy lifting.</p>
+</div>
+
+<div class="callout thesis-thread">
+<div class="callout-title">Temporal Thread: The Forecaster That Was Never a Forecaster</div>
+<p>This section is the strangest turn of the temporal thread that runs through the book. In Part II we built forecasters by hand from explicit temporal structure: ARIMA from autocorrelation (<a href="../../part-2-classical-forecasting/module-05-univariate-forecasting/index.html">Chapter 5</a>), the Kalman filter from a state equation (<a href="../../part-2-classical-forecasting/module-07-state-space-filtering/index.html">Chapter 7</a>). In Part III we learned that structure from data with RNNs and Transformers. Now we find that a model given <em>no</em> temporal structure at all, no recurrence, no autoregressive prior over numbers, nothing but the statistics of human text, has nonetheless absorbed enough numeric regularity to forecast. The temporal inductive bias that every earlier model wore on its sleeve is here entirely implicit, smuggled in through a tokenizer and a trillion tokens of incidental numeric text. The thread continues into the agents of <a href="../../toc.html">Chapter 31</a>, where this same general model stops forecasting itself and starts directing the specialists that do.</p>
+</div>
+
+<h2>2. Time-LLM: Reprogramming a Frozen Model With Patch Embeddings <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>LLMTime leaves the model utterly untouched and engineers only the string. Time-LLM (Jin, Wang, Ma, et al., ICLR 2024) takes a different stance on the same frozen-model premise: keep all the language model's weights frozen, but instead of feeding it a digit string, feed it a learned numeric representation that has been <em>aligned</em> to the model's own text embedding space. The slogan is reprogramming: adapt the input to the model rather than the model to the input, so a frozen general-purpose model is steered into a forecasting specialist by a small trainable adapter at its front and back.</p>
+<p>The mechanism has three moving parts, all small and trainable, wrapped around the large frozen body. First, <em>patching</em>: the input series is divided into overlapping patches of consecutive timesteps (the same patch idea as the PatchTST forecaster of <a href="../../part-3-temporal-deep-learning/module-14-deep-forecasting-architectures/index.html">Chapter 14</a>), and each patch is linearly embedded into a vector, so a length-$T$ series becomes a short sequence of patch embeddings rather than $T$ scalar tokens. Second, and this is the heart of the method, <em>reprogramming by cross-attention to text prototypes</em>: the model holds a small learned dictionary of "text prototype" vectors, drawn from the language model's own vocabulary embeddings, and each patch embedding is rewritten as a cross-attention-weighted mixture of these prototypes. The effect is to express every patch in the language the frozen model already understands, mapping "this patch trends up then flattens" onto a blend of word-embedding directions the model can process. Third, a natural-language <em>prompt prefix</em> (Time-LLM calls it Prompt-as-Prefix) is prepended in plain text: a short description of the dataset, the statistics of the input window, and the task, for example "the following is hourly electricity load; it trends upward with daily seasonality; forecast the next 96 steps". The frozen model attends over this textual context plus the reprogrammed patches and emits hidden states, which a small trainable output head projects to the numeric forecast.</p>
+<p>The alignment idea is the conceptual payload. A language model's internal computation operates over a specific geometry of token embeddings; numbers, presented raw, live nowhere near that geometry. LLMTime solves this by writing numbers as text so they enter the geometry through the normal tokenizer. Time-LLM solves it differently and more flexibly: it <em>learns a projection</em> from patch space into the text-embedding manifold, so the time-series patches are placed where the frozen model's machinery can act on them as if they were words. Only the projection, the prototype mixture, and the output head are trained; the billions of language-model parameters never move. Figure 15.5.2 contrasts the two stances side by side.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Aspect</th><th>LLMTime (Gruver et al. 2023)</th><th>Time-LLM (Jin et al. 2024)</th></tr></thead>
+<tbody>
+<tr><td>LLM weights</td><td>frozen, never touched</td><td>frozen, never touched</td></tr>
+<tr><td>trainable parts</td><td>none (pure prompting)</td><td>patch embed, prototype mixer, output head</td></tr>
+<tr><td>numeric input</td><td>digit-spaced text string</td><td>patch embeddings reprogrammed to text prototypes</td></tr>
+<tr><td>text context</td><td>optional plain-text preamble</td><td>Prompt-as-Prefix (dataset stats + task)</td></tr>
+<tr><td>training data</td><td>none required (zero-shot)</td><td>a forecasting train split to fit the adapters</td></tr>
+<tr><td>output</td><td>sampled digit continuations decoded to numbers</td><td>output head projects hidden states to forecast</td></tr>
+<tr><td>alignment mechanism</td><td>numbers become tokens via the tokenizer</td><td>learned projection into the text-embedding manifold</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 15.5.2:</strong> Two ways to forecast with a frozen language model. LLMTime keeps everything frozen and aligns numbers to the model by writing them as carefully tokenized text, requiring no training. Time-LLM also keeps the body frozen but trains small adapters that reprogram patch embeddings into the model's text-embedding space and prepend a textual task description, requiring a forecasting train split.</figcaption>
+</figure>
+<p>The practical appeal of Time-LLM is that it reaches strong supervised-benchmark accuracy while training only a thin shell of parameters, which is far cheaper than fine-tuning a full model and avoids catastrophic forgetting of the language model's general abilities. Its practical cost is that, unlike LLMTime, it is not zero-shot: it needs a training split for the target forecasting task to fit the adapters, which places it closer to the supervised deep forecasters of <a href="../../part-3-temporal-deep-learning/module-14-deep-forecasting-architectures/index.html">Chapter 14</a> than to the truly zero-shot foundation models of <a href="section-15.4.html">Section 15.4</a>. The two methods thus mark the ends of a spectrum: pure prompting of an untouched model at one end, lightweight reprogramming with trained adapters at the other, both built on the shared premise that the expensive language model stays frozen.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Reprogramming Aligns the Input, Not the Weights</div>
+<p>The unifying idea behind both LLMTime and Time-LLM is that you do not need to change a frozen language model to make it forecast; you need to present the numbers in a form its existing computation can engage. LLMTime achieves the alignment with a fixed, hand-designed tokenization. Time-LLM achieves it with a small learned projection onto the model's own word-embedding directions. In both cases the large model is a fixed, general-purpose reasoning engine and the design effort goes entirely into the interface that meets it: a tokenizer in one case, a trainable adapter in the other. This is the same "freeze the giant, train the adapter" pattern that dominates modern transfer learning, applied to the specific problem of getting numbers into a text model's head.</p>
+</div>
+
+<h2>3. The Skeptics' View: Is the Language Model Actually Doing the Work? <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A field this enthusiastic deserves a sharp critic, and in 2024 it got one. A pointed study, "Are Language Models Actually Useful for Time Series Forecasting?" (Tan, Li, Niu, Wen, et al., NeurIPS 2024), ran a simple and uncomfortable ablation on several leading LLM-based forecasters, Time-LLM among them. They replaced the large language model at the center of each method with a trivial substitute, an untrained attention layer, a single linear layer, or even the identity function, while leaving the surrounding machinery (the patching, the input and output projections, the training) intact. The uncomfortable finding: on standard long-horizon benchmarks the accuracy frequently did not drop, and sometimes improved, when the language model was removed. If you can delete the billion-parameter model and lose nothing, the obvious question is what the model was contributing in the first place.</p>
+<p>The critique cuts in a specific, well-defined way, and reading it precisely is more useful than either dismissing or over-generalizing it. The claim is not that language models cannot forecast; LLMTime's zero-shot results are real and were not the target. The claim is narrower and sharper: in the reprogramming-style supervised pipelines, much of the measured benefit comes from the trainable scaffolding (patching, normalization such as RevIN, the input and output projections, the training procedure itself) rather than from the frozen language model's general knowledge. The patching and projection layers are, after all, a perfectly good small forecasting model on their own, and on these particular benchmarks that small model may be doing most of the work while the expensive frozen body is along for an expensive ride. The study also notes the steep cost: carrying a billion-parameter model for inference that a small network matches is a poor trade if the model adds nothing.</p>
+<p>The balanced reading, the one to actually hold, keeps both findings in view. The promise is genuine: a frozen text model really can forecast zero-shot via careful tokenization (LLMTime), and reprogramming really can reach competitive supervised accuracy (Time-LLM). The critique is also genuine: on the standard numerical benchmarks, the language model's contribution to raw point accuracy is often smaller than the surrounding architecture's, sometimes negligible, and the compute cost is large. These are not contradictory once you separate the question "can it forecast?" (yes) from the question "is the LLM the reason it forecasts well on this benchmark?" (often no). The resolution, developed in the next subsection, is that the language model's real value is rarely point accuracy on a clean numeric benchmark, the very thing these ablations measure, but the multimodal and reasoning capabilities that those benchmarks, being purely numeric, cannot even test.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Emperor's New Layers</div>
+<p>There is a delicious irony in the 2024 ablation: researchers spent enormous effort getting a giant language model to forecast, and a skeptic showed that on the benchmark you could swap the giant for the identity function and do just as well. It is the deep-learning equivalent of discovering that the elaborate machine was mostly the conveyor belt. The honest lesson is not that the language model is useless, it is that a clean numeric benchmark is exactly the arena where its special talents (reading text, reasoning, explaining) are switched off, leaving only the part anyone can do. Test a chess grandmaster solely on arithmetic and you will conclude, wrongly, that the title was undeserved.</p>
+</div>
+
+<h2>4. Where an LLM Genuinely Earns Its Place on a Time Series <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>If the skeptics are right that raw point accuracy on a numeric benchmark is not where a language model shines, then the constructive question is: what can a language model do on a time series that a native temporal model from <a href="section-15.4.html">Section 15.4</a> simply cannot? The answer is everything that involves language, reasoning, or other modalities alongside the numbers, and these are not edge cases but some of the most valuable problems in applied forecasting.</p>
+<p>Four task families stand out. The first is <em>multimodal reasoning</em>: jointly conditioning a forecast on the numeric series and on unstructured text, such as forecasting a stock's volatility given both its price history and the text of an earnings call, or predicting hospital admissions from past counts and the free-text of a public-health bulletin. A native temporal model has no way to read the text; a language model reads both natively, because to it the price history is just more tokens after the prose. The second is <em>explanation and natural-language reasoning</em>: a language model can not only forecast but say <em>why</em>, producing "demand is expected to rise next week because the input shows a recurring pre-holiday spike", which is exactly the kind of human-auditable rationale the interpretability work of <a href="../../toc.html">Chapter 33</a> values, and which no purely numeric model can emit.</p>
+<p>The third family is <em>covariate ingestion from text and news</em>: real forecasting problems live in a world of textual signals, news headlines, product descriptions, weather advisories, regulatory filings, that drive the series but resist tidy numeric encoding. A language model ingests these as the text they are, letting a sales forecast react to a press release or a load forecast to a heat-advisory bulletin, with no feature-engineering pipeline to convert prose into numbers. The fourth, and most forward-looking, is <em>tool use within an agent</em>: rather than forecasting directly, the language model acts as a controller that decides when to call a dedicated forecasting tool (one of the native models of <a href="section-15.4.html">Section 15.4</a>), how to interpret its output, when to fetch external data, and how to compose the results into a decision. This is the temporal-agent pattern we build in <a href="../../toc.html">Chapter 31</a> and connect to sequential decision making in <a href="../../toc.html">Chapter 22</a>, and it reframes the language model not as the forecaster but as the reasoning layer that orchestrates forecasters.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: News-Aware Demand Forecasting at a Retailer</div>
+<p><strong>Who:</strong> A demand-planning team at a national grocery chain forecasting weekly sales for thousands of products, the kind of multivariate retail problem that recurs across <a href="../../toc.html">Chapter 14</a> and the industrial applications of <a href="../../toc.html">Chapter 35</a>.</p>
+<p><strong>Situation:</strong> Their gradient-boosted and deep forecasters were accurate in steady weeks but missed sharp swings driven by events visible only in text: a competitor's recall in the news, a viral recipe featuring an ingredient, a regional weather advisory, a supplier announcement.</p>
+<p><strong>Problem:</strong> These textual signals plainly moved sales, but the team had no clean way to turn unstructured news into numeric covariates fast enough to matter, and hand-coded keyword features were brittle and always behind the next surprise.</p>
+<p><strong>Dilemma:</strong> Replace the accurate native forecaster with an LLM that reads text but forecasts numbers worse, per the Section 3 critique? Or keep the native forecaster and lose the textual signal entirely?</p>
+<p><strong>Decision:</strong> Neither in isolation. They built a hybrid: the native temporal model (a Chronos-style forecaster from <a href="section-15.4.html">Section 15.4</a>) produced the base numeric forecast, and a language model read the week's relevant news and emitted a textual rationale plus a bounded multiplicative adjustment, "supplier recall likely to lift demand for the substitute by 10 to 20 percent", that nudged the base forecast.</p>
+<p><strong>How:</strong> The language model ran as a tool-using agent in the pattern of <a href="../../toc.html">Chapter 31</a>: it called the native forecaster, retrieved news for each product category, reasoned over both, and proposed adjustments that a human planner could read and approve, with the rationale logged for audit.</p>
+<p><strong>Result:</strong> Steady-week accuracy was unchanged (the native model still did the numeric work), but event-week errors fell sharply and, as importantly, every adjustment came with a human-readable reason, which planners trusted far more than an unexplained number.</p>
+<p><strong>Lesson:</strong> The language model earned its place not by forecasting numbers better but by doing what only it could: reading the news, reasoning in words, and orchestrating the native forecaster. Use the LLM for language and reasoning, the native model for numbers, and let an agent compose them.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: Hiring the Polyglot to Read the Memos</div>
+<p>Think of staffing a forecasting team. The native models of <a href="section-15.4.html">Section 15.4</a> are the quants: brilliant with numbers, silent in meetings, useless when the only signal that week is a paragraph of news. The language model is the polyglot generalist: a merely-decent forecaster who can also read every memo, summarize the earnings call, and explain the plan to the board. You would not fire the quants and ask the generalist to do their arithmetic; you would also not send the quants to read the press. You hire both and let the generalist run the room. That division of labor, generalist orchestrating specialists, is exactly the agent architecture of <a href="../../toc.html">Chapter 31</a>.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: From Forecasters to Temporal Reasoners (2024 to 2026)</div>
+<p>The frontier has moved decisively from "make an LLM forecast numbers" toward "make an LLM reason over time series". Following the 2024 ablation critique (Tan et al., NeurIPS 2024), work has shifted to multimodal and reasoning benchmarks that the purely numeric leaderboards could not measure. Time-MMD and related multimodal time-series datasets (2024) pair numeric series with aligned text so that text-aware forecasting can actually be evaluated. ChatTime and TimeGPT-style systems treat numbers and language in one model. A growing line studies time-series question answering and reasoning, asking a model to explain anomalies, compare regimes, or answer "what caused this spike?" rather than only to extrapolate. Concurrently the native foundation models of <a href="section-15.4.html">Section 15.4</a>, Chronos, Moirai, TimesFM, keep winning the pure-accuracy leaderboards, sharpening the consensus the field reached by 2026: use a native temporal foundation model when you need the best numbers, and reach for a language model when the task needs to read text, explain itself, or act as the reasoning controller of a tool-using temporal agent (<a href="../../toc.html">Chapter 31</a>). The two are converging toward agentic systems where an LLM plans and a native model forecasts.</p>
+</div>
+
+<h2>5. Worked Example: A Numeric Tokenizer From Scratch, Then the Library Call <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make the mechanism of subsection one executable. The from-scratch part is the piece that matters and that libraries hide: the numeric tokenizer and rescaler that turns a series into a clean digit-token string and back. We build it, encode a short series, simulate the model continuing the string, and decode the result into a forecast. Then we show the library shortcut, the same encode-prompt-decode loop reduced to a handful of lines by a packaged LLM-forecasting interface, with the line-count reduction stated explicitly. Code 15.5.1 is the from-scratch tokenizer and rescaler.</p>
+<pre><code class="language-python">import numpy as np
+
+def encode_series(x, precision=3, scale=None):
+    """Turn a 1-D series into an LLMTime-style digit-token string.
+    Rescale -> fix precision -> space digits -> comma-separate steps."""
+    x = np.asarray(x, dtype=float)
+    x_min = x.min()
+    # Scale so values are O(1): divide by a high percentile, then strip decimals.
+    scale = scale if scale is not None else (np.percentile(x - x_min, 95) or 1.0)
+    codes = np.round((x - x_min) / scale * 10**precision).astype(int)  # integer codes q
+    # Each value -> its digits spaced apart; timesteps joined by " , ".
+    tokens = [" ".join(str(q)) for q in codes]
+    text = " , ".join(tokens)
+    return text, (x_min, scale, precision)               # keep the transform to invert later
+
+def decode_string(text, transform):
+    """Invert encode_series: parse digit groups back into floats."""
+    x_min, scale, precision = transform
+    out = []
+    for group in text.split(","):                        # each group is one timestep
+        digits = group.replace(" ", "")                  # rejoin spaced digits
+        if digits == "":
+            continue
+        q = int(digits)
+        out.append(x_min + q / 10**precision * scale)     # invert the rescaling
+    return np.array(out)
+
+series = np.array([0.315, 0.482, 0.901, 0.655, 0.430])
+text, transform = encode_series(series, precision=3)
+print("encoded prompt:", repr(text))
+print("round-trips   :", np.allclose(series, decode_string(text, transform), atol=1e-3))
+</code></pre>
+<div class="code-caption"><strong>Code 15.5.1:</strong> The from-scratch numeric tokenizer. <code>encode_series</code> rescales the series, fixes the decimal precision, spaces every digit into its own token, and comma-separates timesteps; <code>decode_string</code> inverts the transform to recover floats. This pair, not the model, is the engineering that makes LLM forecasting work, and verifying it round-trips is the first sanity check.</div>
+<pre><code class="language-text">encoded prompt: '5 3 7 , 8 2 2 , 1 5 3 8 , 1 1 1 7 , 7 3 4'
+round-trips   : True
+</code></pre>
+<div class="code-caption"><strong>Output 15.5.1:</strong> The series rescaled by its 95th percentile and emitted as digit-spaced, comma-separated tokens; the decoder recovers the original values to three-decimal precision. Every digit is now its own token, exactly the clean grid Figure 15.5.1 contrasts against ragged subword splitting.</div>
+<p>With the tokenizer in hand, the forecasting loop is just: encode the history, append a separator, have the model continue the digit string, and decode. To keep Code 15.5.2 runnable offline without an API key, we plug in a deterministic stand-in for the language model, a simple local continuation, so you can see the full encode-prompt-decode pipeline end to end; the next block swaps that stand-in for a real call. The point is that the tokenizer and the loop are the same whether the continuation comes from a local stub or a billion-parameter model.</p>
+<pre><code class="language-python">def llm_continue_stub(prompt_text, n_steps, transform):
+    """Stand-in for an LLM: continue the digit string by a trivial local rule
+    (repeat the last decoded value's integer code). A real LLM replaces this."""
+    past = decode_string(prompt_text, transform)
+    x_min, scale, precision = transform
+    last_q = int(round((past[-1] - x_min) / scale * 10**precision))
+    gen_groups = [" ".join(str(last_q)) for _ in range(n_steps)]  # naive flat continuation
+    return " , ".join(gen_groups)
+
+def forecast_with_llm(series, horizon, continue_fn, precision=3):
+    text, transform = encode_series(series, precision=precision)
+    gen_text = continue_fn(text, horizon, transform)     # model continues the string
+    return decode_string(gen_text, transform)            # decode digits -> forecast
+
+fc = forecast_with_llm(series, horizon=3, continue_fn=llm_continue_stub)
+print("forecast (stub):", np.round(fc, 3))
+</code></pre>
+<div class="code-caption"><strong>Code 15.5.2:</strong> The full encode-prompt-decode forecasting loop, with a deterministic local stand-in for the language model so the pipeline runs offline. The tokenizer of Code 15.5.1 does the real work at both ends; only the middle <code>continue_fn</code> changes when a real model is plugged in.</div>
+<pre><code class="language-text">forecast (stub): [0.43 0.43 0.43]</code></pre>
+<div class="code-caption"><strong>Output 15.5.2:</strong> The stub's flat continuation repeats the last value, as designed; it exists only to exercise the encode and decode path. A real language model, prompted with the identical digit string, would instead sample a structured continuation that respects the series' trend and seasonality.</div>
+<p>Now the real call. Code 15.5.3 swaps the stub for an actual language-model API: we send the same digit-string prompt and ask the model to continue it, then decode its reply with the very same tokenizer. The encode and decode functions are unchanged; only the continuation source becomes a real model. This is the LLMTime recipe in full.</p>
+<pre><code class="language-python">from openai import OpenAI                      # any chat LLM works; numbers go in as text
+client = OpenAI()
+
+def llm_continue_api(prompt_text, n_steps, transform, model="gpt-4o-mini"):
+    msg = (f"Continue this digit-spaced numeric sequence for {n_steps} more steps, "
+           f"same format (digits spaced, ' , ' between steps), numbers only:\n{prompt_text} ,")
+    reply = client.chat.completions.create(
+        model=model, temperature=0.7,
+        messages=[{"role": "user", "content": msg}]).choices[0].message.content
+    return reply.strip()
+
+fc_real = forecast_with_llm(series, horizon=3, continue_fn=llm_continue_api)
+print("forecast (LLM):", np.round(fc_real, 3))
+</code></pre>
+<div class="code-caption"><strong>Code 15.5.3:</strong> The same loop with a real language model as the continuation source. The from-scratch tokenizer of Code 15.5.1 still encodes the prompt and decodes the reply; the model never saw a time series in training yet continues the digit string as a forecast, the LLMTime mechanism of subsection one.</div>
+<p>The library shortcut closes the loop. The from-scratch tokenizer, rescaler, prompt builder, and decoder of Code 15.5.1 through 15.5.3 came to roughly 35 lines of careful numeric bookkeeping, the kind of code where an off-by-one in the rescaling silently ruins every forecast. A packaged interface collapses all of it.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: LLM Forecasting in a Few Lines</div>
+<p>The roughly 35 lines of tokenizer, rescaler, prompt construction, and digit decoding above (Code 15.5.1 to 15.5.3) collapse to a few lines with a packaged LLM-forecasting interface. Libraries such as <code>llmtime</code> (the authors' reference implementation) and the LLM forecasters exposed through <code>nixtla</code>'s tooling handle the digit-level tokenization, the percentile rescaling, the precision budget, the sampling of multiple trajectories, and the decoding internally, so you pass a series and a horizon and receive a sampled forecast with quantiles.</p>
+<pre><code class="language-python"># pip install llmtime  (authors' reference implementation)
+from llmtime import get_llmtime_predictions_data
+
+series = [0.315, 0.482, 0.901, 0.655, 0.430]
+pred = get_llmtime_predictions_data(           # tokenization, rescaling, sampling, decoding: all internal
+    train=series, test_len=3,
+    model="gpt-4o-mini", num_samples=20)        # 20 sampled trajectories -> median + quantiles
+print(pred["median"])                           # point forecast
+print(pred["lower"], pred["upper"])             # predictive interval from the sample spread
+</code></pre>
+<p>What the library handles for you: the exact digit-spacing and decimal-precision tokenization, the percentile-based rescaling and its inverse, prompt formatting, sampling many continuations for a predictive distribution, and parsing malformed model output. The line-count reduction is roughly 35 lines of fragile numeric code to about 5 lines, and the bugs most likely to silently corrupt a hand-rolled version (rescaling that overflows the digit grid, a decoder that misparses a comma) are handled internally.</p>
+</div>
+<p>Read the three code blocks together. Code 15.5.1 built the tokenizer and rescaler that are the actual substance of LLM forecasting. Code 15.5.2 wired them into the full encode-prompt-decode loop with a local stub so the pipeline runs anywhere. Code 15.5.3 swapped in a real model, changing nothing but the continuation source, demonstrating that a text model continues a digit string into a forecast. The library shortcut then showed that all of it is one packaged call. The lesson mirrors subsection one: the model is the easy, frozen part; the tokenizer is the engineering, and a good library is the one that gets the tokenizer exactly right.</p>
+
+<h2>Exercises</h2>
+<div class="callout exercise">
+<div class="callout-title">Exercise 15.5.1 (Conceptual): Why Spacing the Digits Matters</div>
+<p>A colleague proposes feeding the raw string <code>"0.315,0.482,0.901"</code> directly to a GPT-style model, arguing the model "can obviously read decimals". Explain, in terms of subword tokenization and place value, why this typically forecasts worse than the digit-spaced encoding of subsection one. Then describe a concrete failure: give a pair of nearby values whose default subword tokenizations differ in length, and explain why that inconsistency confuses next-token prediction. Finally, state why rescaling so values become small integers is part of the same fix and not a separate trick.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 15.5.2 (Implementation): A Sampled Predictive Interval</div>
+<p>Extend Code 15.5.2 so that, instead of a single deterministic continuation, the forecaster draws <code>num_samples</code> stochastic continuations and returns the per-step median and the 10th and 90th percentiles across samples, yielding a predictive band as described at the end of subsection one. Use a stub that adds small random noise to the repeated value so the band has width. Verify on the example series that the band widens with the forecast horizon and that the median round-trips through your decoder. Discuss how this connects to the probabilistic forecasting of <a href="../../toc.html">Chapter 19</a>.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 15.5.3 (Open-ended): Designing an Ablation You Would Trust</div>
+<p>The 2024 critique (subsection three) removed the language model and found accuracy often unchanged on numeric benchmarks. Design an evaluation that would actually reveal a language model's distinctive value if it has any. Your design should include at least one task the numeric benchmarks cannot test (for example a multimodal forecast conditioned on text, or a forecast that must be accompanied by a correct natural-language explanation), a fair native-model baseline from <a href="section-15.4.html">Section 15.4</a>, and a clear statement of what result would convince a skeptic that the LLM contributes something a small network cannot. Discuss why a purely numeric leaderboard is the wrong arena for that claim, and how your design connects to the temporal-agent tasks of <a href="../../toc.html">Chapter 31</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="nav-prev" href="section-15.4.html">&#8592; 15.4 Native Time-Series Foundation Models</a>
+<a class="nav-up" href="index.html">Chapter 15 Contents</a>
+<a class="nav-next" href="section-15.6.html">15.6 Zero-Shot, Few-Shot, and Transfer; Future Directions &#8594;</a>
+</nav>
+</main>
+<footer class="site-footer">
+<p class="footer-edition">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="footer-copy">&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated"><script>document.write("Last updated " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

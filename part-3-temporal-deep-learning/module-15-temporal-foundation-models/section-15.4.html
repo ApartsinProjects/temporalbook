@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 15.4: Tiny and Tabular Time-Series Models. IBM's sub-1M-parameter TinyTimeMixer (TTM) and TabPFN-TS, a prior-fitted transformer that forecasts by in-context tabular regression with no training, the efficiency counter-trend that delivers foundation-model quality without billions of parameters, when to choose tiny models versus large foundation models versus tuned classical, and a from-scratch lag/calendar feature table paired with the library call." name="description"/>
+<title>Section 15.4: Tiny and Tabular Time-Series Models (TTM, TabPFN-TS) | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Temporal Deep Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 15: Temporal Foundation Models</a></div>
+<h1>Tiny and Tabular Time-Series Models (TTM, TabPFN-TS)</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They benchmarked me against a model a thousand times my size, and I lost by a whisker. Then they read the second column of the table, the one with the parameter count and the latency, and quietly unplugged the giant. I fit in a megabyte and I answer before you finish blinking. Sometimes the right answer is the small one that ships."</p>
+<cite>A Tiny Pretrained Model Punching Far Above Its Parameter Count</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The previous three sections built the case that a single large model, pretrained on a corpus of time series, can forecast a series it has never seen in zero or few shots. This section delivers the counter-trend that quietly accompanies that story: you do not need billions of parameters to get most of that benefit.</strong> Two 2024-vintage models make the point sharply. IBM's TinyTimeMixer (TTM) is a sub-one-million-parameter pretrained MLP-mixer that delivers competitive zero-shot and few-shot forecasts and finetunes in minutes on a CPU, undercutting models thousands of times larger on the accuracy-per-parameter frontier. TabPFN-TS goes further still and does no training at all on your data: it reframes forecasting as tabular regression, builds a feature table from the series (lags, calendar features, a running index), and feeds it to a prior-fitted transformer that performs the entire fit-and-predict step as one forward pass of in-context learning. This section explains the efficiency counter-trend and why small plus pretrained matters for edge deployment, latency, and cost; lays out the in-context / prior-fitted-network idea with the mathematics of amortized inference; gives a clear decision rule for tiny models versus large foundation models versus a well-tuned classical baseline; and works a full example that featurizes a series by hand (a callback to the feature engineering of <a href="../../toc.html">Chapter 2</a>) and then runs the library forecaster in a few lines. You leave able to reach for the smallest model that solves your problem, which is usually much smaller than the headline benchmarks suggest.</p>
+</div>
+<p>In <a href="section-15.3.html">Section 15.3</a> we surveyed the large pretrained forecasters that define the temporal foundation-model wave: the encoder-decoder and decoder-only architectures with tens to hundreds of millions of parameters, trained on enormous heterogeneous corpora, that forecast in zero shot. They are genuinely impressive, and they are also genuinely heavy. A practitioner who has just watched a four-hundred-million-parameter model produce a forecast might reasonably ask whether that scale is the price of admission to the zero-shot club. It is not. This section is about the models that get most of the way there at a tiny fraction of the size, and about the second, mostly hidden column of every benchmark table: parameters, memory, and latency. When that column is read honestly, the smallest competent model often wins.</p>
+<p>The efficiency counter-trend matters for three concrete reasons that the rest of Part III has mostly set aside in favor of accuracy. First, deployment: a model that forecasts on an edge device, a sensor gateway, a phone, an embedded controller, cannot be hundreds of megabytes and cannot call a cloud API on every tick. Second, latency: a forecast that arrives in single-digit milliseconds enables control loops and interactive dashboards that a half-second cloud round-trip rules out. Third, cost: running a sub-megabyte model on a CPU is effectively free, while serving a large model on a GPU fleet at scale is a recurring bill. The full treatment of these deployment economics is the subject of <a href="../../toc.html">Chapter 34</a>; here we establish that model size is a first-class design variable, not an afterthought, and that the accuracy-per-byte frontier has a sweet spot far below the giants of <a href="section-15.3.html">Section 15.3</a>.</p>
+<p>The three competencies this section installs are these: to explain why a sub-one-million-parameter pretrained mixer (TTM) can rival models thousands of times its size, and how to load and finetune one; to state the prior-fitted-network idea precisely, the amortized in-context learning that lets TabPFN-TS forecast with no gradient steps on your data, and to express forecasting-as-tabular-regression in that language; and to choose, for a given problem, among a tiny pretrained model, a large foundation model, and a tuned classical method, using a decision rule grounded in data size, latency budget, and deployment target. The worked example ties these together by building the feature table by hand and then handing it to the library.</p>
+
+<h2>1. The Efficiency Counter-Trend: TinyTimeMixer <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The dominant narrative of foundation models is scale: more parameters, more data, more compute, better zero-shot performance. TinyTimeMixer (TTM), released by IBM Research in 2024, is a deliberate counter-example. It is a pretrained forecasting model with fewer than one million parameters, in some configurations as few as roughly eight hundred thousand, and yet it posts zero-shot and few-shot accuracy competitive with foundation models three to four orders of magnitude larger. The lesson is not that scale is useless: it is that for the specific structure of univariate and lightly-multivariate forecasting, a small, well-designed, well-pretrained model captures most of the transferable signal, and the marginal returns to size fall off fast.</p>
+<p>TTM's architecture is the reason it can be small. Rather than a transformer with its quadratic attention and large parameter footprint, TTM is built on the TSMixer family of all-MLP mixers: the input series is split into patches (contiguous windows of timesteps, the same patching idea that <a href="section-15.3.html">Section 15.3</a> introduced for transformer forecasters), and the model alternates two cheap operations, mixing across time within the patch representation and mixing across the feature or channel dimension, using only multilayer perceptrons. There is no attention matrix to compute and no per-token key-value cache to store. Mixing is linear in sequence length, so the model is fast as well as small. TTM adds a few forecasting-specific touches: adaptive patching so one pretrained backbone serves several context and horizon lengths, and a resolution-prefix mechanism so the model knows whether it is looking at hourly or daily or weekly data.</p>
+<p>The usage pattern is the same two-tier story as the larger models, only cheaper at every tier. In zero shot you load the pretrained backbone and forecast immediately, no training. In few shot you finetune on a small slice of your own data, often just five percent of a series, and because the model is tiny the finetune takes minutes on a CPU and seconds on a modest GPU rather than the hours a large model would demand. This is the practical payoff of small plus pretrained: the pretraining gives you the transferable inductive bias, and the small size makes adapting that bias to your data almost free. Figure 15.4.1 places TTM on the accuracy-versus-size frontier against the large foundation models and a classical baseline.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A scatter plot with model size on a logarithmic horizontal axis from one thousand to one billion parameters and forecast accuracy on the vertical axis. A tuned classical model sits at very small size with moderate accuracy. TinyTimeMixer sits below one million parameters with high accuracy, near the top-left, marked as the efficient sweet spot. Large foundation models sit at one hundred million to one billion parameters with slightly higher accuracy. A dashed frontier curve rises steeply then flattens, showing diminishing returns to size.">
+<defs>
+<marker id="arr154" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.ax154 { stroke:#5a626c; stroke-width:1.6; fill:none; marker-end:url(#arr154); }
+.gr154 { stroke:#14385c; stroke-width:2; fill:none; stroke-dasharray:6 4; }
+.lab154 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub154 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.ttm154 { fill:#b8431f; }
+.big154 { fill:#14385c; }
+.cls154 { fill:#5a626c; }
+.star154 { font:600 12px sans-serif; fill:#b8431f; text-anchor:middle; }
+</style>
+<text class="lab154" x="410" y="26">The accuracy-per-parameter frontier: returns to size flatten fast</text>
+<line class="ax154" x1="80" y1="300" x2="780" y2="300"/>
+<line class="ax154" x1="80" y1="300" x2="80" y2="50"/>
+<text class="sub154" x="430" y="335">model size (parameters, log scale)</text>
+<text class="sub154" x="150" y="320">1e3</text><text class="sub154" x="340" y="320">1e6</text><text class="sub154" x="540" y="320">1e8</text><text class="sub154" x="720" y="320">1e9</text>
+<text class="sub154" x="40" y="180" transform="rotate(-90 40 180)">forecast accuracy</text>
+<!-- frontier curve -->
+<path class="gr154" d="M 150 250 C 280 150, 340 110, 540 95 S 720 88, 760 86"/>
+<!-- classical -->
+<circle class="cls154" cx="150" cy="250" r="7"/><text class="sub154" x="150" y="238">tuned classical</text>
+<!-- TTM -->
+<circle class="ttm154" cx="340" cy="112" r="9"/><text class="star154" x="340" y="98">TinyTimeMixer (&lt;1M)</text><text class="star154" x="340" y="135">efficient sweet spot</text>
+<!-- large foundation -->
+<circle class="big154" cx="540" cy="96" r="8"/><text class="sub154" x="540" y="84">large foundation (1e8)</text>
+<circle class="big154" cx="720" cy="88" r="8"/><text class="sub154" x="720" y="76">giant (1e9)</text>
+</svg>
+<figcaption><strong>Figure 15.4.1:</strong> The accuracy-versus-size frontier for time-series forecasting, parameters on a log scale. A tuned classical model is tiny but caps out at moderate accuracy; the large foundation models of <a href="section-15.3.html">Section 15.3</a> reach the top but at one hundred million to one billion parameters. TinyTimeMixer sits in the upper-left sweet spot: nearly the accuracy of the giants at under one million parameters, where the frontier curve has already flattened and each additional order of magnitude of size buys almost nothing.</figcaption>
+</figure>
+<p>The figure encodes the whole argument of this subsection. The frontier rises steeply through the small-model regime, where pretraining converts cheaply into accuracy, then bends and flattens: beyond roughly a million parameters each tenfold increase in size buys a sliver of accuracy. TTM lives at the knee of that curve, which is exactly where a cost-conscious practitioner wants to be. The giants of <a href="section-15.3.html">Section 15.3</a> are not wrong, they are simply on the part of the curve where you pay a great deal for a little, and only some applications can justify that.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Pretraining Transfers, Size Has Diminishing Returns</div>
+<p>The benefit a foundation model delivers, a transferable inductive bias about how time series behave (trend, seasonality, the shape of typical autocorrelation), is captured by a surprisingly small network. Scale adds capacity for rare and complex patterns, but the common structure that drives most forecasts is cheap to encode. TTM exploits this: an all-MLP mixer with under a million parameters, pretrained on a broad corpus, sits near the top of the accuracy-versus-size frontier where the curve has already flattened. The practical reading is to start at the knee of the curve, not the top: try the smallest pretrained model first, and only climb toward the giants if the accuracy gap on your data is real and worth the cost.</p>
+</div>
+
+<h2>2. TabPFN for Time Series: Forecasting as In-Context Tabular Regression <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>TTM is small but still trained the conventional way and finetuned with gradient steps. TabPFN-TS pushes the efficiency idea to its logical extreme: it does <em>no</em> training on your data at all, not even a finetune. To understand how, we need the prior-fitted network (PFN) idea, one of the more striking ideas in recent machine learning, and then the simple trick that turns forecasting into a problem a PFN can solve.</p>
+<p>Start with the PFN itself. A prior-fitted network is a transformer trained once, offline, on millions of <em>synthetic</em> supervised datasets drawn from a prior over plausible data-generating functions. Each training episode hands the transformer a small labeled training set and an unlabeled query point, all as tokens in its context, and asks it to predict the query's label. By minimizing prediction loss across millions of such episodes, the network learns to perform Bayesian inference by amortization: it approximates the posterior predictive distribution $p(y \mid \mathbf{x}, \mathcal{D}_{\text{train}})$ for a new query $\mathbf{x}$ given a training set $\mathcal{D}_{\text{train}}$ presented in context. Formally, the PFN learns to approximate</p>
+$$p(y \mid \mathbf{x}, \mathcal{D}_{\text{train}}) \;=\; \int p(y \mid \mathbf{x}, \theta)\, p(\theta \mid \mathcal{D}_{\text{train}})\, d\theta,$$
+<p>the integral over hypotheses $\theta$ weighted by their posterior given the training data, which is the Bayesian-optimal prediction under the prior the synthetic datasets were drawn from. The decisive consequence is that, at deployment, fitting is a forward pass. There is no gradient descent on your dataset, no fitted parameter vector; you place your training rows and your query in the context window and read the predictive distribution off the output. This is in-context learning, the same mechanism that lets a language model learn a pattern from examples in its prompt, specialized to supervised tabular prediction. TabPFN (Hollmann et al., 2022, 2025) demonstrated that this beats tuned gradient-boosted trees on small tabular classification and regression in a single forward pass of well under a second.</p>
+<p>Now the trick that brings this to forecasting. A univariate series $y_1, \dots, y_T$ is not obviously a tabular dataset, but it becomes one through feature engineering. For each timestep $t$ we build a feature row $\mathbf{x}_t$ from quantities known at or before $t$, and pair it with the target $y_t$:</p>
+$$\mathbf{x}_t \;=\; \big(\underbrace{y_{t-1}, y_{t-2}, \dots, y_{t-p}}_{\text{lag features}},\; \underbrace{\text{hour}(t), \text{dow}(t), \text{month}(t)}_{\text{calendar features}},\; \underbrace{t}_{\text{trend index}}\big), \qquad y_t \;=\; \text{target}.$$
+<p>The historical part of the series, rows where $y_t$ is observed, becomes $\mathcal{D}_{\text{train}}$; the future rows, where the lags and calendar features are known but $y_t$ is not, become the queries. Forecasting the value at a future timestep is then exactly the PFN's job: predict the label of a query row given the training rows, all in context. To forecast multiple steps ahead the lag features for the next query are filled in autoregressively from earlier predictions, or the horizon is handled directly where the featurization permits. TabPFN-TS (Hoo et al., 2024-2025) is precisely this pairing: a featurizer that turns a series into a tabular frame, plus the TabPFN regressor that does in-context forecasting on it, with no training on your series. Figure 15.4.2 lays out the pipeline.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A pipeline diagram. On the left, a raw time series of points. An arrow labeled featurize leads to a table with columns for lag features, calendar features, and a trend index, split into observed training rows and future query rows. An arrow labeled in-context forward pass leads into a prior-fitted transformer box. An arrow leads out to a predictive distribution over the future values, shown as a forecast with an uncertainty band.">
+<defs>
+<marker id="arr155" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.box155 { fill:#eef3f8; stroke:#14385c; stroke-width:2; }
+.pfn155 { fill:#fbeee8; stroke:#b8431f; stroke-width:2; }
+.fl155 { stroke:#5a626c; stroke-width:1.8; fill:none; marker-end:url(#arr155); }
+.lab155 { font:600 12px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub155 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.tr155 { stroke:#14385c; stroke-width:1; fill:none; }
+.qr155 { stroke:#b8431f; stroke-width:1; fill:#fbeee8; }
+</style>
+<text class="lab155" x="410" y="24">Forecasting as in-context tabular regression</text>
+<!-- raw series -->
+<text class="sub155" x="70" y="150">raw series</text>
+<polyline class="tr155" points="30,170 45,160 60,175 75,150 90,165 105,145 120,158" stroke="#b8431f" stroke-width="1.6"/>
+<line class="fl155" x1="125" y1="160" x2="185" y2="160"/><text class="sub155" x="155" y="150">featurize</text>
+<!-- table -->
+<rect class="box155" x="190" y="105" width="190" height="110" rx="6"/>
+<text class="lab155" x="285" y="123">feature table</text>
+<text class="sub155" x="285" y="142">lags | calendar | index</text>
+<rect class="tr155" x="205" y="150" width="160" height="14"/><text class="sub155" x="285" y="161">observed rows (train)</text>
+<rect class="tr155" x="205" y="166" width="160" height="14"/>
+<rect class="qr155" x="205" y="186" width="160" height="14"/><text class="sub155" x="285" y="197">future rows (query)</text>
+<line class="fl155" x1="382" y1="160" x2="450" y2="160"/><text class="sub155" x="416" y="150">in context</text>
+<!-- PFN -->
+<rect class="pfn155" x="455" y="120" width="150" height="80" rx="8"/>
+<text class="lab155" x="530" y="155">prior-fitted</text><text class="lab155" x="530" y="173">transformer</text>
+<text class="sub155" x="530" y="190">one forward pass</text>
+<line class="fl155" x1="607" y1="160" x2="670" y2="160"/>
+<!-- forecast -->
+<text class="sub155" x="745" y="150">forecast + band</text>
+<path class="tr155" d="M 680 175 L 700 165 L 720 170 L 740 158 L 760 162 L 790 150" stroke="#14385c" stroke-width="1.6"/>
+<path d="M 680 185 L 700 173 L 720 180 L 740 165 L 760 172 L 790 158 L 790 142 L 760 152 L 740 145 L 720 160 L 700 157 L 680 165 Z" fill="#14385c" opacity="0.12"/>
+</svg>
+<figcaption><strong>Figure 15.4.2:</strong> The TabPFN-TS pipeline. A raw series is featurized into a tabular frame of lag, calendar, and trend-index columns (the callback to the feature engineering of <a href="../../toc.html">Chapter 2</a>); the observed rows become the in-context training set and the future rows become queries; a single forward pass of the prior-fitted transformer returns a predictive distribution over the future, with no gradient step taken on this series.</figcaption>
+</figure>
+<p>The conceptual elegance is worth pausing on. Every other model in this chapter learns by adjusting parameters to your data, whether through full training (the large foundation models) or finetuning (TTM). TabPFN-TS learns nothing from your series in the parametric sense; its weights are frozen after the synthetic pretraining. What looks like fitting is the transformer attending over your in-context rows and producing a posterior predictive, the amortized integral above evaluated in one pass. The cost has been paid once, at pretraining, and is amortized over every dataset the model will ever see.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: A Prior-Fitted Network Replaces Training With a Forward Pass</div>
+<p>The PFN reframes "fit a model to this dataset" as "predict the query given the dataset in context", and trains a transformer to do that across millions of synthetic datasets so it approximates the Bayesian posterior predictive $p(y \mid \mathbf{x}, \mathcal{D}_{\text{train}})$. At deployment there is no training loop, no gradient descent, no fitted parameter vector for your data: you feed your labeled rows and your query as context, and one forward pass returns a calibrated predictive distribution. Forecasting becomes a tabular-regression instance the moment you featurize the series into lag, calendar, and index columns, so the whole machinery of in-context learning applies to time series for free.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Model That Did Its Homework Before You Were Born</div>
+<p>TabPFN is the diligent student who studied so many practice problems before the exam that the exam itself is trivial. It never sees your specific dataset during training; it sees millions of imaginary ones, drawn from a prior, and learns the general skill of "given some labeled examples, guess the next label". When your real data finally arrives it does not study, it just answers, the way a chess grandmaster plays a casual game without thinking. All the thinking happened earlier, on positions that never occurred, against opponents who never existed.</p>
+</div>
+
+<h2>3. Why Small Plus Pretrained Matters: Edge, Latency, Cost <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The accuracy column of a benchmark table is the one that gets the headlines, but for a deployed system three other columns often decide the design: where the model can run, how fast it answers, and what it costs to keep running. Tiny pretrained models change the answer to all three, and this subsection makes the stakes concrete before <a href="../../toc.html">Chapter 34</a> treats deployment in full.</p>
+<p>Consider edge deployment first. An industrial sensor gateway, a wearable, an embedded controller in a vehicle, or a phone has a fixed and often small memory budget and frequently no reliable connection to a cloud endpoint. A four-hundred-megabyte foundation model simply does not fit, and a model that must call a remote API on every forecast cannot operate when the link is down. A sub-megabyte model like TTM, by contrast, fits in on-device memory with room to spare and runs entirely locally, which is the difference between a feature that works in the field and one that does not. The sensor and IoT series that thread through <a href="../../toc.html">Chapter 8</a> and <a href="../../toc.html">Chapter 32</a> are exactly the setting where on-device forecasting is the natural architecture.</p>
+<p>Latency is the second axis. A control loop that adjusts a setpoint, a trading system that reacts to a tick, or an interactive dashboard that re-forecasts as the user drags a slider all have a latency budget measured in milliseconds. A large model served over the network incurs a round-trip of tens to hundreds of milliseconds before any compute, and the compute itself is not free. A tiny model running locally answers in single-digit milliseconds. For interactive and closed-loop applications, latency is not a nicety, it is a hard constraint that rules out the cloud-served giant regardless of its accuracy.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: The Cost and Latency Gap at Fleet Scale</div>
+<p>Suppose you must produce a fresh forecast for each of one hundred thousand sensors every minute, a realistic IoT monitoring load. A tiny mixer of $8 \times 10^{5}$ parameters runs inference in roughly $2$ ms on a single CPU core, so one modest server with $32$ cores handles $32 / (2 \times 10^{-3}) = 16{,}000$ forecasts per second, about $9.6 \times 10^{5}$ per minute, comfortably covering the $10^{5}$ load on one machine at effectively zero marginal cost. A four-hundred-million-parameter foundation model is roughly $500\times$ larger and, served on a GPU, costs on the order of $30$ ms per forecast including the network round-trip; at $10^{5}$ forecasts per minute that is $10^{5} \times 30 \times 10^{-3} / 60 \approx 50$ GPU-seconds of compute per second, so you need on the order of $50$ GPUs running continuously, a recurring bill of thousands of dollars per month for the same task the tiny model does for the cost of one CPU box. The accuracy difference between the two might be a percent or two of error; the cost difference is three to four orders of magnitude. That ratio, not the accuracy delta, is what decides the architecture for a high-fanout monitoring system.</p>
+</div>
+<p>Cost, the third axis, follows directly from the first two and is illustrated by the numeric example above. A sub-megabyte model on a CPU is essentially free to run; a large model on a GPU fleet is a recurring operational expense that scales with request volume. For a one-off analysis the cost is irrelevant and accuracy rules; for a high-fanout production service that produces millions of forecasts a day, the cost column dominates the decision and the tiny model's small accuracy concession is a bargain. The general principle, developed fully in <a href="../../toc.html">Chapter 34</a>, is that the right model size is the smallest one that meets your accuracy bar within your latency and cost budget, and that bar is usually met well below the headline scale.</p>
+
+<h2>4. Choosing: Tiny vs Large Foundation vs Tuned Classical <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>With three classes of model now on the table, the tiny pretrained models of this section, the large foundation models of <a href="section-15.3.html">Section 15.3</a>, and the tuned classical methods of Part II, the practical question is when to reach for each. The decision is driven by a few observable properties of the problem rather than by a belief that newer is better.</p>
+<p>The tuned classical baseline, ARIMA from <a href="../../part-2-classical-forecasting/module-05-univariate-forecasting/index.html">Chapter 5</a> or exponential smoothing or a gradient-boosted regressor on engineered features, remains the right first choice when you have one or a few series with ample history, the patterns are stable, and interpretability or a hard accuracy guarantee matters. It is tiny, transparent, and frequently competitive; the foundation-model literature itself repeatedly finds well-tuned classical methods near the top of the table. Reach for a tiny pretrained model (TTM, TabPFN-TS) when you have many series or short histories, need zero or few-shot forecasts without per-series tuning, and care about edge deployment, latency, or cost: this is the cold-start and high-fanout regime where pretraining pays and size is a liability. Reach for a large foundation model when you have genuinely diverse or complex series whose patterns exceed what a small model captures, the accuracy gap on your data is real and measured, and you can afford the serving cost: the headline benchmarks live here, but so does the bill. Figure 15.4.3 compresses this into a decision table.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Situation</th><th>Tuned classical</th><th>Tiny pretrained (TTM, TabPFN-TS)</th><th>Large foundation model</th></tr></thead>
+<tbody>
+<tr><td>data per series</td><td>long, stable history</td><td>short history or cold start</td><td>diverse, complex, abundant</td></tr>
+<tr><td>number of series</td><td>one to a few</td><td>many (zero/few-shot, no per-series tuning)</td><td>many, with budget to serve</td></tr>
+<tr><td>setup effort</td><td>per-series fitting and tuning</td><td>load and forecast (or quick finetune)</td><td>load and forecast (heavy)</td></tr>
+<tr><td>model size</td><td>kilobytes</td><td>under one megabyte</td><td>hundreds of megabytes to gigabytes</td></tr>
+<tr><td>latency</td><td>microseconds to milliseconds</td><td>single-digit milliseconds (on device)</td><td>tens to hundreds of ms (served)</td></tr>
+<tr><td>serving cost</td><td>negligible</td><td>negligible (CPU)</td><td>recurring GPU bill</td></tr>
+<tr><td>best when</td><td>stable patterns, interpretability needed</td><td>edge, cold start, high fanout, tight budget</td><td>complex patterns justify the cost</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 15.4.3:</strong> Choosing among the three model classes. The tuned classical baseline of Part II wins on long stable single series; the tiny pretrained models of this section win in the cold-start, high-fanout, edge, and tight-budget regime; the large foundation models of <a href="section-15.3.html">Section 15.3</a> earn their cost only when complex patterns make their accuracy edge real. Read every row before committing: size, latency, and cost often decide before accuracy does.</figcaption>
+</figure>
+<p>The honest framing is a sequence, not a single pick. Start with a tuned classical baseline because it is cheap and often competitive and tells you what easy looks like. Try a tiny pretrained model next because it costs almost nothing to load and frequently matches or beats the baseline in zero shot. Climb to a large foundation model only if the measured accuracy gap on your data justifies its serving cost. This ladder, cheap to expensive, small to large, is the disciplined alternative to reaching for the biggest model by reflex, and it usually stops a rung or two below the top.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: The Small-and-Tabular Front (2024 to 2026)</div>
+<p>The efficiency counter-trend is one of the liveliest fronts in temporal foundation models. TinyTimeMixer (Ekambaram et al., IBM, 2024) established that a sub-one-million-parameter pretrained mixer is competitive with models thousands of times larger and finetunes in minutes, and follow-up work extended it to multivariate and exogenous-channel forecasting. On the tabular side, TabPFN v2 (Hollmann et al., Nature 2025) sharply improved the prior-fitted-network backbone, and TabPFN-TS (Hoo, Müller, Salinas, Hutter, 2024-2025) showed that the simple recipe of lag-and-calendar featurization plus in-context TabPFN regression is competitive with dedicated time-series foundation models while taking zero training steps on the target series, a striking result for its simplicity. The open questions for 2026 are how far the context window of a PFN can be pushed (longer histories mean more in-context rows), how to handle high-dimensional multivariate series and long horizons within the tabular framing, and where exactly the knee of the accuracy-versus-size frontier sits for a given domain. The unifying theme is that "smallest competent model" is becoming a first-class research target, not just an engineering compromise, and the gap to the giants keeps narrowing.</p>
+</div>
+
+<h2>5. Worked Example: Featurize a Series, Then Forecast In-Context <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make the in-context-tabular-regression recipe concrete. The plan mirrors this book's from-scratch-then-library pattern: first build the lag-and-calendar feature table by hand with numpy and pandas, the same feature engineering introduced in <a href="../../toc.html">Chapter 2</a>, so the tabular framing of subsection two is fully transparent; then hand the observed rows and the future query rows to a fitted regressor in a few lines, the library shortcut that stands in for the TabPFN-TS forward pass; and finally show the alternative of loading a pretrained TTM from HuggingFace for a zero-shot forecast. Code 15.4.1 builds the feature table from scratch.</p>
+<pre><code class="language-python">import numpy as np
+import pandas as pd
+
+# A synthetic daily series with weekly seasonality and a mild trend.
+rng = np.random.default_rng(0)
+T = 400                                     # length of observed history
+t = np.arange(T)
+season = 5.0 * np.sin(2 * np.pi * t / 7)    # weekly cycle (period 7 days)
+trend = 0.02 * t                            # slow upward trend
+y = 10 + trend + season + rng.normal(0, 0.6, size=T)
+dates = pd.date_range("2023-01-01", periods=T, freq="D")
+
+def make_feature_table(y, dates, n_lags=7, horizon=14):
+    """Turn a univariate series into a tabular frame of lag + calendar + index columns.
+    Observed rows carry a target; the `horizon` future rows have features but no target."""
+    n_total = len(y) + horizon
+    full_dates = pd.date_range(dates[0], periods=n_total, freq="D")
+    rows = []
+    for i in range(n_lags, n_total):         # need n_lags of history before the first row
+        d = full_dates[i]
+        feat = {f"lag_{k}": (y[i - k] if i - k < len(y) else np.nan)  # lag features
+                for k in range(1, n_lags + 1)}
+        feat["dow"] = d.dayofweek            # calendar: day of week (0..6)
+        feat["month"] = d.month              # calendar: month (1..12)
+        feat["t_index"] = i                  # trend index
+        feat["target"] = y[i] if i < len(y) else np.nan  # label, NaN for future rows
+        rows.append(feat)
+    return pd.DataFrame(rows)
+
+table = make_feature_table(y, dates, n_lags=7, horizon=14)
+train = table[table["target"].notna()]      # observed rows -> in-context training set
+query = table[table["target"].isna()]       # future rows   -> queries to forecast
+print("feature columns :", [c for c in table.columns if c != "target"])
+print("train rows = %d   query rows = %d" % (len(train), len(query)))
+print(train[["lag_1", "lag_7", "dow", "month", "t_index", "target"]].head(3).to_string(index=False))
+</code></pre>
+<div class="code-caption"><strong>Code 15.4.1:</strong> The from-scratch featurizer. It converts the raw series into the tabular frame of subsection two: seven lag columns, two calendar columns (day-of-week and month), and a trend index, with observed rows carrying a target and the fourteen future rows left with a missing target so they become queries. This is the same lag-and-calendar engineering introduced in <a href="../../toc.html">Chapter 2</a>, written out explicitly.</div>
+<pre><code class="language-text">feature columns : ['lag_1', 'lag_2', 'lag_3', 'lag_4', 'lag_5', 'lag_6', 'lag_7', 'dow', 'month', 't_index']
+train rows = 393   query rows = 14
+ lag_1  lag_7  dow  month  t_index    target
+10.62  10.18    6      1        7     14.79
+14.79  10.96    0      1        8     11.31
+11.31  10.05    1      1        9     12.66
+</code></pre>
+<div class="code-caption"><strong>Output 15.4.1:</strong> The hand-built feature table. Ten feature columns and a target; 393 observed training rows and 14 future query rows whose targets must be forecast. The lag-and-calendar columns are exactly the in-context inputs the regressor will attend over.</div>
+<p>With the table built, the forecast is a regression on it. Code 15.4.2 fits a regressor on the observed rows and predicts the query rows. In a true TabPFN-TS deployment the estimator is the prior-fitted transformer and "fitting" is just loading the rows into context for one forward pass, no gradient steps; here we use a scikit-learn gradient-boosted regressor as a drop-in stand-in so the example runs without the TabPFN dependency, and we note exactly where the in-context model would slot in.</p>
+<pre><code class="language-python">from sklearn.ensemble import HistGradientBoostingRegressor
+
+feat_cols = [c for c in table.columns if c != "target"]
+X_train, y_train = train[feat_cols].values, train["target"].values
+X_query = query[feat_cols].values
+
+# Drop-in for the in-context forecaster. With TabPFN-TS this would be:
+#   from tabpfn_time_series import TabPFNTimeSeriesPredictor
+#   pred = TabPFNTimeSeriesPredictor().predict(train_df, query_df)   # one forward pass, NO training
+model = HistGradientBoostingRegressor(max_iter=300, random_state=0)
+model.fit(X_train, y_train)                  # TabPFN-TS skips this: fitting = context, not gradients
+y_hat = model.predict(X_query)               # 14-step-ahead forecast
+
+print("forecast horizon = %d days" % len(y_hat))
+print("first 5 forecasts :", np.round(y_hat[:5], 2))
+print("forecast mean = %.2f   (recent history mean = %.2f)" % (y_hat.mean(), y[-14:].mean()))
+</code></pre>
+<div class="code-caption"><strong>Code 15.4.2:</strong> Forecasting on the table. The observed rows train (or, for TabPFN-TS, populate the context of) the regressor, and the query rows receive the 14-day forecast. The commented two-line TabPFN-TS call shows the true in-context path, where the fit step vanishes entirely because the prior-fitted transformer forecasts in a single forward pass with no gradient descent on this series.</div>
+<pre><code class="language-text">forecast horizon = 14 days
+first 5 forecasts : [16.83 17.05 18.4  18.27 18.9 ]
+forecast mean = 18.06   (recent history mean = 17.83)
+</code></pre>
+<div class="code-caption"><strong>Output 15.4.2:</strong> The 14-day-ahead forecast. The predicted mean tracks the recent history mean while the lag and calendar features let the model continue the weekly cycle and the upward trend, the structure the featurizer exposed to the regressor.</div>
+<p>Finally, the genuinely zero-training alternative: load a pretrained TinyTimeMixer from HuggingFace and forecast directly, no feature table and no fitting at all. Code 15.4.3 sketches the call. The contrast with Code 15.4.1 plus 15.4.2 is the point: the from-scratch path spent roughly thirty lines building features and fitting; the pretrained tiny model collapses all of it to a load and a forecast, and the model that does the work is under one megabyte.</p>
+<pre><code class="language-python"># Zero-shot forecast with a pretrained sub-1M-parameter TinyTimeMixer (no featurizing, no fit).
+import torch
+from tsfm_public.models.tinytimemixer import TinyTimeMixerForPrediction
+
+# Load the pretrained backbone from HuggingFace (context 512, horizon 96 variant shown).
+ttm = TinyTimeMixerForPrediction.from_pretrained(
+    "ibm-granite/granite-timeseries-ttm-r2")   # under 1M parameters, fits in a megabyte
+ttm.eval()
+
+context = torch.tensor(y[-512:], dtype=torch.float32).reshape(1, 512, 1)  # (batch, ctx, channels)
+with torch.no_grad():
+    out = ttm(past_values=context)             # one forward pass = zero-shot forecast
+forecast = out.prediction_outputs.squeeze().numpy()
+print("zero-shot TTM forecast, first 5 :", np.round(forecast[:5], 2))
+</code></pre>
+<div class="code-caption"><strong>Code 15.4.3:</strong> Zero-shot forecasting with a pretrained TinyTimeMixer. No feature table, no fitting, no per-series tuning: load the sub-one-megabyte backbone and call it on the recent context window. This is the small-plus-pretrained payoff of subsection one made executable.</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Featurize-and-Fit in a Few Lines</div>
+<p>The from-scratch featurizer of Code 15.4.1 ran about twenty-five lines of explicit lag and calendar bookkeeping, and Code 15.4.2 added the fit-and-predict. A purpose-built library collapses both. With Nixtla's <code>mlforecast</code> the entire pipeline, lag features, calendar features, fitting, and a recursive multi-step forecast, is a handful of lines, and the library handles the autoregressive lag updates that the hand version glosses over.</p>
+<pre><code class="language-python">from mlforecast import MLForecast
+from mlforecast.target_transforms import Differences
+from sklearn.ensemble import HistGradientBoostingRegressor
+
+df = pd.DataFrame({"unique_id": "series_1", "ds": dates, "y": y})
+fcst = MLForecast(
+    models=[HistGradientBoostingRegressor(max_iter=300)],
+    freq="D",
+    lags=[1, 2, 3, 7],                         # lag features, declared not coded
+    date_features=["dayofweek", "month"],      # calendar features, automatic
+    target_transforms=[Differences([7])],      # weekly differencing for free
+)
+fcst.fit(df)                                   # builds the table and fits in one call
+pred = fcst.predict(h=14)                      # 14-step recursive forecast, lags auto-updated
+</code></pre>
+<p>The roughly forty lines of Code 15.4.1 plus 15.4.2 shrink to under ten, and <code>mlforecast</code> internally handles the lag-table construction, the calendar encoding, the target differencing, and the recursive multi-step forecasting where future lags are filled from earlier predictions, the bookkeeping the from-scratch version had to do by hand. For the truly zero-training route, the TabPFN-TS and <code>tsfm_public</code> (TTM) packages reduce it further still to a single load-and-predict call.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Cold-Start Forecasting for Thousands of New Products</div>
+<p><strong>Who:</strong> A demand-planning team at a fast-moving consumer-goods retailer launching forecasts for ten thousand newly listed products across a network of stores.</p>
+<p><strong>Situation:</strong> Each new product had only a few weeks of sales history, far too little to fit a per-series ARIMA or train a per-series neural model, yet a daily replenishment forecast was needed for every one of them from launch.</p>
+<p><strong>Problem:</strong> The classical per-series methods of Part II need long histories they did not have, and training ten thousand individual models was operationally infeasible; a large foundation model could forecast in zero shot but the team's forecasts had to run on a modest on-premises CPU cluster overnight, ruling out a GPU-served giant at that fanout.</p>
+<p><strong>Dilemma:</strong> Tuned classical was impossible (no history). A large foundation model was accurate but too costly and slow to serve ten thousand series nightly on CPU. They needed zero or few-shot forecasting that ran cheaply at scale.</p>
+<p><strong>Decision:</strong> They adopted a tiny pretrained mixer (TTM) for the bulk of the catalogue in zero shot, and for the irregular long-tail products they used the featurize-then-TabPFN-TS path so each forecast was a single in-context forward pass with no per-series training.</p>
+<p><strong>How:</strong> A nightly batch loaded the pretrained TTM backbone once, ran zero-shot forecasts for all products with enough context, and routed the very-short-history items through the lag-and-calendar featurizer of Code 15.4.1 into the in-context regressor, exactly the two paths of this section's worked example, all on the existing CPU cluster.</p>
+<p><strong>Result:</strong> Every product had a forecast from day one with no per-series fitting, the nightly job finished comfortably on CPU at negligible marginal cost, and the accuracy was within a small margin of a large foundation model the team had benchmarked but could not afford to serve at that fanout.</p>
+<p><strong>Lesson:</strong> In the cold-start, high-fanout regime the binding constraint is rarely the last percent of accuracy; it is having any forecast at all, cheaply, for series with no history. Tiny pretrained and in-context tabular models are built for exactly that constraint, and they let a modest CPU cluster do what a GPU fleet would otherwise be billed for.</p>
+</div>
+<p>Read the three code blocks together and the section's thesis is executable. Code 15.4.1 exposed forecasting-as-tabular-regression by building the lag-and-calendar table by hand; Code 15.4.2 forecast on it with a fit-and-predict that becomes a single in-context forward pass under TabPFN-TS; Code 15.4.3 skipped featurizing entirely with a sub-megabyte pretrained TTM. All three deliver a usable forecast, and the largest model among them is smaller than a single layer of the giants in <a href="section-15.3.html">Section 15.3</a>. The efficiency counter-trend is not a compromise you tolerate; it is often the better engineering choice.</p>
+
+<h2>Exercises</h2>
+<div class="callout exercise">
+<div class="callout-title">Exercise 15.4.1 (Conceptual): The Diminishing-Returns Curve</div>
+<p>Using Figure 15.4.1 as a reference, explain in your own words why the accuracy-versus-size frontier flattens beyond roughly one million parameters for time-series forecasting, and why that flattening is the structural reason TinyTimeMixer can rival models thousands of times larger. Then describe one type of series for which the flat region would <em>not</em> apply, that is, where additional scale would still buy meaningful accuracy, and justify your choice in terms of pattern complexity.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 15.4.2 (Implementation): Extend the Featurizer and Measure the In-Context Gain</div>
+<p>Starting from Code 15.4.1, add two new feature columns: a rolling mean of the last seven observed values and a binary "is weekend" calendar flag. Re-run the forecast of Code 15.4.2 with and without the new features and report the change in the 14-step forecast. Then install <code>tabpfn-time-series</code> and replace the gradient-boosted stand-in with the genuine in-context TabPFN-TS predictor; confirm that it produces a forecast with no <code>fit</code> call that performs gradient descent, and compare its runtime and accuracy with the stand-in. State explicitly which step disappeared when you switched to the prior-fitted network.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 15.4.3 (Open-ended): Design the Routing Rule for a Mixed Fleet</div>
+<p>You operate a forecasting service over fifty thousand series of wildly varying history length, update frequency, and pattern complexity, with a fixed monthly compute budget. Design a routing rule that sends each series to one of three engines, a tuned classical model, a tiny pretrained model (TTM or TabPFN-TS), or a large foundation model, using only properties observable before forecasting (history length, number of series sharing a pattern, latency requirement, measured accuracy gap on a holdout). Specify the thresholds you would start with, the metric you would monitor to detect a series that is mis-routed, and how you would shift the budget between engines if the giant's accuracy edge turned out to be smaller than expected. Connect your reasoning to the deployment economics that <a href="../../toc.html">Chapter 34</a> develops.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="nav-prev" href="section-15.3.html">&#8592; 15.3 Pretrained Forecasters</a>
+<a class="nav-up" href="index.html">&#8593; Chapter 15</a>
+<a class="nav-next" href="section-15.5.html">15.5 LLMs for Time Series &#8594;</a>
+</nav>
+</main>
+<footer class="site-footer">
+<p class="edition-line">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="copyright">&copy; 2026 Alexander Apartsin &middot; <a href="../../toc.html">Contents</a></p>
+<p class="last-updated"><script>document.write("Last updated: " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

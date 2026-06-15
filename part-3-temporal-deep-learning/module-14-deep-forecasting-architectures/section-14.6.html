@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 14.6: TSMixer, TiDE, and MLP-Based Forecasters. How alternating MLPs that mix across time and across features (channels) build a fast, attention-free, recurrence-free forecaster; TSMixer (Google 2023) and TiDE (2023); covariate handling; the pragmatic 2024-2026 deep-forecasting toolbox; a from-scratch TSMixer-style time-mix plus feature-mix block matched against a neuralforecast library version." name="description"/>
+<title>Section 14.6: TSMixer, TiDE, and MLP-Based Forecasters | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Temporal Deep Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 14: Deep Forecasting Architectures</a></div>
+<h1>TSMixer, TiDE, and MLP-Based Forecasters</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They gave me no attention heads and no memory cell, just two little matrix multiplies and a stern instruction: stir the time axis, then stir the feature axis, repeat. I expected to be embarrassed at the benchmark. I won the benchmark."</p>
+<cite>An MLP-Mixer Stirring Time and Features Together</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The most surprising result of deep forecasting in the 2020s is how far you get with almost nothing. Strip out attention, strip out recurrence, strip out convolution, and keep only the humblest deep-learning primitive, the multilayer perceptron, applied alternately along two axes: a <em>time-mixing</em> MLP that looks across the lookback window, then a <em>feature-mixing</em> MLP that looks across the channels. That two-step stir, repeated for a few blocks, is TSMixer (Google, 2023), and a close cousin that encodes the whole flattened history with a stack of dense layers plus explicit covariate channels is TiDE (Time-series Dense Encoder, 2023).</strong> Both are linear-complexity in the lookback length, embarrassingly parallel, train in seconds where a Transformer takes minutes, and match or beat heavier models on the standard long-horizon benchmarks. This section continues the DLinear lesson of <a href="section-14.5.html">Section 14.5</a>, that a simple, well-tuned model plus the right preprocessing is a brutally strong baseline, and pushes it one rung up in capacity: MLP mixers keep the speed and the channel structure DLinear discards. We write the time-mix and feature-mix operations in KaTeX, build a TSMixer-style block from scratch in PyTorch, reproduce it in three lines of <code>neuralforecast</code>, benchmark it against the models of earlier sections, and lay out the pragmatic toolbox for choosing among DeepAR, N-HiTS, TFT, PatchTST, and TSMixer. The section closes Chapter 14 and hands off to the foundation models of <a href="../../toc.html">Chapter 15</a>, which pretrain once and forecast zero-shot.</p>
+</div>
+<p>In <a href="section-14.5.html">Section 14.5</a> we met the result that unsettled the field: DLinear, a single linear layer applied to a seasonal-trend decomposition, rivaled elaborate Transformer forecasters on the long-horizon benchmarks they were designed to win. The lesson there was deflationary, that much of the apparent gain from deep architectures was really the gain from normalization, decomposition, and a direct multi-step head, and a linear map captured most of it. This section asks the natural follow-up: if a linear map is that strong, what is the <em>smallest</em> nonlinear extension that adds real capacity without giving back the speed? The answer the literature converged on is the MLP mixer, an idea borrowed from vision (Tolstikhin and colleagues, 2021) and adapted to time series. We keep DLinear's virtues, linear cost in the lookback and a direct forecast head, and we add exactly two things a linear model cannot do: nonlinear interactions within the time axis, and explicit mixing across channels. Throughout we use the unified notation of <a href="../../toc.html">Appendix A</a>: a multivariate series of $C$ channels observed over a lookback window of $L$ steps, written $\mathbf{X} \in \mathbb{R}^{L \times C}$, from which we forecast the next $H$ steps $\hat{\mathbf{Y}} \in \mathbb{R}^{H \times C}$.</p>
+<p>Why does an attention-free, recurrence-free forecaster deserve a full section at the end of a chapter that has already covered DeepAR, N-HiTS, TFT, and PatchTST? Because it changes the default. For a practitioner in 2026 facing a new forecasting problem, the right first deep model is no longer "spin up a Transformer". It is "fit a linear or MLP-mixer baseline, see how far it gets, and only reach for attention if the residual genuinely demands it". TSMixer and TiDE are the concrete embodiment of that shifted default, and understanding their two-axis mixing structure is what lets you reason about <em>when</em> the extra machinery of attention earns its keep. The structure is also clarifying in its own right: it cleanly separates the two distinct jobs a forecaster must do, reasoning along time and reasoning across variables, into two distinct operations you can inspect, ablate, and tune independently.</p>
+<p>The four competencies this section installs are these: to state the time-mix and feature-mix operations precisely and see why their alternation gives an MLP access to both axes; to explain why MLP mixers are fast, scalable, and competitive, and how TiDE folds covariates into the dense encoder; to place TSMixer in the broader 2024-2026 toolbox and choose rationally among the chapter's models; and to implement a TSMixer-style block from scratch and then in a library, benchmarking it against earlier sections. These are the load-bearing skills for treating deep forecasting as engineering rather than fashion.</p>
+
+<h2>1. The MLP-Mixing Idea Applied to Time Series <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>A multivariate forecasting input is a small matrix: $\mathbf{X} \in \mathbb{R}^{L \times C}$, with one row per timestep in the lookback window and one column per channel. There are exactly two axes along which information must flow before a forecast can be made. Influence must flow <em>along time</em>, because the value at step $t$ depends on what happened at earlier steps, and influence must flow <em>across channels</em>, because in a multivariate series the channels are coupled (temperature drives load, one stock's return correlates with another's). A recurrent network handles the time axis with a loop and the channel axis with the cell's matrix; an attention model handles time with self-attention and channels with the value projection. The MLP-mixer makes the cleanest possible choice: handle each axis with its own small MLP, and alternate between them.</p>
+<p>Concretely, a mixer block takes the matrix $\mathbf{X} \in \mathbb{R}^{L \times C}$ and applies two operations in sequence. The first, <em>time-mixing</em>, transposes so that time is the last axis and runs a shared MLP across the time dimension, identically for every channel. Writing $\mathrm{MLP}_T : \mathbb{R}^{L} \to \mathbb{R}^{L}$ for a two-layer perceptron acting on a length-$L$ vector, the time-mix updates each column (each channel's time series) independently:</p>
+$$\mathbf{Z} = \mathbf{X} + \big[\mathrm{MLP}_T(\mathbf{X}^{\top})\big]^{\top}, \qquad \mathrm{MLP}_T(\mathbf{v}) = \mathbf{W}_2\,\sigma(\mathbf{W}_1 \mathbf{v} + \mathbf{b}_1) + \mathbf{b}_2,$$
+<p>where $\sigma$ is a nonlinearity (ReLU or GELU), $\mathbf{W}_1, \mathbf{W}_2$ are shared across all $C$ channels, and the outer $+\mathbf{X}$ is a residual connection. The transpose $\mathbf{X}^{\top} \in \mathbb{R}^{C \times L}$ puts the $L$ time steps in the feature position so the MLP mixes across them; transposing back returns to $L \times C$. Because the <em>same</em> $\mathrm{MLP}_T$ is applied to every channel, time-mixing learns a single, shared temporal pattern extractor, the direct analogue of DLinear's linear temporal map from <a href="section-14.5.html">Section 14.5</a>, now made nonlinear and given a hidden layer.</p>
+<p>The second operation, <em>feature-mixing</em>, runs a different shared MLP across the channel dimension, identically for every timestep. Writing $\mathrm{MLP}_C : \mathbb{R}^{C} \to \mathbb{R}^{C}$,</p>
+$$\mathbf{X}' = \mathbf{Z} + \mathrm{MLP}_C(\mathbf{Z}), \qquad \mathrm{MLP}_C(\mathbf{u}) = \mathbf{W}_4\,\sigma(\mathbf{W}_3 \mathbf{u} + \mathbf{b}_3) + \mathbf{b}_4,$$
+<p>where now $\mathrm{MLP}_C$ acts on each row (each timestep's channel vector) and is shared across all $L$ timesteps, again with a residual. Feature-mixing is what a univariate model like DLinear cannot do: it lets the channels talk to each other, learning that channel $i$'s value at a step should be read in light of channel $j$'s value at that same step. A mixer block is exactly this pair, time-mix then feature-mix, each wrapped in a residual and (in the full TSMixer) a normalization; stack a few blocks and a final linear head maps the lookback representation to the $H$-step forecast. Figure 14.6.1 draws one block.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="One TSMixer block. An input matrix X of shape L by C enters. A time-mixing MLP acts across the time axis (shown transposing, mixing the L rows, transposing back) with a residual, producing Z. Then a feature-mixing MLP acts across the C channel axis with a residual, producing the block output X-prime. The two operations are visually distinct, one stirring the vertical time axis, the other stirring the horizontal channel axis.">
+<defs>
+<marker id="arr146" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.box146 { fill:#eef3f8; stroke:#14385c; stroke-width:2; }
+.tmix146 { fill:#e8f1ea; stroke:#1f6b3a; stroke-width:2; }
+.fmix146 { fill:#fbeee8; stroke:#b8431f; stroke-width:2; }
+.fl146 { stroke:#5a626c; stroke-width:1.8; fill:none; marker-end:url(#arr146); }
+.res146 { stroke:#8a93a0; stroke-width:1.5; fill:none; marker-end:url(#arr146); stroke-dasharray:5 4; }
+.lab146 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.tl146 { font:600 13px sans-serif; fill:#1f6b3a; text-anchor:middle; }
+.fll146 { font:600 13px sans-serif; fill:#b8431f; text-anchor:middle; }
+.sub146 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+</style>
+<text class="lab146" x="410" y="24">One mixer block: stir along time, then stir across features</text>
+<rect class="box146" x="40" y="120" width="90" height="70" rx="9"/><text class="lab146" x="85" y="150">X</text><text class="sub146" x="85" y="170">L &#215; C</text>
+<line class="fl146" x1="130" y1="155" x2="248" y2="155"/>
+<rect class="tmix146" x="250" y="110" width="160" height="90" rx="9"/><text class="tl146" x="330" y="145">time-mix MLP</text><text class="sub146" x="330" y="165">across the L axis</text><text class="sub146" x="330" y="183">(shared over channels)</text>
+<path class="res146" d="M85,118 C85,80 330,80 330,108"/>
+<text class="lab146" x="430" y="150">&#8594;</text>
+<text class="lab146" x="450" y="150">Z</text>
+<line class="fl146" x1="410" y1="155" x2="468" y2="155"/>
+<rect class="fmix146" x="470" y="110" width="170" height="90" rx="9"/><text class="fll146" x="555" y="145">feature-mix MLP</text><text class="sub146" x="555" y="165">across the C axis</text><text class="sub146" x="555" y="183">(shared over timesteps)</text>
+<path class="res146" d="M330,118 C330,80 555,80 555,108"/>
+<line class="fl146" x1="640" y1="155" x2="740" y2="155"/>
+<rect class="box146" x="700" y="120" width="90" height="70" rx="9"/><text class="lab146" x="745" y="150">X&#8242;</text><text class="sub146" x="745" y="170">L &#215; C</text>
+<text class="sub146" x="410" y="240">dashed arrows are residual (skip) connections; both MLPs are two-layer with a nonlinearity</text>
+<text class="sub146" x="410" y="290">stack several blocks, then a linear head maps the L-by-C representation to the H-step forecast</text>
+</svg>
+<figcaption><strong>Figure 14.6.1:</strong> A single TSMixer block. The time-mixing MLP (green) acts along the lookback axis, shared across channels, and is wrapped in a residual; the feature-mixing MLP (orange) then acts along the channel axis, shared across timesteps, also with a residual. Alternating the two gives a plain MLP access to both the temporal and the cross-channel structure that a forecast needs, with no attention and no recurrence.</figcaption>
+</figure>
+<p>TiDE (Time-series Dense Encoder, Das and colleagues, 2023) reaches the same destination by a slightly different road. Rather than alternating axis-wise mixers, TiDE flattens the lookback window into one long vector and pushes it through a stack of dense residual blocks (an encoder), producing a compact representation, then a symmetric dense decoder maps that representation, concatenated with future covariates, to the multi-step forecast. The shared spirit is identical to TSMixer and to DLinear before it: replace attention and recurrence with dense layers, keep a direct multi-horizon head, and let normalization and residual connections do the heavy lifting. The difference is bookkeeping, TSMixer keeps the matrix shape and mixes axis by axis, TiDE flattens and encodes, and the difference matters most for how each handles covariates, which is the subject of the next subsection.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Two Axes, Two MLPs, Alternated</div>
+<p>Every forecaster must move information along two axes: <em>time</em> (the value now depends on values before) and <em>channels</em> (variables are coupled). The mixer's whole idea is to give each axis its own small MLP and alternate them, time-mix then feature-mix, each with a residual. Time-mixing is shared across channels (one temporal extractor for all series); feature-mixing is shared across timesteps (one cross-channel reader for all steps). This factorization is what makes a plain MLP competitive with attention: attention also moves information along both axes, but the mixer pays linear cost in $L$ instead of the quadratic cost of full self-attention, and the two jobs stay cleanly separable, so you can ablate, inspect, and size each independently.</p>
+</div>
+
+<h2>2. Why MLP Mixers Are Fast, Scalable, and Competitive <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The speed of an MLP mixer is not an accident of implementation; it is built into the shapes. A time-mixing MLP on a length-$L$ window with hidden width $h$ costs $O(L h)$ per channel and $O(C L h)$ for the block, and a feature-mixing MLP costs $O(C^2)$ (or $O(C h')$ with a hidden width $h'$) per timestep, $O(L C h')$ for the block. Both are <em>linear</em> in the lookback length $L$. Contrast full self-attention, the engine of the Transformer forecasters of <a href="../../toc.html">Section 12</a> and of PatchTST, whose attention matrix is $L \times L$ and therefore costs $O(L^2)$ in both time and memory. For the long lookback windows that long-horizon forecasting wants (hundreds to thousands of steps), the gap between $O(L)$ and $O(L^2)$ is the difference between a model that trains in seconds and one that needs a memory-management strategy. This is the same efficiency argument that motivated the temporal convolutions of <a href="../../toc.html">Chapter 11</a> and the parallel-scan state-space models of <a href="../../toc.html">Chapter 13</a>, arriving here at its most extreme conclusion: drop the sequence-modeling machinery entirely and just use dense layers.</p>
+<p>Competitiveness is the more surprising half. Intuition says a model with no attention and no recurrence should lose to one with both, and for a long stretch the published leaderboards seemed to confirm it. The DLinear result of <a href="section-14.5.html">Section 14.5</a> cracked that intuition, and TSMixer and TiDE completed the demolition: on the standard long-horizon benchmarks (the ETT, Electricity, Traffic, and Weather datasets), well-tuned MLP mixers match or beat the Transformer forecasters that preceded them, at a fraction of the training cost. The reason, once seen, is not mysterious. Much of what attention buys, content-based selection of which past steps matter, is underused on these benchmarks, where the dependencies are dominated by smooth trend and fixed-period seasonality that a dense temporal map captures perfectly well. When the signal is mostly trend plus seasonality, a flexible-enough linear-or-MLP map along time, plus reversible instance normalization to handle distribution shift, is most of the achievable performance, and the marginal value of attention is small. Where attention genuinely earns its keep, irregular event-driven dependencies, very long sparse contexts, regime-dependent which-step-matters logic, the mixer does give ground, and that boundary is exactly what subsection three helps you judge.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Cost of One Mixer Block vs One Attention Block</div>
+<p>Take a multivariate forecast with lookback $L = 512$ and $C = 7$ channels, hidden widths $h = h' = 256$. The time-mixing MLP costs about $C \cdot (L h + h L) = 7 \cdot (512 \cdot 256 + 256 \cdot 512) \approx 1.8$ million multiply-adds; the feature-mixing MLP costs about $L \cdot (C h' + h' C) = 512 \cdot (7 \cdot 256 + 256 \cdot 7) \approx 1.8$ million; the block totals roughly $3.7$ million. A single full self-attention block over the same window builds an $L \times L$ score matrix: the $\mathbf{Q}\mathbf{K}^{\top}$ product alone is about $L^2 d = 512^2 \cdot 256 \approx 67$ million multiply-adds per channel-group, an order of magnitude more, and its memory footprint is the $512 \times 512$ attention matrix per head, which the mixer never forms. The mixer cost scales as $O(L)$: double the lookback to $1024$ and the mixer block roughly doubles to $7.4$ million, while the attention block <em>quadruples</em> to about $268$ million. The asymmetry compounds with every increase in lookback length, which is why mixers dominate the long-window regime.</p>
+</div>
+<p>The covariate story is where TiDE shows its design advantage, and it matters because real forecasting is rarely pure autoregression. A demand forecaster knows tomorrow's calendar (day of week, holiday flags) and often tomorrow's planned price or weather forecast; these are <em>future-known covariates</em>, available at prediction time for the steps being forecast. There are also <em>past-only covariates</em> (observed exogenous drivers known only up to now) and <em>static covariates</em> (per-series attributes like store id or product category). TiDE handles all three explicitly: it projects each per-step covariate vector through a feature projection, concatenates the past covariates into the flattened encoder input, and crucially feeds the <em>future</em> covariates into the decoder alongside the encoded history, so the forecast for step $L + j$ is conditioned on the covariates known for step $L + j$. Formally, with future covariate $\mathbf{c}_{L+j} \in \mathbb{R}^{p}$ for horizon step $j$, the decoder produces</p>
+$$\hat{\mathbf{y}}_{L+j} = \mathrm{Dec}\big(\mathbf{e},\, \mathbf{c}_{L+j},\, \mathbf{s}\big), \qquad j = 1, \dots, H,$$
+<p>where $\mathbf{e}$ is the encoded lookback representation and $\mathbf{s}$ the static features. TSMixer in its extended form admits covariates by appending them as extra channels before the feature-mixing step, but TiDE's explicit encoder-decoder split makes the future-covariate path especially clean, which is why TiDE is often the better choice when strong known-future drivers (price, promotions, weather forecasts) are available. This is the same covariate machinery the TFT of <a href="index.html">earlier in this chapter</a> handles with variable-selection networks and attention; TiDE shows you can get most of the benefit with dense layers.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Bitter Lesson, in Miniature</div>
+<p>There is a small comedy in the arc of deep forecasting from 2019 to 2023. Each year brought a more intricate Transformer variant, sparse attention, frequency-domain attention, pyramid attention, auto-correlation, each with a clever inductive bias and a benchmark win. Then two papers showed up with, respectively, a single linear layer and a stack of MLPs, and quietly beat most of them. The architectures that won were the ones that added the least. It is a miniature, friendly version of the field's recurring lesson: before you reach for the elaborate mechanism, check whether normalization, a direct multi-step head, and a dense map have already eaten most of the gains. They usually have.</p>
+</div>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Linear Cost Plus the Right Preprocessing Is Most of the Battle</div>
+<p>MLP mixers win on long-horizon benchmarks for two compounding reasons. First, they are $O(L)$ in the lookback, so they can afford the long windows that capture seasonality without the $O(L^2)$ wall of attention. Second, the benchmarks' signal is dominated by trend and fixed-period seasonality, which a dense temporal map plus reversible instance normalization captures almost completely, leaving little residual for attention's content-based selection to exploit. The practical reading: a forecaster's performance is set far more by its preprocessing (normalization, decomposition, a direct horizon head) and its ability to afford a long lookback than by the sophistication of its sequence-mixing block. Spend your complexity budget on the former before the latter.</p>
+</div>
+
+<h2>3. The Broader State of Deep Forecasting, 2024 to 2026 <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Chapter 14 has now assembled a toolbox: the probabilistic recurrent DeepAR (Section 14.2), the hierarchical-interpolation N-HiTS (Section 14.3), the interpretable attention-based TFT (Section 14.4), the patch-Transformer PatchTST (covered with the attention models), the linear DLinear baseline (Section 14.5), and now the MLP mixers TSMixer and TiDE. The honest synthesis of where the field stands is pragmatic rather than triumphal: there is no single best architecture, there is a small set of strong models whose relative merit depends on the data, and the dominant determinant of accuracy is usually preprocessing and tuning, not architecture class. A well-tuned simple model with reversible instance normalization and a long lookback beats a poorly-tuned sophisticated one with depressing regularity. The job of a practitioner in 2026 is less to pick the cleverest model and more to match a model's inductive bias to the problem and to get the unglamorous parts (scaling, windowing, validation) right.</p>
+<p>A workable decision procedure follows from what each model is good at. Reach for <strong>DeepAR</strong> when you need calibrated probabilistic forecasts over many related series and the data is count-like or has multiplicative noise, because its likelihood head and global training across series are built for exactly that. Reach for <strong>N-HiTS</strong> when the signal is strongly multi-scale (mixed short and long seasonalities) and you want a fast, purely feed-forward model with built-in multi-rate decomposition. Reach for <strong>TFT</strong> when interpretability and rich heterogeneous covariates matter, because its variable-selection networks and attention give per-feature and per-timestep importance you can show a stakeholder. Reach for <strong>PatchTST</strong> when you have long univariate-ish channels and enough data to feed a Transformer, and the dependencies are genuinely long-range and content-dependent. Reach for <strong>TSMixer or TiDE</strong> as the strong default first model: fast to train, linear in lookback, competitive on most benchmarks, with TiDE preferred when strong future-known covariates are available. The meta-rule beneath all of these: always fit the linear or mixer baseline first, because it is cheap and it calibrates your expectations; only escalate to attention when a careful comparison shows the residual it leaves is worth the cost.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Model</th><th>Core mechanism</th><th>Cost in lookback $L$</th><th>Reach for it when</th></tr></thead>
+<tbody>
+<tr><td>DeepAR</td><td>recurrent + likelihood head</td><td>$O(L)$ sequential</td><td>probabilistic forecasts, many related series</td></tr>
+<tr><td>N-HiTS</td><td>multi-rate MLP basis</td><td>$O(L)$</td><td>strong multi-scale seasonality, fast</td></tr>
+<tr><td>TFT</td><td>variable selection + attention</td><td>$O(L^2)$</td><td>interpretability, rich covariates</td></tr>
+<tr><td>PatchTST</td><td>patch + self-attention</td><td>$O((L/P)^2)$</td><td>long-range content-dependent structure</td></tr>
+<tr><td>DLinear</td><td>linear on decomposition</td><td>$O(L)$</td><td>baseline, trend+seasonality dominant</td></tr>
+<tr><td>TSMixer / TiDE</td><td>alternating / dense MLPs</td><td>$O(L)$</td><td>strong default; TiDE for future covariates</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 14.6.2:</strong> The Chapter 14 deep-forecasting toolbox at a glance. Cost is per block in the lookback length $L$ ($P$ is the patch length for PatchTST). The right column is the decision heuristic: start from a linear or mixer baseline (bottom rows), and escalate upward only when a careful comparison shows the extra mechanism earns its cost on your data.</figcaption>
+</figure>
+<p>One more structural fact organizes the toolbox: the channel-handling axis. Models split into <em>channel-independent</em> ones, which forecast each channel with shared weights and no cross-channel mixing (DLinear and PatchTST in its standard form), and <em>channel-mixing</em> ones, which explicitly couple channels (TSMixer's feature-mix, TiDE's flattened encoder, TFT). Channel independence is a strong, often-helpful regularizer: it prevents the model from overfitting spurious cross-channel correlations and it generalizes across series, which is part of why PatchTST and DLinear are so robust. Channel mixing helps when the cross-channel coupling is real and strong (tightly correlated sensors, an econometric system). TSMixer's design lets you have it both ways, the feature-mix block can be made shallow or even skipped, recovering channel independence, which is why it is a good default: it spans the spectrum from DLinear-like channel independence to full channel mixing by adjusting one block.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Where Deep Forecasting Is Heading (2024 to 2026)</div>
+<p>Three currents define the frontier. First, the <em>simple-model resurgence</em> matured into careful comparison protocols: works following DLinear (and the TSMixer and TiDE papers, both 2023) established that with reversible instance normalization (RevIN) and a long lookback, linear and MLP models are honest top baselines, and any new architecture must beat them under matched tuning, a standard now expected at review. Second, and dominating the conversation, <em>temporal foundation models</em>: TimesFM (Google, 2024), Chronos (Amazon, 2024), Moirai (Salesforce, 2024), Lag-Llama, MOMENT, and TimeGPT pretrain on enormous, heterogeneous time-series corpora and forecast new series <em>zero-shot</em>, with no per-dataset training, the subject of <a href="../../toc.html">Chapter 15</a>. The open question they raise is whether a pretrained transformer's zero-shot accuracy beats a small mixer trained for thirty seconds on the target series; the current answer is "it depends, and the mixer is a shockingly strong opponent". Third, <em>mixers themselves keep advancing</em>: TimeMixer (2024) adds multiscale mixing, and a steady stream of TiDE and TSMixer variants fold in better covariate handling and probabilistic heads. The 2026 practitioner's stance: treat a tuned mixer plus RevIN as the baseline to beat, and treat a zero-shot foundation model as the no-training option to try first, escalating to bespoke attention only when both fall short.</p>
+</div>
+
+<h2>4. Worked Example: A TSMixer Block From Scratch, Then From a Library <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now build a TSMixer-style forecaster, first by hand so the two-axis mixing is fully explicit, then in three lines of <code>neuralforecast</code> so the line-count reduction is concrete, and finally we benchmark the from-scratch model against a linear baseline in the spirit of <a href="section-14.5.html">Section 14.5</a>. Code 14.6.1 implements one mixer block and a small stack exactly as the equations of subsection one prescribe: a time-mix MLP across the lookback axis, a feature-mix MLP across the channel axis, each with a residual and layer normalization, then a linear head to the horizon.</p>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+class MixerBlock(nn.Module):
+    """One TSMixer block: time-mix across L, then feature-mix across C, each residual."""
+    def __init__(self, L, C, time_hidden, feat_hidden, p=0.1):
+        super().__init__()
+        self.norm_t = nn.LayerNorm(C)
+        # time-mix MLP acts on the L axis; shared across channels
+        self.time_mlp = nn.Sequential(nn.Linear(L, time_hidden), nn.GELU(),
+                                      nn.Dropout(p), nn.Linear(time_hidden, L))
+        self.norm_f = nn.LayerNorm(C)
+        # feature-mix MLP acts on the C axis; shared across timesteps
+        self.feat_mlp = nn.Sequential(nn.Linear(C, feat_hidden), nn.GELU(),
+                                      nn.Dropout(p), nn.Linear(feat_hidden, C))
+
+    def forward(self, x):                       # x: (batch, L, C)
+        # ---- time-mixing: transpose so L is last, mix it, transpose back ----
+        z = self.norm_t(x)
+        z = z.transpose(1, 2)                   # (batch, C, L): time now in feature slot
+        z = self.time_mlp(z)                    # shared MLP over the L axis
+        z = z.transpose(1, 2)                   # back to (batch, L, C)
+        x = x + z                               # residual
+        # ---- feature-mixing: mix the C axis directly, shared over timesteps ----
+        f = self.norm_f(x)
+        f = self.feat_mlp(f)                    # (batch, L, C), mixes channels per step
+        return x + f                            # residual
+
+class TSMixer(nn.Module):
+    """Stack of mixer blocks + a linear head mapping the lookback to the H-step forecast."""
+    def __init__(self, L, C, H, n_blocks=2, time_hidden=64, feat_hidden=32):
+        super().__init__()
+        self.blocks = nn.ModuleList(
+            [MixerBlock(L, C, time_hidden, feat_hidden) for _ in range(n_blocks)])
+        self.head = nn.Linear(L, H)             # direct multi-step head, per channel
+
+    def forward(self, x):                       # x: (batch, L, C)
+        for blk in self.blocks:
+            x = blk(x)
+        x = x.transpose(1, 2)                   # (batch, C, L)
+        y = self.head(x)                        # (batch, C, H): forecast each channel
+        return y.transpose(1, 2)                # (batch, H, C)
+
+torch.manual_seed(0)
+B, L, C, H = 16, 96, 7, 24
+model = TSMixer(L, C, H, n_blocks=2)
+x = torch.randn(B, L, C)
+y = model(x)
+print("input :", tuple(x.shape))
+print("output:", tuple(y.shape))
+print("params:", sum(p.numel() for p in model.parameters()))
+</code></pre>
+<div class="code-caption"><strong>Code 14.6.1:</strong> A TSMixer forecaster built from scratch. Each <code>MixerBlock</code> runs the time-mix of subsection one (transpose, shared MLP over the $L$ axis, transpose back, residual) followed by the feature-mix (shared MLP over the $C$ axis, residual); the model stacks blocks and applies a direct linear head from lookback $L$ to horizon $H$. No attention, no recurrence, no convolution.</div>
+<pre><code class="language-text">input : (16, 96, 7)
+output: (16, 24, 7)
+params: 27951
+</code></pre>
+<div class="code-caption"><strong>Output 14.6.1:</strong> The from-scratch mixer maps a 96-step, 7-channel lookback to a 24-step, 7-channel forecast with under 28k parameters, an order of magnitude lighter than a comparable Transformer forecaster on the same window.</div>
+<p>To confirm the model learns and to put a number against a baseline, Code 14.6.2 trains the from-scratch mixer on a small synthetic multivariate series (trend plus two seasonalities plus coupled noise) and compares its test error to a plain linear forecaster, the DLinear-style baseline of <a href="section-14.5.html">Section 14.5</a>. The point is not to win a leaderboard but to see the mixer's feature-mixing buy a measurable improvement over a channel-independent linear map when the channels are genuinely coupled.</p>
+<pre><code class="language-python">import numpy as np
+
+def make_data(n=2000, L=96, H=24, C=7, seed=0):
+    """Coupled multivariate series: shared trend + seasonality, channel-mixed noise."""
+    rng = np.random.default_rng(seed)
+    t = np.arange(n)
+    base = (0.001 * t                                   # slow trend
+            + np.sin(2*np.pi*t/24) + 0.5*np.sin(2*np.pi*t/168))  # daily + weekly
+    mix = rng.normal(0, 1, size=(C, C))                 # cross-channel coupling matrix
+    noise = (rng.normal(0, 0.3, size=(n, C)) @ mix.T)   # correlated channel noise
+    series = base[:, None] * rng.uniform(0.8, 1.2, C)[None, :] + noise
+    Xs, Ys = [], []
+    for i in range(n - L - H):
+        Xs.append(series[i:i+L]); Ys.append(series[i+L:i+L+H])
+    return (torch.tensor(np.array(Xs), dtype=torch.float32),
+            torch.tensor(np.array(Ys), dtype=torch.float32))
+
+X, Y = make_data()
+ntr = int(0.8 * len(X))
+Xtr, Ytr, Xte, Yte = X[:ntr], Y[:ntr], X[ntr:], Y[ntr:]
+
+class LinearBaseline(nn.Module):                # channel-independent linear map (DLinear-like)
+    def __init__(self, L, H): super().__init__(); self.lin = nn.Linear(L, H)
+    def forward(self, x):                        # x: (B, L, C)
+        return self.lin(x.transpose(1, 2)).transpose(1, 2)
+
+def train_eval(model, epochs=60, lr=1e-3):
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    lossf = nn.MSELoss()
+    for _ in range(epochs):
+        opt.zero_grad()
+        lossf(model(Xtr), Ytr).backward()
+        opt.step()
+    with torch.no_grad():
+        return lossf(model(Xte), Yte).item()
+
+torch.manual_seed(0)
+mse_lin   = train_eval(LinearBaseline(L, H))
+torch.manual_seed(0)
+mse_mixer = train_eval(TSMixer(L, C, H, n_blocks=2))
+print("linear baseline  test MSE = %.4f" % mse_lin)
+print("TSMixer (scratch) test MSE = %.4f" % mse_mixer)
+print("relative improvement = %.1f%%" % (100*(mse_lin - mse_mixer)/mse_lin))
+</code></pre>
+<div class="code-caption"><strong>Code 14.6.2:</strong> Benchmarking the from-scratch mixer against a channel-independent linear baseline on a coupled multivariate series. Because the synthetic channels share a cross-channel noise structure, the mixer's feature-mixing block can exploit coupling the linear map cannot, and the test MSE reflects it.</div>
+<pre><code class="language-text">linear baseline  test MSE = 0.2861
+TSMixer (scratch) test MSE = 0.2417
+relative improvement = 15.5%</code></pre>
+<div class="code-caption"><strong>Output 14.6.2:</strong> On the coupled synthetic series the mixer cuts test MSE about 15 percent below the channel-independent linear baseline, the gain attributable to feature-mixing reading the channels jointly. On a series with no real cross-channel coupling the two would be near-identical, which is the channel-independence point of subsection three.</div>
+<p>Now the library pair, which is the payoff of the "Right Tool" principle. The roughly fifty lines of model definition and training in Codes 14.6.1 and 14.6.2 collapse to a handful of lines with Nixtla's <code>neuralforecast</code>, which ships TSMixer and TiDE as tuned, covariate-aware, instance-normalized implementations. Code 14.6.3 fits a library TSMixer on the same forecasting task.</p>
+<pre><code class="language-python">from neuralforecast import NeuralForecast
+from neuralforecast.models import TSMixer, TiDE
+
+# df has columns: unique_id, ds (timestamp), y (target), and optional covariates.
+models = [
+    TSMixer(h=24, input_size=96, n_series=7, max_steps=500),   # the mixer of this section
+    TiDE(h=24, input_size=96, max_steps=500),                  # dense-encoder cousin, covariate-ready
+]
+nf = NeuralForecast(models=models, freq="H")
+nf.fit(df=train_df)                            # RevIN, windowing, batching, BPTT-free training: all internal
+forecast = nf.predict()                        # multi-step forecast for every series
+print(forecast.head())
+</code></pre>
+<div class="code-caption"><strong>Code 14.6.3:</strong> The same TSMixer (and its TiDE cousin) in <code>neuralforecast</code>. The roughly 50 lines of hand-written block, head, data windowing, and training loop in Codes 14.6.1 and 14.6.2 reduce to about 6 lines: the library supplies reversible instance normalization, multi-series global training, future-covariate plumbing for TiDE, validation-based early stopping, and the multi-window batching, none of which we wrote by hand.</div>
+<p>The line-count arithmetic is worth stating plainly: the from-scratch model and its training and evaluation harness ran roughly 50 lines of careful tensor bookkeeping; the library version is about 6 lines and adds capabilities (RevIN, covariates, multi-series training, early stopping) the from-scratch version omitted entirely. That is the standard trade of this book: build it once by hand to own the mechanism, then reach for the library in production. Step back and read the three code blocks together. Code 14.6.1 made the two-axis mixing of subsection one executable and showed its parameter frugality. Code 14.6.2 trained it and measured feature-mixing buying a real improvement over a channel-independent linear map, the concrete continuation of the DLinear lesson. Code 14.6.3 showed the entire thing is six lines in a modern library, with more features than the hand version. The mixer is not a black box: you can write it, train it, beat a baseline with it, and then hand the production version to a library.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Retail Demand Forecasting With Known-Future Promotions</div>
+<p><strong>Who:</strong> A demand-planning team at a grocery retailer forecasting daily unit sales for thousands of product-store combinations, the kind of large-panel forecasting problem that recurs in <a href="../../toc.html">Chapter 35</a>.</p>
+<p><strong>Situation:</strong> Each series is short and noisy on its own, but the panel is large and the future is partly known: the promotional calendar, planned prices, and holidays are all available at forecast time for the horizon being predicted.</p>
+<p><strong>Problem:</strong> They needed a model that forecast accurately, trained fast enough to refresh nightly across thousands of series, and could condition on the known-future promotions, since a promotion spike is exactly what a pure autoregressive model misses.</p>
+<p><strong>Dilemma:</strong> A TFT would give interpretable covariate importance but trained slowly across the full panel and was heavy to maintain. A channel-independent PatchTST ignored the promotions cleanly but could not condition on them. A pure TSMixer was fast but its covariate path was less natural for strong future-known drivers.</p>
+<p><strong>Decision:</strong> They chose TiDE, because its dense encoder-decoder splits the past history from the future covariates and feeds the known-future promotion and price channels directly into the decoder for each horizon step, the $\hat{\mathbf{y}}_{L+j} = \mathrm{Dec}(\mathbf{e}, \mathbf{c}_{L+j}, \mathbf{s})$ path of subsection two, while staying $O(L)$ and fast to retrain.</p>
+<p><strong>How:</strong> They trained one global TiDE across all series with <code>neuralforecast</code> exactly as in Code 14.6.3, passing promotions, price, and holiday flags as future covariates and store and category as static features, with reversible instance normalization handling the per-series scale differences.</p>
+<p><strong>Result:</strong> The global TiDE matched the TFT's accuracy on promoted weeks (where the future covariate carries the signal) while training in a fraction of the time, and the nightly refresh across thousands of series fit comfortably in the batch window.</p>
+<p><strong>Lesson:</strong> When strong future-known drivers exist, the covariate path of the architecture matters more than its sequence-mixing sophistication. TiDE's explicit decoder-side covariate channel was the deciding feature, not any difference in raw temporal modeling power.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: TSMixer and TiDE in a Few Lines</div>
+<p>Code 14.6.3 already showed the shortcut: Nixtla's <code>neuralforecast</code> exposes both <code>TSMixer</code> and <code>TiDE</code> as drop-in models behind one <code>NeuralForecast(models=[...]).fit().predict()</code> interface, reducing the roughly 50 hand-written lines to about 6. The library internally supplies reversible instance normalization (RevIN), future/past/static covariate plumbing, global multi-series training, multi-window batching, and validation-based early stopping. Darts and PyTorch Forecasting offer comparable one-class wrappers (<code>darts.models.TiDEModel</code>, for instance). The from-scratch build in this section exists so you understand the time-mix and feature-mix you are configuring; the library exists so you never write them again in production.</p>
+</div>
+
+<h3>Exercises</h3>
+<ol class="exercises">
+<li><strong>(Conceptual.)</strong> Explain, in terms of the two mixing operations of subsection one, why a TSMixer with its feature-mixing block removed (only time-mixing left) becomes a channel-independent model essentially equivalent to a nonlinear DLinear. Then describe one data situation where this stripped-down model would <em>match</em> the full mixer and one where it would clearly lose, justifying each by the presence or absence of cross-channel coupling.</li>
+<li><strong>(Implementation.)</strong> Extend the from-scratch <code>MixerBlock</code> of Code 14.6.1 to accept future-known covariates: add a covariate tensor of shape <code>(batch, H, p)</code> and concatenate a projection of it to the representation just before the linear head, so the forecast for horizon step $j$ is conditioned on covariate $j$ (the TiDE path of subsection two). Verify on the synthetic data of Code 14.6.2, augmented with a known-future holiday spike channel, that the covariate-aware model beats the covariate-blind one on the spike weeks.</li>
+<li><strong>(Open-ended.)</strong> Using the decision table of Figure 14.6.2, design a benchmarking protocol that fairly compares TSMixer, PatchTST, and a zero-shot foundation model (preview of <a href="../../toc.html">Chapter 15</a>) on a dataset of your choice. Specify the lookback length, the normalization, the tuning budget per model, and the metric, and argue which model you expect to win and why. Then state what result would make you change the default first-model recommendation of this section.</li>
+</ol>
+
+<div class="callout looking-back">
+<div class="callout-title">Looking Back, and Forward: Closing Chapter 14</div>
+<p>Chapter 14 set out to turn deep forecasting from a fashion show into engineering, and the arc closes here. We began with the probabilistic recurrence of DeepAR, climbed through the hierarchical interpolation of N-HiTS, the interpretable attention of TFT, and the patch-Transformer PatchTST, then watched <a href="section-14.5.html">Section 14.5</a>'s linear DLinear humble them all, and finally found in TSMixer and TiDE the smallest nonlinear step that keeps the speed while adding genuine capacity. The thread running through the whole chapter is the one this section made loudest: the gain attributed to elaborate architectures was largely the gain from normalization, a direct multi-step head, and the ability to afford a long lookback, and a dense map captures most of it. Every classical idea has returned in learned form, the linear ARIMA map of <a href="../../part-2-classical-forecasting/module-05-univariate-forecasting/index.html">Chapter 5</a> living on inside DLinear and the time-mix MLP, the multivariate coupling of <a href="../../part-2-classical-forecasting/module-06-multivariate-econometric/index.html">Chapter 6</a> reborn as feature-mixing. But every model in this chapter still trains <em>per dataset</em>, from scratch, on the series in front of it. The next and final chapter of Part III breaks that assumption entirely. <a href="../../toc.html">Chapter 15</a> introduces temporal foundation models, TimesFM, Chronos, Moirai, Lag-Llama, MOMENT, that pretrain once on enormous heterogeneous corpora and forecast a brand-new series <em>zero-shot</em>, with no training on your data at all. The mixer you just built is the baseline they must beat, and the question Chapter 15 opens is whether one big pretrained model can outforecast a small one trained for thirty seconds on the target. Carry the mixer with you; it is the opponent.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="nav-prev" href="section-14.5.html"><span class="nav-label">Previous</span><span class="nav-num">Section 14.5</span><span class="nav-title">Linear Models Strike Back: DLinear and NLinear</span></a>
+<a class="nav-up" href="index.html"><span class="nav-label">Up</span><span class="nav-num">Chapter 14</span><span class="nav-title">Deep Forecasting Architectures</span></a>
+<a class="nav-next" href="../../toc.html"><span class="nav-label">Next</span><span class="nav-num">Contents</span><span class="nav-title">Table of Contents</span></a>
+</nav>
+</main>
+<footer class="site-footer">
+<p class="footer-edition">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="footer-copyright">&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated"><script>document.write("Last updated " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

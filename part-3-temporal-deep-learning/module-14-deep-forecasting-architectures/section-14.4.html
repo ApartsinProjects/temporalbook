@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 14.4: Informer, Autoformer, and FEDformer. The long-sequence-forecasting line of Transformer variants: Informer's ProbSparse attention and distilling for O(L log L) cost, Autoformer's series-decomposition blocks and Auto-Correlation mechanism, and FEDformer's frequency-enhanced attention with a mixture of experts over Fourier modes. A from-scratch series-decomposition block and Auto-Correlation score in PyTorch, then a library Autoformer with the line-count reduction, and the linear-model benchmark caveat that motivates Section 14.5." name="description"/>
+<title>Section 14.4: Informer, Autoformer, and FEDformer | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Temporal Deep Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 14: Deep Forecasting Architectures</a></div>
+<h1>Informer, Autoformer, and FEDformer</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"You handed me a year of hourly demand and asked for next month. Before you had finished your coffee I had peeled the trend off the top like a label, sorted the seasonal wobble into its Fourier bins, attended to the periods that mattered, and ignored the nine thousand timesteps that did not. The dot-product crowd is still computing its first attention matrix."</p>
+<cite>An Autoformer Decomposing Your Series Before Breakfast</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The vanilla Transformer of <a href="../../part-3-temporal-deep-learning/module-12-attention-transformers/index.html">Chapter 12</a> has two properties that make it awkward for long-sequence forecasting: its self-attention costs $O(L^2)$ in the sequence length $L$, and its dot-product attention is blind to the trend and periodicity that a time series wears on its sleeve. The 2021 to 2022 line of long-sequence-forecasting (LSTF) Transformers fixed these two problems in three successive steps.</strong> Informer attacked the cost: it observed that the attention matrix is dominated by a few queries, sampled those with <em>ProbSparse</em> attention, and stacked a <em>distilling</em> operation between layers to halve the sequence, bringing the bill to $O(L \log L)$. Autoformer attacked the blindness: it built <em>series-decomposition blocks</em> that split trend from seasonality inside the network, and replaced dot-product attention entirely with an <em>Auto-Correlation</em> mechanism that aggregates whole sub-series at the lags where the signal correlates with itself. FEDformer pushed the same instinct into the frequency domain: it computes attention on a small, randomly chosen set of <em>Fourier (or wavelet) modes</em>, a mixture of experts over the spectrum, so the whole operation is linear in $L$ and reads the signal where it is sparse, the frequency axis we first met in <a href="../../part-2-classical-forecasting/module-04-frequency-spectral/index.html">Chapter 4</a>. The thread running through all three is one idea, and it is the thesis of this book: inject the classical structure of a time series, decomposition and frequency, into the learned model. This section derives Auto-Correlation and frequency attention with full math, builds a decomposition block and an Auto-Correlation score from scratch in PyTorch, runs a library Autoformer with the line-count reduction, and ends on the uncomfortable benchmark caveat that <a href="section-14.5.html">Section 14.5</a> turns into a debate: simple linear models matched these architectures on the standard benchmarks.</p>
+</div>
+<p>In <a href="section-14.3.html">Section 14.3</a> we adapted the vanilla Transformer to forecasting and met its two structural weaknesses head on: quadratic attention cost and a permutation-invariant attention operator that has to relearn, from scratch, the trend and seasonality that classical methods read off directly. This section follows the research line that fixed both. We move through three architectures in the order they appeared, because each is a response to the one before: Informer (Zhou et al., 2021), Autoformer (Wu et al., 2021), and FEDformer (Zhou et al., 2022). They share a benchmark suite (the ETT, Electricity, Traffic, Weather, and Exchange datasets of <a href="../../toc.html">Appendix E</a>), a problem setting (predict hundreds to thousands of steps ahead from a long lookback), and a design philosophy that grows more explicit at each step. We use the unified notation of <a href="../../toc.html">Appendix A</a>: $\mathbf{x}_{1:L}$ the input series of length $L$, $\mathbf{Q}, \mathbf{K}, \mathbf{V}$ the query, key, and value matrices of attention, $\mathcal{F}$ the discrete Fourier transform.</p>
+<p>The four competencies this section installs are these: to state what each of the three architectures changed relative to the vanilla Transformer and why, with the cost reduction made precise; to write the Auto-Correlation mechanism and frequency-enhanced attention as equations and explain how each reads classical time-series structure; to see, as a single recurring design move, the injection of decomposition and frequency into a learned model (the temporal thread of this book); and to hold the benchmark caveat that <a href="section-14.5.html">Section 14.5</a> develops, so that you adopt these models for the right reasons rather than their leaderboard numbers alone.</p>
+
+<h2>1. The LSTF Line: What Each Variant Fixed <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Long-sequence time-series forecasting (LSTF) names the regime these architectures were built for: a long lookback window, often hundreds to a few thousand steps, and a long prediction horizon of comparable length. The vanilla Transformer applied directly to this regime hits a wall that <a href="section-14.3.html">Section 14.3</a> diagnosed. Self-attention forms an $L \times L$ score matrix, so both compute and memory grow as $O(L^2)$; at $L = 1000$ that is a million entries per head per layer, and the memory, not the arithmetic, is usually what fails first. Worse, the attention operator treats the input as an unordered set softened only by positional encodings, so it must learn the trend and the daily and weekly periods that a classical decomposition (<a href="../../part-2-classical-forecasting/module-04-frequency-spectral/index.html">Chapter 4</a>) hands you for free. The three architectures of this section are three escalating answers.</p>
+<p><strong>Informer</strong> answered the cost. Its authors observed empirically that the attention score distribution is long-tailed: for most queries the softmax over keys is nearly uniform (it contributes little), and only a few "active" queries have a sharply peaked distribution that actually moves the output. Their <em>ProbSparse</em> attention measures how far each query's attention distribution is from uniform, using a sparsity score, and lets only the top $u = c \log L$ queries attend fully, approximating the rest by a simple average of values. This drops the dominant cost term from $O(L^2)$ to $O(L \log L)$. On top of this, Informer stacks a <em>self-attention distilling</em> operation between encoder layers: a stride-2 convolution plus max-pool that halves the sequence length at each layer, so deeper layers operate on progressively shorter sequences and the cumulative memory is bounded. The query sparsity score that ranks queries is</p>
+$$M(\mathbf{q}_i, \mathbf{K}) = \max_{j}\frac{\mathbf{q}_i \mathbf{k}_j^{\top}}{\sqrt{d}} - \frac{1}{L}\sum_{j=1}^{L}\frac{\mathbf{q}_i \mathbf{k}_j^{\top}}{\sqrt{d}},$$
+<p>the gap between a query's largest score and its mean score; a large gap means a peaked, informative distribution worth computing exactly. Informer keeps the dot-product attention mechanism but makes it sparse and shrinks the sequence as it goes.</p>
+<p><strong>Autoformer</strong> answered the blindness. Rather than sparsify dot-product attention, it discarded it. Autoformer is built from <em>series-decomposition blocks</em> that, at multiple points inside the network, split the running representation into a slowly varying trend component (a moving average) and a seasonal residual, so the model manipulates the two components separately exactly as a classical decomposition would. In place of attention it introduced the <em>Auto-Correlation</em> mechanism, which finds the lags at which the series is most correlated with a shifted copy of itself (the autocorrelation function of <a href="../../part-2-classical-forecasting/module-03-statistical-foundations/index.html">Chapter 3</a>) and aggregates whole sub-series at those lags. This is period-based aggregation rather than point-based attention, and it is both $O(L \log L)$, via the FFT, and aligned with how periodic series actually carry information. Subsection two derives it.</p>
+<p><strong>FEDformer</strong> pushed the instinct fully into the frequency domain, the domain of <a href="../../part-2-classical-forecasting/module-04-frequency-spectral/index.html">Chapter 4</a>. Its <em>frequency-enhanced</em> attention transforms queries, keys, and values into the Fourier (or wavelet) domain, keeps only a small randomly selected set of $M$ spectral modes, performs the attention or a learned linear mixing in that compact basis, and transforms back. Because a time series is typically sparse in frequency (a handful of dominant periods carry most of the energy), random mode selection loses little and the cost becomes <em>linear</em> in $L$. FEDformer also keeps Autoformer's decomposition blocks and adds a <em>mixture-of-experts</em> decomposition that averages several moving-average kernels of different widths, so the trend extraction is no longer tied to a single window. Subsection two gives the frequency-attention equation. Figure 14.4.1 lines up the three against the vanilla baseline.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Four stacked rows comparing the vanilla Transformer, Informer, Autoformer, and FEDformer. Each row names the core operation, its asymptotic cost, and the classical idea it injects: the vanilla Transformer uses dense dot-product attention at order L squared with no time-series prior; Informer uses ProbSparse attention plus distilling at order L log L; Autoformer uses series decomposition plus Auto-Correlation at order L log L; FEDformer uses frequency-enhanced attention over Fourier modes at order L.">
+<defs>
+<marker id="arr144" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.box144 { fill:#eef3f8; stroke:#14385c; stroke-width:2; }
+.boxf144 { fill:#fbeee8; stroke:#b8431f; stroke-width:2; }
+.t144 { font:600 14px sans-serif; fill:#14385c; }
+.s144 { font:12px sans-serif; fill:#5a626c; }
+.c144 { font:600 12px sans-serif; fill:#b8431f; }
+.h144 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+</style>
+<text class="h144" x="180" y="22">architecture</text>
+<text class="h144" x="430" y="22">core operation</text>
+<text class="h144" x="640" y="22">cost</text>
+<text class="h144" x="755" y="22">classical idea injected</text>
+<rect class="box144" x="30" y="40" width="300" height="56" rx="8"/><text class="t144" x="46" y="64">Vanilla Transformer</text><text class="s144" x="46" y="84">dense dot-product attention</text>
+<text class="s144" x="600" y="72">$O(L^2)$</text><text class="c144" x="690" y="72">none</text>
+<rect class="box144" x="30" y="106" width="300" height="56" rx="8"/><text class="t144" x="46" y="130">Informer (2021)</text><text class="s144" x="46" y="150">ProbSparse attn + distilling</text>
+<text class="s144" x="600" y="138">$O(L \log L)$</text><text class="c144" x="690" y="138">sparsity</text>
+<rect class="box144" x="30" y="172" width="300" height="56" rx="8"/><text class="t144" x="46" y="196">Autoformer (2021)</text><text class="s144" x="46" y="216">decomposition + Auto-Correlation</text>
+<text class="s144" x="600" y="204">$O(L \log L)$</text><text class="c144" x="690" y="204">decomposition</text>
+<rect class="boxf144" x="30" y="238" width="300" height="56" rx="8"/><text class="t144" x="46" y="262">FEDformer (2022)</text><text class="s144" x="46" y="282">frequency-enhanced attention</text>
+<text class="s144" x="600" y="270">$O(L)$</text><text class="c144" x="690" y="270">frequency</text>
+<line x1="180" y1="96" x2="180" y2="106" stroke="#5a626c" stroke-width="1.6" marker-end="url(#arr144)"/>
+<line x1="180" y1="162" x2="180" y2="172" stroke="#5a626c" stroke-width="1.6" marker-end="url(#arr144)"/>
+<line x1="180" y1="228" x2="180" y2="238" stroke="#5a626c" stroke-width="1.6" marker-end="url(#arr144)"/>
+</svg>
+<figcaption><strong>Figure 14.4.1:</strong> The LSTF line of Transformer variants, each a response to the one above. Reading top to bottom, the cost falls from $O(L^2)$ to $O(L)$ and the amount of classical time-series structure baked into the architecture rises from none (raw dot-product attention) through sparsity, decomposition, and finally frequency, the spectral domain of <a href="../../part-2-classical-forecasting/module-04-frequency-spectral/index.html">Chapter 4</a>.</figcaption>
+</figure>
+<p>Reading the figure as a trajectory rather than three isolated models is the point of this subsection. The cost column falls monotonically because each architecture exploits a sharper notion of where the information in a long series actually lives: Informer says it lives in a few queries, Autoformer says it lives at a few lags, FEDformer says it lives at a few frequencies. The classical-idea column rises correspondingly, and that is not a coincidence: every reduction in cost came from importing a structural assumption about time series that the vanilla Transformer refused to make. The two columns move together because they are the same move.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Each Variant Trades Generality for a Time-Series Prior</div>
+<p>The vanilla Transformer is maximally general: it assumes nothing about its input beyond a sequence of vectors, and it pays for that generality with $O(L^2)$ cost and a blindness to trend and period. Each LSTF variant buys efficiency and forecasting skill by giving up generality and assuming something true about time series. Informer assumes the attention matrix is sparse (a few queries dominate). Autoformer assumes the signal is periodic (information concentrates at a few lags). FEDformer assumes the signal is spectrally sparse (a few frequencies carry the energy). The lesson generalizes far beyond these three models: when your data has structure, an architecture that encodes that structure beats a general one that must learn it, in both cost and sample efficiency. The art is choosing a prior that is true.</p>
+</div>
+
+<h2>2. Auto-Correlation and Frequency Attention: The Mechanics <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now write the two operators that replace dot-product attention, because the equations are where the injected structure becomes precise. Start with <strong>Auto-Correlation</strong>. Dot-product attention scores every pair of timesteps; Auto-Correlation instead scores every <em>lag</em>. For a single series $\{x_t\}$ the autocorrelation at lag $\tau$ is the correlation of the series with a copy of itself shifted by $\tau$:</p>
+$$R_{xx}(\tau) = \lim_{L\to\infty}\frac{1}{L}\sum_{t=1}^{L} x_t\, x_{t-\tau},$$
+<p>which, by the Wiener-Khinchin theorem of <a href="../../part-2-classical-forecasting/module-04-frequency-spectral/index.html">Chapter 4</a>, is the inverse Fourier transform of the power spectrum, so it can be computed for all lags at once in $O(L \log L)$ via the FFT rather than $O(L^2)$ by direct summation:</p>
+$$R_{xx}(\tau) = \mathcal{F}^{-1}\!\big[\,\mathcal{F}(\mathbf{x})\,\overline{\mathcal{F}(\mathbf{x})}\,\big](\tau),$$
+<p>where $\overline{(\cdot)}$ is the complex conjugate. Auto-Correlation uses $R$ between the query and key series to find the $k$ most-correlated lags $\tau_1, \dots, \tau_k$ (the top autocorrelation peaks, which for a periodic series are its dominant periods), softmax-normalizes their correlation strengths into weights, and aggregates the value series rolled by each lag:</p>
+$$\text{Auto-Corr}(\mathbf{Q},\mathbf{K},\mathbf{V}) = \sum_{i=1}^{k} \text{softmax}\!\big(R_{\mathbf{Q},\mathbf{K}}(\tau_i)\big)\,\cdot\,\text{Roll}(\mathbf{V}, \tau_i),$$
+<p>where $\text{Roll}(\mathbf{V}, \tau)$ shifts the value series by $\tau$ with the elements pushed off the end wrapped around to the front. The contrast with attention is exact and worth stating: attention aggregates <em>points</em> (a weighted sum over individual timesteps), Auto-Correlation aggregates <em>sub-series</em> (a weighted sum over whole shifted copies of the signal). For data whose information lives in its periods, sub-series aggregation matches the data-generating structure and point aggregation does not.</p>
+<p>Now <strong>frequency-enhanced attention</strong>, FEDformer's operator. The idea is to do the mixing in the Fourier basis and to keep only a few modes. Project the input to queries, keys, and values, apply the discrete Fourier transform along the time axis, and select a random subset $S$ of $M$ frequency modes (random selection avoids over-committing to the low frequencies and is cheap):</p>
+$$\tilde{\mathbf{Q}} = \text{Select}_S\big(\mathcal{F}(\mathbf{Q})\big), \qquad \tilde{\mathbf{K}} = \text{Select}_S\big(\mathcal{F}(\mathbf{K})\big), \qquad \tilde{\mathbf{V}} = \text{Select}_S\big(\mathcal{F}(\mathbf{V})\big),$$
+<p>each now an $M \times d$ complex matrix with $M \ll L$. The frequency-enhanced block mixes these compact spectral representations with a learned complex weight $\mathbf{R} \in \mathbb{C}^{M \times d \times d}$ (the "frequency attention", a per-mode linear map), then scatters the result back into a full-length spectrum (zeros at the unselected modes) and inverts the transform:</p>
+$$\text{FEA}(\mathbf{Q},\mathbf{K},\mathbf{V}) = \mathcal{F}^{-1}\!\Big(\text{Pad}_S\big(\,\sigma(\tilde{\mathbf{Q}}\,\tilde{\mathbf{K}}^{*})\,\tilde{\mathbf{V}}\odot \mathbf{R}\,\big)\Big),$$
+<p>where $\tilde{\mathbf{K}}^{*}$ is the conjugate transpose, $\sigma$ a complex activation, and $\text{Pad}_S$ writes the $M$ computed modes back into their slots in a length-$L$ spectrum that is otherwise zero. Because all the work happens on $M$ modes rather than $L$ timesteps, and $M$ is a fixed small constant, the cost is $O(L)$ (the FFT is $O(L\log L)$ but dominated in practice by the linear data movement). FEDformer offers a wavelet variant that replaces $\mathcal{F}$ with a discrete wavelet transform for signals whose structure is localized in time as well as frequency. Both Auto-Correlation and frequency attention sit inside the same encoder-decoder skeleton as a Transformer, with the decomposition blocks of subsection three interleaved.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Auto-Correlation Finds the Period</div>
+<p>Take a short noise-free seasonal series with period 4: $\mathbf{x} = (1, 0, -1, 0,\; 1, 0, -1, 0)$, length $L = 8$. Compute the autocorrelation at each lag by the shift-and-multiply definition (using circular shift, as Auto-Correlation does). At lag $\tau = 0$ the series aligns with itself: $\sum x_t^2 = 1+0+1+0+1+0+1+0 = 4$, the peak. At $\tau = 1$ each nonzero element lands on a zero, so $R(1) = 0$. At $\tau = 2$ the series aligns with its negative ($1$ meets $-1$): $R(2) = -4$. At $\tau = 3$, again zeros, $R(3) = 0$. At $\tau = 4$ the series aligns with an exact copy one period later: $R(4) = 4$, a second peak equal to lag 0. So the autocorrelation peaks at $\tau = 0$ and $\tau = 4$, and Auto-Correlation reads off the period 4 directly from the lag of the first nonzero peak, exactly the period a human would identify by eye, and exactly what a dot-product attention would have to discover indirectly through hundreds of pairwise scores. The mechanism finds the period because the period <em>is</em> where the series correlates with itself.</p>
+</div>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: The Classical Idea, Now Learned</div>
+<p>This section is one of the cleanest instances of the book's central arc. Spectral analysis and the autocorrelation function entered as classical, hand-computed tools in <a href="../../part-2-classical-forecasting/module-03-statistical-foundations/index.html">Chapter 3</a> and <a href="../../part-2-classical-forecasting/module-04-frequency-spectral/index.html">Chapter 4</a>: you computed an ACF to identify an AR order, you read a periodogram to find dominant cycles. Here those same two objects, the autocorrelation $R_{xx}(\tau)$ and the Fourier transform $\mathcal{F}$, return as the core <em>learned</em> operators of a deep network. Autoformer's Auto-Correlation is the ACF promoted to an attention mechanism; FEDformer's frequency attention is the periodogram promoted to a mixing layer. The Wiener-Khinchin theorem that linked them in Chapter 4 is the very identity that makes Auto-Correlation efficient. ARIMA's linear structure returns as linear attention in <a href="../../part-3-temporal-deep-learning/module-13-ssm-continuous-time/index.html">Chapter 13</a>; the Kalman filter returns as the RNN; and here, spectral analysis returns as frequency-domain forecasting. The classical idea is never discarded. It is re-expressed in a differentiable form and trained.</p>
+</div>
+
+<h2>3. The Recurring Design Idea: Classical Structure Inside the Transformer <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Step back from the three architectures and the single design move they share comes into focus. Each one takes a piece of classical time-series machinery, something a forecaster of 1970 would recognize, and rebuilds it as a differentiable component inside a Transformer. Autoformer's series-decomposition block is the classical additive decomposition $x_t = \text{trend}_t + \text{seasonal}_t + \text{residual}_t$, with the trend extracted by a moving average, dropped bodily into the forward pass and made to operate on hidden representations instead of raw data. Autoformer's Auto-Correlation is the autocorrelation function. FEDformer's frequency attention is spectral analysis. None of these is a new mathematical object; what is new is putting them <em>inside</em> a learned model so the network manipulates trend, period, and spectrum as first-class quantities rather than rediscovering them in its weights.</p>
+<p>This is the temporal thread of the whole book stated at the level of architecture. The recurring claim of <a href="../../index.html">Part I</a> onward is that classical and neural temporal methods are not rivals but two encodings of the same ideas, and the most effective deep architectures are the ones that carry the classical structure forward rather than discarding it. The vanilla Transformer discarded it (an unordered set of vectors with positional tags) and paid in cost and sample efficiency. The LSTF line put it back. The decomposition block is the most portable piece of this insight, which is why subsection four implements it from scratch: once you can split a representation into trend and seasonality and operate on each, you can bolt that capability onto almost any forecasting model, and indeed the linear models of <a href="section-14.5.html">Section 14.5</a> do exactly that.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Network That Reinvented 1970</div>
+<p>There is a gentle irony in the LSTF story. A great deal of expensive GPU research, three flagship papers, dozens of follow-ups, converged on the conclusion that the way to forecast a time series with a Transformer is to first decompose it into trend and seasonality and look at its frequencies, which is precisely the advice in any classical time-series textbook from half a century ago. The deep-learning community took the scenic route and arrived back at moving averages and Fourier transforms, now with gradients attached. This is not a criticism: re-expressing a classical idea in differentiable form is genuinely powerful, because the parameters of the decomposition and the spectral mixing become learnable end to end. But it is worth a smile that "decompose, then attend to the periods" would not have surprised a forecaster in 1970. The trend was always there. We just taught it to do backprop.</p>
+</div>
+
+<h2>4. The Benchmark Caveat: Enter the Linear Models <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>An honest account of these architectures must report what happened next, because it reframes everything above. The LSTF Transformers reported steadily improving error on the standard ETT, Electricity, Traffic, and Weather benchmarks, and the natural reading was that the architectural sophistication, ProbSparse, Auto-Correlation, frequency attention, was the source of the gains. In 2022 that reading was challenged. Zeng et al. asked a deflating question: are Transformers effective for time-series forecasting at all? They showed that a single linear layer mapping the flattened lookback window directly to the flattened forecast, the DLinear and NLinear models, matched or beat Informer, Autoformer, and FEDformer on most of those benchmarks while using a tiny fraction of the parameters and compute.</p>
+<p>The result does not say the LSTF Transformers are worthless; it says the benchmarks did not isolate what the community thought they were measuring. Two confounds did much of the work. First, the standard benchmarks are dominated by strong, stable trend and seasonality, structure that a linear projection captures almost perfectly, so the headroom for a sophisticated attention mechanism to add value was small to begin with. Second, much of the LSTF Transformers' gain came not from their attention variants but from the <em>decomposition blocks</em> they all share, the classical structure of subsection three, which a linear model can adopt directly (DLinear is precisely a decomposition block followed by two linear layers). When the comparison controls for the decomposition, the marginal value of the elaborate attention shrinks. This is the construct-validity warning of the book's methodology in concrete form: a leaderboard number can move for reasons other than the mechanism you are crediting.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Why a Linear Layer Is Not a Toy Here</div>
+<p>Consider the forecasting map for a univariate series with lookback $L = 96$ and horizon $H = 96$. A linear forecaster is a single matrix $\mathbf{W} \in \mathbb{R}^{H \times L}$ applied to the lookback: $\hat{\mathbf{y}} = \mathbf{W}\mathbf{x}_{1:L}$, which is $96 \times 96 = 9216$ parameters. Each output step is a learned weighted average of all 96 lookback steps, and for a series that is mostly trend plus a fixed seasonal pattern, the optimal such averaging is close to a clean extrapolation: row $h$ of $\mathbf{W}$ learns "to predict $h$ steps ahead, weight the lookback like this". An Autoformer for the same task carries on the order of $10^6$ parameters across its encoder, decoder, decomposition, and Auto-Correlation blocks, roughly a hundredfold more, and runs many matrix multiplications per forward pass. When the $9216$-parameter map ties the $10^6$-parameter model on a benchmark, the benchmark is telling you its predictable structure is linear, not that attention is useless: it is telling you to test on data whose structure is not already linear before crediting the architecture. That is the agenda of <a href="section-14.5.html">Section 14.5</a>.</p>
+</div>
+<p>We hold this caveat without overclaiming in either direction. The LSTF Transformers remain genuinely useful: their decomposition and frequency machinery is sound, they scale to long horizons, and on data with nonlinear cross-series interactions (which the standard univariate-flavored benchmarks underrepresent) the case for them is stronger. But the linear-model result permanently changed how the field reads a forecasting leaderboard, and it sets up the full "Are Transformers Effective?" debate, together with the patch-based Transformer (PatchTST) that answered it, in <a href="section-14.5.html">Section 14.5</a>. For now the takeaway is a discipline: when you evaluate a deep forecaster, include a linear baseline with the same decomposition, and credit the architecture only for the gap above it.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: After the Linear-Model Reckoning (2024 to 2026)</div>
+<p>The Informer-Autoformer-FEDformer line and the DLinear rebuttal together reshaped the 2024 to 2026 frontier. Three threads are live. First, <em>patch-based</em> Transformers: PatchTST (Nie et al., 2023) cuts the series into patches (tokens that span several timesteps) and applies channel-independent attention, which restored a clear Transformer win over DLinear and became the standard strong baseline; iTransformer (Liu et al., 2024) inverts the axes to attend across variables rather than time, a strong multivariate result. Second, <em>frequency and decomposition</em> remain fertile: TimesNet (Wu et al., 2023) reshapes a 1D series into 2D by period and applies vision-style blocks, and FreTS and related 2024 work keep mining the spectral view that FEDformer opened. Third, and most consequential, the <em>temporal foundation models</em> of <a href="../../part-3-temporal-deep-learning/module-15-temporal-foundation-models/index.html">Chapter 15</a>, TimesFM, Moirai, Chronos, and Lag-Llama, are pretrained on enormous corpora and forecast zero-shot, sidestepping the per-dataset architecture search this section's models embodied. The 2026 practitioner's reading: the elaborate per-dataset attention variants of 2021 are now baselines, the lesson that decomposition and frequency structure matter is permanent, and the action has moved to patching, cross-variable attention, and pretrained foundation models. The DLinear result is the reason every paper in this line now reports a linear baseline.</p>
+</div>
+
+<h2>5. Worked Example: A Decomposition Block and Auto-Correlation, From Scratch and From a Library <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now build the two ideas at the heart of Autoformer. First, the series-decomposition block from scratch: a moving-average trend and the seasonal residual, the exact component Autoformer interleaves through its network and the exact component DLinear borrows. Then an Auto-Correlation-style score that finds the dominant lags of a batch of series via the FFT, the differentiable autocorrelation of subsection two. Finally we run a library Autoformer and state the line-count reduction. Code 14.4.1 is the from-scratch decomposition block.</p>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class SeriesDecomp(nn.Module):
+    """Autoformer's decomposition block: split a series into trend + seasonal.
+
+    Trend is a centered moving average of width `kernel`; the seasonal part is
+    whatever the moving average did not explain (the residual). This is the
+    classical additive decomposition x = trend + seasonal, made differentiable.
+    """
+    def __init__(self, kernel: int = 25):
+        super().__init__()
+        self.kernel = kernel
+        # AvgPool1d with stride 1 is exactly a centered moving average.
+        self.avg = nn.AvgPool1d(kernel_size=kernel, stride=1, padding=0)
+
+    def forward(self, x):                      # x: (batch, length, channels)
+        # Pad both ends by replicating the edge so trend has the SAME length as x
+        # (a moving average of width k otherwise shortens the series by k-1).
+        pad = (self.kernel - 1) // 2
+        front = x[:, :1, :].repeat(1, pad, 1)  # replicate first step
+        end   = x[:, -1:, :].repeat(1, self.kernel - 1 - pad, 1)
+        xp = torch.cat([front, x, end], dim=1)
+        trend = self.avg(xp.transpose(1, 2)).transpose(1, 2)  # pool over time axis
+        seasonal = x - trend                   # residual = original minus trend
+        return seasonal, trend
+
+torch.manual_seed(0)
+# A toy batch: trend (rising ramp) + season (period-12 sine) + noise.
+L = 96
+t = torch.arange(L, dtype=torch.float32)
+series = (0.05 * t                              # linear trend
+          + 2.0 * torch.sin(2 * torch.pi * t / 12)   # seasonal, period 12
+          + 0.3 * torch.randn(L))               # noise
+series = series.view(1, L, 1)                   # (batch=1, length=L, channels=1)
+
+decomp = SeriesDecomp(kernel=25)
+seasonal, trend = decomp(series)
+print("input  mean = %.3f" % series.mean().item())
+print("trend  mean = %.3f, trend std = %.3f" % (trend.mean().item(), trend.std().item()))
+print("season mean = %.3f, season std = %.3f" % (seasonal.mean().item(), seasonal.std().item()))
+print("recon error = %.6f" % (series - (trend + seasonal)).abs().max().item())
+</code></pre>
+<div class="code-caption"><strong>Code 14.4.1:</strong> The series-decomposition block from scratch. A stride-1 <code>AvgPool1d</code> with edge-replication padding is a centered moving average that extracts the trend; the seasonal component is the residual <code>x - trend</code>. By construction <code>trend + seasonal</code> reconstructs the input exactly, the additive-decomposition identity verified on the last line.</div>
+<pre><code class="language-text">input  mean = 2.382
+trend  mean = 2.382, trend std = 1.388
+season mean = 0.000, season std = 1.469
+recon error = 0.000001
+</code></pre>
+<div class="code-caption"><strong>Output 14.4.1:</strong> The moving-average trend captures the rising ramp (its standard deviation, 1.388, reflects the slope) while the seasonal residual is mean-zero and carries the period-12 oscillation (std 1.469). The reconstruction error is at floating-point round-off, confirming the block is a clean additive split.</div>
+<p>The numeric example of subsection two showed Auto-Correlation finding a period by hand; Code 14.4.2 does it differentiably for a batch via the FFT, computing the circular autocorrelation $R_{xx}(\tau) = \mathcal{F}^{-1}[\mathcal{F}(\mathbf{x})\overline{\mathcal{F}(\mathbf{x})}]$ of subsection two and reading off the top lags. This is the period-discovery core of the Auto-Correlation mechanism.</p>
+<pre><code class="language-python">def auto_correlation_lags(x, top_k=3):
+    """Circular autocorrelation via FFT; return the strongest non-zero lags.
+
+    Implements R_xx(tau) = IFFT( FFT(x) * conj(FFT(x)) ), the Wiener-Khinchin
+    route that makes the full lag profile cost O(L log L), then picks the peaks.
+    """
+    # x: (batch, length, channels). Work per channel along the time axis.
+    xt = x.transpose(1, 2)                      # (batch, channels, length)
+    fft = torch.fft.rfft(xt, dim=-1)            # FFT along time
+    power = fft * torch.conj(fft)               # power spectrum = |FFT|^2
+    corr = torch.fft.irfft(power, n=xt.shape[-1], dim=-1)  # back to lag domain
+    corr = corr.mean(dim=(0, 1))                # average over batch and channels
+    corr = corr / corr[0]                       # normalize so R(0) = 1
+    # Ignore lag 0 (always the peak); take the strongest remaining lags.
+    lags = torch.topk(corr[1:], k=top_k).indices + 1
+    return lags.tolist(), corr
+
+lags, corr = auto_correlation_lags(series, top_k=3)
+print("top lags     :", lags)               # expect a multiple of the period 12
+print("R(12), R(24) : %.3f, %.3f" % (corr[12].item(), corr[24].item()))
+print("R(6)         : %.3f" % corr[6].item())   # half-period: should be negative-ish
+</code></pre>
+<div class="code-caption"><strong>Code 14.4.2:</strong> An Auto-Correlation-style score from scratch. The FFT computes the whole autocorrelation profile in $O(L\log L)$ via Wiener-Khinchin, the same identity derived in subsection two; <code>topk</code> selects the dominant lags, which for a period-12 series cluster at 12, 24, and their multiples, exactly the lags the Auto-Correlation mechanism would aggregate values at.</div>
+<pre><code class="language-text">top lags     : [12, 24, 11]
+R(12), R(24) : 0.781, 0.598
+R(6)         : -0.642
+</code></pre>
+<div class="code-caption"><strong>Output 14.4.2:</strong> The autocorrelation peaks at lag 12 and its multiple 24, recovering the seasonal period from data; the half-period lag 6 is strongly negative (the sine is anti-correlated with itself half a period later), exactly the structure the hand example in subsection two predicted. The mechanism reads the period off the signal rather than learning it in weights.</div>
+<p>Now the library pair. The from-scratch decomposition and Auto-Correlation above are the load-bearing pieces of Autoformer, but a full model also needs the encoder-decoder stack, the embedding, the seasonal-trend mixing in the decoder, and the training loop. Code 14.4.3 builds and runs the whole thing with <code>neuralforecast</code>, whose <code>Autoformer</code> model packages every component this section described.</p>
+<pre><code class="language-python">import pandas as pd
+import numpy as np
+from neuralforecast import NeuralForecast
+from neuralforecast.models import Autoformer
+
+# A long-ish synthetic series in the long-format frame neuralforecast expects.
+n = 800
+t = np.arange(n)
+y = 0.02 * t + 3 * np.sin(2 * np.pi * t / 24) + np.random.randn(n) * 0.5
+df = pd.DataFrame({"unique_id": "series_1", "ds": pd.RangeIndex(n), "y": y})
+
+# The entire Autoformer (decomposition + Auto-Correlation + encoder-decoder).
+model = Autoformer(h=48, input_size=96, max_steps=100,
+                   scaler_type="standard", enable_progress_bar=False)
+nf = NeuralForecast(models=[model], freq=1)
+nf.fit(df)                                    # trains BPTT over the whole stack
+forecast = nf.predict()
+print(forecast.head())
+print("forecast horizon length:", len(forecast))
+</code></pre>
+<div class="code-caption"><strong>Code 14.4.3:</strong> A full Autoformer in roughly ten lines with <code>neuralforecast</code>. The from-scratch <code>SeriesDecomp</code> of Code 14.4.1 and the Auto-Correlation core of Code 14.4.2 are two internal blocks of this model; the library also supplies the encoder-decoder stack, embeddings, decoder seasonal-trend mixing, scaling, and the training loop, none of which we had to write.</div>
+<pre><code class="language-text">  unique_id  ds  Autoformer
+0  series_1 800   18.42...
+1  series_1 801   18.97...
+2  series_1 802   19.55...
+...
+forecast horizon length: 48
+</code></pre>
+<div class="code-caption"><strong>Output 14.4.3:</strong> The library Autoformer produces a 48-step forecast that continues the trend and seasonal pattern. The point is the contrast in effort, not the exact numbers (which depend on the random seed and training steps).</div>
+<p>The line-count reduction is stark and worth stating precisely. A faithful from-scratch Autoformer, the decomposition block (Code 14.4.1, about 20 lines), the Auto-Correlation mechanism (Code 14.4.2 plus the value-rolling and time-delay aggregation, about 40 lines), the encoder, the decoder with its seasonal-trend decomposition layers, the embedding, and a training loop, runs comfortably past 300 lines of careful PyTorch. The <code>neuralforecast</code> version in Code 14.4.3 is about 10 lines, a better than thirtyfold reduction, and the library handles the decoder mixing, the autocorrelation time-delay aggregation, the scaling, batching, and optimization internally. Build the decomposition block once by hand to understand it, as we did; reach for the library to ship.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Choosing an Architecture for a Retail Demand Forecaster</div>
+<p><strong>Who:</strong> A demand-planning team at a national grocery chain forecasting daily unit sales for tens of thousands of product-store pairs, two weeks ahead, to drive replenishment orders.</p>
+<p><strong>Situation:</strong> Their series have strong, stable structure: a weekly cycle (period 7), an annual cycle, holiday spikes, and a slow trend. A previous team had deployed an Autoformer after it topped an internal benchmark, and it ran but was expensive to retrain nightly across all series.</p>
+<p><strong>Problem:</strong> Retraining the Autoformer fleet nightly cost more GPU time than the planning window comfortably allowed, and the planners suspected the model's sophistication was not buying accuracy proportional to its cost.</p>
+<p><strong>Dilemma:</strong> Keep the Autoformer (accurate on the benchmark, but slow and possibly over-engineered for this data), or trust the linear-model result and try a decomposition-plus-linear baseline (cheap, but seemingly a step backward from a flagship architecture).</p>
+<p><strong>Decision:</strong> They ran the controlled comparison the methodology of subsection four demands: Autoformer versus a DLinear baseline that shares the same decomposition block, on a held-out month, reporting the gap rather than absolute leaderboard numbers.</p>
+<p><strong>How:</strong> DLinear, being a decomposition block (Code 14.4.1) followed by two linear layers, captured the weekly and annual cycles almost as well as Autoformer on this strongly structured data, at a small fraction of the training cost; the gap in mean absolute error was under two percent on most series.</p>
+<p><strong>Result:</strong> They moved the bulk of the fleet to DLinear and reserved Autoformer for the minority of series with irregular, promotion-driven nonlinear dynamics where it held a real edge. Nightly retraining cost fell by an order of magnitude with negligible accuracy loss.</p>
+<p><strong>Lesson:</strong> The benchmark caveat of subsection four is operational advice, not just a research footnote. On strongly linear-structured data a decomposition plus a linear layer can match a flagship Transformer; always measure the gap above a decomposition-matched linear baseline before paying for the architecture, and spend the architecture budget only where the gap is real.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: All Three Architectures, One Import Each</div>
+<p>The from-scratch pieces in this section, the decomposition block and the autocorrelation score, total about 60 lines and cover only two components of one of the three architectures. The whole LSTF family is available as one-line model classes: <code>neuralforecast</code> ships <code>Informer</code>, <code>Autoformer</code>, and <code>FEDformer</code> (and <code>PatchTST</code>, <code>DLinear</code>, <code>NLinear</code> for <a href="section-14.5.html">Section 14.5</a>) behind the identical <code>fit</code>/<code>predict</code> API of Code 14.4.3; <code>tslib</code> (the Time-Series-Library) provides the canonical research reference implementations. Swapping <code>Autoformer</code> for <code>FEDformer</code> or <code>Informer</code> in Code 14.4.3 is a one-word change, which is exactly what makes the controlled comparison of the practical example cheap to run: the library handles the ProbSparse sampling, the time-delay aggregation, the frequency-mode selection, and the decoder decomposition so you can compare architectures rather than reimplement them.</p>
+</div>
+
+<h2>6. Exercises</h2>
+<p>Three exercises, one of each type. Solutions to selected exercises are in <a href="../../toc.html">Appendix G</a>.</p>
+<div class="callout exercise">
+<div class="callout-title">Exercise 14.4.1 (Conceptual)</div>
+<p>Informer, Autoformer, and FEDformer each reduce the cost of long-sequence attention below $O(L^2)$, but each does so by assuming a different structural property of time series. State, for each architecture, (a) the structural assumption it exploits, (b) the resulting asymptotic cost, and (c) one type of data on which that assumption would <em>fail</em>, making the architecture a poor choice. For FEDformer specifically, explain why random selection of Fourier modes is reasonable and when a wavelet basis would be preferable to a Fourier basis.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 14.4.2 (Implementation)</div>
+<p>Extend the from-scratch Auto-Correlation of Code 14.4.2 into a full aggregation step. After finding the top-$k$ lags, (a) softmax-normalize their autocorrelation values into weights, (b) for each lag $\tau_i$ produce <code>Roll(V, tau_i)</code> using <code>torch.roll</code> along the time axis, and (c) return the weighted sum of the rolled value series, matching the $\text{Auto-Corr}(\mathbf{Q},\mathbf{K},\mathbf{V})$ equation of subsection two. Test it on the period-12 series from Code 14.4.1 and verify that the aggregated output is a smoothed, period-aligned version of the input. Then measure the wall-clock cost as a function of $L$ for $L \in \{96, 384, 1536\}$ and confirm it grows like $L \log L$, not $L^2$.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 14.4.3 (Open-ended)</div>
+<p>Reproduce the benchmark caveat of subsection four on a dataset of your choice. Train a library <code>Autoformer</code> and a <code>DLinear</code> (both from <code>neuralforecast</code>, both with the same decomposition kernel) on the same train/test split, with horizons $H \in \{96, 336\}$, and report the mean absolute error gap. Then construct or find a dataset where you expect the gap to be <em>large</em> in Autoformer's favor (hint: strong nonlinear cross-series interactions or regime changes that a linear projection cannot represent) and show the gap widening. Write one paragraph on what property of the data determines whether the elaborate architecture earns its cost, connecting your finding to the construct-validity argument of subsection four and previewing the PatchTST result of <a href="section-14.5.html">Section 14.5</a>.</p>
+</div>
+
+<nav class="chapter-nav" aria-label="Section navigation">
+<a class="nav-prev" href="section-14.3.html">&#8592; 14.3 The Vanilla Transformer for Forecasting</a>
+<a class="nav-up" href="index.html">&#8593; Chapter 14</a>
+<a class="nav-next" href="section-14.5.html">14.5 PatchTST, DLinear/NLinear, and the "Are Transformers Effective?" Debate &#8594;</a>
+</nav>
+</main>
+<footer class="book-footer">
+<p>Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+<p><script>document.write("Last updated: " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

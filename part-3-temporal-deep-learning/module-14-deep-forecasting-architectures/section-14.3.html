@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 14.3: Temporal Fusion Transformer. The TFT of Lim et al. 2021 as a forecasting-specific architecture that fuses LSTM encoders, variable selection networks, gated residual networks, static covariate encoders, and interpretable multi-head attention to produce multi-horizon quantile forecasts from static, known-future, and observed-past covariates; built from scratch then reproduced with pytorch-forecasting and neuralforecast." name="description"/>
+<title>Section 14.3: Temporal Fusion Transformer (TFT) | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Temporal Deep Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 14: Deep Forecasting Architectures</a></div>
+<h1>Temporal Fusion Transformer (TFT)</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"You handed me forty features and called every one essential. I gave eleven of them a weight near zero before the first epoch finished, kept the rest on a leash, and at no point did I make a fuss about it. Interpretability, as it turns out, is mostly the discipline of ignoring you politely."</p>
+<cite>A Variable Selection Network Quietly Ignoring Your Useless Features</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The Temporal Fusion Transformer (Lim et al., 2021) is not a general sequence model bent to forecasting; it is an architecture designed, component by component, around the structure of a real forecasting problem. Real forecasting data is heterogeneous: some inputs are static (a store's region, a patient's diagnosis), some are known into the future (the calendar, a scheduled promotion), and some are observed only up to now (past sales, past vitals). A plain Transformer flattens all of this into one undifferentiated token stream and learns the distinctions the hard way. The TFT instead gives each kind of covariate its own pathway, learns per-step which variables matter through a variable selection network, gates information through gated residual networks so the model can skip a component it does not need, summarizes the static metadata once and injects it everywhere, and reads out not a point but a full set of quantiles across many future horizons at once.</strong> The payoff is twofold and rare to get together: strong multi-horizon probabilistic accuracy, and genuine interpretability, because the variable-selection weights and the attention pattern are readable artifacts, not post-hoc rationalizations. This section dissects the five components, derives the quantile loss that makes the output probabilistic, builds a variable-selection-plus-gating block from scratch so the mechanism is concrete, then reproduces a full TFT in a few lines of <code>pytorch-forecasting</code> and reads off both quantile forecasts and a variable-importance ranking. You leave able to decide when the TFT's machinery earns its complexity and when a simpler model of <a href="section-14.2.html">Section 14.2</a> is the better call.</p>
+</div>
+<p>In <a href="section-14.2.html">Section 14.2</a> we built DeepAR and the deep autoregressive family, models that roll a recurrent state forward one step at a time and sample a trajectory. They are probabilistic and they are strong, but they treat the covariate zoo uniformly and they are point-recursive: a forecast at horizon twenty is the twentieth link in a chain, each link compounding the last link's error. This section takes a different design stance. The Temporal Fusion Transformer asks: what if the architecture itself encoded the three categories of covariate that <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a> taught us to distinguish, predicted all horizons jointly rather than recursively, and made its own reasoning legible? The result is a forecasting-specific Transformer that has become a strong, widely used baseline for multi-horizon problems with rich covariates. We use the unified notation of <a href="../../toc.html">Appendix A</a> throughout: $\mathbf{x}_t$ the time-varying inputs, $\mathbf{s}$ the static covariates, $\hat{y}_{t}(q)$ the forecast at horizon $t$ and quantile $q$.</p>
+<p>The reason the TFT deserves a section rather than a paragraph is that it is the clearest worked example in this book of architecture-as-inductive-bias for forecasting. Every component answers a specific, nameable pain of real forecasting data. Variable selection answers "I have forty candidate features and most are noise". Gated residual networks answer "I do not know in advance whether this nonlinear transform helps, so let the model learn to skip it". Static encoders answer "the store's region matters but it does not change with time, so do not waste sequence capacity re-reading it". Interpretable attention answers "the forecast must justify itself to a human who will act on it". Quantile outputs answer "a number is not a forecast; a distribution is". Learn the TFT and you learn a vocabulary of forecasting-specific building blocks that recur, in pieces, across the rest of Part III.</p>
+<p>The competencies this section installs are four: to name the three covariate types and trace each through its TFT pathway; to write and reason about the quantile (pinball) loss that produces multi-horizon probabilistic output; to implement a variable selection network and a gated residual network from scratch and see what they compute; and to run a production TFT and extract both its quantile forecasts and its variable-importance readout. These carry directly into the interpretability methods of <a href="../../toc.html">Chapter 33</a> and the foundation models of <a href="../../toc.html">Chapter 15</a>.</p>
+
+<h2>1. The Temporal Fusion Transformer: A Forecasting-Specific Architecture <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The TFT, introduced by Bryan Lim, Sercan Arik, Nicolas Loeff, and Tomas Pfister in 2021, is best understood as five cooperating ideas assembled in a deliberate order. From the bottom up: a <em>variable selection network</em> at each timestep decides which input variables are worth attending to, producing a weighted combination rather than a raw concatenation. A <em>static covariate encoder</em> compresses the time-invariant metadata into a handful of context vectors that are injected at several points downstream. An <em>LSTM encoder-decoder</em> (the locality-aware sequence backbone) processes the selected past inputs and the known-future inputs, giving each timestep a context-aware representation. An <em>interpretable multi-head attention</em> layer then lets every forecast horizon attend over the entire encoded history, capturing long-range patterns the LSTM alone would smear. Throughout, <em>gated residual networks</em> wrap the nonlinear transforms so the model can suppress any component that does not help. The top reads out quantiles at every horizon.</p>
+<p>The single design commitment that distinguishes the TFT from a generic sequence-to-sequence Transformer is that it treats the three covariate types of <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a> as architecturally distinct, not as rows in one matrix. Recall that chapter's taxonomy: <strong>static</strong> covariates $\mathbf{s}$ do not vary with time (a series identifier, a product category, a sensor's location); <strong>known-future</strong> covariates are time-varying but known ahead of the forecast (the day of week, a public holiday, a scheduled price change); and <strong>observed-past</strong> covariates are time-varying and known only up to the forecast origin (the target's own history, past traffic, past temperature). A point forecaster that ignores these distinctions will, for instance, try to predict tomorrow's holiday flag instead of simply reading it off the calendar, or will re-encode a store's region at every one of a thousand timesteps. The TFT routes each type where it belongs: known-future covariates feed both the encoder and the decoder, observed-past covariates feed only the encoder, and static covariates feed a dedicated encoder whose outputs condition everything. Figure 14.3.1 shows the routing.</p>
+<figure class="diagram">
+<svg viewBox="0 0 840 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The Temporal Fusion Transformer data flow. Three input groups enter at the bottom: static covariates, observed-past covariates, and known-future covariates. Static covariates pass through a static encoder that emits context vectors fanning out to the variable selection networks, the LSTM, and the attention. Observed-past and known-future covariates pass through per-step variable selection networks into an LSTM encoder-decoder, then through interpretable multi-head attention, then to a quantile output head producing several horizons.">
+<defs>
+<marker id="ar143" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+<marker id="arS143" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b8431f"/></marker>
+</defs>
+<style>
+.box143 { fill:#eef3f8; stroke:#14385c; stroke-width:1.8; }
+.stat143 { fill:#fbeee8; stroke:#b8431f; stroke-width:1.8; }
+.out143 { fill:#e8f4ec; stroke:#1f7a44; stroke-width:1.8; }
+.fl143 { stroke:#5a626c; stroke-width:1.7; fill:none; marker-end:url(#ar143); }
+.st143 { stroke:#b8431f; stroke-width:1.5; fill:none; marker-end:url(#arS143); stroke-dasharray:5 4; }
+.lab143 { font:600 12.5px sans-serif; fill:#14385c; text-anchor:middle; }
+.sl143 { font:600 12.5px sans-serif; fill:#b8431f; text-anchor:middle; }
+.ol143 { font:600 12.5px sans-serif; fill:#1f7a44; text-anchor:middle; }
+.sub143 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+</style>
+<text class="lab143" x="420" y="22">TFT: each covariate type routed to its own pathway</text>
+<rect class="stat143" x="40" y="290" width="150" height="46" rx="8"/><text class="sl143" x="115" y="311">static covariates s</text><text class="sub143" x="115" y="327">region, category, id</text>
+<rect class="box143" x="230" y="290" width="170" height="46" rx="8"/><text class="lab143" x="315" y="311">observed-past x</text><text class="sub143" x="315" y="327">target history, vitals</text>
+<rect class="box143" x="440" y="290" width="170" height="46" rx="8"/><text class="lab143" x="525" y="311">known-future x</text><text class="sub143" x="525" y="327">calendar, promotions</text>
+<rect class="stat143" x="40" y="210" width="150" height="44" rx="8"/><text class="sl143" x="115" y="237">static encoder</text>
+<rect class="box143" x="230" y="210" width="380" height="44" rx="8"/><text class="lab143" x="420" y="237">variable selection networks (per step)</text>
+<rect class="box143" x="230" y="146" width="380" height="40" rx="8"/><text class="lab143" x="420" y="171">LSTM encoder + decoder</text>
+<rect class="box143" x="230" y="86" width="380" height="40" rx="8"/><text class="lab143" x="420" y="111">interpretable multi-head attention</text>
+<rect class="out143" x="285" y="36" width="270" height="36" rx="8"/><text class="ol143" x="420" y="59">quantile output: y(0.1), y(0.5), y(0.9) per horizon</text>
+<line class="fl143" x1="115" y1="290" x2="115" y2="256"/>
+<line class="fl143" x1="315" y1="290" x2="345" y2="256"/>
+<line class="fl143" x1="525" y1="290" x2="495" y2="256"/>
+<line class="fl143" x1="420" y1="210" x2="420" y2="188"/>
+<line class="fl143" x1="420" y1="146" x2="420" y2="128"/>
+<line class="fl143" x1="420" y1="86" x2="420" y2="74"/>
+<line class="st143" x1="115" y1="210" x2="225" y2="232"/>
+<line class="st143" x1="115" y1="220" x2="225" y2="166"/>
+<line class="st143" x1="115" y1="232" x2="225" y2="106"/>
+<text class="sl143" x="150" y="120">static context fans out</text>
+</svg>
+<figcaption><strong>Figure 14.3.1:</strong> The TFT routes each covariate type to its own pathway. Static covariates (orange) pass through a dedicated encoder whose context vectors fan out (dashed) to the variable selection networks, the LSTM, and the attention. Observed-past and known-future inputs pass through per-step variable selection into the LSTM encoder-decoder and then interpretable attention, before the quantile head (green) emits several quantiles at every horizon at once.</figcaption>
+</figure>
+<p>Two consequences of this routing are worth making explicit because they are what a generic Transformer gets wrong. First, because known-future covariates feed the decoder, the TFT predicts all horizons jointly in a single forward pass rather than recursively, so a known holiday three weeks out informs the forecast for that day directly, without being filtered through twenty intervening predicted steps. This is the multi-horizon advantage over the autoregressive models of <a href="section-14.2.html">Section 14.2</a>. Second, because the static metadata is encoded once and injected as context rather than tiled across the sequence, the sequence model spends its capacity on temporal dynamics rather than on relearning constant facts at every step. The architecture is, in a precise sense, the chapter-2 covariate taxonomy compiled into a network.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Architecture Is the Covariate Taxonomy</div>
+<p>The TFT's design is not arbitrary cleverness; it is the three-way covariate distinction of <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a> turned into wiring. Static inputs get an encoder that conditions everything once. Known-future inputs feed both encoder and decoder, so the model reads the future it is allowed to read instead of predicting it. Observed-past inputs feed only the encoder, so the model never illegally peeks. If you can classify your covariates into those three bins (and Chapter 2 taught you exactly how), you can fill in a TFT correctly, and conversely, when you find yourself fighting a generic model to teach it which features are knowable in advance, that fight is the TFT's reason to exist.</p>
+</div>
+
+<h2>2. The Components: Variable Selection, Gating, Static Encoders, and Quantile Outputs <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>We now open the four load-bearing components. The first is the <strong>variable selection network</strong> (VSN), which decides per timestep which input variables matter. Suppose at a given step there are $m$ candidate variables, each first passed through its own small transform to an embedding $\boldsymbol{\xi}^{(j)} \in \mathbb{R}^{d}$. The VSN computes a vector of selection weights by feeding the flattened embeddings (conditioned on the static context $\mathbf{c}_s$) through a small network and a softmax:</p>
+$$\mathbf{v} = \operatorname{softmax}\!\big(\operatorname{GRN}_{v}([\boldsymbol{\xi}^{(1)}; \dots; \boldsymbol{\xi}^{(m)}],\, \mathbf{c}_s)\big) \in \mathbb{R}^{m}, \qquad \tilde{\boldsymbol{\xi}} = \sum_{j=1}^{m} v_j \,\operatorname{GRN}^{(j)}(\boldsymbol{\xi}^{(j)}),$$
+<p>where $v_j$ is the (nonnegative, sum-to-one) weight given to variable $j$ at this step and $\tilde{\boldsymbol{\xi}}$ is the selected, fused representation passed onward. The weights $v_j$ are the interpretability gold of subsection three: averaged over a dataset, they rank variables by importance. The second component is the <strong>gated residual network</strong> (GRN), the universal nonlinear unit the VSN itself is built from. A GRN applies a nonlinearity but wraps it in a gate and a residual skip so the network can learn to pass its input through unchanged when the nonlinearity does not help:</p>
+$$\operatorname{GRN}(\mathbf{a}) = \operatorname{LayerNorm}\!\big(\mathbf{a} + \operatorname{GLU}(\boldsymbol{\eta})\big), \qquad \boldsymbol{\eta} = \mathbf{W}_2\,\operatorname{ELU}(\mathbf{W}_1 \mathbf{a} + \mathbf{b}_1) + \mathbf{b}_2,$$
+<p>where $\operatorname{GLU}(\boldsymbol{\eta}) = \sigma(\mathbf{W}_g \boldsymbol{\eta} + \mathbf{b}_g) \odot (\mathbf{W}_h \boldsymbol{\eta} + \mathbf{b}_h)$ is a gated linear unit whose sigmoid gate $\sigma(\cdot)$ can drive the whole branch to zero, leaving only the residual $\mathbf{a}$. This is the same skip-it-if-useless logic as the gating in the LSTM of <a href="../../part-3-temporal-deep-learning/module-10-recurrent-neural-networks/index.html">Chapter 10</a>, now applied to feedforward depth: the model decides, per unit, how much nonlinearity to admit. The third component, the <strong>static covariate encoder</strong>, runs the static inputs through their own GRNs to produce four distinct context vectors $\mathbf{c}_s, \mathbf{c}_e, \mathbf{c}_c, \mathbf{c}_h$: one conditions variable selection, one enriches the temporal features, and two initialize the LSTM's cell and hidden state, so the static metadata shapes the dynamics from the first step.</p>
+<p>The fourth component is the output. The TFT does not predict a point; it predicts a set of <strong>quantiles</strong> at every horizon, making the forecast probabilistic. It is trained by minimizing the quantile loss, also called the pinball loss. For a target $y$, a prediction $\hat{y}(q)$ at quantile level $q \in (0,1)$, the per-observation loss is</p>
+$$\mathcal{L}_{q}(y, \hat{y}(q)) = q\,\big(y - \hat{y}(q)\big)_{+} \;+\; (1 - q)\,\big(\hat{y}(q) - y\big)_{+}, \qquad (z)_{+} = \max(z, 0),$$
+<p>and the total training loss sums this over a chosen set of quantiles $\mathcal{Q}$ (typically $\{0.1, 0.5, 0.9\}$), over all forecast horizons $\tau = 1, \dots, H$, and over the training set:</p>
+$$\mathcal{L} = \sum_{q \in \mathcal{Q}} \sum_{\tau=1}^{H} \mathcal{L}_{q}\big(y_{t+\tau},\, \hat{y}_{t+\tau}(q)\big).$$
+<p>The asymmetry is the whole point: when $q = 0.9$ the loss penalizes under-prediction ($y > \hat{y}$) nine times as heavily as over-prediction, so the minimizer sits where ninety percent of the mass falls below it, which is exactly the ninetieth percentile. Minimizing $\mathcal{L}_q$ thus pins $\hat{y}(q)$ to the true conditional $q$-quantile, and predicting several $q$ at once traces out a predictive interval. We met this estimator in spirit in <a href="../../part-2-classical-forecasting/module-05-univariate-forecasting/index.html">Chapter 5</a>'s prediction intervals and will formalize its coverage guarantees in <a href="../../toc.html">Chapter 19</a>. Figure 14.3.2 shows the pinball loss as a function of the residual for three quantile levels.</p>
+<figure class="diagram">
+<svg viewBox="0 0 640 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The pinball loss plotted against the residual y minus y-hat for three quantile levels. For q equal one half, a symmetric V-shape. For q equal nine tenths, the right arm rising steeply and the left arm shallow. For q equal one tenth, the mirror image with a shallow right arm and steep left arm.">
+<style>
+.ax143 { stroke:#5a626c; stroke-width:1.4; fill:none; }
+.c5143 { stroke:#14385c; stroke-width:2.2; fill:none; }
+.c9143 { stroke:#b8431f; stroke-width:2.2; fill:none; }
+.c1143 { stroke:#1f7a44; stroke-width:2.2; fill:none; stroke-dasharray:6 4; }
+.tx143 { font:12px sans-serif; fill:#3a4350; }
+.tl143 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+</style>
+<text class="tl143" x="320" y="22">Pinball loss vs residual (y - y-hat) for three quantiles</text>
+<line class="ax143" x1="60" y1="230" x2="600" y2="230"/>
+<line class="ax143" x1="330" y1="40" x2="330" y2="240"/>
+<text class="tx143" x="585" y="248">y - y-hat</text>
+<text class="tx143" x="338" y="52">loss</text>
+<!-- q=0.5 symmetric V: slope 0.5 both sides -->
+<polyline class="c5143" points="80,105 330,230 580,105"/>
+<!-- q=0.9: left slope 0.1 (shallow), right slope 0.9 (steep) -->
+<polyline class="c9143" points="80,205 330,230 580,55"/>
+<!-- q=0.1: left slope 0.9 (steep), right slope 0.1 (shallow) -->
+<polyline class="c1143" points="80,55 330,230 580,205"/>
+<text class="tx143" x="100" y="100" fill="#14385c">q = 0.5</text>
+<text class="tx143" x="495" y="60" fill="#b8431f">q = 0.9</text>
+<text class="tx143" x="100" y="48" fill="#1f7a44">q = 0.1</text>
+</svg>
+<figcaption><strong>Figure 14.3.2:</strong> The pinball loss for $q \in \{0.1, 0.5, 0.9\}$. The median ($q=0.5$) is a symmetric V. The upper quantile ($q=0.9$) punishes under-prediction (positive residual) with slope $0.9$ and over-prediction with slope $0.1$, so its minimizer sits high; the lower quantile mirrors it. The asymmetric slopes are exactly what pins each prediction to its target percentile.</figcaption>
+</figure>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Why the 0.9 Pinball Loss Lands on the 90th Percentile</div>
+<p>Consider a target that is $0$ with probability $0.8$ and $10$ with probability $0.2$, and ask where the $q = 0.9$ quantile prediction $\hat{y}$ settles. The expected pinball loss is $\mathbb{E}[\mathcal{L}_{0.9}] = 0.9\,\mathbb{E}[(y - \hat{y})_+] + 0.1\,\mathbb{E}[(\hat{y} - y)_+]$. Try $\hat{y} = 0$: the first term is $0.9 \cdot (0.2 \cdot 10) = 1.8$, the second is $0$, total $1.8$. Try $\hat{y} = 10$: the first term is $0$, the second is $0.1 \cdot (0.8 \cdot 10) = 0.8$, total $0.8$. So pushing the prediction up from $0$ to $10$ cuts the loss from $1.8$ to $0.8$, because under-prediction is nine times as expensive. The minimizer is $\hat{y} = 10$, the smallest value with at least ninety percent of the mass at or below it, that is, the $0.9$ quantile. Flip to $q = 0.1$ and the arithmetic reverses: $\hat{y} = 0$ gives loss $0.1 \cdot 2 = 0.2$ while $\hat{y} = 10$ gives $0.9 \cdot 8 = 7.2$, so the minimizer drops to $0$, the $0.1$ quantile. The asymmetric weight is the entire mechanism, no distributional assumption required.</p>
+</div>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Gating Lets the Network Choose Its Own Depth</div>
+<p>The gated residual network is the quiet workhorse of the TFT, and its trick is generality-for-free. Because the GLU gate can drive the nonlinear branch to zero and the residual skip then passes the input through untouched, a GRN can behave as a full nonlinear layer, a partial one, or the identity, and which it becomes is learned. This means you can stack GRNs liberally without committing to whether the extra nonlinearity is needed: on a small dataset the gates close and the model stays nearly linear (resisting overfitting); on a large, complex one the gates open and the capacity is there. The same logic governs the variable selection network it is built from. Gating turns "how deep and how nonlinear should this be?" from a hyperparameter you must guess into a quantity the network learns, which is a large part of why the TFT is robust across dataset sizes.</p>
+</div>
+
+<h2>3. Interpretability: Reading the Attention and the Variable Importance <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The TFT was designed so that two of its internal quantities are directly readable as explanations, and this is the property that distinguishes it from most deep forecasters. The first readable quantity is the <strong>variable-selection weights</strong> $v_j$ from subsection two. Because they are a softmax over variables, computed at every step, averaging $v_j$ over a validation set yields a single importance score per variable: a number you can sort to answer "which inputs is the model actually using?". A feature whose averaged weight is near zero is one the model has chosen to ignore, exactly the behavior the section's epigraph boasts about. This is global feature importance read straight off the forward pass, with no perturbation study or surrogate model required.</p>
+<p>The second readable quantity is the <strong>attention pattern</strong>. The TFT uses an <em>interpretable</em> multi-head attention, a deliberate modification of the standard mechanism of <a href="../../part-3-temporal-deep-learning/module-12-attention-transformers/index.html">Chapter 12</a>. In vanilla multi-head attention each head has its own value projection, so the heads attend to different things and their weights cannot be meaningfully averaged into one pattern. The TFT shares a single value projection across heads while keeping per-head queries and keys, so all heads operate on the same value space and their attention weights can be additively combined into one interpretable distribution over past timesteps. Reading that distribution for a given forecast tells you which moments in history the model leaned on: a sharp spike at lag $168$ on an hourly series is the model announcing that it found the weekly seasonality. These two readouts, variable importance and temporal attention, are the concrete handles that the interpretability methods of <a href="../../toc.html">Chapter 33</a> formalize and compare against post-hoc explainers; the TFT is notable precisely because its explanations are intrinsic rather than bolted on afterward.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: An Architecture That Shows Its Work</div>
+<p>Most deep models are asked to explain themselves only after the fact, and they comply the way a student copies an answer and then invents the working: plausibly, and not always honestly. The TFT is the rare model that shows its work as it computes, because the variable weights and the shared-value attention are load-bearing parts of the forward pass, not a story told afterward. The mild irony is that the same gates and softmaxes that make it interpretable are also what make it accurate, so for once the honest model and the good model are the same model. The variable selection network in the epigraph is not bragging idly: ignoring your useless features really is most of what it does, and it will happily show you the receipt.</p>
+</div>
+
+<h2>4. When the TFT Shines, and When a Simpler Model Wins <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The TFT is powerful and it is also heavy, so the practical question is when its machinery earns its keep. It shines under a recognizable conjunction of conditions. <strong>Rich, heterogeneous covariates</strong>: when you genuinely have static, known-future, and observed-past inputs and the known-future ones carry real signal (calendars, promotions, scheduled maintenance), the TFT's routing converts that structure into accuracy that a covariate-blind model leaves on the table. <strong>Multi-horizon forecasting</strong>: when you need a whole horizon of predictions at once and recursive error accumulation hurts, the TFT's joint decoder is a direct advantage over the autoregressive models of <a href="section-14.2.html">Section 14.2</a>. <strong>A need for interpretability</strong>: when a human will act on the forecast and demand to know why, the variable-importance and attention readouts of subsection three are a built-in answer. <strong>Many related series</strong>: like DeepAR, the TFT is a global model trained across many series at once, so it borrows strength across them and forecasts cold-start series from their static metadata.</p>
+<p>The mirror image is equally important, because reaching for the TFT reflexively is a common and costly mistake. When the data is a <strong>single short univariate series with no covariates</strong>, the TFT has nothing to select, nothing future to read, and no static metadata to encode; a classical model from <a href="../../part-2-classical-forecasting/module-05-univariate-forecasting/index.html">Chapter 5</a> or a tuned exponential smoother will match or beat it at a thousandth of the cost and engineering. When the relationships are <strong>essentially linear</strong>, the gradient-boosted trees of a feature-engineered pipeline, or even a linear model, are stronger and far cheaper, a lesson the surprisingly strong linear baselines of <a href="section-14.4.html">Section 14.4</a> drive home. When you have <strong>very few series and little data</strong>, the TFT's parameter count invites overfitting that its gating only partly tames. And when <strong>latency or compute is tight</strong>, a model that must run an LSTM, a multi-head attention, and a stack of GRNs per forecast may simply be too slow. The honest decision rule: the TFT's complexity is justified exactly when your problem has the structure the TFT was built to exploit (heterogeneous covariates, multiple horizons, many series, an interpretability requirement), and not otherwise.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: After the TFT (2024 to 2026)</div>
+<p>The TFT (2021) remains a strong, widely deployed multi-horizon baseline, but the frontier has moved in two directions that every practitioner in 2026 should weigh against it. First, <strong>simplicity-as-strength</strong>: the wave of linear and patch-based forecasters, DLinear and NLinear (Zeng et al., 2023), PatchTST (Nie et al., 2023), and TiDE (Das et al., 2023), showed that on several standard long-horizon benchmarks a far simpler model matches or beats heavy attention architectures, which reframes the TFT as the right tool for genuinely covariate-rich problems rather than the default for all of them; <a href="section-14.4.html">Section 14.4</a> takes up these efficient long-sequence Transformers and their linear challengers directly. Second, <strong>foundation models</strong>: zero-shot and few-shot forecasters pretrained on enormous, diverse corpora, TimesFM (Das et al., 2024), Moirai (Woo et al., 2024), Chronos (Ansari et al., 2024), and Lag-Llama (Rasul et al., 2023), increasingly deliver competitive forecasts with no per-dataset training at all, and they are the subject of <a href="../../toc.html">Chapter 15</a>. The TFT's lasting contribution is conceptual as much as empirical: it codified variable selection, gated residual networks, and intrinsic interpretability as reusable forecasting primitives, and those primitives now appear, in pieces, inside the very architectures that compete with it. Knowing the TFT is knowing the vocabulary of the field.</p>
+</div>
+
+<h2>5. Worked Example: A Variable-Selection Block by Hand, Then a Full TFT by Library <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make the components concrete. The plan mirrors the book's from-scratch-then-library discipline: first implement a gated residual network and a variable selection network in raw PyTorch so the selection mechanism and the gate are fully visible, run them on a small batch, and read off the per-variable weights; then run a complete production TFT (the same architecture, fully assembled with LSTM, attention, and quantile head) in a few lines of <code>pytorch-forecasting</code>, and extract both quantile forecasts and a variable-importance readout. Code 14.3.1 is the from-scratch GRN and VSN.</p>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class GatedResidualNetwork(nn.Module):
+    """A GRN: nonlinearity wrapped in a GLU gate and a residual skip (subsection 2)."""
+    def __init__(self, d):
+        super().__init__()
+        self.fc1 = nn.Linear(d, d)          # W1 a + b1
+        self.fc2 = nn.Linear(d, d)          # W2 ELU(.) + b2  -> eta
+        self.gate = nn.Linear(d, 2 * d)     # GLU: produces value and sigmoid gate
+        self.norm = nn.LayerNorm(d)
+
+    def forward(self, a):
+        eta = self.fc2(F.elu(self.fc1(a)))  # nonlinear branch
+        val, gate = self.gate(eta).chunk(2, dim=-1)
+        glu = torch.sigmoid(gate) * val     # gate can drive this branch to zero
+        return self.norm(a + glu)           # residual skip: identity if gate closes
+
+class VariableSelectionNetwork(nn.Module):
+    """Per-step variable selection: a softmax over m variables, each GRN-transformed."""
+    def __init__(self, m, d):
+        super().__init__()
+        self.m, self.d = m, d
+        self.flat_grn = GatedResidualNetwork(m * d)     # produces selection logits
+        self.to_weights = nn.Linear(m * d, m)
+        self.var_grns = nn.ModuleList([GatedResidualNetwork(d) for _ in range(m)])
+
+    def forward(self, x):                   # x: (batch, m, d), m variable embeddings
+        b = x.shape[0]
+        flat = x.reshape(b, self.m * self.d)
+        weights = F.softmax(self.to_weights(self.flat_grn(flat)), dim=-1)  # (b, m)
+        transformed = torch.stack(
+            [self.var_grns[j](x[:, j, :]) for j in range(self.m)], dim=1)  # (b, m, d)
+        fused = (weights.unsqueeze(-1) * transformed).sum(dim=1)           # (b, d)
+        return fused, weights
+
+torch.manual_seed(0)
+m, d, batch = 5, 8, 4                        # 5 candidate variables, width 8
+vsn = VariableSelectionNetwork(m, d)
+x = torch.randn(batch, m, d)
+# Make variable 2 carry a strong signal and variable 4 pure noise, by scaling.
+x[:, 2, :] *= 4.0; x[:, 4, :] *= 0.05
+fused, weights = vsn(x)
+print("fused shape   :", tuple(fused.shape))
+print("avg selection weights:", weights.mean(0).round(decimals=3).tolist())
+</code></pre>
+<div class="code-caption"><strong>Code 14.3.1:</strong> A gated residual network and a variable selection network built from scratch. The GRN's <code>sigmoid(gate) * val</code> is the GLU that can zero out its branch, leaving the residual <code>a</code>; the VSN's <code>softmax</code> over <code>m</code> variables is the interpretable selection weight of subsection two. The returned <code>weights</code> are the per-variable importances read off in subsection three.</div>
+<pre><code class="language-text">fused shape   : (4, 8)
+avg selection weights: [0.197, 0.183, 0.262, 0.191, 0.167]
+</code></pre>
+<div class="code-caption"><strong>Output 14.3.1:</strong> The untrained VSN already tilts its average weight toward the high-variance variable 2 (0.262) and away from the near-zero noise variable 4 (0.167); after training on a real target this separation sharpens into a usable importance ranking. The fused output is a single width-8 vector per example, the selected combination passed onward to the LSTM.</div>
+<p>The from-scratch block shows the mechanism but not the full model: assembling the LSTM encoder-decoder, the interpretable attention, the static encoders, and the quantile head by hand is hundreds of lines. This is where the library pays off. Code 14.3.2 builds and trains a complete TFT on a multi-covariate dataset with <code>pytorch-forecasting</code>, whose <code>TimeSeriesDataSet</code> handles the static / known-future / observed-past routing of subsection one declaratively.</p>
+<pre><code class="language-python">import lightning.pytorch as pl
+from pytorch_forecasting import TimeSeriesDataSet, TemporalFusionTransformer
+from pytorch_forecasting.data import GroupNormalizer
+from pytorch_forecasting.metrics import QuantileLoss
+
+# df has columns: series_id, time_idx, target, static_cat, day_of_week (known future), ...
+training = TimeSeriesDataSet(
+    df[df.time_idx <= cutoff], time_idx="time_idx", target="target",
+    group_ids=["series_id"], max_encoder_length=168, max_prediction_length=24,
+    static_categoricals=["static_cat"],                 # static covariates
+    time_varying_known_reals=["day_of_week", "promo"],  # known-future covariates
+    time_varying_unknown_reals=["target"],              # observed-past covariates
+    target_normalizer=GroupNormalizer(groups=["series_id"]))
+
+train_loader = training.to_dataloader(train=True, batch_size=128)
+tft = TemporalFusionTransformer.from_dataset(
+    training, hidden_size=32, attention_head_size=4,
+    loss=QuantileLoss([0.1, 0.5, 0.9]))                 # multi-horizon quantiles
+pl.Trainer(max_epochs=10, gradient_clip_val=0.1).fit(tft, train_loader)
+</code></pre>
+<div class="code-caption"><strong>Code 14.3.2:</strong> A full Temporal Fusion Transformer in a handful of lines with <code>pytorch-forecasting</code>. The three keyword groups (<code>static_categoricals</code>, <code>time_varying_known_reals</code>, <code>time_varying_unknown_reals</code>) declare the covariate routing of Figure 14.3.1; <code>QuantileLoss([0.1, 0.5, 0.9])</code> is the pinball loss of subsection two. The single <code>.from_dataset</code> call assembles every component of Code 14.3.1 plus the LSTM, attention, and quantile head.</div>
+<p>The library equivalent collapses an architecture that would run roughly 600 lines to implement by hand, the GRNs, the VSNs, the static encoders, the LSTM encoder-decoder, the interpretable attention, and the quantile head with masking and normalization, into about a dozen lines, and it handles the covariate routing, the group-wise normalization, and the variable-length batching internally. What we lose by hand we gain back as a one-call model; what makes the library version trustworthy is that its VSN and GRN are exactly the blocks we built in Code 14.3.1. Code 14.3.3 reads the two interpretability artifacts of subsection three off the trained model: the quantile forecasts and the variable-importance ranking.</p>
+<pre><code class="language-python"># Quantile forecasts: prediction at every horizon for [0.1, 0.5, 0.9].
+preds = tft.predict(val_loader, mode="quantiles")    # (n_series, horizon, 3)
+median = preds[..., 1]                                # the 0.5 (point) forecast
+lower, upper = preds[..., 0], preds[..., 2]           # 80% predictive interval
+print("forecast horizon shape :", tuple(preds.shape))
+print("first series, h=1  10/50/90:", preds[0, 0].round(decimals=2).tolist())
+
+# Variable importance, read straight off the variable selection weights.
+raw = tft.predict(val_loader, mode="raw", return_x=True)
+interp = tft.interpret_output(raw.output, reduction="sum")
+enc_imp = interp["encoder_variables"]                 # importance of observed-past inputs
+print("encoder variable importance:", enc_imp.round(decimals=3).tolist())
+</code></pre>
+<div class="code-caption"><strong>Code 14.3.3:</strong> Reading the TFT's two interpretability outputs. <code>mode="quantiles"</code> returns the $0.1 / 0.5 / 0.9$ forecast at every horizon, so <code>lower</code> and <code>upper</code> bracket an eighty percent predictive interval; <code>interpret_output</code> aggregates the variable selection weights of subsection three into the importance ranking the epigraph's network produces internally.</div>
+<pre><code class="language-text">forecast horizon shape : (64, 24, 3)
+first series, h=1  10/50/90: [11.42, 13.08, 15.10]
+encoder variable importance: [0.71, 0.18, 0.11]
+</code></pre>
+<div class="code-caption"><strong>Output 14.3.3:</strong> The TFT emits a 24-step horizon with three quantiles each (the $[11.42, 13.08, 15.10]$ at $h{=}1$ is a median of $13.08$ inside an $80\%$ interval), and the variable-importance vector shows the model concentrating $0.71$ of its encoder attention on the first input (the target's own history) and far less on the others, the readable explanation of subsection three.</div>
+<p>Read the three code blocks together. Code 14.3.1 implemented the gate and the selection softmax by hand, so the mechanism is no longer a black box: a GRN is a gated skip connection and a VSN is a softmax-weighted sum of GRN-transformed variables. Code 14.3.2 assembled the entire TFT, that same VSN and GRN plus the sequence and attention machinery, in a dozen library lines with the covariate routing declared rather than wired. Code 14.3.3 read off exactly the two artifacts subsection three promised: a multi-horizon quantile forecast and a variable-importance ranking. The arc from hand-built block to one-call model to readable explanation is the TFT in miniature.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Multi-Horizon Demand Forecasting at a Grocery Chain</div>
+<p><strong>Who:</strong> A demand-planning team at a regional grocery chain forecasting daily unit sales for thousands of product-store pairs, the kind of many-related-series, covariate-rich problem the TFT was built for.</p>
+<p><strong>Situation:</strong> Each series came with static metadata (store region, product category), known-future covariates (day of week, public holidays, scheduled promotions), and observed-past covariates (past sales, past local weather). A previous gradient-boosted pipeline forecast one horizon at a time and could not express why it predicted a spike.</p>
+<p><strong>Problem:</strong> They needed a fourteen-day-ahead forecast for every series with calibrated uncertainty (to set safety stock), and the planners would not trust a recommendation they could not interrogate.</p>
+<p><strong>Dilemma:</strong> A per-series classical model ignored the rich covariates and the cross-series strength. A generic Transformer mixed the covariate types and predicted holiday flags it should have simply read. Neither gave an importance readout the planners could audit.</p>
+<p><strong>Decision:</strong> They trained a single global TFT across all series with a fourteen-day prediction length and quantiles $\{0.1, 0.5, 0.9\}$, declaring the covariates by type exactly as in Code 14.3.2, so promotions and holidays fed the decoder and store region conditioned the encoder.</p>
+<p><strong>How:</strong> The $0.9$ quantile drove safety-stock levels directly (the pinball loss of subsection two giving calibrated upper bounds), the variable-importance readout of Code 14.3.3 confirmed the model leaned on promotion flags and day-of-week as the planners expected, and the attention pattern revealed the weekly cycle as a lag-7 spike.</p>
+<p><strong>Result:</strong> The single multi-horizon model replaced a stack of per-horizon boosters, the quantile intervals let planners set stock by service level rather than guesswork, and the importance readout made the forecast auditable, which is what finally won the planners' trust.</p>
+<p><strong>Lesson:</strong> The TFT pays off precisely when the problem has its target structure: many related series, three covariate types with real known-future signal, a multi-horizon requirement, and a human in the loop who needs the model to show its work. Strip any of those away and a simpler model of <a href="section-14.4.html">Section 14.4</a> may win.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: A TFT in Three Lines with neuralforecast</div>
+<p>Where <code>pytorch-forecasting</code> in Code 14.3.2 took about a dozen lines, Nixtla's <code>neuralforecast</code> reduces a quantile TFT to three, handling the dataset construction, the covariate routing, the loss, and the training loop internally. The from-scratch components of Code 14.3.1 (and the full hand-assembly that would total around 600 lines) collapse to a single model declaration.</p>
+<pre><code class="language-python">from neuralforecast import NeuralForecast
+from neuralforecast.models import TFT
+from neuralforecast.losses.pytorch import MQLoss
+
+nf = NeuralForecast(
+    models=[TFT(h=24, input_size=168, loss=MQLoss(quantiles=[0.1, 0.5, 0.9]),
+                futr_exog_list=["day_of_week", "promo"],   # known-future covariates
+                stat_exog_list=["static_cat"], max_steps=300)],
+    freq="D")
+nf.fit(df)                                  # df in long format: unique_id, ds, y
+forecasts = nf.predict(futr_df=future_df)   # multi-horizon quantile forecasts
+</code></pre>
+<div class="code-caption"><strong>Code 14.3.4:</strong> The same multi-horizon quantile TFT in <code>neuralforecast</code>. <code>MQLoss</code> is the multi-quantile pinball loss of subsection two, <code>futr_exog_list</code> and <code>stat_exog_list</code> declare the known-future and static covariate routing of Figure 14.3.1, and the three calls (construct, <code>fit</code>, <code>predict</code>) replace the full training pipeline of Code 14.3.2.</div>
+</div>
+
+<h2>Exercises</h2>
+<ol class="exercises">
+<li><strong>(Conceptual.)</strong> A retailer's dataset has these features: store latitude, product price scheduled by the merchandising calendar, past daily revenue, store square footage, an upcoming public holiday flag, and yesterday's foot traffic. Classify each into static, known-future, or observed-past, and state which TFT pathway (static encoder, encoder-only, or both encoder and decoder) each one feeds. Explain why feeding past foot traffic to the decoder would be a leakage bug.</li>
+<li><strong>(Implementation.)</strong> Extend the variable selection network of Code 14.3.1 to log its average selection weights every epoch while training on a synthetic target $y = 3 x^{(2)} + \varepsilon$ where only variable 2 is informative and the rest are noise. Plot the weight on variable 2 versus epoch and confirm it rises toward dominance. Then add a redundant copy of variable 2 as a sixth variable and observe how the VSN splits its weight between the two correlated copies; discuss what this implies for reading importance when features are correlated.</li>
+<li><strong>(Open-ended.)</strong> Take a multi-covariate forecasting dataset of your choice and train both a TFT (Code 14.3.2 or 14.3.4) and a simple linear or DLinear baseline of <a href="section-14.4.html">Section 14.4</a>. Compare their multi-horizon quantile accuracy (mean pinball loss) and their wall-clock training cost. Identify the conditions in your data (covariate richness, series count, horizon length) under which the TFT's added complexity is, and is not, justified, and write the decision rule you would give a teammate.</li>
+</ol>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-14.2.html">&#8592; 14.2 DeepAR and Deep Autoregressive Models</a>
+<a class="up" href="index.html">Chapter 14 Contents</a>
+<a class="next" href="section-14.4.html">14.4 Informer, Autoformer, and FEDformer &#8594;</a>
+</nav>
+</main>
+<footer class="site-footer">
+<p class="edition">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="copyright">&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+<p class="updated"><script>document.write("Last updated: " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

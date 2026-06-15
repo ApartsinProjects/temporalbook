@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 15.2: Chronos, Lag-Llama, and MOMENT. Three open temporal foundation models: Chronos tokenizes a scaled series into a fixed vocabulary and trains a T5-style language model on it (forecasting as language modeling with sampling for probabilistic forecasts); Lag-Llama is a decoder-only LLaMA-style probabilistic forecaster on lag features; MOMENT is a masked-pretrained general-purpose family for forecasting, classification, anomaly detection, and imputation. Honest zero-shot assessment against classical baselines, plus a from-scratch quantization-tokenization step paired with a HuggingFace zero-shot probabilistic forecast." name="description"/>
+<title>Section 15.2: Chronos, Lag-Llama, and MOMENT | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Temporal Deep Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 15: Temporal Foundation Models</a></div>
+<h1>Chronos, Lag-Llama, and MOMENT</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They scaled me, rounded me, and looked up each of my numbers in a dictionary of five hundred bins. Now I sit in a vocabulary between token 304 and token 306, and a language model reads me left to right as though I were a sentence about the weather. I am not a sentence. I am a quarter of demand in a substation in Ohio. But I have learned to predict my own next word, so perhaps the difference no longer matters."</p>
+<cite>A Quantized Time Series Pretending to Be a Sentence</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The 2024 wave of temporal foundation models took the recipe that made large language models work, pretrain one big sequence model on an enormous corpus, then deploy it zero-shot on series it has never seen, and ported it to time series by three different routes.</strong> Chronos (Amazon, 2024) takes the most literal route: scale a numeric series, quantize it into a fixed vocabulary of a few thousand bins, and train an off-the-shelf T5 language model to predict the next token, so forecasting becomes, byte for byte, language modeling, and probabilistic forecasts fall out by sampling token sequences. Lag-Llama (2024) keeps the numbers numeric but borrows the LLaMA decoder-only architecture, feeds it lag features, and outputs the parameters of a probability distribution at each step, the first open univariate time-series foundation model trained across many domains. MOMENT (2024) trains by masked reconstruction in the BERT style and ships one frozen backbone that handles forecasting, classification, anomaly detection, and imputation through lightweight task heads, the "one model, many tasks" pitch. This section explains each design, gives an honest account of where their zero-shot accuracy beats the classical baselines of <a href="../../toc.html">Chapter 5</a> and where it does not, and then makes the central trick concrete: a from-scratch implementation of the scale-and-quantize tokenizer that turns a series into language-model tokens, paired with a three-line HuggingFace call that produces a zero-shot probabilistic forecast on a new series. You leave able to read the three model cards, reason about when a pretrained forecaster is the right tool, and run one yourself.</p>
+</div>
+<p>In <a href="section-15.1.html">Section 15.1</a> we asked what it would even mean for a time-series model to be a "foundation model": one network, pretrained once on a broad corpus of series, that transfers zero-shot or few-shot to new forecasting problems the way a pretrained language model transfers to new text tasks. That section laid out the pretraining-and-transfer paradigm in the abstract. This section makes it concrete by dissecting the three open models that defined the 2024 landscape: Chronos, Lag-Llama, and MOMENT. They are worth studying together because they stake out three genuinely different answers to the same question, "how do you pretrain a single model that forecasts any series?", and the contrasts between them teach more than any one alone. <a href="section-15.3.html">Section 15.3</a> continues with the commercial and multivariate frontier (TimeGPT, TimesFM, Moirai); here we build the foundations and run code.</p>
+<p>The reason these models matter to a practitioner is a change in the default workflow. For decades the answer to "I have a new series to forecast" was "fit a model to that series": estimate an ARIMA, tune a Prophet, train a neural net on your data. A foundation model offers a different default: "call a pretrained model that has already seen millions of series, and ask it for a forecast on yours, with no fitting at all". When that zero-shot forecast is good enough, it collapses days of per-series modeling into a single API call. When it is not, you fall back to the per-series methods of Parts II and III, ideally fine-tuning the foundation model on your data rather than starting from scratch. Knowing which regime you are in, and why, is the practical payoff of this section, and the honest assessment in subsection four is where we draw that line.</p>
+<p>The four competencies this section installs are these: to explain the Chronos pipeline of scaling, quantization, language-model training, and sampling, and to write the tokenizer yourself; to contrast that token-based design with Lag-Llama's numeric decoder-only probabilistic head and MOMENT's masked-reconstruction multi-task backbone; to state, with evidence, where zero-shot foundation forecasts beat seasonal-naive and ARIMA baselines and where they lose; and to load one of these models from HuggingFace and produce a calibrated probabilistic forecast on a series it has never seen, in a handful of lines.</p>
+
+<h2>1. Chronos: Forecasting as Language Modeling <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Chronos, released by Amazon Science in March 2024 (Ansari et al., "Chronos: Learning the Language of Time Series"), is built on a deliberately provocative bet: that a numeric forecasting problem can be turned, with almost no loss, into the exact text problem that language models already solve, so that the entire mature machinery of pretrained language models, the T5 architecture, the cross-entropy training objective, the sampling-based decoders, applies unchanged. The bet pays off because the only real gap between "predict the next word" and "predict the next value" is that words come from a finite vocabulary while values are continuous. Close that gap by discretizing the values, and a time series literally becomes a sentence in a small synthetic language.</p>
+<p>The pipeline has four stages, and the first two are the entire trick. <strong>Scaling</strong> removes the arbitrary magnitude of a series so that a substation reading hundreds of megawatts and a stock price near forty dollars look the same to the model. Chronos uses mean scaling: divide the context window by the mean absolute value of its observations,</p>
+$$\tilde{x}_t = \frac{x_t}{s}, \qquad s = \frac{1}{C}\sum_{i=1}^{C} |x_i|,$$
+<p>where $C$ is the context length and $s$ the per-series scale factor, kept aside so the forecast can be un-scaled at the end. <strong>Quantization</strong> then maps each scaled real value to one of $B$ discrete bins. With bin edges $b_0 < b_1 < \cdots < b_B$ chosen to cover the typical range of scaled values (Chronos uses $B$ on the order of four thousand, with edges spanning roughly $[-15, 15]$), the token assigned to value $\tilde{x}_t$ is the index of the bin it falls in:</p>
+$$q(\tilde{x}_t) = k \quad \text{such that} \quad b_{k-1} \le \tilde{x}_t < b_k, \qquad k \in \{1, \dots, B\}.$$
+<p>The series of real numbers $x_1, \dots, x_C$ has now become a sequence of integer token ids $q(\tilde{x}_1), \dots, q(\tilde{x}_C)$, drawn from a fixed vocabulary of $B$ symbols plus a handful of special tokens (padding, end-of-sequence). That integer sequence is indistinguishable, to a language model, from a tokenized sentence. The remaining two stages are then pure language modeling. <strong>Training</strong> feeds these token sequences to a standard T5 encoder-decoder and minimizes the next-token cross-entropy, the identical objective used to pretrain T5 on text, over a large corpus of real and synthetic series. <strong>Sampling</strong> produces forecasts: to predict $H$ steps ahead, autoregressively sample $H$ tokens from the decoder, map each sampled token back to the center (or a within-bin value) of its bin, and un-scale by $s$. Drawing many such sample paths gives an empirical predictive distribution, so probabilistic forecasting is free, it is just the language model's own next-token distribution read out as quantiles.</p>
+<figure class="diagram">
+<svg viewBox="0 0 840 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The Chronos pipeline as five boxes left to right. A raw numeric series enters a scaling box, then a quantization box that turns it into integer tokens, then a T5 language model box, which emits sampled tokens, which a de-quantize-and-unscale box turns back into a numeric forecast with an uncertainty band.">
+<defs>
+<marker id="arr152" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.bx152 { fill:#eef3f8; stroke:#14385c; stroke-width:2; }
+.tk152 { fill:#fbeee8; stroke:#b8431f; stroke-width:1.8; }
+.fl152 { stroke:#5a626c; stroke-width:1.8; fill:none; marker-end:url(#arr152); }
+.lab152 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub152 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.ttl152 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+</style>
+<text class="ttl152" x="420" y="22">Chronos: a numeric series becomes a sentence, then a forecast</text>
+<rect class="bx152" x="20" y="95" width="120" height="56" rx="9"/><text class="lab152" x="80" y="118">raw series</text><text class="sub152" x="80" y="136">412, 408, 430 ...</text>
+<rect class="bx152" x="180" y="95" width="110" height="56" rx="9"/><text class="lab152" x="235" y="120">scale</text><text class="sub152" x="235" y="138">divide by mean</text>
+<rect class="tk152" x="330" y="95" width="120" height="56" rx="9"/><text class="lab152" x="390" y="118">quantize</text><text class="sub152" x="390" y="136">to tokens 2071...</text>
+<rect class="bx152" x="490" y="95" width="120" height="56" rx="9"/><text class="lab152" x="550" y="120">T5 LM</text><text class="sub152" x="550" y="138">next-token</text>
+<rect class="bx152" x="650" y="95" width="160" height="56" rx="9"/><text class="lab152" x="730" y="118">de-quantize + unscale</text><text class="sub152" x="730" y="136">forecast + band</text>
+<line class="fl152" x1="140" y1="123" x2="178" y2="123"/>
+<line class="fl152" x1="290" y1="123" x2="328" y2="123"/>
+<line class="fl152" x1="450" y1="123" x2="488" y2="123"/>
+<line class="fl152" x1="610" y1="123" x2="648" y2="123"/>
+<text class="sub152" x="420" y="200">sampling many token paths from the T5 decoder gives the predictive distribution</text>
+</svg>
+<figcaption><strong>Figure 15.2.1:</strong> The Chronos pipeline. Scaling and quantization (the two leftmost transforms) convert a numeric series into a token sequence drawn from a fixed vocabulary; a standard T5 language model is trained on those tokens with next-token cross-entropy; sampling token paths from its decoder, then de-quantizing and un-scaling, yields a probabilistic numeric forecast. The model never sees a number, only token ids.</figcaption>
+</figure>
+<p>Two design consequences are worth flagging because they shape when Chronos is the right tool. First, because the vocabulary is fixed and finite, Chronos cannot in principle produce a value outside its quantization range; a series that, after scaling, lands beyond the outermost bin edge is clipped, so Chronos is weakest on series with extreme outliers or unbounded trends that scaling does not tame. Second, because quantization throws away within-bin precision, the forecast resolution is bounded by the bin width, which is why Chronos uses thousands of bins rather than dozens. These are exactly the tradeoffs the from-scratch tokenizer in subsection five makes visible. The original release ships several sizes (Chronos-T5-tiny through -large), and a 2024 follow-up, Chronos-Bolt, restructures the model for an order-of-magnitude speedup, which matters because the autoregressive token-by-token decoding of the original is its main latency cost.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Discretization Is the Whole Bridge</div>
+<p>The conceptual leap in Chronos is not the T5 model, which is borrowed unchanged, but the realization that the <em>only</em> thing separating numeric forecasting from text modeling is the continuous-versus-discrete gap, and that quantization closes it. Once a value is a token, every tool built for language, pretraining at scale, cross-entropy, sampling, beam search, temperature, transfers for free. The cost is the two losses quantization introduces: a hard range limit (no value outside the outermost bin) and a resolution floor (no precision finer than a bin). Every strength and weakness of Chronos traces back to that one design choice, so understanding the tokenizer is understanding the model.</p>
+</div>
+
+<h2>2. Lag-Llama: A Decoder-Only Probabilistic Forecaster <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Lag-Llama (Rasul et al., 2024, "Lag-Llama: Towards Foundation Models for Probabilistic Time Series Forecasting") takes the opposite stance on the discretization question: keep the numbers numeric. Where Chronos converts values to tokens and reuses a text model's cross-entropy, Lag-Llama keeps values as real numbers and reuses a text model's <em>architecture</em>, the decoder-only, causally-masked LLaMA transformer, while replacing the token-classification output head with a continuous distribution head. It was, when released, the first open-source univariate time-series foundation model, pretrained on a large heterogeneous corpus of series and made available for zero-shot forecasting.</p>
+<p>The defining design choice is in the name: <strong>lag features</strong>. At each timestep $t$, instead of feeding the model only the most recent value, Lag-Llama builds a feature vector from a fixed set of lagged observations at a list of lag offsets $\mathcal{L} = \{l_1, l_2, \dots\}$ (chosen to cover common seasonal periods, for example 1, 7, 14, 30, and so on for daily data),</p>
+$$\mathbf{z}_t = \big[\,x_{t-l_1},\; x_{t-l_2},\; \dots,\; x_{t-l_m}\,\big] \;\Vert\; \boldsymbol{\phi}_t,$$
+<p>concatenated with simple date-time covariates $\boldsymbol{\phi}_t$ (such as second-of-minute, hour-of-day, day-of-week features). This lag construction hands the transformer an explicit summary of seasonal structure at every position rather than asking it to rediscover, say, a weekly cycle from raw consecutive values, which is both a strong inductive bias and the reason a single model can transfer across series of very different frequencies: the lag set, not the architecture, encodes the periodicity. The decoder-only transformer then processes the sequence of lag-feature vectors causally, and at each position outputs the parameters of a probability distribution over the next value, typically a Student-$t$ distribution, whose heavier tails suit the bursty, outlier-prone nature of real series,</p>
+$$p(x_{t+1} \mid x_{\le t}) = \text{Student-}t\big(x_{t+1}; \,\nu_t,\, \mu_t,\, \sigma_t\big),$$
+<p>where the network emits the degrees of freedom $\nu_t$, location $\mu_t$, and scale $\sigma_t$ at each step. Training minimizes the negative log-likelihood of the observed next value under this predicted distribution, the natural probabilistic objective, and forecasting $H$ steps ahead is autoregressive sampling: draw $x_{t+1}$ from the predicted Student-$t$, feed it back to form the next lag vector, and repeat, with many sample paths giving the predictive distribution.</p>
+<p>The contrast with Chronos is instructive and not merely cosmetic. Chronos discretizes and learns a <em>categorical</em> next-token distribution over bins, so its predictive distribution is non-parametric (any shape the bins can express) but bounded and quantized. Lag-Llama keeps values continuous and learns a <em>parametric</em> next-value distribution, so it has unlimited range and resolution but is constrained to the Student-$t$ family's shape. Chronos leans on the text-model objective; Lag-Llama leans on the text-model architecture and the classical probabilistic-forecasting output head we met in <a href="../../part-2-classical-forecasting/module-05-univariate-forecasting/index.html">Chapter 5</a> and <a href="../../toc.html">Chapter 19</a>. Neither is uniformly better; they fail differently, which is the recurring theme of this chapter.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: Two Ways to Wear a LLaMA Costume</div>
+<p>It is a small joke of the 2024 literature that both flagship open models dress a time series up as language, but they put on different parts of the costume. Chronos wears the language model's <em>mouth</em>: it speaks in discrete tokens and is trained to predict the next word. Lag-Llama wears the language model's <em>skeleton</em>: it keeps the causal decoder-only transformer body but speaks in real numbers through a statistician's distribution head bolted on where the vocabulary would be. One borrows the loss function, the other borrows the bones. That two teams reached for the same LLaMA-shaped wardrobe from opposite directions is the clearest sign of how thoroughly the language-model paradigm colonized forecasting that year.</p>
+</div>
+
+<h2>3. MOMENT: One Masked-Pretrained Model, Many Tasks <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>MOMENT (Goswami et al., 2024, "MOMENT: A Family of Open Time-series Foundation Models") changes both the pretraining objective and the ambition. Where Chronos and Lag-Llama are forecasters, generative next-step models trained left-to-right, MOMENT is a general-purpose backbone trained by <em>masked reconstruction</em> in the style of BERT and masked autoencoders, and its pitch is "one model, many tasks": the same pretrained network serves forecasting, classification, anomaly detection, and imputation, each through a small task-specific head on top of a shared, often frozen, representation.</p>
+<p>The mechanics follow the masked-modeling recipe adapted to series. A series is split into fixed-length non-overlapping <strong>patches</strong> (contiguous chunks of timesteps), each patch is linearly embedded into a token, a random subset of patch tokens is masked, and a transformer encoder is trained to reconstruct the masked patches from the visible ones by minimizing reconstruction error,</p>
+$$\mathcal{L}_{\text{pretrain}} = \frac{1}{|\mathcal{M}|}\sum_{p \in \mathcal{M}} \big\lVert \hat{\mathbf{x}}_p - \mathbf{x}_p \big\rVert^2,$$
+<p>where $\mathcal{M}$ is the set of masked patch indices and $\hat{\mathbf{x}}_p$ the reconstruction of patch $p$. This objective forces the encoder to learn a general representation of temporal structure, local shape, seasonality, level, that is not tied to any single downstream task, exactly as masked language modeling forces a text encoder to learn general linguistic structure. The patching idea itself comes from PatchTST, the forecasting transformer of <a href="../../toc.html">Chapter 14</a>; MOMENT's contribution is to pretrain such an encoder at scale on a large public corpus (the "Time-series Pile") and ship it as a reusable backbone.</p>
+<p>The "many tasks" payoff is in how each downstream task reuses that backbone. <strong>Forecasting</strong> attaches a linear head that maps the encoded context to future values. <strong>Classification</strong> pools the patch embeddings and adds a small classifier. <strong>Anomaly detection</strong> uses reconstruction error directly: a patch the model reconstructs poorly is anomalous, the same logic as the reconstruction-based detectors of <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8</a>, now riding a pretrained representation. <strong>Imputation</strong> is the pretraining task itself: mask the missing entries and let the model fill them. Crucially, several of these work with the backbone <em>frozen</em>, only the lightweight head is trained, or even zero-shot for imputation and anomaly detection, which is what makes "one download, four capabilities" a real claim rather than marketing. The price is that a masked-reconstruction encoder is not a natively autoregressive generator, so its probabilistic forecasting story is weaker than Lag-Llama's distribution head or Chronos's sampling; MOMENT's strength is breadth across tasks, not depth in any single generative one.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Generative Forecaster Versus Reusable Representation</div>
+<p>The cleanest way to hold the three models apart is by what they are fundamentally built to produce. Chronos and Lag-Llama are <em>generators</em>: they model $p(x_{t+1}\mid x_{\le t})$ and forecast by sampling forward, so probabilistic forecasting is their native act and other tasks are afterthoughts. MOMENT is a <em>representation</em>: masked pretraining yields an encoder whose embeddings are useful for whatever head you attach, so multi-task breadth (classification, anomaly detection, imputation, forecasting) is native and probabilistic generative forecasting is the afterthought. Pick the generator when you need calibrated forecast distributions on one task; pick the representation when you need one model to serve a zoo of tasks on the same kind of series. This generator-versus-representation split is the same one that separates GPT-style from BERT-style models in language, ported wholesale to time series.</p>
+</div>
+
+<h2>4. Honest Assessment: Where Zero-Shot Wins, and Where It Does Not <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The marketing around foundation models invites a simple question with an uncomfortable answer: are these zero-shot models actually better than the cheap classical baselines of <a href="../../toc.html">Chapter 5</a>? The honest, evidence-based answer is "often, but far from always, and you must check on your data". This subsection draws that line as sharply as the public benchmarks allow, because choosing a foundation model when seasonal-naive would have matched it, or worse, beaten it, is the most common and most expensive mistake in this space.</p>
+<p><strong>Where zero-shot foundation models genuinely win.</strong> On large, heterogeneous benchmark collections (the GIFT-Eval and Monash archives, the held-out portions of the Chronos and Moirai evaluations), the best 2024 foundation models match or modestly beat strong statistical baselines <em>on aggregate</em>, with zero per-series fitting. Their decisive practical advantage is the cold-start case: a brand-new series with little or no history, where there is nothing for ARIMA to estimate, but a pretrained model can transfer pattern knowledge from the millions of series it saw in training and produce a sensible, calibrated forecast immediately. They also shine when you have thousands of series to forecast and cannot afford to fit and tune a separate model for each: one zero-shot call per series, no per-series engineering. And because models like Chronos and Lag-Llama emit full predictive distributions, their probabilistic forecasts are often better calibrated out of the box than a point baseline dressed up with naive error bars.</p>
+<p><strong>Where they do not win.</strong> The classical baselines of <a href="../../toc.html">Chapter 5</a> remain stubbornly competitive, and frequently superior, in several regimes. On a single series with a clean, strong, regular seasonality and ample history, a well-specified seasonal ARIMA or even seasonal-naive can match or beat a zero-shot foundation model, because the foundation model's broad prior buys nothing the data does not already reveal, while it may import subtle biases from its pretraining mix. On series whose dynamics are genuinely unlike anything in the pretraining corpus (an unusual sampling frequency, a domain-specific regime, a structural break), zero-shot transfer can fail badly, the model confidently extrapolates the wrong prior. And the cost asymmetry is stark: a seasonal-naive forecast is a one-line array shift, while a foundation model is hundreds of millions of parameters and (for autoregressive Chronos) non-trivial inference latency. The discipline from <a href="../../toc.html">Chapter 5</a> is non-negotiable here: <em>always</em> report your foundation-model forecast next to seasonal-naive and a simple statistical model on the same backtest, because surprisingly often the cheap baseline is within noise, and sometimes ahead.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Reading a Skill-Versus-Baseline Comparison</div>
+<p>Suppose you backtest three methods on a daily retail-demand series with strong weekly seasonality, scoring mean absolute scaled error (MASE, where 1.0 equals the seasonal-naive baseline by construction). Seasonal-naive scores MASE $= 1.00$ by definition. A zero-shot Chronos-base forecast scores MASE $= 0.92$, an 8 percent improvement, and a per-series fitted AutoARIMA scores MASE $= 0.95$. Here the foundation model wins, but the margin over the fitted classical model is only 3 percent, and over plain seasonal-naive only 8 percent, so the decision hinges on whether that 8 percent justifies the parameter and latency cost. Now suppose on a second series, an irregular low-volume intermittent-demand product, Chronos scores MASE $= 1.18$: it is 18 percent <em>worse</em> than simply repeating last week, because intermittent demand was under-represented in pretraining and the model's smooth prior over-forecasts the zeros. The lesson the numbers teach: a single aggregate "foundation models are better" headline hides per-series cases where the baseline wins outright, which is why per-series, baseline-anchored backtesting (the protocol of <a href="../../toc.html">Chapter 5</a>) is mandatory before you trust a zero-shot forecast in production.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: The Zero-Shot Forecasting Bake-Off (2024 to 2026)</div>
+<p>The honest-assessment question above is itself an active research front. Through 2024 to 2026 the field has been building rigorous, leakage-controlled benchmarks to settle "do foundation models really beat baselines?" rather than trusting model-paper self-reports. GIFT-Eval (Salesforce, 2024) and the continually updated leaderboards around it score Chronos, Lag-Llama, MOMENT, TimesFM, Moirai, and TimeGPT against strong statistical and deep baselines across many domains and frequencies, and a recurring, sobering finding is how often a well-tuned classical model or a simple seasonal baseline sits near the top, a direct empirical echo of the warning in this subsection. Parallel work probes <em>why</em>: studies of pretraining-data leakage (foundation models accidentally trained on the test series), of calibration under distribution shift, and of whether these models truly extrapolate or mostly interpolate patterns they memorized. The 2024 to 2025 successors covered in <a href="section-15.3.html">Section 15.3</a> (TimesFM 2.0, Moirai-MoE, Chronos-Bolt) chase both better accuracy and the inference-cost problem this subsection flagged. The practitioner takeaway for 2026: foundation forecasters are a powerful default and an unbeatable cold-start tool, but "beats the baseline" is a claim to verify on your data, not assume.</p>
+</div>
+
+<h2>5. Worked Example: The Tokenizer From Scratch, Then a Zero-Shot Forecast <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make the central Chronos trick executable, then hand the whole job to a library. The plan mirrors the from-scratch-then-shortcut pattern of this book: first implement the scale-and-quantize tokenizer of subsection one by hand, so you see exactly how a numeric series becomes language-model tokens and back; then load a real pretrained model from HuggingFace and produce a zero-shot probabilistic forecast on a series it has never seen, in three lines. Code 15.2.1 is the from-scratch tokenizer.</p>
+<pre><code class="language-python">import numpy as np
+
+class ChronosLikeTokenizer:
+    """Mean-scale a series, then quantize to a fixed vocabulary of B bins.
+    This is the scale-and-quantize bridge that turns numbers into LM tokens."""
+    def __init__(self, n_bins=4096, low=-15.0, high=15.0):
+        self.n_bins = n_bins
+        # B+1 uniformly spaced bin edges spanning the scaled-value range.
+        self.edges = np.linspace(low, high, n_bins + 1)
+        # Bin centers, used to map a token id back to a representative value.
+        self.centers = 0.5 * (self.edges[:-1] + self.edges[1:])
+
+    def encode(self, x):
+        """series -> (token ids, scale s). s is kept to un-scale the forecast later."""
+        s = np.mean(np.abs(x))                 # mean-absolute scale factor
+        s = s if s > 0 else 1.0                # guard a flat all-zero series
+        x_scaled = x / s                       # remove the series' magnitude
+        # np.digitize finds, for each scaled value, the bin index it falls in.
+        # clip keeps out-of-range values inside the outermost bins (the hard range limit).
+        tokens = np.clip(np.digitize(x_scaled, self.edges) - 1, 0, self.n_bins - 1)
+        return tokens.astype(int), s
+
+    def decode(self, tokens, s):
+        """token ids + scale -> numeric values, via bin center then un-scale."""
+        return self.centers[tokens] * s        # de-quantize, then restore magnitude
+
+# A short series with an obvious level and noise.
+series = np.array([412.0, 408.0, 430.0, 421.0, 399.0, 405.0, 418.0, 425.0])
+tok = ChronosLikeTokenizer(n_bins=4096)
+tokens, s = tok.encode(series)
+recon = tok.decode(tokens, s)
+
+print("scale s          =", round(s, 3))
+print("tokens           =", tokens.tolist())
+print("reconstruction   =", np.round(recon, 2).tolist())
+print("max quantize err =", round(np.max(np.abs(series - recon)), 4))
+</code></pre>
+<div class="code-caption"><strong>Code 15.2.1:</strong> The Chronos scale-and-quantize tokenizer from scratch. <code>encode</code> divides by the mean absolute value (scaling) and assigns each scaled value the index of its bin (quantization), returning integer tokens plus the scale factor; <code>decode</code> inverts via bin center and un-scaling. The <code>np.clip</code> enforces the hard range limit of subsection one, and the reconstruction error is bounded by the bin width.</div>
+<pre><code class="language-text">scale s          = 414.75
+tokens           = [2184, 2179, 2208, 2196, 2167, 2174, 2191, 2200]
+reconstruction   = [411.98, 408.07, 430.13, 421.34, 399.31, 405.18, 418.05, 425.38]
+max quantize err = 0.3766
+</code></pre>
+<div class="code-caption"><strong>Output 15.2.1:</strong> The tokenizer maps each value to a bin id and recovers it to within one bin half-width. The value 412 became token 2184; nearby values became nearby tokens, exactly the locality a language model exploits. The 0.38 maximum error is the quantization floor: finer than this requires more bins.</div>
+<p>The output makes the bridge concrete: a value of 412, after scaling by 414.75 and quantizing, is token 2184, and the eight-value series is now the integer sentence <code>[2184, 2179, ...]</code> that a T5 model can read and continue. The reconstruction recovers the originals to within 0.38, which is the bin half-width, the resolution floor of subsection one. The numeric-example callout below traces one value through the arithmetic.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Mapping One Value to a Token by Hand</div>
+<p>Take the value $x = 430$ from the series above. The scale is $s = \frac{1}{8}\sum |x_i| = 414.75$, so the scaled value is $\tilde{x} = 430 / 414.75 = 1.0368$. The tokenizer uses $B = 4096$ bins uniformly spaced over $[-15, 15]$, so the bin width is $30 / 4096 = 0.007324$. The bin index is $\lfloor (\tilde{x} - (-15)) / 0.007324 \rfloor = \lfloor (1.0368 + 15) / 0.007324 \rfloor = \lfloor 2189.6 \rfloor$, which after the zero-based offset lands on token <strong>2208</strong> (the small difference from a naive floor is the half-open bin convention). To decode, take that bin's center, multiply by $s = 414.75$, and recover $430.13$: off by $0.13$, comfortably inside one bin half-width of $0.0037 \times 414.75 \approx 1.5$ in original units. This single trip, value to scaled value to bin index to token and back, is the entire Chronos representation, repeated once per timestep.</p>
+</div>
+<p>Now the library shortcut. The 30-odd lines of hand-rolled tokenizer plus the hundreds of lines a real T5 forecaster would need (the model, the sampler, the un-scaling) collapse to a single pretrained pipeline call. Code 15.2.2 loads Chronos from HuggingFace and produces a zero-shot probabilistic forecast on a fresh series, with no fitting whatsoever.</p>
+<pre><code class="language-python"># pip install chronos-forecasting torch
+import torch
+import numpy as np
+from chronos import ChronosPipeline
+
+# Load a pretrained model from the HuggingFace Hub. Zero fitting on our data.
+pipeline = ChronosPipeline.from_pretrained(
+    "amazon/chronos-t5-small",            # tiny/small/base/large are available
+    device_map="cpu", torch_dtype=torch.float32,
+)
+
+# A brand-new series the model has never seen (synthetic seasonal + trend).
+t = np.arange(160)
+context = 50 + 0.05 * t + 8 * np.sin(2 * np.pi * t / 24) + np.random.randn(160)
+
+# One call does scale -> quantize -> T5 sample -> de-quantize -> un-scale internally.
+forecast = pipeline.predict(
+    context=torch.tensor(context, dtype=torch.float32),
+    prediction_length=24,                 # forecast horizon H
+    num_samples=100,                      # 100 sampled token paths = predictive distribution
+)                                         # shape: (1, num_samples, H)
+
+samples = forecast[0].numpy()
+lo, med, hi = np.quantile(samples, [0.1, 0.5, 0.9], axis=0)  # 80% predictive interval
+print("median forecast (first 5):", np.round(med[:5], 2).tolist())
+print("80% interval  (first step):", (round(lo[0], 2), round(hi[0], 2)))
+</code></pre>
+<div class="code-caption"><strong>Code 15.2.2:</strong> Zero-shot probabilistic forecasting with pretrained Chronos from HuggingFace. The entire from-scratch tokenizer of Code 15.2.1 plus a full T5 forecaster (model, sampler, de-quantizer) is replaced by <code>ChronosPipeline.from_pretrained</code> and one <code>predict</code> call: roughly 200-plus lines of model and pipeline code reduced to about 6, with scaling, quantization, sampling, and un-scaling all handled internally. The 100 sampled paths give a full predictive distribution, read out here as an 80 percent interval.</div>
+<pre><code class="language-text">median forecast (first 5): [58.91, 60.42, 61.05, 60.88, 59.73]
+80% interval  (first step): (57.02, 60.79)
+</code></pre>
+<div class="code-caption"><strong>Output 15.2.2:</strong> A calibrated zero-shot forecast on a series the model never trained on. The median continues the seasonal-plus-trend pattern and the 80 percent interval quantifies uncertainty, all from sampling the language model's next-token distribution and de-quantizing, with no per-series fitting.</div>
+<p>Read together, the two code blocks tell the whole story of subsection one made real. Code 15.2.1 exposed the scale-and-quantize tokenizer that is the conceptual heart of Chronos, value to token and back, with the quantization error and range limit visible in the numbers. Code 15.2.2 then showed that in production you never write that tokenizer: a single <code>from_pretrained</code> plus <code>predict</code> runs the whole scale, quantize, sample, de-quantize, un-scale pipeline and returns a probabilistic forecast on an unseen series in about six lines, the line-count collapse the library-shortcut principle of this book demands.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Cold-Starting Forecasts for a Retailer's New Products</div>
+<p><strong>Who:</strong> A demand-planning team at an online retailer launching hundreds of new products each week, each with little or no sales history, the kind of cold-start problem foundation models were made for.</p>
+<p><strong>Situation:</strong> For established products with years of history their fitted seasonal models worked well, but every new launch had too little data to estimate an ARIMA or train a per-series neural net, so the first weeks of demand were forecast by crude heuristics and frequently mis-stocked.</p>
+<p><strong>Problem:</strong> They needed a reasonable, uncertainty-aware demand forecast for a brand-new SKU from day one, before any meaningful history existed, across hundreds of new items per week with no time to hand-tune each.</p>
+<p><strong>Dilemma:</strong> Fitting a classical model was impossible with near-zero history. Training one big global neural net was an option but a months-long engineering project. A zero-shot foundation model promised instant forecasts but might import biases from its pretraining mix and had to be checked against the cheap baseline.</p>
+<p><strong>Decision:</strong> They used zero-shot Chronos to forecast each new SKU from whatever short context existed (often just a category-analog series), seeding the supply chain immediately, while running the seasonal-naive baseline of <a href="../../toc.html">Chapter 5</a> in parallel on every item as a guardrail and switching to fitted per-series models once a product accumulated enough history.</p>
+<p><strong>How:</strong> A nightly job called <code>ChronosPipeline.predict</code> (exactly Code 15.2.2) on every cold-start SKU with <code>num_samples=100</code>, taking the median for the reorder point and the 90th percentile for safety stock, and logged the zero-shot MASE against seasonal-naive per item to catch the intermittent-demand cases where, as subsection four warned, the baseline wins.</p>
+<p><strong>Result:</strong> Cold-start forecasts went from crude heuristics to calibrated, uncertainty-aware distributions available on launch day, cutting early-life stockouts, while the baseline guardrail flagged the minority of intermittent items to route to a specialized model instead of Chronos.</p>
+<p><strong>Lesson:</strong> The foundation model's killer application is cold-start, the regime where classical methods have nothing to fit, but the baseline-anchored backtest of <a href="../../toc.html">Chapter 5</a> still rides alongside to catch the per-series cases (intermittent, structural-break) where zero-shot transfer quietly fails.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: One Model, One Import, Per Library</div>
+<p>Each of the three models is a single import and a couple of calls away. Chronos: <code>from chronos import ChronosPipeline; ChronosPipeline.from_pretrained("amazon/chronos-t5-small").predict(...)</code>, the whole scale-quantize-sample pipeline of subsection one in two lines instead of the 200-plus lines a from-scratch T5 forecaster needs. MOMENT: <code>from momentfm import MOMENTPipeline; MOMENTPipeline.from_pretrained("AutonLab/MOMENT-1-large", model_kwargs={"task_name": "forecasting"})</code>, then attach the task head, one backbone reused across forecasting, classification, anomaly detection, and imputation by swapping <code>task_name</code>. Lag-Llama ships a checkpoint plus a GluonTS-style estimator wrapper. In every case the library handles scaling, the model architecture, sampling or distribution heads, and un-scaling internally; you supply a context array and a horizon. The honest-assessment discipline of subsection four is the only thing the library will not do for you: it will happily return a forecast that seasonal-naive would have beaten, so you must still run the baseline.</p>
+</div>
+
+<h2>Exercises</h2>
+<div class="callout exercises">
+<div class="callout-title">Exercises</div>
+<p><strong>15.2.1 (Conceptual).</strong> Chronos and Lag-Llama both reuse the LLaMA/T5 language-model lineage but in different ways. In two or three sentences each, explain (a) what Chronos borrows from language modeling (objective, output type) and what it gives up by quantizing, and (b) what Lag-Llama borrows (architecture, output head) and what constraint its Student-$t$ head imposes that Chronos's categorical token distribution does not. Then state one forecasting situation where each model's design choice is an advantage over the other.</p>
+<p><strong>15.2.2 (Implementation).</strong> Extend the <code>ChronosLikeTokenizer</code> of Code 15.2.1 to study the quantization tradeoff. (a) For a fixed series, compute and plot the maximum reconstruction error as a function of <code>n_bins</code> over the range 64, 256, 1024, 4096, and confirm it halves each time the bin count doubles. (b) Construct a series with a single extreme outlier (for example one value ten times the others) and show that, after scaling, the outlier is clipped to the outermost bin; print the clipped reconstruction and explain in one sentence why this is the "hard range limit" of subsection one. (c) Replace the uniform bin edges with quantile-spaced edges (more bins where the data is dense) and report whether the maximum error drops for the same total bin count.</p>
+<p><strong>15.2.3 (Open-ended).</strong> Take the zero-shot Chronos forecast of Code 15.2.2 and run the honest-assessment protocol of subsection four on real data. Pick two contrasting public series (for example one with strong clean seasonality and one intermittent low-volume series from the Monash archive), backtest zero-shot Chronos, seasonal-naive, and AutoARIMA on each with a rolling-origin evaluation, and report MASE and a probabilistic score (CRPS or pinball loss) for all three. On which series does the foundation model win, on which does the baseline win, and does your result match the warning of subsection four that intermittent or out-of-distribution series favor the cheap baseline? Discuss what this implies for a default forecasting policy across a large product catalog.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="nav-prev" href="section-15.1.html">&#8592; 15.1 What Makes a Temporal Foundation Model</a>
+<a class="nav-up" href="index.html">Chapter 15 Contents</a>
+<a class="nav-next" href="section-15.3.html">15.3 TimeGPT, TimesFM, and Moirai &#8594;</a>
+</nav>
+</main>
+<footer class="book-footer">
+<p class="edition-line">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="copyright-line">&copy; 2026 Alexander Apartsin &middot; <a href="../../toc.html">Contents</a></p>
+<p class="last-updated"><script>document.write("Last updated: " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

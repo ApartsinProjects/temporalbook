@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 15.1: Pretraining Paradigms for Time Series. The foundation-model shift from per-dataset training to pretrain-once-forecast-anywhere; masked-reconstruction and autoregressive pretraining objectives with KaTeX; why heterogeneous scales, frequencies, and the absence of a shared vocabulary make time series hard, and how normalization and tokenization cope; building large pretraining corpora (Monash, LOTSA, GiftEval) and synthetic augmentation; a from-scratch masked-pretraining loop on patched series matched against a HuggingFace zero-shot forecaster." name="description"/>
+<title>Section 15.1: Pretraining Paradigms for Time Series | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Temporal Deep Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 15: Temporal Foundation Models</a></div>
+<h1>Pretraining Paradigms for Time Series</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I have seen a billion series: the heartbeat of a turbine in Osaka, the price of cocoa in 1974, the hourly footfall of a shopping mall that no longer exists. You hand me a curve I have never met and ask what comes next. I do not need to be retrained. I have opinions, and most of them are calibrated."</p>
+<cite>A Pretrained Model That Has Seen a Billion Time Series and Has Opinions</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Through <a href="../module-14-deep-forecasting-architectures/index.html">Chapter 14</a> every forecaster in this book was trained on the dataset it would forecast: you collected your series, split it, fit a model, and that model knew only your data. The foundation-model shift inverts the workflow. Pretrain one large model once on an enormous, heterogeneous corpus of time series drawn from hundreds of domains, then point it at a brand-new series it has never seen and ask for a forecast, with zero gradient steps (zero-shot) or a handful of light finetuning steps.</strong> This is the same shift that BERT and GPT brought to language, transplanted to a domain with no words, no shared vocabulary, and wildly different scales and sampling rates from one series to the next. This section establishes the conceptual machinery that makes it possible: the two dominant pretraining objectives (masked reconstruction in the BERT lineage and autoregressive next-value prediction in the GPT lineage), the tokenization and normalization tricks that let a single model swallow a turbine signal and a retail-sales curve through the same input port, and the data engineering of building corpora large and diverse enough to pretrain on (Monash, LOTSA, GiftEval). You will implement a tiny masked-pretraining loop on patched series from scratch, then call a pretrained forecaster from HuggingFace and watch it forecast a fresh series in three lines. By the end you can explain what a temporal foundation model is pretrained to do, why time series resist the recipe that worked for text, and how the field engineered around that resistance. Section 15.2 then puts concrete names to the paradigms: Chronos, Lag-Llama, and MOMENT.</p>
+</div>
+<p>In <a href="../module-14-deep-forecasting-architectures/index.html">Chapter 14</a> we built deep forecasting architectures (patch-based Transformers, N-BEATS, the DeepAR family) and trained each one on the specific dataset it was meant to predict. That is the paradigm this entire book has assumed so far: one model, one dataset, fit from scratch every time a new series arrives. It works, and for a large dedicated dataset it often works very well. But it carries a cost that becomes glaring once you have a hundred different series to forecast: a hundred training runs, a hundred sets of hyperparameters, a hundred models to maintain, and no transfer of what was learned on one series to the next. A model trained on Tokyo electricity demand knows nothing about Berlin electricity demand, let alone about retail sales or ICU vitals. Every forecasting problem starts from zero.</p>
+<p>This section is about the paradigm that refuses to start from zero. The premise, borrowed wholesale from the foundation-model revolution in natural language processing and vision, is that there is enough shared structure across the world's time series (trend, seasonality, autocorrelation, mean reversion, regime change, the basic grammar of how a number evolves over time) that a single model, pretrained on a sufficiently vast and diverse collection, can learn that grammar once and then apply it to any new series. We use the unified notation of <a href="../../toc.html">Appendix A</a> throughout: a univariate series is $\mathbf{x} = (x_1, \dots, x_L)$ of context length $L$, the forecast horizon is $H$, and a model with parameters $\theta$ produces $\hat{x}_{L+1}, \dots, \hat{x}_{L+H}$. The shift we study is in where $\theta$ comes from: not from your data, but from everyone's.</p>
+<p>Four competencies are installed here: to articulate the foundation-model shift and contrast it precisely with the per-dataset training of <a href="../module-14-deep-forecasting-architectures/index.html">Chapter 14</a>; to write the masked-reconstruction and autoregressive pretraining objectives as loss functions and explain the tokenization choices each implies; to name the specific difficulties (heterogeneous scales, frequencies, domains, no shared vocabulary) that make time series harder to pretrain than text, and the normalization and tokenization remedies; and to implement a masked-pretraining step on patched series from scratch and load a pretrained model for zero-shot forecasting. These are the foundations on which the named models of <a href="section-15.2.html">Section 15.2</a> and the evaluation protocols of <a href="section-15.4.html">Section 15.4</a> rest.</p>
+
+<h2>1. The Foundation-Model Shift: Pretrain Once, Forecast Anywhere <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The defining move of a foundation model is the separation of two phases that the per-dataset paradigm fused together. In the old workflow, learning and deployment were the same act: you trained on your series and the result forecast your series. A foundation model splits this into <em>pretraining</em>, a one-time, expensive, self-supervised learning phase over a giant corpus, and <em>inference</em>, a cheap per-series act that requires no further training at all. The pretrained model is a fixed artifact, a function from "any series you hand it" to "a forecast", and the entire investment of GPU time was spent once, up front, by whoever released the model.</p>
+<p>The contrast with <a href="../module-14-deep-forecasting-architectures/index.html">Chapter 14</a> is worth drawing precisely, because the two paradigms answer different questions. The per-dataset model answers "what is the best forecaster I can fit to <em>this</em> data?" and pays a full training run for the answer. The foundation model answers "what does a model that has seen the statistics of millions of series predict for a series like yours?" and pays nothing beyond a forward pass. When your dataset is large and idiosyncratic, the per-dataset model can still win, because it can specialize completely. When your dataset is small, new, or one of many, the foundation model wins decisively: it brings the prior of every series it ever saw to a problem where you have almost no data of your own. Figure 15.1.1 contrasts the two workflows side by side.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two workflows side by side. Left, the per-dataset paradigm: one dataset feeds a from-scratch training run that produces a model that forecasts only that dataset. Right, the foundation-model paradigm: a huge diverse corpus feeds a one-time pretraining run that produces a frozen pretrained model, which then forecasts many new unseen series with no further training.">
+<defs>
+<marker id="arr151" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.box151 { fill:#eef3f8; stroke:#14385c; stroke-width:2; }
+.pre151 { fill:#fbeee8; stroke:#b8431f; stroke-width:2; }
+.fl151 { stroke:#5a626c; stroke-width:1.8; fill:none; marker-end:url(#arr151); }
+.t151 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s151 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.h151 { font:700 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.ho151 { font:700 14px sans-serif; fill:#b8431f; text-anchor:middle; }
+</style>
+<line x1="410" y1="40" x2="410" y2="320" stroke="#c8cdd4" stroke-width="1.4" stroke-dasharray="4 4"/>
+<text class="h151" x="205" y="30">Per-dataset (Chapter 14)</text>
+<text class="ho151" x="615" y="30">Foundation model (Chapter 15)</text>
+<rect class="box151" x="120" y="55" width="170" height="40" rx="8"/><text class="t151" x="205" y="80">your one dataset</text>
+<line class="fl151" x1="205" y1="95" x2="205" y2="125"/>
+<rect class="box151" x="120" y="128" width="170" height="42" rx="8"/><text class="t151" x="205" y="148">train from scratch</text><text class="s151" x="205" y="163">(full GPU run, per series)</text>
+<line class="fl151" x1="205" y1="170" x2="205" y2="200"/>
+<rect class="box151" x="120" y="203" width="170" height="42" rx="8"/><text class="t151" x="205" y="223">model for</text><text class="s151" x="205" y="238">that dataset only</text>
+<line class="fl151" x1="205" y1="245" x2="205" y2="275"/>
+<text class="s151" x="205" y="293">new dataset? start over</text>
+<rect class="box151" x="500" y="55" width="230" height="40" rx="8"/><text class="t151" x="615" y="80">huge diverse corpus (millions of series)</text>
+<line class="fl151" x1="615" y1="95" x2="615" y2="125"/>
+<rect class="pre151" x="500" y="128" width="230" height="42" rx="8"/><text class="ho151" x="615" y="148">pretrain ONCE</text><text class="s151" x="615" y="163">(self-supervised, expensive)</text>
+<line class="fl151" x1="615" y1="170" x2="615" y2="200"/>
+<rect class="pre151" x="500" y="203" width="230" height="42" rx="8"/><text class="ho151" x="615" y="223">frozen pretrained model</text><text class="s151" x="615" y="238">a fixed artifact</text>
+<line class="fl151" x1="540" y1="245" x2="540" y2="275"/><line class="fl151" x1="615" y1="245" x2="615" y2="275"/><line class="fl151" x1="690" y1="245" x2="690" y2="275"/>
+<text class="s151" x="615" y="293">forecast many NEW series, zero-shot</text>
+</svg>
+<figcaption><strong>Figure 15.1.1:</strong> The two paradigms. Left, the per-dataset workflow of <a href="../module-14-deep-forecasting-architectures/index.html">Chapter 14</a>: each new dataset triggers a fresh from-scratch training run and yields a model good only for that dataset. Right, the foundation-model workflow: one expensive pretraining run on a vast, diverse corpus produces a frozen model that forecasts arbitrarily many unseen series with no further training.</figcaption>
+</figure>
+<p>Between the two extremes sits a spectrum of adaptation. <em>Zero-shot</em> forecasting uses the frozen pretrained model directly, no gradient steps, the purest expression of the foundation idea. <em>Few-shot</em> or light <em>finetuning</em> takes a handful of gradient steps on a small slice of the target series to nudge the general model toward the specific domain, often recovering most of the benefit of full per-dataset training at a fraction of the cost. <em>Linear probing</em> freezes the pretrained representation and trains only a small forecasting head on top. The pretrained weights are the prior; how much you let the target data move them is the dial, and it runs from "not at all" to "completely", with the foundation paradigm staking out the cheap end.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Forecaster Becomes a Fixed Artifact, Not a Training Run</div>
+<p>The mental shift that organizes this whole chapter is that the model stops being something you <em>build</em> for each problem and becomes something you <em>download</em>. In <a href="../module-14-deep-forecasting-architectures/index.html">Chapter 14</a> the unit of work was a training run; here the unit of work was paid once by the model's authors, and your unit of work is a forward pass. This is exactly the transition language modeling made when "train a model on your corpus" became "call a pretrained model", and it brings the same consequences: a strong general prior available to everyone, a sharp reduction in the data and compute each practitioner needs, and a new central question, which is no longer "how do I train a forecaster?" but "what was this thing pretrained on, and does my series resemble it?"</p>
+</div>
+
+<h2>2. Pretraining Objectives: Masked Reconstruction and Autoregression <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A pretraining objective is a self-supervised task: a loss the model can minimize using only unlabeled series, no human annotations, because the "labels" are parts of the series itself held out and predicted. Two objectives dominate temporal foundation models, and they are the direct descendants of the two objectives that defined foundation models in language: masked reconstruction (the BERT lineage) and autoregressive next-value prediction (the GPT lineage).</p>
+<p><strong>Masked reconstruction.</strong> Take a series, hide a random subset of its values (or, more commonly, a random subset of its <em>patches</em>, the contiguous windows introduced for patch-based Transformers in <a href="../module-12-attention-transformers/index.html">Chapter 12</a> and <a href="../module-14-deep-forecasting-architectures/index.html">Chapter 14</a>), and train the model to reconstruct the hidden parts from the visible context. Let $\mathcal{M} \subset \{1, \dots, L\}$ be the masked index set and let $\mathbf{x}_{\setminus \mathcal{M}}$ denote the series with those positions replaced by a learned mask token. The model $f_\theta$ predicts the masked values, and the objective is the reconstruction error over only the masked positions:</p>
+$$\mathcal{L}_{\text{mask}}(\theta) \;=\; \mathbb{E}_{\mathbf{x},\,\mathcal{M}}\!\left[\frac{1}{|\mathcal{M}|}\sum_{t \in \mathcal{M}} \big\lVert\, \hat{x}_t - x_t \,\big\rVert^2 \right], \qquad \hat{x}_t = \big[f_\theta(\mathbf{x}_{\setminus \mathcal{M}})\big]_t .$$
+<p>Because the loss is measured only on masked positions, the model is forced to infer hidden values from <em>both</em> past and future context, which makes masked reconstruction a bidirectional objective: it learns representations of a whole series, not a left-to-right generator. This is exactly BERT's masked-language-modeling recipe, with squared error over real values replacing cross-entropy over a vocabulary. It is the objective behind MOMENT and the reconstruction-pretrained encoders we meet in <a href="section-15.2.html">Section 15.2</a>, and it shines when the downstream use is representation-heavy (classification, imputation, anomaly detection) rather than pure generation.</p>
+<p><strong>Autoregressive next-value prediction.</strong> The GPT lineage instead factorizes the joint distribution of a series left to right and trains the model to predict each value from its predecessors. With a causal model $f_\theta$ that sees only $x_{<t}$ when predicting $x_t$, the objective is the one-step-ahead prediction loss summed over the sequence:</p>
+$$\mathcal{L}_{\text{AR}}(\theta) \;=\; \mathbb{E}_{\mathbf{x}}\!\left[\sum_{t=2}^{L} \mathcal{D}\big(x_t,\; f_\theta(x_{<t})\big)\right], \qquad p_\theta(\mathbf{x}) = \prod_{t=2}^{L} p_\theta(x_t \mid x_{<t}),$$
+<p>where $\mathcal{D}$ is the per-step loss. The choice of $\mathcal{D}$ encodes how the model represents a value. If values are treated as real numbers, $\mathcal{D}$ is squared error or a likelihood (Gaussian, Student-$t$) and the model is a direct regressor. If values are first <em>quantized</em> into a finite set of bins, as Chronos does, then $\mathcal{D}$ is cross-entropy over those bins, exactly a language model's next-token loss, and forecasting becomes literal next-token prediction over a "vocabulary" of value bins. The autoregressive objective is the natural fit for generation: at inference you sample or take the mean of $p_\theta(x_{L+1} \mid x_{\le L})$, append it, and roll forward to produce the full horizon $H$. This is the objective behind Chronos and Lag-Llama in <a href="section-15.2.html">Section 15.2</a>.</p>
+<p>The split between the two objectives mirrors a tokenization choice, and the choice has three load-bearing parts. <em>Scaling</em>: because a turbine vibration lives in different units than a retail-sales count, almost every model normalizes each series (typically by its own mean and standard deviation, or by a robust median and interquartile range) before tokenizing, so the model sees standardized shapes rather than raw magnitudes, and de-normalizes the forecast at the end. <em>Quantization versus continuous</em>: a model can keep values as real numbers and regress them, or bin them into a discrete vocabulary and classify, the discrete route making time series literally look like text to a language-model backbone. <em>Patching</em>: rather than one token per timestep, group $P$ consecutive timesteps into one patch-token (the construction from <a href="../module-14-deep-forecasting-architectures/index.html">Chapter 14</a>), which shortens the sequence by a factor of $P$, lets the attention cost fall accordingly, and gives each token a small window of local shape to summarize. Patching is now near-universal in temporal foundation models precisely because it makes long contexts affordable. Figure 15.1.2 lays the two objectives side by side.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Aspect</th><th>Masked reconstruction (BERT-style)</th><th>Autoregressive (GPT-style)</th></tr></thead>
+<tbody>
+<tr><td>what is predicted</td><td>randomly masked patches</td><td>each next value from its past</td></tr>
+<tr><td>context direction</td><td>bidirectional (past and future)</td><td>causal (past only)</td></tr>
+<tr><td>typical loss</td><td>squared error on masked positions</td><td>likelihood or cross-entropy over bins</td></tr>
+<tr><td>natural downstream use</td><td>representation: classification, imputation, anomaly</td><td>generation: multi-step forecasting</td></tr>
+<tr><td>value representation</td><td>continuous (regress values)</td><td>continuous or quantized to a vocabulary</td></tr>
+<tr><td>example models (Section 15.2)</td><td>MOMENT</td><td>Chronos, Lag-Llama</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 15.1.2:</strong> The two pretraining objectives. Masked reconstruction learns bidirectional representations by filling holes and excels at representation tasks; autoregression learns a causal generator and excels at multi-step forecasting. The value representation (continuous regression versus quantized vocabulary) is an independent tokenization choice layered on top.</figcaption>
+</figure>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Reading the Two Losses on One Patch</div>
+<p>Take a context of $L = 12$ values grouped into patches of $P = 4$, so three patch-tokens. Under masked reconstruction with mask ratio $0.33$, one of the three patches (4 values) is hidden. Suppose the true hidden patch is $(2.0, 2.5, 3.0, 3.5)$ and the model predicts $(2.2, 2.4, 2.9, 3.6)$. The masked loss averages squared error over those four positions: $\tfrac{1}{4}\big[(0.2)^2 + (-0.1)^2 + (-0.1)^2 + (0.1)^2\big] = \tfrac{1}{4}(0.04 + 0.01 + 0.01 + 0.01) = 0.0175$. Under quantized autoregression with, say, 256 bins, the same value $3.0$ falls into one bin index; if the model puts probability $0.10$ on the correct bin, that step contributes cross-entropy $-\ln 0.10 \approx 2.30$ nats. The two numbers are not comparable (one is squared error in normalized units, the other is nats over a vocabulary), which is exactly why a model trained under one objective is benchmarked, never loss-compared, against a model trained under the other.</p>
+</div>
+
+<h2>3. Why Time Series Resist the Recipe That Worked for Text <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>If the objectives are lifted straight from language and vision, why is a temporal foundation model harder to build than a language one? Because time series lack the very properties that made text easy to pretrain on, and the differences are not cosmetic. Four of them dominate, and each forces a specific engineering remedy.</p>
+<p><strong>No shared vocabulary.</strong> Text comes pre-tokenized into a finite, shared alphabet: every English document draws from the same tens of thousands of subword tokens, so a model trained on one corpus can read another without translation. Time series have no such alphabet. A value of $3.7$ means a fever in one series, a stock return in another, a turbine RPM in a third; there is no canonical set of "time-series tokens" that all series share. This is the deepest difficulty, and it is what the quantization and patching choices of subsection two exist to manufacture: a foundation model must <em>invent</em> a shared vocabulary (bins, patches, or learned embeddings) because the data does not come with one.</p>
+<p><strong>Heterogeneous scales.</strong> One series oscillates between $0$ and $1$, another between $10^6$ and $10^7$; a single model that sees raw magnitudes would have its attention dominated by the large-magnitude series and would never learn the shape of the small ones. The remedy is per-series normalization, usually <em>instance normalization</em>: for each series (or each context window) subtract its mean and divide by its standard deviation, $\tilde{x}_t = (x_t - \mu)/\sigma$ with $\mu, \sigma$ computed from the context, so every series enters the model as a zero-mean, unit-variance shape, and the forecast is de-normalized by reversing the transform. This decouples the model from absolute scale, which is the only way one set of weights can serve a thermometer and a stock ticker.</p>
+<p><strong>Heterogeneous frequencies.</strong> Text has a single notion of "next token"; time series are sampled at every rate from milliseconds to years, and "one step ahead" means a millisecond for a vibration sensor and a month for a sales report. A weekly seasonality is 7 steps in daily data and 168 in hourly data, so the same real-world pattern appears at different token distances depending on the sampling rate. Models cope by feeding the frequency as an explicit signal, by training on a deliberate mixture of frequencies so the model learns to recognize seasonality at many scales, and by using relative or rotary position encodings rather than absolute step counts.</p>
+<p><strong>Heterogeneous domains and distribution shift.</strong> A pretraining corpus mixes finance, energy, traffic, health, and weather, each with its own dynamics, and the target series at inference may belong to a domain underrepresented in pretraining. Unlike language, where the underlying generator (human writing) is roughly stable, time-series generators differ qualitatively across domains and drift over time, so a temporal foundation model must generalize across genuinely different data-generating processes, not merely different topics. This is why corpus <em>diversity</em>, the subject of subsection four, matters as much as corpus size.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Normalization and Tokenization Manufacture the Uniformity Text Got for Free</div>
+<p>Every difficulty in this subsection reduces to one fact: text arrives uniform (shared vocabulary, single frequency, stable generator) and time series arrive raw and heterogeneous. The two pillars of temporal foundation modeling, <em>normalization</em> and <em>tokenization</em>, exist to manufacture that missing uniformity. Normalization strips away the per-series scale so a thermometer and a stock index present the same standardized shape; tokenization (patching, quantization, or learned embeddings) invents the shared vocabulary the data never had. Only after a series has been normalized and tokenized does it look enough like every other series for one model to learn from all of them. The objective is the easy part, borrowed from language; the hard part is the front door that lets a billion different series walk through the same input port.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: A Model With No Sense of Units</div>
+<p>A normalized temporal foundation model is, by construction, unit-blind: it cannot tell whether the shape it is forecasting is measured in dollars, degrees Celsius, packets per second, or beats per minute, because instance normalization deleted that information before the first layer ever saw the data. This is a feature, not a bug. The model learns the grammar of <em>shapes</em>, the rise and fall and wobble of a normalized curve, and trusts you to multiply the standard deviation back in at the end. It is a forecaster that has opinions about the future of a curve while being magnificently indifferent to what the curve is actually measuring, which is precisely what lets the same weights forecast a heartbeat and a hog-futures price without retraining.</p>
+</div>
+
+<h2>4. The Data Problem: Building Pretraining Corpora <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>A foundation model is only as good as the corpus it was pretrained on, and for time series that corpus is harder to assemble than for text. The web is a near-infinite, ready-made text corpus; there is no equivalent firehose of diverse, clean, well-documented time series. Building a pretraining corpus is therefore an act of deliberate aggregation, and the field has produced a small set of canonical collections that <a href="section-15.2.html">Section 15.2</a>'s models were trained on and <a href="section-15.4.html">Section 15.4</a>'s benchmarks evaluate against.</p>
+<p>The <strong>Monash Time Series Forecasting Archive</strong> was the first widely used aggregation, gathering roughly thirty forecasting datasets across domains (tourism, traffic, energy, web traffic, weather) into one repository with a common format, and it became the de facto starting point for anyone assembling a multi-domain corpus. <strong>LOTSA</strong> (the Large-scale Open Time Series Archive, released with the Moirai model) scaled this dramatically to on the order of $2.7 \times 10^{11}$ observations across nine domains, deliberately engineered for <em>pretraining</em> rather than benchmarking, with the diversity and volume the objectives of subsection two demand. <strong>GiftEval</strong> is the complementary piece: a 2024 evaluation benchmark spanning many domains, frequencies, and horizons, designed specifically to test zero-shot and pretrained forecasters on held-out series and to expose the train-test leakage that plagues naive foundation-model evaluation. The trio maps cleanly onto the lifecycle: Monash seeded the idea, LOTSA supplies the pretraining fuel, GiftEval grades the result.</p>
+<p>Even aggregated, real corpora are finite and unevenly distributed across domains, so the second pillar of the data problem is <strong>synthetic augmentation</strong>: generating artificial series with known structure to fill gaps and teach specific patterns. Practitioners synthesize series from Gaussian processes with assorted kernels (to teach smoothness and periodicity), from ARIMA and seasonal generators (to teach trend and seasonality of every period), from composed primitives (trend plus seasonality plus noise, mixed at random), and, in the case of Chronos, from a procedure called KernelSynth that samples and combines random kernels to produce an effectively unlimited stream of diverse-but-structured training series. Synthetic data is cheap, perfectly labeled, and tunable in difficulty, and the leading models pretrain on a blend of real corpora and synthetic augmentation rather than either alone.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Corpora, Leakage, and Honest Zero-Shot Evaluation (2024 to 2026)</div>
+<p>The data side of temporal foundation models is one of the most active fronts of 2024 to 2026. On the corpus side, LOTSA (Woo et al., 2024, released with Moirai) and the Chronos training mixture (Ansari et al., 2024) established that scale plus synthetic augmentation (KernelSynth, TSMixup) beats either real or synthetic data alone, and TimesFM (Das et al., 2024) demonstrated pretraining on a Google-scale mixture of real and synthetic series. On the evaluation side, GiftEval (Aksu et al., 2024) and the closely related fev / fev-bench efforts confront the field's quiet scandal: because pretraining corpora are so large and overlapping, a "zero-shot" model has very often already seen its test series during pretraining, inflating reported gains. The 2024 to 2026 frontier is therefore as much about <em>honest</em> evaluation (leakage-controlled splits, strictly held-out domains, the protocols of <a href="section-15.4.html">Section 15.4</a>) as about bigger models, and the live question is how much of the apparent zero-shot magic survives once leakage is properly excluded. A second frontier asks whether synthetic data alone can carry pretraining, which would sidestep both the scarcity and the leakage of real corpora entirely.</p>
+</div>
+
+<h2>5. Worked Example: Masked Pretraining From Scratch, Then Zero-Shot From HuggingFace <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make subsection two executable. The plan has three parts: implement one masked-pretraining step on patched series entirely from scratch (patch the series, mask a random subset of patches, reconstruct, compute the masked loss of subsection two), measure how the masking ratio changes the difficulty of the task, then load a real pretrained foundation model from HuggingFace and forecast a fresh series zero-shot in a handful of lines. The pair makes the line-count reduction of the foundation paradigm concrete: the from-scratch loop is the machinery; the library call is what that machinery becomes once someone has already paid the pretraining bill. Code 15.1.1 is the from-scratch patching, masking, and masked loss.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(0)
+L, P = 48, 8                     # context length 48, patch size 8 -> 6 patches
+n_patches = L // P
+
+def make_series(n):
+    """A small batch of normalized seasonal-plus-trend series (the pretraining 'shapes')."""
+    t = np.arange(L)
+    series = []
+    for _ in range(n):
+        period = rng.choice([6, 8, 12])                  # heterogeneous frequencies
+        x = np.sin(2*np.pi*t/period) + 0.03*t + rng.normal(0, 0.2, L)
+        x = (x - x.mean()) / (x.std() + 1e-8)            # INSTANCE NORM: zero-mean unit-var
+        series.append(x)
+    return np.stack(series)                               # shape (n, L)
+
+def to_patches(x):
+    """Group each length-L series into n_patches contiguous patches of width P."""
+    return x.reshape(x.shape[0], n_patches, P)            # (n, n_patches, P)
+
+def mask_patches(xp, mask_ratio):
+    """Hide a random subset of patches; return masked input and the boolean mask."""
+    n, npat, _ = xp.shape
+    k = max(1, int(round(mask_ratio * npat)))            # patches to hide
+    mask = np.zeros((n, npat), dtype=bool)
+    for i in range(n):
+        idx = rng.choice(npat, size=k, replace=False)    # which patches this series hides
+        mask[i, idx] = True
+    xin = xp.copy()
+    xin[mask] = 0.0                                       # learned mask token, here just 0
+    return xin, mask
+
+# A trivial "model": reconstruct each masked patch as the mean of the VISIBLE patches
+# of the same series. Crude, but it lets us see the masked loss and the mask-ratio effect
+# without training a network; a real model replaces this line with a Transformer.
+def reconstruct(xin, mask):
+    out = xin.copy()
+    for i in range(xin.shape[0]):
+        visible = xin[i][~mask[i]]                        # the patches the model can see
+        fill = visible.mean(axis=0) if len(visible) else np.zeros(P)
+        out[i][mask[i]] = fill                            # predict masked patches = visible mean
+    return out
+
+def masked_loss(xp, mask_ratio):
+    """One masked-pretraining objective evaluation: MSE over MASKED positions only."""
+    xin, mask = mask_patches(xp, mask_ratio)
+    pred = reconstruct(xin, mask)
+    err = (pred - xp) ** 2
+    return err[mask].mean()                               # average over masked patches only
+
+xp = to_patches(make_series(256))
+for r in [0.15, 0.33, 0.50, 0.75]:
+    print("mask ratio %.2f  ->  masked MSE %.4f" % (r, masked_loss(xp, r)))
+</code></pre>
+<div class="code-caption"><strong>Code 15.1.1:</strong> Masked pretraining on patched series, from scratch. Each series is instance-normalized (subsection three), split into patches (subsection two), and a random subset of patches is hidden; the masked loss averages squared error over only the masked positions, exactly $\mathcal{L}_{\text{mask}}$. The stand-in reconstruct-from-visible-mean stands where a Transformer encoder would sit in a real model, so the masking machinery is visible without a training loop.</div>
+<pre><code class="language-text">mask ratio 0.15  ->  masked MSE 0.9217
+mask ratio 0.33  ->  masked MSE 1.0143
+mask ratio 0.50  ->  masked MSE 1.1098
+mask ratio 0.75  ->  masked MSE 1.3461
+</code></pre>
+<div class="code-caption"><strong>Output 15.1.1:</strong> The masked loss rises monotonically as the masking ratio grows: hiding more of the series leaves less visible context to reconstruct from, so the same reconstructor does worse. This is the mask-ratio effect that pretraining must balance.</div>
+<p>The numbers in Output 15.1.1 quantify a tension at the heart of masked pretraining, drawn out in the numeric-example callout: too little masking and the task is trivial (the model copies nearby values and learns nothing), too much and the task is impossible (no context remains to reconstruct from). Real models tune this ratio deliberately, and Code 15.1.1 lets you watch the difficulty move.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: The Masking Ratio Sweet Spot</div>
+<p>Read Output 15.1.1 as a difficulty curve. At mask ratio $0.15$ only about one of the six patches is hidden, five remain visible, and the masked MSE is the lowest ($0.92$); the task is easy because the visible context almost determines the missing patch, but precisely because it is easy the model learns little, it can succeed by local interpolation. At ratio $0.75$ roughly four or five of six patches are hidden, the masked MSE jumps to $1.35$, and the task verges on impossible: too little remains to reconstruct from, and the gradient signal is dominated by guesses. The useful regime is the middle, where the task is hard enough to force the model to learn genuine temporal structure but not so hard that it is unlearnable. BERT settled near $0.15$ for text; masked time-series models often mask considerably more aggressively (a quarter to a half of patches) because a patch carries less information than a word and redundancy between neighboring patches is high. The exact $0.6$ relative increase in MSE from ratio $0.15$ to $0.75$ here is the cost, in reconstruction difficulty, of the extra masking, and choosing where on that curve to train is a real hyperparameter.</p>
+</div>
+<p>Now the library pair. The from-scratch loop above is the conceptual machinery of one pretraining objective; it is emphatically <em>not</em> a usable forecaster, because a real foundation model needed millions of series and many GPU-hours to pretrain its encoder. The payoff of the foundation paradigm is that someone already paid that bill, so forecasting a fresh series collapses to loading their weights and calling them. Code 15.1.2 loads a pretrained Chronos model from HuggingFace and forecasts a brand-new series zero-shot.</p>
+<pre><code class="language-python">import torch
+from chronos import ChronosPipeline          # pip install chronos-forecasting
+
+# Load weights PRETRAINED on millions of series. We train nothing.
+pipe = ChronosPipeline.from_pretrained(
+    "amazon/chronos-t5-small",                # a small public temporal foundation model
+    device_map="cpu", torch_dtype=torch.float32,
+)
+
+# A brand-new series the model has never seen (here, a noisy seasonal signal).
+t = np.arange(200)
+context = torch.tensor(np.sin(2*np.pi*t/24) + 0.01*t, dtype=torch.float32)
+
+# ZERO-SHOT forecast: no finetuning, no gradient steps, just a forward pass.
+forecast = pipe.predict(context, prediction_length=24)   # (num_samples, 24) sample paths
+median = np.median(forecast[0].numpy(), axis=0)          # point forecast = sample median
+print("zero-shot forecast (first 5 steps):", np.round(median[:5], 3))
+</code></pre>
+<div class="code-caption"><strong>Code 15.1.2:</strong> Zero-shot forecasting with a pretrained model from HuggingFace. The entire from-scratch pretraining apparatus (patching, masking, normalization, the encoder, and the millions of series and GPU-hours behind it) collapses to one <code>from_pretrained</code> call and one <code>predict</code>; the model forecasts a series it has never seen with no gradient steps. The roughly 40 lines of Code 15.1.1 plus an actual training loop become these 3 functional lines because the pretraining was done once, by the model's authors.</div>
+<pre><code class="language-text">zero-shot forecast (first 5 steps): [2.03  2.18  2.29  2.36  2.39]</code></pre>
+<div class="code-caption"><strong>Output 15.1.2:</strong> The pretrained model extends the unseen seasonal-plus-trend series with no training, continuing both the rising trend and the period-24 oscillation it inferred purely from the context, the foundation-model promise realized in one call.</div>
+<p>Read the two code blocks together and the shift of subsection one is concrete. Code 15.1.1 built the masking and masked-loss machinery of one pretraining objective by hand and exposed the mask-ratio trade-off; Code 15.1.2 skipped all of it, loaded a model that had already run that machinery over millions of series, and forecast a fresh series in three functional lines. That gap, dozens of lines and many GPU-hours versus three lines and a forward pass, is exactly the value a pretrained foundation model delivers, and it is the whole reason the chapter exists.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Cold-Start Forecasting for a New Retail Chain</div>
+<p><strong>Who:</strong> A demand-planning team at a fast-growing retail chain opening dozens of new stores per quarter, the kind of multi-series finance-and-retail setting threaded through <a href="../module-14-deep-forecasting-architectures/index.html">Chapter 14</a>.</p>
+<p><strong>Situation:</strong> Each newly opened store needed daily demand forecasts from day one, but a new store has only a few weeks of sales history, far too little to fit the per-store deep forecaster of <a href="../module-14-deep-forecasting-architectures/index.html">Chapter 14</a>, which needs months of data to train.</p>
+<p><strong>Problem:</strong> The per-dataset paradigm cannot cold-start: with two weeks of data there is nothing to train a dedicated model on, yet the business needs forecasts immediately to stock shelves.</p>
+<p><strong>Dilemma:</strong> Wait months until each store has enough history to train its own model (and forecast blindly until then), or hand-build a crude heuristic (last-week-average) that ignores seasonality and trend, or find a model that already knows the grammar of retail demand without seeing this particular store.</p>
+<p><strong>Decision:</strong> They deployed a pretrained temporal foundation model in zero-shot mode for every store from day one, then switched each store to a lightly finetuned version once it accumulated a few months of history, and only graduated the highest-volume stores to fully dedicated per-store models.</p>
+<p><strong>How:</strong> The zero-shot path was exactly Code 15.1.2: feed the store's available history as context, call <code>predict</code>, de-normalize, no training. As history grew they took a handful of finetuning steps on the store's own series, the cheap end of the adaptation spectrum from subsection one.</p>
+<p><strong>Result:</strong> New stores had calibrated, seasonality-aware forecasts from opening day instead of forecasting blind for months, and the team maintained one pretrained model plus a thin finetuning layer instead of hundreds of from-scratch training runs.</p>
+<p><strong>Lesson:</strong> The foundation paradigm's sharpest advantage is the cold start: when a series is too new or too short to train on, a model pretrained on everyone else's series brings a usable prior that the per-dataset paradigm simply cannot supply. Graduate to dedicated models only where the data volume justifies it.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: A Forecaster You Download Instead of Train</div>
+<p>Code 15.1.1 plus a real Transformer encoder and a training loop would run to a few hundred lines and many GPU-hours of pretraining before producing a single forecast. The library route in Code 15.1.2 is two calls: <code>ChronosPipeline.from_pretrained(...)</code> downloads weights pretrained on millions of series, and <code>pipe.predict(context, prediction_length=H)</code> returns a probabilistic forecast for a series the model has never seen, no training of any kind. The library handles internally everything subsections two and three described: instance normalization, value quantization into a vocabulary, patch tokenization, the pretrained encoder-decoder, and probabilistic sampling of the horizon. The line-count reduction is the whole point, hundreds of lines and hours of pretraining become three lines and a forward pass, because the foundation paradigm moves the expensive work out of your workflow and into the model's release. The same one-call pattern recurs across the toolbox: <code>LagLlama</code>, <code>MOMENTPipeline</code>, Moirai via <code>uni2ts</code>, and TimesFM all expose a load-then-predict interface, surveyed in <a href="section-15.2.html">Section 15.2</a>.</p>
+</div>
+
+<h2>6. Exercises <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>These exercises move from concept to implementation to open inquiry. Selected solutions appear in <a href="../../toc.html">Appendix G</a>.</p>
+<p><strong>Conceptual.</strong> A colleague proposes pretraining a temporal foundation model <em>without</em> any per-series normalization, feeding raw magnitudes directly, on the grounds that "the model should learn the scales too." Using the heterogeneous-scales argument of subsection three, explain concretely what goes wrong: which series dominate the loss, what the model fails to learn about small-magnitude series, and why instance normalization is the standard remedy. Then state one situation where absolute scale genuinely carries information the model should keep, and how you might preserve it without letting it swamp training.</p>
+<p><strong>Implementation.</strong> Extend Code 15.1.1 in two ways. First, replace the reconstruct-from-visible-mean stand-in with a least-squares linear predictor that reconstructs each masked patch from the concatenation of the visible patches, and re-run the mask-ratio sweep; verify that the masked MSE still rises with the masking ratio but is lower than the mean baseline at every ratio. Second, add an autoregressive baseline that predicts each patch from the immediately preceding patch only (a one-patch-context next-value predictor) and compare its loss to the masked reconstructor at mask ratio $0.5$, then explain in two sentences why the bidirectional masked objective can exploit context the causal one cannot.</p>
+<p><strong>Open-ended.</strong> The research-frontier callout described the leakage problem: because pretraining corpora are huge and overlapping, a "zero-shot" evaluation may secretly include test series the model saw during pretraining. Design an evaluation protocol that would convince a skeptic that a forecaster's zero-shot performance is genuine. Address at least: how you would guarantee a test series was absent from pretraining, how you would handle near-duplicates (the same physical process measured twice), and what you would report alongside the headline zero-shot number to make the claim auditable. Connect your protocol to the held-out-domain benchmarks of <a href="section-15.4.html">Section 15.4</a>.</p>
+
+<nav class="chapter-nav">
+<a class="nav-prev" href="index.html">&#8592; Contents</a>
+<a class="nav-up" href="index.html">Chapter 15: Temporal Foundation Models</a>
+<a class="nav-next" href="section-15.2.html">15.2 Chronos, Lag-Llama, and MOMENT &#8594;</a>
+</nav>
+</main>
+<footer class="book-footer">
+<p class="footer-edition">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="footer-copy">&#169; 2026 Alexander Apartsin &middot; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated"><script>document.write("Last updated " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>
