@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 2.2: Sampling, Resampling, and Aggregation. How the sampling interval bounds what you can see, how to downsample with anti-aliasing, when upsampling and interpolation are honest, how to align asynchronous channels with as-of joins, and how bin conventions can leak the future into a bar." name="description"/>
+<title>Section 2.2: Sampling, Resampling, and Aggregation | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Foundations of Temporal AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 2: Temporal Data Engineering</a></div>
+<h1>Sampling, Resampling, and Aggregation</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"People keep asking me to make their data tidy. I oblige, but understand what you are buying: every bar I return is an opinion. The mean is my favorite opinion, the last value is my laziest, and the one you forgot to choose is the one that will hurt you."</p>
+<cite>A Resampler With a Strong Opinion About the Mean</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Resampling looks like bookkeeping and is actually modeling: the moment you pick a sampling interval and an aggregator you have decided which patterns your model is allowed to see and which it will never recover.</strong> The sampling rate sets a hard ceiling on the fastest signal you can represent; downsampling without a filter forges false low-frequency structure out of fast oscillations; upsampling can invent information that was never measured; and the quiet conventions of bin labeling can leak the future into a bar that your evaluation then trusts. This section makes each of those decisions explicit, with runnable pandas you can paste, so that the grid your data sits on is a choice you made on purpose rather than a default you inherited.</p>
+</div>
+<p>The previous section established the temporal index as the spine of every series and showed how to attach a clean, timezone-aware timestamp to each observation (see <a href="section-2.1.html">Section 2.1</a>). With a trustworthy index in hand, the natural next question is the spacing of the observations along it. That spacing, the sampling interval, is rarely fixed by nature; it is fixed by the instrument, the logging policy, or a downstream convenience, and changing it is the single most common transformation in temporal data engineering. We resample to align channels that arrived on different clocks, to coarsen a torrent of ticks into manageable bars, to fill a grid for a model that demands regular spacing, and to match the cadence at which a decision is actually taken. Each of those is legitimate; each also has a way to go wrong that no error message will warn you about.</p>
+<p>The plan of this section follows the lifecycle of a grid. Subsection one fixes intuition for what a sampling rate buys and forbids. Subsections two and three handle the two directions of change, coarser and finer, with their characteristic dangers of aliasing and invention. Subsection four aligns several series onto a shared clock, the operation that makes multivariate temporal data possible at all. Subsection five returns to the leakage theme of <a href="../module-01-intro-temporal-intelligence/section-1.6.html">Section 1.6</a> and shows how an innocent bin-labeling choice can smuggle the future into the present.</p>
+
+<h2>1. Sampling Rate and What It Determines <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>A uniformly sampled series observes an underlying continuous process at instants spaced by a constant interval $\Delta t$, the sampling interval, whose reciprocal $f_s = 1/\Delta t$ is the sampling rate. This single number governs what is knowable. The classical sampling theorem states that a signal can be reconstructed from its samples only if it contains no frequency higher than half the sampling rate, a bound called the Nyquist frequency,</p>
+$$f_{\text{Nyquist}} = \frac{f_s}{2} = \frac{1}{2\,\Delta t}.$$
+<p>The practical reading for time series is blunt: if a pattern repeats faster than once every two samples, your data physically cannot represent it, and any model you train on that data is blind to it no matter how clever the architecture. A vibration that cycles every second is invisible in data logged once per second; you need at least two samples per cycle, and in practice several, to see it honestly. The sampling interval is therefore not a storage detail but a hard ceiling on the fastest structure available to every downstream stage. When you choose $\Delta t$ you are choosing the bandwidth of your own perception, and you cannot buy it back later by interpolation. This frequency-domain way of thinking, where a series is understood through the rates it contains, is developed in full when we reach spectral analysis; the forward pointer is <a href="../../toc.html">Chapter 4</a>, and the notation for sampling rate and frequency is fixed in the unified table of <a href="../../toc.html">Appendix A</a>.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Sampling Interval Is a Ceiling You Cannot Raise Later</div>
+<p>Two samples per cycle is the floor for merely detecting a periodicity, and it is a generous floor; resolving the shape of a fast pattern wants many more. The consequence is asymmetric and worth internalizing: coarsening a series is always possible and discards information, while refining it is never truly possible because the information was never collected. Decide the sampling rate against the fastest phenomenon you actually care about, with margin, before you build anything on top of it. Everything downstream inherits this ceiling and nothing downstream can lift it.</p>
+</div>
+
+<h2>2. Downsampling and Aggregation <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Downsampling moves a series onto a coarser grid, replacing the many samples that fall inside each new, wider bin with a single summary. The summary is the aggregator, and the choice of aggregator is a modeling decision disguised as a default. Formally, writing the coarse bin starting at time $\tau$ as the half-open window $[\tau, \tau + \Delta\tau)$, an aggregated value is a functional of the samples it contains; the mean, the workhorse, is the windowed average</p>
+$$\bar{x}_\tau = \frac{1}{|B_\tau|} \sum_{t \in B_\tau} x_t, \qquad B_\tau = \{\, t : \tau \le t < \tau + \Delta\tau \,\}.$$
+<p>Different questions want different functionals over $B_\tau$. A flow quantity such as rainfall or sales wants the sum; a level quantity such as temperature wants the mean; a state you want sampled at the bin edge wants the last (or first); and a financial bar conventionally wants all four of open, high, low, and close, the OHLC summary, because a single number throws away the path the price took inside the bar. Code 2.2.1 downsamples a minute-level price series to five-minute bars two ways, a plain mean and a full OHLC, so the difference in what each retains is concrete.</p>
+<pre><code class="language-python">import numpy as np
+import pandas as pd
+
+# One trading hour of synthetic minute-level prices on a clean uniform index.
+rng = np.random.default_rng(7)
+idx = pd.date_range("2026-01-02 09:30", periods=60, freq="1min")
+price = 100 + np.cumsum(rng.normal(0, 0.05, size=60))   # a random walk in price
+s = pd.Series(price, index=idx, name="price")
+
+# Downsample to 5-minute bars. The aggregator is the decision, not the freq.
+mean_5min = s.resample("5min").mean()                   # level summary: average price
+ohlc_5min = s.resample("5min").ohlc()                   # open/high/low/close per bar
+
+print(mean_5min.head(3).round(3))
+print()
+print(ohlc_5min.head(3).round(3))
+</code></pre>
+<div class="code-caption"><strong>Code 2.2.1:</strong> Downsampling a minute-level price series to five-minute bars with two aggregators. The <code>.mean()</code> keeps one level summary per bar; <code>.ohlc()</code> keeps the open, high, low, and close, preserving the within-bar path that a single mean discards.</div>
+<pre><code class="language-text">2026-01-02 09:30:00    100.041
+2026-01-02 09:35:00    100.123
+2026-01-02 09:40:00    100.205
+Freq: 5min, Name: price, dtype: float64
+
+                       open     high      low    close
+2026-01-02 09:30:00  100.012  100.121   99.978  100.069
+2026-01-02 09:35:00  100.083  100.196  100.061  100.151
+2026-01-02 09:40:00  100.214  100.279  100.160  100.198
+</code></pre>
+<div class="code-caption"><strong>Output 2.2.1:</strong> The mean collapses each five-minute window to one number, while the OHLC frame keeps four, recording where the bar opened, the extremes it reached, and where it closed. For volatility or range-based features the OHLC summary is irreplaceable; the mean would have hidden the high and low entirely.</div>
+<p>So far the aggregator looks like a free choice, but there is a trap underneath it that the mean does not advertise. Downsampling is decimation, and decimating a signal that still contains energy above the new Nyquist frequency causes aliasing: fast oscillations that the coarse grid cannot represent do not vanish, they fold down and masquerade as slow oscillations that were never really there. A vibration at fifty-five hertz sampled at sixty hertz reappears as a phantom five-hertz trend, and a mean over the bin does not save you because the mean is itself a weak filter that leaks high frequencies. The discipline borrowed from signal processing is to low-pass filter first and decimate second, so that the energy above the new Nyquist limit is removed before it can fold. The warning below states the failure mode in operational terms, and a real team that learned it the hard way appears in the practical example.</p>
+<div class="callout warning">
+<div class="callout-title">Warning: Downsampling Without a Filter Forges False Structure</div>
+<p>If you simply pick every $k$-th sample, or even average within bins, while energy remains above the new Nyquist frequency, that energy aliases: it folds down and appears as low-frequency structure that is entirely an artifact of the decimation. The forged structure is dangerous precisely because it looks plausible. A spurious slow trend or a phantom seasonal cycle invites exactly the wrong model and survives a casual eyeball check. The fix is order of operations: apply an anti-aliasing low-pass filter (or use a decimation routine that bundles one in, such as <code>scipy.signal.decimate</code>) before you reduce the rate, never after. A bin-mean is not an anti-aliasing filter; treating it as one is how the phantom gets in.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Fault Frequency That Vanished into the Mean</div>
+<p><strong>Who:</strong> A reliability engineering team monitoring rotating machinery on a production line with accelerometers.</p>
+<p><strong>Situation:</strong> Raw vibration was captured at twenty kilohertz, far too much data to store long term, so an ingestion job averaged it down to one sample per second before it ever reached the feature store the models read from.</p>
+<p><strong>Problem:</strong> A bearing-wear fault has a characteristic signature near one hundred and twenty hertz. After the one-hertz averaging, that signature was not merely attenuated; it had aliased into a slow wander in the one-second series that looked like ordinary thermal drift, and the anomaly detector trained on those features never flagged a single incipient failure.</p>
+<p><strong>Dilemma:</strong> Keeping the full twenty-kilohertz stream was operationally impossible at fleet scale, yet the cheap averaging had quietly destroyed the one band that mattered. More model capacity would not help because the information was already gone from the stored data.</p>
+<p><strong>Decision:</strong> Rather than store everything or store the wrong summary, the team moved the relevant computation upstream of the decimation, extracting band-energy features around the known fault frequencies on the raw stream before averaging the rest.</p>
+<p><strong>How:</strong> At the edge they band-pass filtered the high-rate signal and logged the energy in the diagnostic bands as additional one-hertz channels, then anti-alias filtered and decimated the broadband signal for the remaining low-frequency features. The fault band now survived as an explicit feature instead of folding invisibly into a trend.</p>
+<p><strong>Result:</strong> The detector began catching bearing degradation days ahead of failure, and the lesson hardened into a rule: never decimate a sensor stream until you have extracted, or filtered to protect, every frequency band you intend to model.</p>
+<p><strong>Lesson:</strong> The aggregator and the sampling rate decide which physics reaches the model. A mean is a lossy filter with a bad frequency response, and choosing it blindly can erase the exact pattern you were hired to detect.</p>
+</div>
+
+<h2>3. Upsampling and Interpolation <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Upsampling moves a series onto a finer grid, which immediately raises an awkward question: where do the new in-between values come from? They were never measured, so something must invent them, and the method of invention is a statement about what you believe happened between observations. Forward-fill (holding the last observed value until the next one arrives) encodes a step function and is the honest choice for a quantity that is genuinely piecewise-constant, such as a thermostat set-point or a configuration flag. Linear interpolation encodes a constant rate of change between samples and suits a slowly varying physical level. Spline interpolation encodes smoothness and is appropriate only when you have real reason to believe the underlying signal is smooth. None of these adds information; every one of them fabricates plausible values, and a model that then treats those fabricated points as if they were measurements will be overconfident about a resolution it does not have. Code 2.2.2 contrasts the three on a deliberately sparse series so the differences in what they assert are visible.</p>
+<pre><code class="language-python">import numpy as np
+import pandas as pd
+
+# A sparse, irregularly observed level signal: four real measurements.
+obs = pd.Series(
+    [10.0, 14.0, 9.0, 12.0],
+    index=pd.to_datetime(["09:00", "09:05", "09:20", "09:35"]),
+    name="level",
+)
+
+grid = obs.resample("5min").asfreq()          # target finer grid, gaps as NaN
+ffill  = grid.ffill()                          # step: hold last observation
+linear = grid.interpolate(method="time")       # constant rate between points
+spline = grid.interpolate(method="spline", order=2)  # smooth curve through points
+
+print(pd.concat(
+    {"ffill": ffill, "linear": linear.round(2), "spline": spline.round(2)}, axis=1
+))
+</code></pre>
+<div class="code-caption"><strong>Code 2.2.2:</strong> Three ways to fill a finer grid from four real observations. Forward-fill asserts a piecewise-constant signal, time-aware linear interpolation asserts a constant rate between samples, and a quadratic spline asserts smoothness; only the bold-faced rows are measured, the rest are invented.</div>
+<pre><code class="language-text">                     ffill  linear  spline
+2026-... 09:00:00     10.0   10.00   10.00
+2026-... 09:05:00     14.0   14.00   14.00
+2026-... 09:10:00     14.0   12.33   11.06
+2026-... 09:15:00     14.0   10.67    9.20
+2026-... 09:20:00      9.0    9.00    9.00
+2026-... 09:25:00      9.0   10.00   10.13
+2026-... 09:30:00      9.0   11.00   11.27
+2026-... 09:35:00     12.0   12.00   12.00
+</code></pre>
+<div class="code-caption"><strong>Output 2.2.2:</strong> At the four measured timestamps all three methods agree, because they pass through the data. Everywhere in between they disagree sharply, and that disagreement is the invented content. The spline even overshoots below the lowest observation near 09:15, a reminder that smoothness assumptions can manufacture values no instrument ever produced.</div>
+<p>When is upsampling legitimate rather than misleading? The honest use is alignment: bringing a slow channel onto the same grid as a fast one so they can be modeled jointly, where forward-fill correctly says "the last known value still holds" and introduces no claim beyond persistence. The misleading use is manufacturing apparent resolution, presenting an interpolated minute-level curve as if the underlying quantity were actually observed every minute, which inflates sample counts, deflates estimated variance, and tempts a model to learn the interpolation rule instead of the signal. A crucial caveat ties back to the leakage discipline of <a href="../module-01-intro-temporal-intelligence/section-1.6.html">Section 1.6</a>: linear and spline interpolation are two-sided, using the next observation to fill the gap, so an interpolated value at time $t$ depends on data from after $t$ and must never feed a feature used to predict at $t$. Only the strictly backward-looking forward-fill is leakage-safe for real-time features. The honest treatment of genuinely irregular and missing observations, including masking and models that consume irregular timestamps directly without resampling at all, is the subject of the next section, <a href="section-2.3.html">Section 2.3</a>.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact: The Straight Line That Pretended to Be Data</div>
+<p>A classic way to fool yourself is to linearly interpolate a sparse series, plot it, and admire how smooth and well-behaved the process looks. The smoothness is yours, not the world's; you drew those straight segments. Forecasters have been known to report suspiciously low error on such series, and the reason is deflating: the model simply rediscovered the interpolation rule it was handed. Whenever a curve looks too clean, ask how many of its points were actually measured.</p>
+</div>
+
+<h2>4. Aligning Multiple Series <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Multivariate temporal modeling presumes that at each timestamp you can read every channel, yet real channels arrive on their own clocks: a price ticks irregularly, a sentiment feed updates on news, a sensor reports on a fixed cadence, and no single instant has all three freshly observed. Aligning them onto a common clock is therefore a precondition for joint modeling, and the tool of choice for asynchronous channels is the as-of join, which for each row of one series finds the most recent row of another whose timestamp is at or before it. This is exactly persistence done correctly: each channel carries its last known value forward to the query time and no value ever comes from the future. The pandas primitive is <code>merge_asof</code>, and a tolerance window caps how stale a carried-forward value may be, after which the match is dropped rather than silently trusted. Code 2.2.3 joins an irregular trade series to an irregular quote series exactly as a market-data pipeline would.</p>
+<pre><code class="language-python">import pandas as pd
+
+trades = pd.DataFrame({
+    "time":  pd.to_datetime(["09:00:01", "09:00:04", "09:00:09"]),
+    "trade_px": [100.1, 100.3, 100.2],
+})
+quotes = pd.DataFrame({
+    "time": pd.to_datetime(["09:00:00", "09:00:03", "09:00:07", "09:00:30"]),
+    "bid":  [100.0, 100.2, 100.1, 100.4],
+})
+
+# For each trade, attach the most recent quote at or before it (never after),
+# but only if that quote is no more than 5 seconds stale.
+aligned = pd.merge_asof(
+    trades, quotes, on="time",
+    direction="backward",                       # look back in time only
+    tolerance=pd.Timedelta("5s"),               # drop matches staler than 5s
+)
+print(aligned)
+</code></pre>
+<div class="code-caption"><strong>Code 2.2.3:</strong> An as-of join aligning irregular trades to irregular quotes with <code>merge_asof</code>. The <code>direction="backward"</code> argument enforces that each trade sees only quotes at or before it, and the five-second <code>tolerance</code> refuses to carry a quote forward once it has gone stale.</div>
+<pre><code class="language-text">                 time  trade_px    bid
+0 2026-01-02 09:00:01     100.1  100.0
+1 2026-01-02 09:00:04     100.3  100.2
+2 2026-01-02 09:00:09     100.2    NaN
+</code></pre>
+<div class="code-caption"><strong>Output 2.2.3:</strong> The first two trades match the most recent prior quote. The third trade at 09:00:09 finds its nearest prior quote at 09:00:07, only two seconds back and within tolerance, so it matches; had the nearest quote been the 09:00:30 one it would correctly have been dropped as a future value. The tolerance is what keeps a long quiet gap from pairing a trade with an ancient, meaningless quote.</div>
+<p>The backward direction is not a cosmetic default; it is the leakage guard. A forward or nearest as-of join would let a trade borrow a quote that had not yet happened, which is precisely the look-ahead bias of <a href="../module-01-intro-temporal-intelligence/section-1.6.html">Section 1.6</a> wearing a join's clothing. For state-space and filtering models that consume aligned multivariate streams, this asynchronous-channel alignment is the data-engineering step that feeds them; the modeling side picks up in <a href="../../toc.html">Chapter 7</a>, and the book's running healthcare dataset, an irregularly sampled multivariate clinical series, is exactly the kind of asynchronous record that <code>merge_asof</code> with a tolerance was built for.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: One Resample Replaces a Manual Binning Loop</div>
+<p>The from-scratch way to make five-minute bars is to compute a bin key for every timestamp, group by it, choose an aggregator, and reattach a clean index, which is a dozen fiddly lines that get the half-open interval and the empty bins wrong on the first try. Pandas collapses all of that into <code>s.resample("5min").mean()</code> (or <code>.ohlc()</code>, <code>.sum()</code>, <code>.last()</code>), one line that handles bin boundaries, empty windows, timezone-aware edges, and the output index for you. For panels of many series, <code>groupby(...).resample(...)</code> and the Nixtla and Darts frequency utilities extend the same one-liner across thousands of series at once, replacing an entire hand-written binning module with a tested primitive.</p>
+</div>
+
+<h2>5. Aggregation Semantics and Leakage <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The most consequential resampling decisions are the quietest: which edge of a bin owns its boundary timestamp, and which edge the resulting bar is labeled with. Pandas exposes these as the <code>closed</code> and <code>label</code> arguments, and on a daily or hourly grid they look like trivia. They are not. A bar that bundles observations from $[\tau, \tau + \Delta\tau)$ but is labeled with the left edge $\tau$ is reporting, at a timestamp $\tau$, a summary that includes information from all the way up to $\tau + \Delta\tau$. If a downstream feature reads that bar as "the value known at $\tau$" it is reading the future, because the bar's close was not knowable until the bin ended. This is leakage by labeling, and it is invisible because the timestamps all look causally innocent. Code 2.2.4 makes the off-by-one-bin concrete on a tiny series.</p>
+<pre><code class="language-python">import pandas as pd
+
+idx = pd.date_range("2026-01-02 09:00", periods=6, freq="1h")
+s = pd.Series([1, 2, 3, 4, 5, 6], index=idx, name="x")
+
+# Two-hour bars. The only difference is which edge owns and labels the bin.
+left  = s.resample("2h", closed="left",  label="left").sum()
+right = s.resample("2h", closed="right", label="right").sum()
+
+print("closed/label = left :"); print(left)
+print("\nclosed/label = right:"); print(right)
+</code></pre>
+<div class="code-caption"><strong>Code 2.2.4:</strong> The same two-hour aggregation under two boundary conventions. With <code>label="left"</code> a bar stamped 09:00 already contains the 10:00 observation; with <code>label="right"</code> the bar is stamped at the moment its contents became fully known.</div>
+<pre><code class="language-text">closed/label = left :
+2026-01-02 09:00:00     3
+2026-01-02 11:00:00     7
+2026-01-02 13:00:00    11
+Freq: 2h, Name: x, dtype: int64
+
+closed/label = right:
+2026-01-02 10:00:00     3
+2026-01-02 12:00:00     7
+2026-01-02 14:00:00    11
+Freq: 2h, Name: x, dtype: int64
+</code></pre>
+<div class="code-caption"><strong>Output 2.2.4:</strong> Both framings carry the same sums, but the left-labeled bar stamps the value 3 (which already includes the 10:00 reading) at 09:00, whereas the right-labeled bar stamps it at 10:00, the first instant the bar was actually complete. For any feature consumed causally, only the right-labeled stamp tells the truth about when the number existed.</div>
+<p>The rule that prevents the leak is to label aggregated bars with the timestamp at which the bar became fully observable, the right edge of a closed-right bin, whenever the bar will be used as a feature for prediction. A bar must never be available to a model before its own window has closed. This connects directly to the decision cadence: in trading you must act before the bar closes, so a model that quietly conditions on the close of the very bar it is trading is using information it will not have live, and the backtest that results is the cardinal sin of <a href="../module-01-intro-temporal-intelligence/section-1.6.html">Section 1.6</a> reincarnated as a labeling default. Because these conventions are so easy to get wrong and so costly when they are, they belong to evaluation as much as to engineering; the leakage-proof pipelines and time-aware evaluation protocols that police bin labeling end to end are built in <a href="section-2.6.html">Section 2.6</a>.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact: The Off-By-One-Bar That Beat the Market</div>
+<p>A surprising fraction of too-good-to-be-true backtests trace to a single mislabeled bar. The strategy "decides" at the open of a bar using features that secretly include that bar's close, a one-line consequence of a left label where a right label belonged. The equity curve soars, the researcher celebrates, and live trading hands the money straight back. The bar was a time machine, and nobody noticed because all the timestamps looked perfectly reasonable.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Beyond the Fixed Grid (2024 to 2026)</div>
+<p>The deepest critique of everything in this section is that resampling onto any fixed grid is itself a lossy, assumption-laden step, and a vigorous 2024 to 2026 line of work tries to avoid it. Continuous-time models read irregular observations directly: neural controlled differential equations and the latent-ODE family treat a series as a path observed at arbitrary times, with no resampling and therefore no aliasing or interpolation artifact, and these mature into the architectures of <a href="../../toc.html">Chapter 13</a>. Transformer-based forecasters increasingly ingest event streams with explicit time encodings rather than insisting on a regular grid, and irregular-time foundation models such as the Moirai and TimesFM families are being pushed toward heterogeneous and mixed-frequency inputs. A parallel thread learns the sampling itself: adaptive and learned sampling policies, including active-sensing and learned-decimation schemes, decide where to spend observations so that the fastest patterns that matter survive while the rest are coarsened, turning the fixed-$\Delta t$ assumption of subsection one into a quantity the system optimizes. The common direction is to stop forcing time onto a grid and instead let the model meet the data where it actually was measured.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 2.2.1: Choose the Aggregator <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each channel, state the correct downsampling aggregator (mean, sum, last, or OHLC) and justify it in one sentence: (a) hourly rainfall coarsened to daily totals, (b) a thermostat reading coarsened to hourly summaries, (c) a tick-level equity price coarsened to one-minute bars for a volatility feature, (d) a battery state-of-charge sampled to align with a slower control loop. Then explain why applying the mean to (a) and the sum to (b) would each give a meaningless number.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 2.2.2: Make the Aliasing Visible <span class="exercise-type coding">Coding</span></div>
+<p>Synthesize a pure sinusoid at fifty-five hertz sampled at one thousand hertz, then downsample it to sixty hertz two ways: first by naive decimation (take every sample on the coarse grid, or a bin-mean), and second with <code>scipy.signal.decimate</code>, which applies an anti-aliasing filter first. Plot or print the apparent frequency of each result. Show that the naive path produces a phantom low-frequency tone near five hertz while the filtered path does not, and write two sentences explaining where the phantom came from in terms of the Nyquist bound of subsection one.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 2.2.3: The Leaky Bar <span class="exercise-type analysis">Analysis</span></div>
+<p>Take a minute-level price series and build one-hour bars with <code>closed="left", label="left"</code>. Construct a trivial "strategy" that, at each bar's timestamp, uses that same bar's close to decide a position, and backtest it. Then rebuild the bars with <code>closed="right", label="right"</code> and shift features so the position at a bar uses only bars whose windows have already closed. Compare the two equity curves, quantify how much of the left-labeled profit was leakage, and connect your finding to the bin-labeling rule of subsection five and the cardinal-sin warning of <a href="../module-01-intro-temporal-intelligence/section-1.6.html">Section 1.6</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-2.1.html"><span class="nav-label">Previous</span><span class="nav-num">Section 2.1</span><span class="nav-title">Temporal Indexing and Time Representations</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 2</span><span class="nav-num">Contents</span><span class="nav-title">Temporal Data Engineering</span></a>
+<a class="next" href="section-2.3.html"><span class="nav-label">Next</span><span class="nav-num">Section 2.3</span><span class="nav-title">Missing Data and Irregular Observations</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

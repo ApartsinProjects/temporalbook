@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 2.5: Windowing, Segmentation, and Lag Construction. How to turn a raw time series into supervised samples through sliding, tumbling, and expanding windows; direct, recursive, and multi-output forecasting strategies; a vectorized windowing function; and overlap-aware segmentation for classification." name="description"/>
+<title>Section 2.5: Windowing, Segmentation, and Lag Construction | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Foundations of Temporal AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 2: Temporal Data Engineering</a></div>
+<h1>Windowing, Segmentation, and Lag Construction</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I am the same fixed length I always was, yet I never sit still. Every step I slide one tick into the future, and the past I carry forward is never quite the past I carried a moment ago."</p>
+<cite>A Sliding Window With No Fixed Address</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A learning algorithm wants a stack of independent input-output pairs, but a time series is a single unbroken thread; windowing is the surgery that turns one into the other.</strong> Every supervised temporal model you will ever train, from a humble linear lag regression to a billion-parameter foundation model, is fed by some windowing function that slices the series into a tensor of inputs and a tensor of targets. The choices you make here, how far back to look, how far ahead to predict, how much windows overlap, and how you keep overlapping windows from straddling the train-test boundary, silently set the ceiling on everything downstream. This section gives you the notation, the trade-offs, and the exact reusable code, then hands the leakage-proof evaluation built on top of it to <a href="section-2.6.html">Section 2.6</a>.</p>
+</div>
+<p>The previous section, <a href="section-2.4.html">Section 2.4</a>, built clean feature representations of a series: lags, rolling statistics, calendar encodings, and the rest of the engineered inputs. This section answers the next question: given those features, how do you carve the continuous record into the discrete supervised samples a model actually consumes? The answer is windowing, and it is deceptively simple to get almost right and quietly wrong. We proceed from the framing (series to samples), through the window-type taxonomy and the multi-step forecasting strategies, to the one vectorized function you will copy into every project, and finally to segmentation for classification where overlap and leakage interact in a way that has embarrassed many a published result.</p>
+
+<h2>1. From a Series to Supervised Samples <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Let the observed series be $x_1, x_2, \ldots, x_T$, where each $x_t \in \mathbb{R}^{d}$ may be a scalar ($d = 1$) or a vector of $d$ channels. A supervised forecasting sample anchored at time $t$ pairs a lookback window of the most recent $L$ observations with a target horizon of the next $H$ observations. Writing $x_{a:b}$ for the contiguous block $(x_a, x_{a+1}, \ldots, x_b)$, the input and target are</p>
+$$X_t = x_{t-L+1:t} \in \mathbb{R}^{L \times d}, \qquad Y_t = x_{t+1:t+H} \in \mathbb{R}^{H \times d}.$$
+<p>Here $L$ is the <em>lookback</em> (also called the context length or window size), $H$ is the <em>horizon</em> (how many steps ahead you predict), and the anchor $t$ is the boundary between known past and unknown future. The single non-negotiable invariant is that the entire input lies strictly before the entire target: $\max(\text{input index}) = t < t+1 = \min(\text{target index})$. Violate it and you have built look-ahead bias directly into your dataset, the cardinal sin catalogued in <a href="../module-01-intro-temporal-intelligence/section-1.6.html">Section 1.6</a> and policed throughout <a href="section-2.6.html">Section 2.6</a>.</p>
+<p>To generate many samples you slide the anchor forward by a fixed <em>stride</em> $S$. Starting from the first position where a full lookback exists, the valid anchors are $t \in \{L, L+S, L+2S, \ldots\}$ subject to $t + H \le T$ so that the target also fits. The number of samples produced is therefore</p>
+$$N = \left\lfloor \frac{T - L - H}{S} \right\rfloor + 1,$$
+<p>a formula worth internalizing because it tells you immediately how a longer horizon or a larger stride shrinks your dataset. The symbols $L$, $H$, $S$, $T$, and the index conventions used here are fixed in the unified notation table of <a href="../../toc.html">Appendix A</a>; we use them consistently for the rest of the book.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Windowing Is the Bridge From Sequence to Supervised Learning</div>
+<p>A time series is not i.i.d. data, but windowing pretends it is: each window becomes a "sample" and the model treats the collection as if the windows were independent. That pretense is what lets you reuse the entire supervised-learning toolbox (gradient descent, mini-batching, train-test splits) on temporal data. The pretense is also exactly where leakage hides, because consecutive windows overlap and are anything but independent. Hold both halves of this idea at once: windowing buys you the supervised machinery, and the overlap it introduces is the bill you pay later at split time.</p>
+</div>
+
+<h2>2. Window Types: Sliding, Tumbling, and Expanding <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The stride $S$ relative to the lookback $L$ defines three classic window regimes, and the choice governs how many samples you get and how correlated they are. A <em>sliding</em> window uses $S < L$ (very commonly $S = 1$), so consecutive windows overlap heavily and share most of their content. A <em>tumbling</em> window uses $S = L$, so windows abut without overlapping and partition the series into disjoint blocks. An <em>expanding</em> window keeps its left edge pinned at the start and grows its right edge, so the lookback length itself increases with $t$ rather than staying fixed; this is the natural shape for cumulative statistics and for the walk-forward evaluation of <a href="section-2.6.html">Section 2.6</a>.</p>
+<p>The trade-off is a direct tension between sample count and sample independence. Sliding windows with $S = 1$ maximize the number of training samples, which helps data-hungry deep models, but adjacent samples differ by a single time step and are therefore almost perfectly correlated, so the effective sample size is far smaller than $N$ suggests. Tumbling windows yield far fewer samples but those samples are much closer to independent, which makes them safer for honest variance estimates and statistical tests. The danger that unites both, and that Section 5 below treats in full, is leakage across the train-validation boundary: if a sliding window centered just before the split and another just after share overlapping timestamps, the validation set contains data the training set has already seen.</p>
+<div class="callout warning">
+<div class="callout-title">Warning: Overlapping Windows Can Leak Across the Split</div>
+<p>The most insidious windowing bug is to generate all windows first and split them afterward. With a sliding stride, the window ending at the last training timestamp and the window beginning at the first validation timestamp overlap by $L - S$ steps, so identical raw observations appear on both sides of the wall. The model has literally seen part of its own test set. The fix is to split the <em>raw series</em> by time first and window each segment independently, then optionally discard a <em>purge</em> gap of $L + H - 1$ steps around the boundary so no surviving window straddles it. Never window-then-split; always split-then-window.</p>
+</div>
+
+<h2>3. Direct, Recursive, and Multi-Output Forecasting <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Once $H > 1$ you must decide <em>how</em> the model produces multiple future steps, and three strategies dominate. The <em>recursive</em> (iterated) strategy trains a single one-step model and rolls it out: predict $\hat{x}_{t+1}$, feed it back as if observed, predict $\hat{x}_{t+2}$, and so on for $H$ steps. The <em>direct</em> strategy trains $H$ separate models, one per horizon, so model $h$ maps the lookback straight to $x_{t+h}$ with no feedback. The <em>multi-output</em> (joint) strategy trains one model whose output layer emits the entire horizon vector $\hat{Y}_t \in \mathbb{R}^{H \times d}$ in a single forward pass; this is what sequence-to-sequence and most modern deep forecasters do.</p>
+<p>The strategies differ sharply in error behavior. Recursive forecasting is cheap to train (one model) but compounds error, because each predicted step becomes a noisy input to the next and small mistakes snowball across the horizon. Direct forecasting avoids that feedback loop and so resists error accumulation, but it trains and stores $H$ models and lets each horizon learn an unrelated function, ignoring the smoothness that ties neighboring horizons together. Multi-output forecasting shares representation across the whole horizon and predicts it consistently in one pass, at the cost of a heavier output head and a fixed horizon baked into the architecture. Table 2.5.1 lays the trade-offs side by side.</p>
+<div class="comparison-table">
+<div class="comparison-table-title">Table 2.5.1: Multi-Step Forecasting Strategies Compared</div>
+<table>
+<thead>
+<tr><th>Property</th><th>Recursive (iterated)</th><th>Direct</th><th>Multi-output (joint)</th></tr>
+</thead>
+<tbody>
+<tr><td>Models trained</td><td>One (one-step)</td><td>$H$ (one per horizon)</td><td>One (emits all $H$)</td></tr>
+<tr><td>Error accumulation</td><td>High; mistakes compound step by step</td><td>None across steps; each horizon independent</td><td>Low; horizon predicted jointly</td></tr>
+<tr><td>Training cost</td><td>Lowest</td><td>Highest (scales with $H$)</td><td>Moderate</td></tr>
+<tr><td>Cross-horizon consistency</td><td>Smooth by construction</td><td>Can be jagged; horizons uncoordinated</td><td>Coherent; shared representation</td></tr>
+<tr><td>Flexible horizon at inference</td><td>Yes; roll out to any length</td><td>No; fixed to trained horizons</td><td>No; fixed at training time</td></tr>
+<tr><td>Typical home</td><td>Classical ARIMA, AR rollouts</td><td>Gradient-boosted per-step models</td><td>Seq2seq, deep forecasters, foundation models</td></tr>
+</tbody>
+</table>
+</div>
+<p>No strategy dominates universally. Recursive shines for short horizons on smooth series and when you need a flexible, retrainable horizon; direct wins when horizons behave very differently and compute is cheap relative to accuracy; multi-output is the default for deep learning and is what the architectures of <a href="../../toc.html">Chapter 14</a> assume. The classical autoregressive roots of recursion are developed in <a href="../../toc.html">Chapter 5</a>, and the foundation-model heads that emit a whole horizon at once appear in <a href="../../toc.html">Chapter 15</a>.</p>
+
+<h2>4. Building the Tensors: A Reusable Windowing Function <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Theory in hand, here is the function you will actually reuse. Code 2.5.1 builds the $(N, L, d)$ input tensor and the $(N, H, d)$ target tensor from a raw array, honoring lookback $L$, horizon $H$, and stride $S$, with an explicit correctness assertion that no target index ever precedes its input. We use NumPy stride tricks (<code>sliding_window_view</code>) so the windowing is a memory view rather than a copy, which matters once $T$ reaches the millions.</p>
+<pre><code class="language-python">import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
+
+def make_windows(series, lookback, horizon, stride=1):
+    """Turn a (T,) or (T, d) series into supervised windows.
+
+    Returns
+    -------
+    X : (N, lookback, d)   input windows  x_{t-L+1 : t}
+    Y : (N, horizon, d)    target windows x_{t+1 : t+H}
+    """
+    x = np.asarray(series, dtype=np.float64)
+    if x.ndim == 1:                       # promote scalar series to (T, 1)
+        x = x[:, None]
+    T, d = x.shape
+    span = lookback + horizon             # total length each sample covers
+    if T < span:
+        raise ValueError(f"series length {T} &lt; lookback+horizon {span}")
+
+    # All length-`span` slices, then split each into past (L) and future (H).
+    frames = sliding_window_view(x, window_shape=span, axis=0)  # (T-span+1, d, span)
+    frames = frames.transpose(0, 2, 1)[::stride]               # (N, span, d), apply stride
+    X = frames[:, :lookback, :]           # x_{t-L+1 : t}
+    Y = frames[:, lookback:, :]           # x_{t+1   : t+H}
+
+    # Correctness: the last input index must precede the first target index
+    # for every single sample. This is the leakage invariant, asserted, not hoped.
+    last_in  = np.arange(X.shape[0]) * stride + lookback - 1
+    first_out = last_in + 1
+    assert np.all(first_out &gt; last_in), "target precedes input: window is leaky"
+    return X, Y
+</code></pre>
+<div class="code-caption"><strong>Code 2.5.1:</strong> A vectorized <code>make_windows</code> built on <code>sliding_window_view</code>. It accepts scalar or multivariate series, applies the stride by simple slicing, and asserts the leakage invariant (every target index strictly follows its input) before returning.</div>
+<p>The usage example in Code 2.5.2 runs the function on a short synthetic series and prints the resulting tensor shapes alongside the sample-count formula from Section 1, confirming they agree. It also shows the first input window and its target so you can read the temporal boundary directly off the numbers.</p>
+<pre><code class="language-python"># A tiny ramp series 0,1,2,... makes the index alignment readable by eye.
+series = np.arange(20.0)
+L, H, S = 4, 2, 2
+X, Y = make_windows(series, lookback=L, horizon=H, stride=S)
+
+T = len(series)
+N_formula = (T - L - H) // S + 1
+print("X shape:", X.shape, " Y shape:", Y.shape)
+print("N from formula:", N_formula, " N actual:", X.shape[0])
+print("first input :", X[0, :, 0])     # x_{1:4}  -> [0 1 2 3]
+print("first target:", Y[0, :, 0])     # x_{5:6}  -> [4 5]
+</code></pre>
+<div class="code-caption"><strong>Code 2.5.2:</strong> Calling <code>make_windows</code> on a 20-point ramp with $L=4$, $H=2$, $S=2$. The printed shapes match the closed-form $N$, and the first input ends at value 3 while its target begins at value 4, so the temporal boundary holds exactly.</div>
+<pre><code class="language-text">X shape: (8, 4, 1)  Y shape: (8, 2, 1)
+N from formula: 8  N actual: 8
+first input : [0. 1. 2. 3.]
+first target: [4. 5.]
+</code></pre>
+<div class="code-caption"><strong>Output 2.5.2:</strong> The actual sample count equals the formula's prediction, and the first target (4, 5) begins exactly one step after the first input ends (3), confirming the windows are aligned and non-leaky.</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Windowing in One Line</div>
+<p>Once you understand the mechanics, you rarely write the loop again. Keras offers <code>keras.utils.timeseries_dataset_from_array(data, targets, sequence_length=L, sequence_stride=S)</code>, which yields a batched, shuffled <code>tf.data</code> pipeline directly; PyTorch users reach for <code>torch.Tensor.unfold(0, L, S)</code> or a tiny <code>Dataset</code> wrapper. Higher up, Darts (<code>TimeSeries</code> plus its forecasting models) and sktime's reduction wrappers, along with Nixtla's <code>mlforecast</code>, perform the windowing, lag construction, and horizon handling internally so you specify $L$ and $H$ as arguments and never touch a stride trick. Reaching for one of these replaces the dozen lines of Code 2.5.1 with a single call and inherits their tested handling of multivariate panels and ragged series.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact: The Off-by-One That Predicts the Present</div>
+<p>The most common windowing bug in the wild is a single misplaced index: writing <code>Y = frames[:, lookback-1:, :]</code> instead of <code>lookback:</code>. That one character makes the first target step equal to the last input step, so the model is rewarded for "predicting" a value it was just handed. Accuracy looks superb in development and collapses in production. An entire genre of suspiciously perfect notebooks owes its glory to this typo.</p>
+</div>
+
+<h2>5. Segmentation for Classification and Events <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Forecasting is not the only consumer of windows. In temporal classification, human activity recognition, sleep staging, machine-fault detection, you cut the series into segments and assign each a label rather than a future. Two anchoring schemes compete. <em>Fixed</em> windows tile the series on a regular grid (often with a chosen overlap) and label each by majority vote of the timestamps it covers. <em>Event-anchored</em> windows instead center a window on each event of interest (a detected heartbeat, an alarm, a button press) and label it by that event's class, which keeps the phenomenon centered but produces irregularly spaced, possibly overlapping segments.</p>
+<p>Label alignment is the subtle part. When a fixed window spans a transition between two activities, majority vote can mislabel it, so practitioners either shrink the window, require a purity threshold (discard windows that are not at least, say, eighty percent one class), or label by the final timestamp when the task is causal. None of this matters, however, next to the overlap-aware splitting rule, because overlapping classification windows are the single most common source of inflated accuracy in the applied temporal-ML literature.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Activity Recognizer That Aced Its Own Leak</div>
+<p><strong>Who:</strong> A wearables team building a human-activity-recognition model from wrist accelerometer data across thirty volunteers.</p>
+<p><strong>Situation:</strong> They cut each recording into two-second windows with ninety percent overlap to maximize training data, then split all windows randomly eighty-twenty into train and test, reporting 98 percent test accuracy.</p>
+<p><strong>Problem:</strong> Field accuracy on new wearers hovered near 70 percent, a thirty-point gap that no amount of hyperparameter tuning closed.</p>
+<p><strong>Dilemma:</strong> Either the field data was somehow harder (a distribution-shift story) or the headline number was contaminated (a splitting story). The first is comfortable; the second voids the result they had already presented.</p>
+<p><strong>Decision:</strong> They re-examined the split before blaming the field, on the reasoning that 98 percent on noisy accelerometer data is far more often a leak than a triumph.</p>
+<p><strong>How:</strong> With ninety percent overlap, each window shared 1.8 seconds with its neighbor, so the random split scattered near-duplicate windows into both train and test. They switched to a subject-wise split (no volunteer appears in both sets) combined with non-overlapping test segments, exactly the split-then-window discipline of Section 2.</p>
+<p><strong>Result:</strong> Honest accuracy fell to 71 percent, matching the field, and a leakage-free splitter became a mandatory gate. The model was no worse than before; only the measurement had been lying.</p>
+<p><strong>Lesson:</strong> Overlapping windows plus a random split is leakage wearing a lab coat. Split by the natural unit (time block or subject) first, then window, and never let two windows that share raw samples land on opposite sides of the wall.</p>
+</div>
+<p>The safe segmentation recipe is therefore mechanical. First split the raw series (or the cohort of subjects) into disjoint train, validation, and test partitions by time or by identity. Then window each partition independently. Then, at every internal boundary, purge a gap of at least one full window length so no surviving window overlaps across the split. Group-aware cross-validators such as scikit-learn's <code>GroupKFold</code> and the purged, embargoed schemes of <a href="section-2.6.html">Section 2.6</a> automate exactly this, and the same overlap-leakage trap, viewed from the evaluation side, is the central concern of <a href="../module-01-intro-temporal-intelligence/section-1.6.html">Section 1.6</a>.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: From Sliding Windows to Patches and Tokens (2024 to 2026)</div>
+<p>The newest temporal architectures reframe windowing as <em>tokenization</em>. Rather than feeding raw per-step values, patch-based transformers split each series into short contiguous patches and treat every patch as a token, which shortens the attention sequence, sharpens local semantics, and is the design behind PatchTST and the channel-independent patching it popularized. Temporal foundation models carry the idea further: Chronos quantizes values into a discrete vocabulary and tokenizes the series like text, while Moirai, TimesFM, and MOMENT pretrain over enormous corpora on patched or masked windows so a frozen model windows-and-forecasts zero-shot on series it never saw. The throughline of this 2024 to 2026 wave is that the window is no longer just a slicing convenience; it has become the model's vocabulary, and the patch length is now a first-class architectural hyperparameter studied in <a href="../../toc.html">Chapter 15</a>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 2.5.1: Counting Samples Under Every Regime <span class="exercise-type conceptual">Conceptual</span></div>
+<p>A series has $T = 1000$ observations. Using the formula $N = \lfloor (T - L - H)/S \rfloor + 1$, compute the number of supervised samples for (a) a sliding window with $L = 50$, $H = 10$, $S = 1$; (b) a tumbling window with the same $L$ and $H$ but $S = L$; and (c) the sliding case but with the horizon raised to $H = 200$. Explain in one sentence each why the sample count changes and what it implies about effective (independent) sample size versus raw sample count.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 2.5.2: Extend make_windows to Emit a Single-Step Target <span class="exercise-type coding">Coding</span></div>
+<p>Modify Code 2.5.1 so that an optional argument <code>flatten_target=True</code> returns <code>Y</code> with shape $(N, H \cdot d)$ instead of $(N, H, d)$, the layout most gradient-boosted multi-output regressors expect. Then add a second optional argument <code>return_index=True</code> that also returns the array of anchor times $t$ for each sample, so a caller can map any window back to its position in the original series. Verify on the Code 2.5.2 ramp that the returned anchors satisfy <code>series[anchor+1 : anchor+1+H]</code> equals the corresponding target row, and keep the leakage assertion intact.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 2.5.3: Demonstrate the Overlap Leak, Then Fix It <span class="exercise-type analysis">Analysis</span></div>
+<p>Generate a series with a slow regime change at the midpoint (for example, a sine whose frequency doubles after $t = T/2$). Build sliding windows with heavy overlap ($S = 1$, $L$ large), then split the resulting windows randomly into train and test and train any classifier to predict the regime. Record the accuracy. Now redo it with the split-then-window discipline of Section 2 plus a purge gap of $L + H - 1$ around the boundary, and record the accuracy again. Quantify the inflation the random split produced, and write a short paragraph explaining why the gap scales with the window length and the overlap.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-2.4.html"><span class="nav-label">Previous</span><span class="nav-num">Section 2.4</span><span class="nav-title">Feature Engineering for Time Series</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 2</span><span class="nav-num">Contents</span><span class="nav-title">Temporal Data Engineering</span></a>
+<a class="next" href="section-2.6.html"><span class="nav-label">Next</span><span class="nav-num">Section 2.6</span><span class="nav-title">Evaluation Protocols, Backtesting, and Data Leakage</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

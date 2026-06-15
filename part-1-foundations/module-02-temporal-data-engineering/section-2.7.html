@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 2.7: Reproducibility and Temporal Data Pipelines. How to build temporal data pipelines that are point-in-time correct, leakage-safe, deterministic, and versioned, with a reference blueprint that synthesizes the whole chapter." name="description"/>
+<title>Section 2.7: Reproducibility and Temporal Data Pipelines | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Foundations of Temporal AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 2: Temporal Data Engineering</a></div>
+<h1>Reproducibility and Temporal Data Pipelines</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"Ask me what the price was last Tuesday and I will give you two honest answers: what I believe today, and what I actually knew on Tuesday. Only the second one is allowed to train a model. The first one is how backtests lie."</p>
+<cite>A Pipeline That Remembers Exactly What It Knew, and When</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A temporal data pipeline is trustworthy only if it is point-in-time correct, leakage-safe, deterministic, and versioned: it must reproduce a feature value exactly as it would have been known at the timestamp the model is asked to predict, fit every transform on the past alone, run the same way twice, and record which vintage of the data produced which result.</strong> The previous six sections of this chapter each solved one stage of temporal data engineering in isolation. This section is the chapter's synthesis: it shows how to chain those stages into one pipeline that does not lie to you, and how to make the result reproduce on demand. Get this right and every downstream chapter inherits a clean foundation; get it wrong and the most sophisticated forecaster in Part III is learning from a future it will never see at inference time.</p>
+</div>
+<p>In the previous section, Section 2.6, we built time-aware splits and evaluation protocols that respect the arrow of time. Now we assemble the whole chapter into a single reproducible pipeline. Reproducibility in temporal machine learning is not the same problem as reproducibility in ordinary tabular work, because two distinct futures can leak into a temporal result: the future relative to the prediction timestamp (look-ahead bias, the cardinal sin named in <a href="../../toc.html">Section 1.6</a>) and the future relative to the experiment, namely a later revision of a data point that quietly overwrites what was originally recorded. Both must be sealed off. The sections below take the four properties in turn (point-in-time correctness, the leakage-safe transform discipline, offline/online parity, and determinism plus versioning) and then fold all of Chapter 2 into one reference blueprint you can carry into every later project.</p>
+
+<h2>1. Point-in-Time Correctness <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Point-in-time correctness is the single most important property of a temporal pipeline, more important than model choice, feature richness, or tuning. A feature computed for a prediction at time $t$ must reflect only the information that was actually available at $t$, nothing that was learned, observed, or revised afterward. Let $\mathcal{I}_t$ denote the information set available up to and including time $t$, the set of all observations the live system could have read at that instant. A point-in-time feature is then any function of that set and nothing more,</p>
+$$x_t = \phi\big(\mathcal{I}_t\big), \qquad \mathcal{I}_t = \{\, o_s : s \le t \,\},$$
+<p>where $o_s$ is the value of observation $o$ as it was known at time $s$. The notation for information sets and filtrations used throughout the book is fixed in the unified table of <a href="../../toc.html">Appendix A</a>. The trap is that many real-world quantities are revised after the fact. Quarterly earnings are restated, sensor readings are recalibrated retroactively, a patient's lab value is corrected the next day, and a government statistic is published with a lag and then revised twice more. If your feature store hands back today's best estimate of last Tuesday's value, it has leaked a revision backward in time, and the model trains on knowledge no live system possessed.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Store Two Timestamps, Not One</div>
+<p>The cure is bitemporal data: every record carries a valid time (the time the fact is about) and a transaction time (the time the fact was recorded in your system). A point-in-time, or as-of, retrieval then asks a question with two clocks: "what was the value <em>for</em> Tuesday, as <em>known on</em> Tuesday?" rather than "what is the value for Tuesday as known now?" A feature built from an as-of-Tuesday join can never see a Wednesday revision, because the revision has a later transaction time and is simply not visible to the query. A single-timestamp table cannot answer this question at all; it has already destroyed the evidence. The discipline is mechanical: keep the vintage, query as-of, and the most common silent temporal leak disappears by construction.</p>
+</div>
+<p>Concretely, an as-of feature retrieval scans the history for the most recent record whose transaction time precedes the prediction timestamp. Code 2.7.1 shows the core join on a tiny restated series so the mechanism is unmistakable. The same logic, executed efficiently over millions of rows, is exactly what a production feature store performs internally, the subject of subsection 3.</p>
+<pre><code class="language-python">import pandas as pd
+
+# A metric that was revised after the fact. valid_time is the day the value
+# is ABOUT; tx_time is the day we actually learned (or corrected) it.
+history = pd.DataFrame({
+    "valid_time": pd.to_datetime(["2026-01-05", "2026-01-05", "2026-01-12"]),
+    "tx_time":    pd.to_datetime(["2026-01-05", "2026-01-08", "2026-01-12"]),
+    "value":      [10.0, 13.0, 20.0],   # the 2026-01-05 fact was restated 10 -> 13
+})
+
+def as_of(history, valid_t, known_by):
+    """Value for `valid_t` as it was known on or before `known_by`."""
+    m = (history["valid_time"] <= valid_t) & (history["tx_time"] <= known_by)
+    rows = history[m].sort_values("tx_time")
+    return rows["value"].iloc[-1] if len(rows) else float("nan")
+
+asof_jan5 = as_of(history, pd.Timestamp("2026-01-05"), pd.Timestamp("2026-01-05"))
+today_jan5 = as_of(history, pd.Timestamp("2026-01-05"), pd.Timestamp("2026-02-01"))
+print(f"as known on 2026-01-05 : {asof_jan5}")   # the honest, point-in-time value
+print(f"as known on 2026-02-01 : {today_jan5}")  # the leaked, revised value
+</code></pre>
+<div class="code-caption"><strong>Code 2.7.1:</strong> A minimal as-of (point-in-time) join. The same valid time returns different values depending on the <code>known_by</code> transaction-time cutoff, which is precisely the information a single-timestamp table throws away.</div>
+<pre><code class="language-text">as known on 2026-01-05 : 10.0
+as known on 2026-02-01 : 13.0
+</code></pre>
+<div class="code-caption"><strong>Output 2.7.1:</strong> The point-in-time query returns the original 10.0 that a live system would have seen on 2026-01-05, while the naive "as known now" query returns the restated 13.0. Training on the latter leaks a revision backward in time.</div>
+
+<h2>2. The Leakage-Safe Pipeline <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Point-in-time correctness governs the raw data; the leakage-safe transform discipline governs everything you compute from it. Section 1.6 stated the rule and Section 2.6 built the splits; here we make the two airtight by wrapping every stateful transform (scalers, imputers, encoders) and the estimator into a single scikit-learn <code>Pipeline</code>, then handing that object to a time-aware splitter. The pipeline guarantees that <code>fit</code> touches only the training fold and that the fitted statistics flow forward to transform the test fold, never the reverse. There is no loose <code>fit_transform</code> over the whole array to leak the mean and variance of the future into the past, because the split boundary is the pipeline's responsibility rather than yours.</p>
+<p>Code 2.7.2 runs the correct end-to-end pattern: build supervised windows from a drifting series (the windowing of Section 2.4 and 2.5), then evaluate an impute-scale-model pipeline with <code>TimeSeriesSplit</code> so that on every fold the test rows lie strictly in the future of the training rows and every transform is fit on the past alone.</p>
+<pre><code class="language-python">import numpy as np
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import Ridge
+from sklearn.model_selection import TimeSeriesSplit, cross_val_score
+
+rng = np.random.default_rng(7)
+T = 720
+t = np.arange(T)
+series = 0.03 * t + np.sin(t / 10.0) + rng.normal(0, 0.5, T)   # non-stationary
+
+# Supervised windows: predict series[i] from the previous L lags (Section 2.5).
+L = 12
+X = np.stack([series[i - L:i] for i in range(L, T)])
+y = series[L:]
+X[rng.random(X.shape) < 0.02] = np.nan   # a few realistic missing entries
+
+# Every stateful step lives INSIDE the pipeline, so each is fit on train only.
+pipe = Pipeline([
+    ("impute", SimpleImputer(strategy="mean")),   # mean from the TRAIN fold alone
+    ("scale",  StandardScaler()),                 # stats from the TRAIN fold alone
+    ("model",  Ridge(alpha=1.0)),
+])
+
+# TimeSeriesSplit guarantees every test fold is in the future of its train fold.
+tss = TimeSeriesSplit(n_splits=5)
+scores = cross_val_score(pipe, X, y, cv=tss,
+                         scoring="neg_root_mean_squared_error")
+print("per-fold RMSE:", np.round(-scores, 3))
+print(f"mean forward-chaining RMSE: {-scores.mean():.3f}")
+</code></pre>
+<div class="code-caption"><strong>Code 2.7.2:</strong> A leakage-safe end-to-end pipeline: window the drifting series, then score an impute-scale-Ridge <code>Pipeline</code> under <code>TimeSeriesSplit</code>. Because the imputer and scaler live inside the pipeline, <code>cross_val_score</code> refits them on each training fold and applies them forward, so no future statistic ever reaches a past row.</div>
+<pre><code class="language-text">per-fold RMSE: [0.601 0.557 0.583 0.546 0.572]
+mean forward-chaining RMSE: 0.572
+</code></pre>
+<div class="code-caption"><strong>Output 2.7.2:</strong> Five expanding-window folds, each tested strictly on the future of its training block. The stable per-fold RMSE is the honest estimate of forward performance, with no peeking across the temporal boundary.</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: The Pipeline Is the Leakage Guard</div>
+<p>The whole leakage defense above is one object. Scikit-learn's <code>Pipeline</code> turns "fit every transform on the training fold and apply it forward" from a discipline you must remember on every line into an invariant the library enforces for you: any <code>cross_val_score</code>, <code>GridSearchCV</code>, or <code>TimeSeriesSplit</code> loop refits the pipeline per fold automatically. Replacing a hand-written loop of <code>scaler.fit</code>, <code>scaler.transform</code>, <code>imputer.fit</code> calls (a dozen leak-prone lines) with a single <code>Pipeline([...])</code> removes the most common way temporal experiments fool themselves, and it is the same object you later deploy, which is exactly what keeps training and serving in sync in subsection 3.</p>
+</div>
+
+<h2>3. Feature Stores and Online/Offline Parity <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>A model is trained offline on historical features and served online on live ones. Training/serving skew is the failure where the same logical feature is computed differently in the two settings, so the model meets inputs at serving time that it never saw in training. The classic instance is a thirty-day rolling average implemented one way in a batch SQL job for training and another way in a streaming service for serving, differing in window edges, time zone, or null handling, with the result that the offline metric and the online behavior diverge for reasons that have nothing to do with the model. A feature store exists to kill this skew: it computes each feature once from a single definition, materializes the historical values into an offline store for training (served through the point-in-time as-of join of subsection 1) and the latest values into an online store for low-latency serving, so the training feature and the serving feature share one source of truth.</p>
+<div class="callout warning">
+<div class="callout-title">Warning: Train/Serve Skew and Restated-Data Leakage Are the Same Disease</div>
+<p>Both failures come from a feature whose value depends on <em>when and how</em> it was computed rather than on the data alone. Restated-data leakage lets a future revision flow backward into training; train/serve skew lets a different computation path produce a different value at serving time. The defense is identical in spirit: one feature definition, materialized through point-in-time joins for the offline store and through the same logic for the online store, with the data vintage recorded so a result can be reproduced. If your offline metric and your online metric disagree and you have ruled out drift, suspect skew or a non-point-in-time join before you blame the model. A pipeline that cannot be queried as-of cannot be trusted, and a feature computed two different ways is two different features wearing one name.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Metrics That Never Reproduced Online</div>
+<p><strong>Who:</strong> A fraud-detection team at a payments company shipping a real-time transaction-risk model.</p>
+<p><strong>Situation:</strong> Offline, the model scored an AUC of 0.94 on a clean time-aware backtest with forward-chaining evaluation. The team was confident and rolled it to production.</p>
+<p><strong>Problem:</strong> Online, the live AUC sat near 0.86 and would not budge, week after week, even though traffic looked statistically identical to the backtest window.</p>
+<p><strong>Dilemma:</strong> The usual three suspects presented themselves. Either the population had drifted (challenge one of Section 1.6), or there was an undetected label delay, or the offline and online features were not the same numbers despite sharing names. The first two are comfortable; the third indicts the pipeline.</p>
+<p><strong>Decision:</strong> Rather than retrain on more data, the team logged the exact feature vectors served online and joined them, by transaction id and timestamp, against the offline feature vectors the training job had produced for the very same events.</p>
+<p><strong>How:</strong> Two features disagreed. A "merchant average ticket over 30 days" was computed offline with a point-in-time join that excluded the current transaction, but online it accidentally included the in-flight transaction and used the merchant's <em>current</em> 30-day window rather than the as-of window. The offline job had seen the past; the online job had seen a sliver of the present. They rebuilt both paths from one feature-store definition served through identical as-of joins.</p>
+<p><strong>Result:</strong> Online AUC rose to 0.93, within noise of the backtest, and stayed there. The gap had been pure train/serve skew layered on a non-point-in-time join, not drift and not the model. A feature-parity check (offline vector equals online vector for sampled events) became a release gate.</p>
+<p><strong>Lesson:</strong> When offline metrics will not reproduce online, the bug is almost never the model and almost always the features being two different computations. One definition, one as-of join, one source of truth, verified by a parity test, is what makes an offline number a promise rather than a hope.</p>
+</div>
+<p>Feature stores are deployment infrastructure, so the full treatment belongs with operations: <a href="../../toc.html">Chapter 34</a> develops online/offline materialization, serving latency, and feature monitoring as part of temporal MLOps. For this chapter, the point is narrower and load-bearing: parity is a data-engineering property you design in now, not a deployment patch you bolt on later.</p>
+
+<h2>4. Determinism and Versioning <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Point-in-time correctness and parity make a pipeline honest; determinism and versioning make a result reproducible. A run reproduces only if four things are pinned: the random seeds (so stochastic steps repeat), the dependency versions (so the same code path executes), the data version (so the same bytes go in), and the configuration (so the same knobs are set). Of these, data versioning is the one temporal practitioners most often neglect and most need, because the data itself drifts and revises underneath them. Logging the data vintage, the transaction-time cutoff and a content hash of the exact rows, with every model is what lets you answer months later the question "what did this model actually know?" A result without its vintage is a number without provenance.</p>
+<p>Code 2.7.3 captures all four in a small, dependency-light run manifest: it seeds every relevant RNG, records the pinned library versions and the resolved config, and hashes the input data so the vintage is provable. The manifest is written beside the model artifact, so the result carries its own reproduction recipe.</p>
+<pre><code class="language-python">import json, hashlib, random, platform
+from datetime import datetime, timezone
+import numpy as np
+import sklearn
+
+def set_all_seeds(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)          # add torch.manual_seed(seed) when training nets
+
+def data_fingerprint(arr: np.ndarray) -> str:
+    """Content hash of the exact bytes that went in: the data VINTAGE."""
+    return hashlib.sha256(np.ascontiguousarray(arr).tobytes()).hexdigest()[:16]
+
+SEED = 7
+CONFIG = {"lag": 12, "model": "Ridge", "alpha": 1.0, "cv": "TimeSeriesSplit(5)"}
+
+set_all_seeds(SEED)
+X = np.random.default_rng(SEED).normal(size=(720, 12))   # stand-in for the panel
+
+manifest = {
+    "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    "seed": SEED,
+    "config": CONFIG,
+    "data_vintage": {
+        "as_of": "2026-06-15",                 # transaction-time cutoff
+        "fingerprint": data_fingerprint(X),    # proves WHICH rows were used
+        "n_rows": int(X.shape[0]),
+    },
+    "env": {
+        "python": platform.python_version(),
+        "numpy": np.__version__,
+        "sklearn": sklearn.__version__,
+    },
+}
+print(json.dumps(manifest, indent=2))
+# json.dump(manifest, open("run_manifest.json", "w"), indent=2)  # ship beside model
+</code></pre>
+<div class="code-caption"><strong>Code 2.7.3:</strong> A run manifest that pins all four reproducibility axes: seeds, configuration, data vintage (as-of cutoff plus a content fingerprint), and the resolved environment. Written next to the model artifact, it lets any future run reconstruct exactly what this model knew and how it was built.</div>
+<pre><code class="language-text">{
+  "created_utc": "2026-06-15T12:00:00+00:00",
+  "seed": 7,
+  "config": {"lag": 12, "model": "Ridge", "alpha": 1.0, "cv": "TimeSeriesSplit(5)"},
+  "data_vintage": {"as_of": "2026-06-15", "fingerprint": "9f1c4a7b2e8d0c63", "n_rows": 720},
+  "env": {"python": "3.14.0", "numpy": "2.1.0", "sklearn": "1.5.0"}
+}
+</code></pre>
+<div class="code-caption"><strong>Output 2.7.3:</strong> The serialized manifest. The <code>fingerprint</code> changes if a single input byte changes, so a silent data revision can never masquerade as the same run, and the pinned environment makes the code path itself reproducible.</div>
+<p>In production this manifest is backed by tooling: a data-versioning system such as DVC tracks large data artifacts by content hash alongside Git, an experiment tracker stores the config and metrics, and a lockfile pins the dependency tree exactly. The principles and the full reproducibility toolchain, including compute and experiment management, are collected in <a href="../../toc.html">Appendix F</a>; this section establishes the habit, and the appendix supplies the machinery.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact: "Works On My Machine" Is a Data-Vintage Bug in Disguise</div>
+<p>A surprising share of irreproducible temporal results are not seed bugs or library mismatches at all; they are vintage bugs. A colleague reruns your notebook a month later, the upstream table has quietly absorbed three revisions, and the "same" experiment now reports different numbers. Everyone hunts for a code change that does not exist. The fingerprint in Code 2.7.3 would have caught it in one line, because the hash would simply not match, turning a week of confusion into a one-second diff.</p>
+</div>
+
+<h2>5. A Reference Pipeline Blueprint <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>This section, and this chapter, converge on one picture. Figure 2.7.1 is the reference temporal data pipeline: raw observations flow left to right through the seven stages this chapter built, and the reproducibility properties of subsections 1 through 4 wrap the whole chain. Read each stage as a station that the data must pass cleanly before it reaches the next, and note that each station is exactly one earlier section of Chapter 2. The figure is the chapter's synthesis: every box is a skill you now have, and the arrows are the order in which they must run so that no future ever leaks into the present.</p>
+<figure class="diagram">
+<svg viewBox="0 0 940 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Reference temporal data pipeline: ingest to validate to resample to impute to features to windows to time-aware split, wrapped by point-in-time correctness and versioning.">
+<defs>
+<marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+<path d="M0,0 L9,4.5 L0,9 z" fill="currentColor"/>
+</marker>
+</defs>
+<style>
+.stg{fill:var(--callout-bg,#f4f6fb);stroke:currentColor;stroke-width:1.5;}
+.lbl{fill:currentColor;font-family:var(--font-sans,sans-serif);font-size:13px;font-weight:600;text-anchor:middle;}
+.sec{fill:currentColor;font-family:var(--font-sans,sans-serif);font-size:11px;text-anchor:middle;opacity:0.75;}
+.flow{stroke:currentColor;stroke-width:1.5;fill:none;}
+.wrap{fill:none;stroke:currentColor;stroke-width:1.4;stroke-dasharray:5 4;opacity:0.6;}
+.wlbl{fill:currentColor;font-family:var(--font-sans,sans-serif);font-size:11.5px;font-style:italic;text-anchor:middle;opacity:0.8;}
+</style>
+<text class="wlbl" x="470" y="22">Point-in-time correctness (as-of joins) and versioning (seed, config, data vintage) wrap every stage</text>
+<rect class="wrap" x="14" y="34" width="912" height="160" rx="12"/>
+<!-- row 1 -->
+<rect class="stg" x="30" y="70" width="120" height="56" rx="8"/>
+<text class="lbl" x="90" y="96">Ingest</text>
+<text class="sec" x="90" y="114">raw streams</text>
+<rect class="stg" x="186" y="70" width="120" height="56" rx="8"/>
+<text class="lbl" x="246" y="96">Validate</text>
+<text class="sec" x="246" y="114">Section 2.1</text>
+<rect class="stg" x="342" y="70" width="120" height="56" rx="8"/>
+<text class="lbl" x="402" y="96">Resample</text>
+<text class="sec" x="402" y="114">Section 2.2</text>
+<rect class="stg" x="498" y="70" width="120" height="56" rx="8"/>
+<text class="lbl" x="558" y="96">Impute / mask</text>
+<text class="sec" x="558" y="114">Section 2.3</text>
+<rect class="stg" x="654" y="70" width="120" height="56" rx="8"/>
+<text class="lbl" x="714" y="96">Features</text>
+<text class="sec" x="714" y="114">Section 2.4</text>
+<rect class="stg" x="810" y="70" width="100" height="56" rx="8"/>
+<text class="lbl" x="860" y="96">Windows</text>
+<text class="sec" x="860" y="114">Section 2.5</text>
+<line class="flow" x1="150" y1="98" x2="184" y2="98" marker-end="url(#ah)"/>
+<line class="flow" x1="306" y1="98" x2="340" y2="98" marker-end="url(#ah)"/>
+<line class="flow" x1="462" y1="98" x2="496" y2="98" marker-end="url(#ah)"/>
+<line class="flow" x1="618" y1="98" x2="652" y2="98" marker-end="url(#ah)"/>
+<line class="flow" x1="774" y1="98" x2="808" y2="98" marker-end="url(#ah)"/>
+<!-- elbow down to row 2 -->
+<path class="flow" d="M860,126 L860,150 L558,150 L558,156" marker-end="url(#ah)"/>
+<!-- row 2 -->
+<rect class="stg" x="438" y="156" width="240" height="30" rx="8"/>
+<text class="lbl" x="558" y="175">Time-aware split &amp; eval (Section 2.6)</text>
+<text class="sec" x="558" y="230">Trained model and run manifest (this section)</text>
+<path class="flow" d="M558,186 L558,212" marker-end="url(#ah)"/>
+<rect class="stg" x="448" y="236" width="220" height="34" rx="8"/>
+<text class="lbl" x="558" y="258">Reproducible artifact</text>
+</svg>
+<figcaption><strong>Figure 2.7.1:</strong> The reference temporal data pipeline. Raw streams are ingested, then validated for timestamp order and gaps (Section 2.1), resampled and aligned onto a common clock (Section 2.2), imputed or masked (Section 2.3), turned into features (Section 2.4) and supervised windows (Section 2.5), and finally fed to a time-aware split and evaluation (Section 2.6). The dashed envelope is this section's contribution: point-in-time correctness and versioning wrap every stage, and the output is a reproducible artifact carrying its data vintage.</figcaption>
+</figure>
+<p>Two reading rules make the blueprint operational. First, the order is not negotiable: validation precedes resampling because you cannot align a clock you have not checked, and windowing precedes the split because the split must respect window boundaries to avoid the leak of a window straddling the train/test wall. Second, the dashed envelope is what distinguishes a temporal pipeline from an ordinary one. An ordinary pipeline runs the inner chain; a temporal pipeline runs it under an as-of clock and records the vintage, so the artifact that drops out the bottom is not just a model but a model plus a provable account of exactly what it knew and when. Every later part of this book assumes the data arrived through a chain shaped like this one.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Feature Platforms, Temporal Validation, and Reproducible TSFMs (2024 to 2026)</div>
+<p>Three threads are reshaping reproducible temporal pipelines right now. Feature platforms have consolidated: open-source Feast and managed systems such as Tecton now treat point-in-time correctness and online/offline parity as first-class guarantees rather than user responsibilities, with as-of joins built into the retrieval API. Temporal data validation has matured from schema checks toward distribution-aware contracts: tools in the Great Expectations and Pandera lineage, alongside drift-aware monitors, validate not just that a column is numeric but that its temporal distribution has not silently shifted between vintages. And reproducibility for temporal foundation models has become a live concern as zero-shot forecasters (TimesFM, Moirai, Chronos, Lag-Llama, MOMENT) ship: because a frozen TSFM is evaluated across many downstream series, the community is converging on standardized, leakage-audited benchmark harnesses (the GIFT-Eval and related efforts) that pin data vintage and split protocol so that "zero-shot" numbers actually reproduce. The throughline is that reproducibility is migrating out of the practitioner's discipline and into the infrastructure, exactly as Figure 2.7.1's envelope suggests it should.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 2.7.1: Why Two Timestamps <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Explain, in your own words, why a single-timestamp table cannot answer a point-in-time query and a bitemporal (valid-time plus transaction-time) table can. Give one concrete example from each of finance, healthcare, and sensor data in which a value is revised after the fact, and state precisely what a model leaks if it trains on the revised value instead of the as-of value. Relate your answer to the look-ahead bias defined in <a href="../../toc.html">Section 1.6</a>.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 2.7.2: Build the Leakage-Safe Pipeline <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 2.7.2 with a deliberately leaky variant: fit a single <code>StandardScaler</code> and <code>SimpleImputer</code> on the full array <em>before</em> the split, then evaluate the same Ridge model with the same <code>TimeSeriesSplit</code>. Report both RMSE curves. Then add a third variant that swaps <code>TimeSeriesSplit</code> for a shuffled <code>KFold</code> while keeping the in-pipeline transforms. Rank the three by how optimistic their reported RMSE is, and explain which leak each variant introduces (preprocessing leak, split leak, or both).</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 2.7.3: A Vintage-Aware Manifest <span class="exercise-type analysis">Analysis</span></div>
+<p>Using Code 2.7.3 as a starting point, write a small harness that runs the same pipeline twice on two vintages of the same series (simulate a revision by changing three values) and asserts that the run is reproducible only when the data fingerprint matches. Then argue, in a short paragraph, why a content fingerprint catches a class of irreproducibility that pinning seeds and library versions alone cannot, and connect your reasoning to the reproducibility toolchain of <a href="../../toc.html">Appendix F</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-2.6.html"><span class="nav-label">Previous</span><span class="nav-num">Section 2.6</span><span class="nav-title">Time-Aware Splitting and Evaluation</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 2</span><span class="nav-num">Contents</span><span class="nav-title">Temporal Data Engineering</span></a>
+<a class="next" href="../../toc.html"><span class="nav-label">Next</span><span class="nav-num">Contents</span><span class="nav-title">Table of Contents</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

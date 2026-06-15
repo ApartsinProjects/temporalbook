@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 2.3: Missing Data and Irregular Observations. Why temporal data goes missing, the MCAR/MAR/MNAR mechanisms and informative missingness, imputation methods and the forward-fill leakage pitfall, representing irregular data natively, and evaluating without imputing across the train/test boundary." name="description"/>
+<title>Section 2.3: Missing Data and Irregular Observations | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Foundations of Temporal AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 2: Temporal Data Engineering</a></div>
+<h1>Missing Data and Irregular Observations</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They keep apologizing for me as if I were a hole in the data. But the day I went missing, I was telling you everything: nobody thought you were sick enough to measure. My absence was the diagnosis."</p>
+<cite>An Observation That Went Missing on Purpose</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>In real temporal data the gaps are not noise to be patched over; they are part of the signal, and the way you fill them decides whether your model learns the world or learns the measurement process.</strong> This section treats missingness as a first-class modeling concern. It separates the three classical mechanisms that determine whether imputation is even safe, walks through the practical imputation toolbox with its single most common leak, and then argues that the cleanest response is often not to impute at all but to represent the irregular observations natively and let the model see both the values and the pattern of their absence. The running example is the book's clinical dataset, where a missing lab result is rarely an accident and almost always a decision a clinician made.</p>
+</div>
+<p>The previous section, <a href="section-2.2.html">Section 2.2</a>, assumed a clean stream of timestamped observations and showed how to align and resample it. Real temporal data is rarely so generous. Sensors drop packets, channels in a multivariate record are sampled on their own schedules, and in many domains a measurement exists only because somebody decided it was worth taking. This section confronts those gaps directly. We first ask why data goes missing, because the cause governs the cure; we formalize the three missingness mechanisms and show why one of them makes imputation actively dangerous; we survey the imputation methods you will actually reach for and the leakage trap hiding inside the most popular one; we then make the case for keeping irregular data irregular; and we close on the one evaluation rule that ties the whole section to <a href="section-2.6.html">Section 2.6</a>: never let imputation cross the train/test boundary.</p>
+<p>Throughout, the clinical record is the lead example because it makes the stakes vivid. A patient's chart is a sparse, asynchronous, event-driven object: heart rate every few minutes from a monitor, a blood lactate value once per shift if at all, an arterial blood gas only when the team suspects deterioration. The absence of a lactate measurement is not the absence of information. It is the trace of a clinical judgment, and a model that ignores that trace is throwing away one of the strongest features in the dataset.</p>
+
+<h2>1. Why Data Goes Missing <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>It helps to name the distinct ways a temporal record acquires holes, because each one suggests a different remedy. The first is the simplest: <strong>sensor dropout</strong>. A device loses power, a wireless link drops a packet, a logger overflows its buffer, and a contiguous block of timestamps simply has no value. These gaps are usually unrelated to the underlying quantity, which, as we will see, makes them the friendliest kind to repair.</p>
+<p>The second is <strong>asynchronous channels</strong>. A multivariate record stitches together streams that were never sampled on a common clock. In a clinical chart the pulse oximeter writes a row every few seconds, the blood pressure cuff every fifteen minutes, the laboratory once or twice a day, so when you line the channels up on a shared time axis almost every cell is empty even though no single instrument failed. The emptiness here is an artifact of forcing many native cadences onto one grid, a problem <a href="section-2.2.html">Section 2.2</a> introduced and this section finishes.</p>
+<p>The third, and the one that should make you most cautious, is <strong>event-driven measurement</strong>. The observation exists only because a process decided to generate it. Clinical laboratory panels are the canonical case: a troponin test is ordered when a clinician suspects a cardiac event, a culture is sent when infection is suspected, an imaging study is requested when the differential calls for it. The decision to measure is itself driven by the patient's hidden state, so the mere presence or absence of a value is correlated with the thing you are trying to predict. This is where missingness stops being a nuisance and becomes a feature, a theme the next subsection makes precise.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Cause of a Gap Dictates Its Cure</div>
+<p>There is no universal right way to fill a hole. A packet dropped by a sensor that was sampling a smooth physical quantity can be interpolated with little harm. A lab value that is missing because nobody ordered the test must not be interpolated as if it were merely unobserved, because its absence carries information about the patient. Before you choose an imputation method, ask why the value is gone. The rest of this section is, in effect, an elaboration of that single question.</p>
+</div>
+
+<h2>2. Missingness Mechanisms: MCAR, MAR, MNAR <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The statistical vocabulary for missingness, due to Rubin, classifies the gaps by what the probability of being missing depends on. Let $X$ denote the complete data we wish we had and let $M$ be the missingness mask, a binary indicator that is one where a value is observed and zero where it is missing. Split the complete data into the part we actually see, $X_{\mathrm{obs}}$, and the part that is hidden, $X_{\mathrm{mis}}$. The three mechanisms are distinguished by which of these the mask depends on. Data is <strong>missing completely at random</strong> when</p>
+$$P(M \mid X_{\mathrm{obs}}, X_{\mathrm{mis}}) = P(M),$$
+<p>so the chance a value is absent has nothing to do with any data at all, observed or not. A sensor that drops packets on a fixed hardware schedule is MCAR. Data is <strong>missing at random</strong>, a weaker and more common condition, when the mask depends only on what we did observe,</p>
+$$P(M \mid X_{\mathrm{obs}}, X_{\mathrm{mis}}) = P(M \mid X_{\mathrm{obs}}),$$
+<p>so once you condition on the observed variables the absence carries no further information about the missing ones. If older patients are monitored more closely and age is recorded, the gaps in younger patients' charts may be MAR given age. Finally, data is <strong>missing not at random</strong> when the probability of being missing depends on the unobserved value itself,</p>
+$$P(M \mid X_{\mathrm{obs}}, X_{\mathrm{mis}}) \neq P(M \mid X_{\mathrm{obs}}),$$
+<p>so that even after conditioning on everything you saw, the very fact a value is absent still tells you something about what it would have been. The event-driven lab measurement is the textbook MNAR case: a troponin is missing precisely because the patient looked well enough not to test, so the missingness is entangled with the latent cardiac state. The full notation for masks and conditional laws used here is collected in the unified table of <a href="../../toc.html">Appendix A</a>.</p>
+<p>The reason this taxonomy matters operationally is that it determines whether imputation can be unbiased. Under MCAR and MAR, methods that fill the gaps using the observed data can recover the right distribution, because the observed data carries everything needed to explain the pattern of absence. Under MNAR no imputation from the observed data alone can be guaranteed unbiased, because the missing values are systematically different from what the observed ones would predict. Worse, blindly imputing an MNAR variable destroys the very signal its absence encoded.</p>
+<div class="callout warning">
+<div class="callout-title">Warning: Imputing MNAR Data Can Erase the Strongest Feature You Have</div>
+<p>When missingness is informative, the act of filling it in is not a neutral cleanup step; it deletes information. Consider a sepsis model. If lactate is ordered mainly for patients the team already worries about, then "lactate was measured at all" is a powerful predictor of deterioration. Impute the missing lactates with a population mean and you have replaced a sharp clinical signal with a flat constant, and the model can no longer tell the worried-about patients from the rest. Before imputing any event-driven variable, preserve the mask, because the pattern of measurement may be more predictive than the measured values themselves.</p>
+</div>
+
+<h2>3. Imputation Methods and the Forward-Fill Leak <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>When imputation is appropriate, a familiar toolbox is available, ordered roughly from least to most assumption-laden. <strong>Forward fill</strong> (last observation carried forward) holds the most recent value until a new one arrives, which matches the semantics of many real systems where a measurement stays "current" until replaced; <strong>backward fill</strong> does the reverse and, as we will stress, peeks into the future. <strong>Linear and spline interpolation</strong> draw a straight or smooth curve between known points and suit quantities that vary continuously, such as a temperature trace. <strong>Mean and seasonal fill</strong> replace a gap with a global average or with the value from the same phase of a known cycle, useful when a series has strong periodicity. <strong>Model-based imputation</strong> treats the gaps as latent states and estimates them with a probabilistic model; the Kalman smoother, developed in <a href="../../toc.html">Chapter 7</a>, is the principled state-space version and returns both a filled value and an uncertainty for it. Finally, the <strong>masking approach</strong> declines to commit to any single fill: it carries the missingness indicator $M$ alongside the data and lets the model learn how to use the pattern of absence, which is exactly the right move when the data is MNAR.</p>
+<p>Code 2.3.1 contrasts the interpolation styles on a short clinical-style series with two gaps, so you can see how forward fill, linear interpolation, and a spline each shape the filled region differently.</p>
+<pre><code class="language-python">import numpy as np
+import pandas as pd
+
+# A heart-rate-like series sampled each minute, with two missing stretches.
+idx = pd.date_range("2026-01-01 00:00", periods=10, freq="min")
+hr = pd.Series([72, 74, np.nan, np.nan, 80, 79, np.nan, 70, 71, 73],
+               index=idx, name="heart_rate")
+
+filled = pd.DataFrame({
+    "raw":     hr,
+    "ffill":   hr.ffill(),                              # carry last value forward
+    "linear":  hr.interpolate(method="time"),          # straight line across the gap
+    "spline":  hr.interpolate(method="spline", order=2) # smooth curve across the gap
+})
+print(filled.round(2))
+</code></pre>
+<div class="code-caption"><strong>Code 2.3.1:</strong> Three imputations of the same gapped heart-rate series. Forward fill holds the last observation flat across each gap; time-based linear interpolation connects the bracketing values with a straight line; the order-2 spline bends a smooth curve through them.</div>
+<pre><code class="language-text">                     raw  ffill  linear  spline
+2026-01-01 00:00:00   72   72.0   72.00   72.00
+2026-01-01 00:01:00   74   74.0   74.00   74.00
+2026-01-01 00:02:00  NaN   74.0   76.00   76.41
+2026-01-01 00:03:00  NaN   74.0   78.00   78.49
+2026-01-01 00:04:00   80   80.0   80.00   80.00
+2026-01-01 00:05:00   79   79.0   79.00   79.00
+2026-01-01 00:06:00  NaN   79.0   74.50   73.99
+2026-01-01 00:07:00   70   70.0   70.00   70.00
+2026-01-01 00:08:00   71   71.0   71.00   71.00
+2026-01-01 00:09:00   73   73.0   73.00   73.00
+</code></pre>
+<div class="code-caption"><strong>Output 2.3.1:</strong> Forward fill produces a flat plateau across each gap, linear interpolation a ramp, and the spline a gentle curve. Only forward fill is safe to use causally in a streaming setting, because the other two read the value on the far side of the gap.</div>
+<p>That last sentence is the crux. Linear interpolation, spline interpolation, and backward fill all use a future observation to reconstruct a past one. Inside a tidy offline dataframe this looks harmless, but it is exactly the look-ahead leakage that <a href="../module-01-intro-temporal-intelligence/section-1.6.html">Section 1.6</a> warned is the cardinal sin of temporal machine learning. If your model is meant to predict at time $t$ using only data available at $t$, then any cell filled with information from after $t$ silently hands the model a future it will not have in production. Even forward fill is not automatically innocent: if you compute it across the whole series and then split into train and test, the first few test rows may have been filled with the last training value, which is fine, but the temptation to also recompute statistics on the filled column over the full series is exactly how the leak creeps back in.</p>
+<div class="callout warning">
+<div class="callout-title">Warning: Interpolation Is Forward-Looking, and Forward-Looking Is a Leak</div>
+<p>The single most common imputation leak in temporal pipelines is calling <code>df.interpolate()</code> or <code>df.bfill()</code> on the entire series before the train/test split. Both reach across the gap to the next observed value, so a row in the past is reconstructed from a value in the future. The number that comes out of evaluation will be optimistic and the model will fail live. If you must interpolate, do it within causal limits (interpolate only over gaps that close with data the model would already have) or restrict it to inside each training fold. Forward fill is the only one of the standard fills that is causal by construction, and even it leaks if you let downstream statistics be fit on the filled-in future.</p>
+</div>
+<p>The masking alternative sidesteps the entire question of what value to invent. Instead of guessing, you record where the data was missing and how long it had been since you last saw a real value, and you feed those signals to the model directly. Code 2.3.2 builds the two features that almost every missingness-aware architecture consumes: the binary mask and the time since the last observation.</p>
+<pre><code class="language-python">import numpy as np
+import pandas as pd
+
+idx = pd.date_range("2026-01-01 00:00", periods=10, freq="min")
+lactate = pd.Series([1.2, np.nan, np.nan, 2.1, np.nan, np.nan, np.nan, 3.4, np.nan, 4.0],
+                    index=idx, name="lactate")
+
+mask = lactate.notna().astype(int)                 # 1 where observed, 0 where missing
+# Time since the most recent real observation, in minutes (a "staleness" feature).
+obs_times = pd.Series(np.where(mask == 1, np.arange(len(idx)), np.nan), index=idx).ffill()
+time_since = (np.arange(len(idx)) - obs_times).fillna(0).astype(int)
+
+frame = pd.DataFrame({"lactate": lactate, "mask": mask, "time_since_obs": time_since})
+print(frame)
+</code></pre>
+<div class="code-caption"><strong>Code 2.3.2:</strong> Building the masking representation for an event-driven lab value. The <code>mask</code> column records presence, and <code>time_since_obs</code> counts steps since the last real reading, so the model can learn that a long-stale value is less trustworthy. No value is ever invented.</div>
+<pre><code class="language-text">                     lactate  mask  time_since_obs
+2026-01-01 00:00:00      1.2     1               0
+2026-01-01 00:01:00      NaN     0               1
+2026-01-01 00:02:00      NaN     0               2
+2026-01-01 00:03:00      2.1     1               0
+2026-01-01 00:04:00      NaN     0               1
+2026-01-01 00:05:00      NaN     0               2
+2026-01-01 00:06:00      NaN     0               3
+2026-01-01 00:07:00      3.4     1               0
+2026-01-01 00:08:00      NaN     0               1
+2026-01-01 00:09:00      4.0     1               0
+</code></pre>
+<div class="code-caption"><strong>Output 2.3.2:</strong> The mask and time-since-observation features computed causally: each only ever looks backward. A downstream model such as GRU-D consumes exactly these three columns and decays the influence of a value as <code>time_since_obs</code> grows, rather than pretending a fill is fresh data.</div>
+<p>The masking representation is also the bridge to the next subsection. Once you accept that the mask and the elapsed time are features rather than bookkeeping, you have already stopped insisting that the data live on a dense grid, and you are ready to represent irregular observations as what they actually are.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Sepsis Model That Learned the Ward, Not the Patient</div>
+<p><strong>Who:</strong> A clinical machine-learning team building an early-warning model for sepsis from intensive-care vitals and labs.</p>
+<p><strong>Situation:</strong> Their model reached an impressive area under the ROC curve on held-out patients and the team prepared to pilot it as a bedside alert.</p>
+<p><strong>Problem:</strong> An external validation on a second hospital collapsed the performance, and a feature-importance audit showed the model leaning heavily on whether certain labs had been ordered rather than on the lab values themselves.</p>
+<p><strong>Dilemma:</strong> The measurement pattern was genuinely predictive in the training hospital, because clinicians there ordered lactate and cultures exactly when they were already worried. Keeping that signal inflated the internal score; the team had to decide whether the model was learning physiology or learning one hospital's ordering habits.</p>
+<p><strong>Decision:</strong> They treated the missingness as MNAR and explicitly modeled it, separating the patient's physiological state from the hospital's measurement policy instead of letting the two blur together in an imputed column.</p>
+<p><strong>How:</strong> They kept the missingness mask as an explicit feature but trained and validated across multiple hospitals so the model could not ride a single site's ordering convention, and they checked that physiological features carried predictive weight on their own.</p>
+<p><strong>Result:</strong> The cross-hospital model scored lower internally but transferred, because it had learned a signal that existed in every ward rather than a measurement habit unique to one. The mask stayed in the model as an honest, generalizable feature rather than a shortcut.</p>
+<p><strong>Lesson:</strong> Informative missingness is a real signal and a real trap at once. Modeled explicitly and validated across environments it generalizes; imputed away or learned implicitly from a single site it becomes a brittle proxy for the local measurement policy.</p>
+</div>
+
+<h2>4. Representing Irregular Data Natively <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The reflex to resample everything onto a fixed grid is so ingrained that it is worth stating the alternative plainly. An irregularly observed series is, at bottom, just a set of timestamped values, $\{(t_i, x_i)\}_{i=1}^{n}$, where the gaps between successive $t_i$ are not equal and carry meaning. Forcing this set onto a uniform grid does two harmful things at once: it invents data in the cells where nothing was observed, and it discards the information encoded in the spacing of the observations. The intervals themselves are signal. A lab redrawn after twenty minutes tells a different story than one redrawn after twenty hours, and a grid erases that distinction.</p>
+<p>Two lighter-weight moves preserve what the grid throws away. The first is to keep the observations as an event list and attach the inter-event time, $\Delta t_i = t_i - t_{i-1}$, as an explicit feature, the continuous cousin of the discrete time-since-observation counter from Code 2.3.2. The second is to carry the elapsed time per channel so a model can decay its trust in a stale value. Both let a model trained on a sequence of $(t_i, x_i, \Delta t_i, m_i)$ tuples reason about timing directly, without ever committing to a fabricated value on an empty grid cell.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Native Irregular-Time Deep Models and Missingness-Aware Foundation Models (2024 to 2026)</div>
+<p>The strongest recent line of work refuses the grid entirely and lets the model consume $\{(t_i, x_i)\}$ as is. Continuous-time architectures evolve a hidden state along a differential equation between observations: Neural Ordinary Differential Equations and the Neural Controlled Differential Equation (Neural CDE), which the book develops in <a href="../../toc.html">Chapter 13</a>, define a state that is genuinely a function of continuous time, so an observation that arrives at an arbitrary $t_i$ is incorporated exactly when it occurs rather than snapped to the nearest grid point. Alongside them, attention-based set models such as the multi-time-attention networks treat the record as an unordered set of timestamped events. On the foundation-model side, the 2024 to 2026 push toward missingness-aware and irregular-time pretraining (variants and successors in the TimesFM, Moirai, and MOMENT families that ingest a mask or variable cadence rather than assuming a dense regular grid) aims to make zero-shot temporal models robust to exactly the asynchronous, gap-riddled records that real deployments produce. The common thread is that the absence and the timing are inputs to be modeled, not defects to be repaired before modeling begins.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact: The Grid Was Always a Convenience, Not a Law of Nature</div>
+<p>The uniform time grid is a habit inherited from the analog era, when chart recorders dragged paper past a pen at constant speed and sampling theory was built around fixed intervals. Nothing about the underlying processes requires it. A patient's physiology, a market's trades, and a machine's faults all unfold in continuous time and announce themselves at irregular moments. The grid was a property of our instruments, never of the world, and continuous-time models are, in a sense, simply catching the math up to that fact.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Mask and Interpolation Plumbing Off the Shelf</div>
+<p>The mask and time-since-observation features of Code 2.3.2 are common enough that you should rarely hand-roll them. Pandas already gives you <code>Series.isna()</code> for the mask and a one-line group-cumulative trick for staleness; scikit-learn's <code>SimpleImputer(add_indicator=True)</code> returns the missingness mask alongside the imputed columns in a single transform, so the indicator survives into the model. For the native irregular-time path, <code>torchcde</code> handles the interpolation control paths that feed a Neural CDE, and <code>sktime</code> and <code>tsai</code> expose missingness-aware transformers. Choosing one of these over a bespoke loop replaces a dozen index-juggling lines with a tested primitive and, crucially, keeps the indicator wired into the pipeline so it cannot be dropped by accident.</p>
+</div>
+
+<h2>5. Evaluation Under Missingness <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Everything above converges on one evaluation rule, and it is strict: imputation is a fittable transformation, so it must never be fit across the train/test boundary. Any imputer that learns a statistic from the data (a column mean, a seasonal profile, a Kalman model's parameters, a learned per-channel fill) is exactly the kind of step <a href="../module-01-intro-temporal-intelligence/section-1.6.html">Section 1.6</a> insists be fit on the training side only. If you compute the imputation values over the whole dataset and then split, the training rows have been filled using statistics that depend on the test rows, and your evaluation is contaminated before the model ever runs.</p>
+<p>The discipline is mechanical. Inside each fold of a time-aware split, fit the imputer on the training block alone, then apply the already-fitted imputer to transform the validation block. Mean fills use only the training mean; a Kalman smoother is parameterized only on training data; interpolation, if you use it at all, is confined within the training segment so it never reaches across the fold boundary into the future. The mask and time-since-observation features, by contrast, are computed causally per row and carry no cross-boundary statistic, which is a further reason to prefer them: they are leak-proof by construction. This is precisely the leakage-proof pipeline pattern that <a href="section-2.6.html">Section 2.6</a> builds in full, wrapping the imputer and the estimator into one object handed to a time-aware splitter so a stray <code>fit</code> can never see the test horizon. Tie the two sections together in your mind: missingness handling is just one more transform that lives inside the pipeline, never outside it.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Impute Inside the Fold, Never Across the Split</div>
+<p>The rule reduces to a single sentence. Fit every imputer on the training side of the temporal boundary and merely apply it to the future side, exactly as you would a scaler. Whole-series imputation followed by splitting is a leak that flatters your offline numbers and fails in production, and it is invisible in code review because <code>fillna</code> and <code>interpolate</code> look like innocent cleanup. The safest design avoids the question where possible by carrying the mask, and where imputation is genuinely needed, it confines that imputation inside each fold.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 2.3.1: Classify the Mechanism <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each scenario, state whether the missingness is best modeled as MCAR, MAR, or MNAR, and say in one sentence whether straightforward imputation from the observed data is safe. (a) A wearable heart-rate monitor loses its Bluetooth link at random moments unrelated to the wearer's activity. (b) In a study where blood pressure is checked more often for patients flagged as high-risk, and the risk flag is recorded, the lower-frequency readings of low-risk patients leave gaps. (c) A pain-score survey is skipped most often by exactly the patients in the most severe pain, whose severity is not otherwise recorded. Explain which scenario makes the absence itself a predictive feature.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 2.3.2: Build a Causal Staleness Feature <span class="exercise-type coding">Coding</span></div>
+<p>Starting from Code 2.3.2, extend the representation to a multivariate frame with three channels sampled on different cadences. Compute a per-channel mask and a per-channel <code>time_since_obs</code> using only backward-looking information, and verify on a small example that no cell of either feature depends on a future row. Then add a single "any channel observed at this step" indicator and discuss when that aggregate would be more useful to a model than the per-channel masks.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 2.3.3: Quantify the Interpolation Leak <span class="exercise-type analysis">Analysis</span></div>
+<p>Take a drifting univariate series, delete twenty percent of its values to simulate gaps, and evaluate a simple forecaster two ways. First impute with <code>interpolate()</code> over the whole series and then split into train and test; second, split first and impute each fold with forward fill alone. Report both error numbers and explain, in a short paragraph, why the whole-series interpolation produces the more optimistic and less trustworthy score. Relate your explanation to the MNAR discussion: how would the gap between the two numbers change if the missingness were informative rather than random?</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-2.2.html"><span class="nav-label">Previous</span><span class="nav-num">Section 2.2</span><span class="nav-title">Resampling, Alignment, and Time Zones</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 2</span><span class="nav-num">Contents</span><span class="nav-title">Temporal Data Engineering</span></a>
+<a class="next" href="section-2.4.html"><span class="nav-label">Next</span><span class="nav-num">Section 2.4</span><span class="nav-title">Feature Engineering for Temporal Data</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

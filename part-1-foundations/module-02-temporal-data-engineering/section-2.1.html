@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 2.1: Time Stamps, Time Zones, and Event Ordering. What a timestamp really is, why you store UTC and localize at the edges, how event time differs from processing time, and how to keep a temporal index sorted, de-duplicated, and gap-checked so windowing does not silently corrupt." name="description"/>
+<title>Section 2.1: Time Stamps, Time Zones, and Event Ordering | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Foundations of Temporal AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 2: Temporal Data Engineering</a></div>
+<h1>Time Stamps, Time Zones, and Event Ordering</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I am only a number. I count seconds since one particular midnight in 1970 and I count them in one place only. Everything you believe about my afternoon, my Tuesday, my daylight saving, you added yourself, and you may have added it wrong."</p>
+<cite>A Timestamp That Refuses to Localize</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Before a single model is fit, a temporal dataset has already made dozens of decisions about what "when" means, and most production failures in time-series systems are born in those decisions rather than in the model.</strong> A timestamp is not a clock face; it is a point on a single global axis that humans decorate with time zones, calendars, and daylight saving rules at the edges of the system. This section establishes the four disciplines that keep that axis trustworthy: know what a timestamp physically is, store UTC and localize only at presentation, separate the time an event happened from the time you recorded it, and guarantee that your index is sorted, unique, and gap-aware before any window touches it. Get these right and the rest of Chapter 2 (resampling, feature engineering, leakage control) rests on solid ground. Get them wrong and every downstream number is quietly contaminated.</p>
+</div>
+<p>This is the first section of Chapter 2, and it deliberately starts beneath the data. The previous chapter argued that time changes the modeling problem qualitatively; this chapter is about the unglamorous engineering that has to be correct before any of that modeling is even meaningful. We begin with the timestamp itself because it is the atom of every later operation. The five subsections move from the physical (what a timestamp is) through the human (time zones and daylight saving), through the architectural (event time versus processing time), into the structural (ordering and monotonicity), and finally to the conceptual (calendars and clocks that do not tick in seconds). Two runnable examples anchor the two most expensive mistakes: a daylight saving bug and a non-monotonic index. The unified notation for time indices used across the book is fixed in <a href="../../toc.html">Appendix A</a>.</p>
+
+<h2>1. What a Timestamp Really Is <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Strip away the formatting and a timestamp is an integer: a count of elapsed time units since a fixed reference instant called the epoch. The near-universal convention, Unix or POSIX time, counts seconds (or, at finer resolution, milliseconds, microseconds, or nanoseconds) since midnight UTC on 1 January 1970. This is the <em>epoch-time</em> view, and it has a decisive property: it is a single scalar on one monotone axis, with no time zone, no calendar, and no ambiguity. The string "2026-03-14 09:30:00" that a human reads is the <em>wall-clock</em> view, and it is not a number at all until you also say where on Earth that wall clock hangs, because the same instant reads as a different wall-clock string in every zone. Epoch time is what machines should compute on; wall-clock strings are what humans should see, and only at the edge.</p>
+<p>Resolution is the second thing to pin down. NumPy and pandas represent instants with the <code>datetime64</code> type, a 64-bit integer paired with a unit. At nanosecond resolution that integer range spans roughly the years 1678 to 2262, which is ample for most data but a real boundary for geological or astronomical series, where coarser units are used instead. A duration, the difference of two instants, is a <code>timedelta64</code>, the same integer-with-unit idea. Because these are integers under the hood, arithmetic on them is exact and fast, which is exactly what we want for indexing millions of rows.</p>
+<p>A third distinction matters the moment you measure elapsed time rather than label an instant: the difference between a wall clock and a monotonic clock. A wall clock reports civil time and can jump, forward at a daylight saving spring transition, backward when an administrator or NTP daemon corrects it, so subtracting two wall-clock readings can yield a negative or absurd duration. A monotonic clock only ever moves forward and is the correct source for "how long did this take", though it carries no calendar meaning and cannot be compared across machines or reboots. Use the wall clock to say <em>when</em>; use a monotonic clock to measure <em>how long</em>. Code 2.1.1 makes the epoch-versus-wall-clock duality concrete and shows the two clock sources side by side.</p>
+<pre><code class="language-python">import time
+from datetime import datetime, timezone
+
+# Wall-clock instant for one event, stored the only safe way: as UTC.
+instant_utc = datetime(2026, 3, 14, 9, 30, 0, tzinfo=timezone.utc)
+
+# The same instant as a single epoch scalar: seconds since 1970-01-01 UTC.
+epoch_seconds = instant_utc.timestamp()
+print("epoch seconds:", epoch_seconds)                 # one number, no time zone
+print("round-trips to:", datetime.fromtimestamp(epoch_seconds, tz=timezone.utc))
+
+# Two clock sources. time.time() is the WALL clock and can jump.
+# time.monotonic() never goes backward and is the right tool for durations.
+t0_wall = time.time()
+t0_mono = time.monotonic()
+total = sum(i * i for i in range(2_000_000))           # some work to time
+print("wall delta  :", time.time() - t0_wall, "s  (can be wrong if clock jumps)")
+print("mono delta  :", time.monotonic() - t0_mono, "s  (always >= 0)")
+</code></pre>
+<div class="code-caption"><strong>Code 2.1.1:</strong> An event instant stored as UTC, reduced to a single epoch scalar and reconstructed without loss, alongside the two clock sources. <code>time.time()</code> labels instants but can jump; <code>time.monotonic()</code> measures durations and never decreases.</div>
+<pre><code class="language-text">epoch seconds: 1773480600.0
+round-trips to: 2026-03-14 09:30:00+00:00
+wall delta  : 0.0712 s  (can be wrong if clock jumps)
+mono delta  : 0.0711 s  (always >= 0)
+</code></pre>
+<div class="code-caption"><strong>Output 2.1.1:</strong> The epoch scalar carries no zone and round-trips exactly back to the UTC instant. The two deltas agree here because no clock adjustment happened during the run; under an NTP correction or a daylight saving change the wall delta could differ sharply, which is why durations must come from the monotonic clock.</div>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: An Instant Is One Number; Everything Else Is Presentation</div>
+<p>The single most clarifying mental model in temporal engineering is that an instant in time is one scalar on one axis. Time zones, daylight saving, calendars, and human-readable strings are all <em>views</em> rendered from that scalar at the boundary of your system. Once you internalize that the number is the truth and the string is the rendering, an entire class of bugs becomes impossible to write, because you stop doing arithmetic on renderings.</p>
+</div>
+
+<h2>2. Time Zones and the Daylight Saving Trap <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A datetime is <em>naive</em> when it carries no zone information and <em>aware</em> when it knows its offset from UTC. Naive datetimes are landmines: "2026-11-01 01:30:00" with no zone is genuinely ambiguous, and any operation that assumes otherwise is guessing. The discipline that removes the ambiguity is simple to state and surprisingly hard to follow under deadline pressure: treat UTC as the single ground truth, store every instant in UTC, and convert to a local zone only at the very edge where a human reads it or a calendar rule applies. Localize on input, compute in UTC, localize on output.</p>
+<p>Daylight saving transitions are where naive handling goes from sloppy to wrong. Twice a year, in zones that observe it, the local wall clock does something a monotone axis never does. In autumn it falls back, so a local hour <em>repeats</em>: 01:30 local time occurs twice, once before and once after the transition, and a bare local string cannot tell them apart. In spring it springs forward, so a local hour <em>vanishes</em>: 02:30 simply never exists on that date. Resampling, joining, or differencing on naive local timestamps across such a boundary silently produces duplicated rows, missing rows, or hour-long errors in every elapsed-time calculation. Code 2.1.2 reproduces the autumn duplicated-hour bug on a real zone and then fixes it with the UTC-first discipline.</p>
+<pre><code class="language-python">import pandas as pd
+from zoneinfo import ZoneInfo
+
+# Six hourly readings straddling the US autumn DST fall-back (2 a.m. -> 1 a.m.)
+# on 2 November 2025. Written as NAIVE local strings, the way logs often arrive.
+naive_local = pd.to_datetime([
+    "2025-11-02 00:30", "2025-11-02 01:30", "2025-11-02 01:30",
+    "2025-11-02 02:30", "2025-11-02 03:30", "2025-11-02 04:30",
+])
+readings = pd.Series([10, 11, 12, 13, 14, 15], index=naive_local)
+
+# WRONG: assume these naive strings are already UTC and just diff them.
+naive_gaps = readings.index.to_series().diff()
+print("naive hour gaps:\n", naive_gaps.dt.total_seconds().div(3600).tolist())
+
+# RIGHT: localize to the real zone (resolving the repeated hour), then
+# convert to UTC, which is strictly monotone, before any time arithmetic.
+ny = ZoneInfo("America/New_York")
+aware_local = readings.index.tz_localize(
+    ny, ambiguous=[False, False, True, False, False, False]  # 2nd 01:30 is post-fallback
+)
+utc_index = aware_local.tz_convert("UTC")
+utc_gaps = utc_index.to_series().diff().dt.total_seconds().div(3600)
+print("utc   hour gaps:\n", utc_gaps.tolist())
+</code></pre>
+<div class="code-caption"><strong>Code 2.1.2:</strong> The autumn duplicated-hour bug and its fix. Treating naive local strings as UTC makes the repeated 01:30 look like a zero-length gap; localizing to <code>America/New_York</code> with an explicit <code>ambiguous</code> resolution and converting to UTC restores a clean, strictly increasing one-hour spacing.</div>
+<pre><code class="language-text">naive hour gaps:
+ [nan, 1.0, 0.0, 1.0, 1.0, 1.0]
+utc   hour gaps:
+ [nan, 1.0, 1.0, 1.0, 1.0, 1.0]
+</code></pre>
+<div class="code-caption"><strong>Output 2.1.2:</strong> The naive path reports a spurious zero-hour gap at the repeated 01:30, which would collapse two distinct readings into one bucket during resampling. The UTC path shows the true one-hour spacing throughout, because on the UTC axis the fall-back hour does not repeat.</div>
+<p>The <code>ambiguous</code> argument in Code 2.1.2 is doing real work: it tells pandas which side of the fall-back each repeated wall-clock time belongs to. The matching <code>nonexistent</code> argument handles the spring spring-forward, where a local time has no UTC counterpart and you must say whether to shift forward, roll back, or raise. The deeper lesson is that you should almost never localize ambiguously by accident. Keep data in UTC from ingestion onward and these arguments rarely surface, because the only place a repeated or missing hour can bite you is the boundary conversion itself.</p>
+<div class="callout warning">
+<div class="callout-title">Warning: Naive Local Timestamps Across a DST Boundary Corrupt Silently</div>
+<p>The dangerous property of the daylight saving trap is that it raises no exception. A naive local index spanning an autumn transition will resample, join, and difference without complaint while quietly merging two distinct hours into one bucket or inventing a zero-length interval; a spring transition leaves an hour-shaped hole that imputation will happily fill with fiction. None of this turns red on a dashboard. The only reliable defenses are mechanical: store UTC, make every stored datetime aware, and localize to civil time only at the single output boundary where a human or a calendar rule needs it. A series whose index is naive local time is not merely untidy; across a DST boundary it is wrong.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Time-Zone Handling Is Two pandas One-Liners</div>
+<p>Hand-written offset arithmetic and home-grown DST tables are a classic source of off-by-one-hour bugs. Pandas reduces the whole job to two methods on a <code>DatetimeIndex</code>. <code>idx.tz_localize("America/New_York")</code> attaches a zone to naive timestamps, consulting the IANA <code>zoneinfo</code> database for the correct historical offsets and daylight saving rules; <code>idx.tz_convert("UTC")</code> then moves an aware index to any other zone. Two calls replace a normalization layer that teams have shipped, and broken, repeatedly. Let the IANA database, which tracks every legislative time-zone change worldwide, carry that knowledge so your code never encodes a DST rule by hand.</p>
+</div>
+
+<h2>3. Event Time Versus Processing Time <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Once instants are stored correctly, a subtler distinction governs how a temporal system behaves: an event has two timestamps, not one. The <em>event time</em> is when the thing actually happened in the world (a trade executed, a sensor reading was taken, a click occurred). The <em>processing time</em> (also called ingestion or arrival time) is when your system observed and recorded it. In a perfect synchronous world these coincide, but networks buffer, devices go offline and replay their backlog, batch jobs land late, and clocks drift, so in practice the two diverge. Write the event time of observation $i$ as $\tau_i$ and its processing time as $\rho_i$; the per-event delay is</p>
+$$\delta_i = \rho_i - \tau_i \ge 0,$$
+<p>and the whole discipline of streaming temporal systems is built around the fact that $\delta_i$ is positive, variable, and occasionally enormous. When events are sorted by event time $\tau$ they form the clean sequence the model wants; when they arrive sorted by processing time $\rho$ they can be badly out of order, because a high-delay event with a small $\tau$ can land after a low-delay event with a larger $\tau$.</p>
+<p>Two consequences follow directly. A <em>late event</em> is one whose processing time falls after a window over its event time has already been computed and emitted, so the window's result was wrong and must either be revised or discarded. An <em>out-of-order event</em> is one that arrives after an event with a later event time, breaking the assumption that arrival order equals event order. Both are normal, not pathological, in any real stream. The leakage discipline of <a href="index.html">Section 2.6</a> sharpens the stakes further: a feature for the prediction at event time $t$ may use only information whose <em>processing</em> time is at or before $t$, because that is all a live system would actually have. Confusing "everything with event time before $t$" for "everything available by processing time $t$" is one of the most common ways a backtest leaks the future.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Stream Systems Trade Latency for Completeness Through Watermarks</div>
+<p>Modern stream processors (Apache Flink, Spark Structured Streaming, Beam) confront the late-event problem with a <em>watermark</em>: a moving assertion that "all events with event time at or before $W$ have probably now arrived". A window closes when the watermark passes its end. Set the watermark aggressively (small allowed lateness) and you get low latency but drop or mis-handle stragglers; set it generously and you wait longer but capture more late data. There is no free lunch, only an explicit dial between latency and completeness, and choosing where to set it is a modeling decision, not an infrastructure detail.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Learning Directly From Asynchronous Event Streams (2024 to 2026)</div>
+<p>The classical answer to irregular, out-of-order, multi-channel streams is to resample everything onto a regular grid and hope the artifacts are small. Recent work refuses that compromise and models event time as a first-class signal. Continuous-time architectures such as Neural Controlled Differential Equations and Latent ODE-RNN variants ingest irregularly timed observations directly, and the 2024 to 2026 literature on temporal point processes and transformer-based event models (building on the Neural Hawkes line and its attention successors) predicts both <em>what</em> happens and <em>when</em>, treating the inter-arrival delay as something to learn rather than to erase. Temporal foundation models (Moirai, TimesFM, Chronos) increasingly carry explicit time covariates and masking so that asynchronous, partially observed multivariate streams can be handled without a lossy grid projection. The throughline is a shift from "regularize the clock, then model" to "let the model see the real, ragged timing". The architectural machinery appears in <a href="../../toc.html">Chapter 13</a> and the event-modeling view in <a href="../../toc.html">Chapter 18</a>.</p>
+</div>
+
+<h2>4. Ordering and Monotonicity <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Almost every temporal operation, rolling windows, resampling, <code>asof</code> joins, differencing, lag features, assumes the index is sorted in increasing time and has no duplicates. Make that assumption explicit. A well-formed temporal index is a strictly increasing sequence</p>
+$$t_1 < t_2 < \cdots < t_n,$$
+<p>with no ties (which would be duplicates) and known, deliberate spacing (regular if $t_{i+1} - t_i$ is constant, irregular otherwise, but in either case understood rather than accidental). Three properties are worth checking on every dataset before modeling: monotonicity (is it sorted), uniqueness (are there duplicate timestamps), and gap structure (where are the holes, and are they expected). Pandas exposes the first two as cheap flags, <code>index.is_monotonic_increasing</code> and <code>index.is_unique</code>, and reconstructs the third with a <code>diff</code> on the index.</p>
+<p>The reason to be strict is that a non-monotonic or duplicated index does not raise; it silently produces wrong answers. A rolling mean over an unsorted index mixes the future into the past within each window. A duplicate timestamp double-counts in any aggregation and can make a <code>merge_asof</code> match the wrong row. A resample over an index with an unnoticed multi-day gap fabricates rows by forward-filling across the hole, manufacturing data that never existed. Because windowing is the foundation of nearly every feature in Chapter 2, a corrupt index poisons the feature matrix before any model sees it. The validator in Code 2.1.3 makes the three properties auditable in one pass and is the kind of guard worth running at every ingestion boundary.</p>
+<pre><code class="language-python">import pandas as pd
+import numpy as np
+
+def audit_temporal_index(idx: pd.DatetimeIndex, expected_freq="h"):
+    """Return a dict of health checks for a temporal index, plus the gap list."""
+    sorted_idx = idx.sort_values()
+    step = pd.Timedelta(1, unit=expected_freq)
+    gaps = sorted_idx.to_series().diff()
+    return {
+        "is_monotonic": bool(idx.is_monotonic_increasing),  # already sorted?
+        "is_unique":    bool(idx.is_unique),                 # no duplicate stamps?
+        "n_duplicates": int(idx.duplicated().sum()),
+        "n_missing_steps": int(((gaps - step) / step).round().clip(lower=0).sum()),
+        "max_gap": gaps.max(),                               # largest hole
+    }
+
+# A deliberately broken index: out of order, one duplicate, and a 3-hour hole.
+broken = pd.to_datetime([
+    "2026-01-01 00:00", "2026-01-01 02:00", "2026-01-01 01:00",  # 02:00 before 01:00
+    "2026-01-01 01:00",                                          # duplicate 01:00
+    "2026-01-01 06:00",                                          # jumps past 03,04,05
+])
+report = audit_temporal_index(pd.DatetimeIndex(broken))
+for k, v in report.items():
+    print(f"{k:>16}: {v}")
+
+# The repair recipe: sort, drop exact-duplicate timestamps, then proceed.
+clean = pd.DatetimeIndex(broken).sort_values()
+clean = clean[~clean.duplicated(keep="first")]
+print("clean & monotonic:", clean.is_monotonic_increasing, "| unique:", clean.is_unique)
+</code></pre>
+<div class="code-caption"><strong>Code 2.1.3:</strong> A one-pass temporal-index validator and the canonical repair (sort, then drop duplicates). It reports monotonicity, uniqueness, duplicate count, the number of missing regular steps, and the largest gap, the five facts you want before trusting any window.</div>
+<pre><code class="language-text">    is_monotonic: False
+       is_unique: False
+    n_duplicates: 1
+ n_missing_steps: 4
+         max_gap: 0 days 05:00:00
+clean & monotonic: True | unique: True
+</code></pre>
+<div class="code-caption"><strong>Output 2.1.3:</strong> The audit flags the unsorted order, the single duplicate 01:00, and four missing hourly steps hidden inside the jump to 06:00. After sorting and dropping the duplicate the index is monotonic and unique, ready for windowing; the gaps themselves are a separate decision (resample, interpolate, or leave), taken up in <a href="index.html">Section 2.2</a>.</p></div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Logging Pipeline That Averaged the Future Into the Past</div>
+<p><strong>Who:</strong> A site-reliability team computing rolling latency percentiles from multi-region service logs.</p>
+<p><strong>Situation:</strong> Logs from three data centers were unioned into one table and a 5-minute rolling p99 latency was computed for alerting. The dashboard looked smooth and alerts fired sensibly in testing.</p>
+<p><strong>Problem:</strong> In production the p99 line developed impossible dips, momentary latencies far below anything physically achievable, and a real incident was masked because the rolling window reported healthy numbers during an outage.</p>
+<p><strong>Dilemma:</strong> The numbers were not random noise, so the team suspected either a clock-skew problem between regions or a bug in the percentile code. Rewriting the percentile logic was tempting and visible; auditing the index was tedious and invisible.</p>
+<p><strong>Decision:</strong> They audited the index first, on the principle that a window computed over a disordered index is meaningless regardless of how correct the percentile math is.</p>
+<p><strong>How:</strong> The union step interleaved rows by arrival, not event time, and one region logged in naive local time while the others logged UTC, so the merged index was neither sorted nor consistently zoned. Running the equivalent of Code 2.1.3 revealed a non-monotonic index riddled with apparent duplicates. The fix was to convert every region's timestamps to UTC at ingestion, sort, and de-duplicate before any rolling computation, exactly the repair recipe shown above.</p>
+<p><strong>Result:</strong> The phantom dips vanished, the masked incident would have alerted correctly under the fixed pipeline, and an index audit became a mandatory gate at the ingestion boundary for every regional join.</p>
+<p><strong>Lesson:</strong> A rolling window is only as trustworthy as the order of its index. Validate monotonicity and uniqueness before you debug the statistic; the statistic is rarely the culprit when the index is wrong.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact: The Leap Second That Confused Half the Internet</div>
+<p>Civil time occasionally inserts a <em>leap second</em> to keep clocks aligned with Earth's slightly irregular rotation, producing a minute that is 61 seconds long. When this happens, a naive monotonicity check can see time appear to stand still or step backward for one second. Several large platforms have had outages at leap-second boundaries, which is why some operators now "smear" the extra second across a whole day rather than insert it abruptly. It is a small reminder that even UTC, the axis we trust, has its own quiet irregularities.</p>
+</div>
+
+<h2>5. Calendars, Business Time, and Irregular Clocks <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The final idea loosens the assumption that "time" means seconds at all. Many series live on a <em>business calendar</em> rather than a physical one. A stock index has no value at 3 a.m. on a Sunday, not because the data is missing but because the market is closed; a daily-returns model that naively assumes 365 evenly spaced days will compute a wrong overnight gap across every weekend and holiday. Trading calendars encode exactly which days and hours are valid, and libraries such as <code>pandas</code> business-day offsets and the <code>exchange_calendars</code> project turn "the next valid trading day" into a single call rather than a hand-maintained holiday list that goes stale.</p>
+<p>Pushing the idea further, the natural clock for some processes is an <em>event counter</em>, not a wall clock. Sampling "every 100 trades" (volume or tick bars) instead of "every minute" produces bars with far more uniform statistical properties, because activity, not the rotation of the Earth, drives the relevant dynamics. In the running healthcare dataset of this book, a patient's vitals are recorded when clinically warranted, so the meaningful index is the sequence of measurements, not a regular grid; resampling it to fixed minutes would both invent data and erase the information carried by <em>when</em> a measurement was taken. The reframing is liberating: time is whatever monotone index best parameterizes the process, and sometimes that index counts events rather than seconds. This perspective returns when we handle irregular sampling architecturally in <a href="../../toc.html">Chapter 13</a> and when we model event sequences directly in <a href="../../toc.html">Chapter 18</a>.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact: Markets Run on Their Own Clock</div>
+<p>Quantitative traders have long known that "clock time" is a poor axis for price data. The returns over the busy first and last half-hours of a trading day carry far more information than the sleepy lunchtime hour, even though each spans the same sixty minutes. Sampling by traded volume rather than by the clock effectively stretches and compresses time to match activity, and the resulting bars look far more like the textbook independent, identically distributed draws that classical models assume. The market's true clock ticks in trades, not seconds.</p>
+</div>
+<p>Taken together, the five subsections form a single contract for the rest of Chapter 2. Know that an instant is one scalar (subsection 1); keep that scalar in UTC and localize only at the edge (subsection 2); never confuse when an event happened with when you saw it (subsection 3); guarantee a sorted, unique, gap-aware index before any window (subsection 4); and remember that the right time axis is sometimes a calendar or an event counter rather than seconds (subsection 5). With this foundation in place, <a href="index.html">Section 2.2</a> can resample and aggregate safely, because the index it operates on is finally trustworthy.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 2.1.1: Event Time, Processing Time, and What a Live System Can See <span class="exercise-type conceptual">Conceptual</span></div>
+<p>A fraud model scores each card transaction the instant it is authorized. For a transaction with event time $\tau$, explain precisely which other transactions it may legitimately use as features and which it may not, in terms of event time $\tau_i$ and processing time $\rho_i$. Then describe a concrete scenario in which a transaction with an <em>earlier</em> event time must nonetheless be excluded from the feature set, and connect your answer to the watermark idea and to the leakage discipline of <a href="index.html">Section 2.6</a>.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 2.1.2: Break and Fix a Daylight Saving Resample <span class="exercise-type coding">Coding</span></div>
+<p>Construct an hourly pandas series of naive local timestamps spanning the spring forward transition for <code>Europe/London</code> (the missing-hour case). First resample it to a daily mean while leaving the index naive and observe the result. Then localize the index with the appropriate <code>nonexistent</code> argument, convert to UTC, resample again, and explain the difference. Repeat for an autumn fall-back date using the <code>ambiguous</code> argument as in Code 2.1.2, and state in one sentence the general rule your two fixes share.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 2.1.3: Quantify the Damage of a Disordered Index <span class="exercise-type analysis">Analysis</span></div>
+<p>Take a clean hourly series and compute a 6-hour rolling mean as the reference. Now corrupt the index three ways in turn: (a) shuffle a few rows so it is non-monotonic, (b) inject a handful of duplicate timestamps, and (c) delete a contiguous block to create a gap, then resample with forward fill. For each corruption, compute the rolling mean again and measure how far it departs from the reference. Rank the three corruptions by how badly they distort the window and explain, using the audit fields of Code 2.1.3, why a silent non-monotonic index is the most dangerous of the three.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html"><span class="nav-label">Previous</span><span class="nav-num">Contents</span><span class="nav-title">Temporal Data Engineering</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 2</span><span class="nav-num">Contents</span><span class="nav-title">Temporal Data Engineering</span></a>
+<a class="next" href="section-2.2.html"><span class="nav-label">Next</span><span class="nav-num">Section 2.2</span><span class="nav-title">Sampling, Resampling, and Aggregation</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>
