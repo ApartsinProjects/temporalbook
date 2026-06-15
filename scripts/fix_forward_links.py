@@ -52,7 +52,7 @@ def fix_file(f: pathlib.Path) -> int:
 
 def main():
     if len(sys.argv) > 1:
-        files = [pathlib.Path(a) for a in sys.argv[1:]]
+        files = [pathlib.Path(a).resolve() for a in sys.argv[1:]]
     else:
         files = [p for p in ROOT.rglob("*.html")
                  if not any(x in str(p) for x in ("VisionBook", "archive", "templates"))]
