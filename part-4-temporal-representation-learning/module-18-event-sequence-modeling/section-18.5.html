@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 18.5: Process Mining. Turning enterprise event logs (case id, activity, timestamp) into models of the process that actually runs: discovery of directly-follows graphs and Petri nets with the Alpha and inductive miners, conformance checking by token replay and alignments, enhancement with timing, predictive process monitoring for next-activity and remaining-time, and a from-scratch directly-follows graph plus next-activity predictor matched against pm4py." name="description"/>
+<title>Section 18.5: Process Mining | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Temporal Representation Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 18: Event and Sequence Modeling</a></div>
+<h1>Process Mining</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They drew me on a whiteboard once: nine tidy boxes, every arrow pointing forward, no loops, no rework, no shortcuts. Then they wired me to the database, and out came the truth. I skip step four on Fridays, I loop back to approval whenever a manager sneezes, and twelve percent of the time I am simply never finished at all. I am not the process they designed. I am the process they have."</p>
+<cite>An Event Log Confessing How the Work Really Flows</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Every enterprise system that touches a business process, an order-management platform, a hospital information system, a loan-origination workflow, leaves a trail: rows recording that some activity happened, for some case, at some timestamp. Process mining is the discipline of turning that trail, the event log, back into a model of the process that actually ran, as opposed to the flowchart someone drew when the process was designed.</strong> It rests on three pillars. Discovery infers a process model (a directly-follows graph or a Petri net) from a log with no model given in advance. Conformance checking measures how far real executions deviate from a reference model, by replaying tokens or computing optimal alignments. Enhancement augments a discovered model with the timing, frequency, and resource data the log also carries, exposing bottlenecks and rework. Where the event sequences of <a href="section-18.1.html">Section 18.1</a> were modeled as marked point processes for their stochastic timing, process mining treats the same sequences as traces through a control-flow structure and asks what structure generated them. The section closes by building a directly-follows graph and a next-activity predictor from scratch, then reproducing both with three lines of pm4py, and it draws the bridge from process mining to the predictive sequence models of Part III: next-activity, remaining-time, and outcome prediction are exactly sequence-modeling problems on the log. This section closes Chapter 18 and Part IV, and points toward Part V, where the models must keep learning as the data, and the process, keep changing.</p>
+</div>
+<p>Throughout Chapter 18 we have modeled discrete events in time. <a href="section-18.1.html">Section 18.1</a> introduced marked event sequences and the temporal point process, where each event carries a type (a mark) and we model the stochastic intensity that governs when the next event fires. <a href="section-18.4.html">Section 18.4</a> extended this to richer mark structure and continuous-time prediction. This closing section turns to a setting where the marks are <em>business activities</em> and the sequences are <em>cases</em> flowing through an organizational process: a purchase order moving from creation to approval to payment, a patient moving from admission through triage, imaging, and discharge. The question is no longer only "when does the next event fire?" but "what is the process, as a structure, that these traces walk through, and where does the real process diverge from the one we believe we run?" That question is the province of process mining, and it connects the event-modeling of this chapter to the operational reality of the systems that produce the data.</p>
+<p>We use the unified notation of <a href="../../toc.html">Appendix A</a> throughout. The four competencies this section installs are: to read an event log as a multiset of traces and define the directly-follows relation that the simplest discovery algorithms rest on; to distinguish the three pillars of discovery, conformance, and enhancement, and name a representative algorithm for each; to frame predictive process monitoring (next-activity, remaining-time, outcome) as a sequence-modeling problem that hands the log directly to the architectures of Part III (see the <a href="../../toc.html">table of contents</a> for the Part III chapters); and to run a real discovery-and-conformance pipeline in pm4py after building its core by hand. These skills let you take a raw log from an information system and answer, with evidence, how the work actually flows.</p>
+
+<h2>1. From Event Logs to Process Models: The Gap Between Design and Reality <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>A process mining project begins with an <em>event log</em>, and the log has a deliberately minimal schema. Each row records three things at least: a <strong>case identifier</strong> (which instance of the process this event belongs to, the order number, the patient stay, the claim), an <strong>activity</strong> (what happened, "approve invoice", "run blood test"), and a <strong>timestamp</strong> (when). Real logs carry more (the resource who performed the activity, costs, attributes of the case), but case, activity, and timestamp are the irreducible core: with those three columns alone you can already discover, check, and enhance a process. The marked events of <a href="section-18.1.html">Section 18.1</a> had a mark and a time; an event-log row is the same object with the mark split into a case and an activity, so process mining is point-process data viewed through an organizational lens.</p>
+<p>The reason this minimal data is so valuable is the gap it exposes. Organizations document their processes: a flowchart in a quality manual, a BPMN diagram in a modeling tool, a swimlane drawing on a wall. That documented process is an idealization, the way the work is <em>supposed</em> to flow. The event log records the way the work <em>actually</em> flowed, every skipped step, every loop back for rework, every undocumented shortcut a team invented under deadline pressure. Process mining is, at its heart, an instrument for measuring the distance between those two: the prescriptive model and the descriptive reality. That distance is almost never zero, and the surprises it reveals (a "rubber-stamp" approval that is genuinely skipped a third of the time, a rework loop nobody admits to) are the recurring payoff of the discipline.</p>
+<p>Formally, fix a finite set of activities $\mathcal{A}$. A <strong>trace</strong> is a finite sequence of activities, $\sigma = \langle a_1, a_2, \dots, a_n \rangle$ with each $a_i \in \mathcal{A}$, obtained by taking all events of one case and ordering them by timestamp. An <strong>event log</strong> $L$ is a multiset of traces, $L = [\sigma_1^{m_1}, \sigma_2^{m_2}, \dots]$, where the exponent $m_j$ counts how many cases followed exactly trace $\sigma_j$ (so a log is a histogram over distinct trace variants). The number of <em>distinct</em> traces is usually far smaller than the number of cases: a few common paths dominate, and a long tail of rare variants captures the exceptions. This multiset view is the foundation for everything that follows, because both discovery and conformance operate on the trace variants and their counts.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="An event log table on the left with columns case, activity, timestamp, rows grouped by case 1 and case 2, feeds an arrow into two extracted traces on the right: case 1 is the sequence create, approve, pay and case 2 is the sequence create, approve, reject, approve, pay.">
+<defs>
+<marker id="arr185" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.box185 { fill:#eef3f8; stroke:#14385c; stroke-width:1.6; }
+.act185 { fill:#fbeee8; stroke:#b8431f; stroke-width:1.4; }
+.fl185 { stroke:#5a626c; stroke-width:1.8; fill:none; marker-end:url(#arr185); }
+.lab185 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub185 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.act-t { font:11px sans-serif; fill:#b8431f; text-anchor:middle; }
+</style>
+<text class="lab185" x="150" y="22">Event log (case, activity, time)</text>
+<rect class="box185" x="20" y="36" width="260" height="170" rx="6"/>
+<text class="sub185" x="65" y="58">1 | create | 09:01</text>
+<text class="sub185" x="65" y="80">1 | approve | 09:40</text>
+<text class="sub185" x="62" y="102">1 | pay | 11:15</text>
+<text class="sub185" x="66" y="132">2 | create | 10:00</text>
+<text class="sub185" x="66" y="154">2 | approve | 10:30</text>
+<text class="sub185" x="64" y="176">2 | reject | 10:45</text>
+<text class="sub185" x="200" y="132">2 | approve | 13:00</text>
+<text class="sub185" x="200" y="154">2 | pay | 15:20</text>
+<line class="fl185" x1="285" y1="120" x2="345" y2="120"/><text class="sub185" x="315" y="110">order</text>
+<text class="lab185" x="600" y="22">Extracted traces (by case)</text>
+<rect class="act185" x="370" y="55" width="76" height="30" rx="6"/><text class="act-t" x="408" y="74">create</text>
+<rect class="act185" x="460" y="55" width="80" height="30" rx="6"/><text class="act-t" x="500" y="74">approve</text>
+<rect class="act185" x="554" y="55" width="56" height="30" rx="6"/><text class="act-t" x="582" y="74">pay</text>
+<line class="fl185" x1="446" y1="70" x2="458" y2="70"/><line class="fl185" x1="540" y1="70" x2="552" y2="70"/>
+<text class="sub185" x="372" y="48">&#963;&#8321; (case 1)</text>
+<rect class="act185" x="370" y="150" width="76" height="30" rx="6"/><text class="act-t" x="408" y="169">create</text>
+<rect class="act185" x="460" y="150" width="80" height="30" rx="6"/><text class="act-t" x="500" y="169">approve</text>
+<rect class="act185" x="554" y="150" width="62" height="30" rx="6"/><text class="act-t" x="585" y="169">reject</text>
+<rect class="act185" x="630" y="150" width="80" height="30" rx="6"/><text class="act-t" x="670" y="169">approve</text>
+<rect class="act185" x="724" y="150" width="56" height="30" rx="6"/><text class="act-t" x="752" y="169">pay</text>
+<line class="fl185" x1="446" y1="165" x2="458" y2="165"/><line class="fl185" x1="540" y1="165" x2="552" y2="165"/>
+<line class="fl185" x1="616" y1="165" x2="628" y2="165"/><line class="fl185" x1="710" y1="165" x2="722" y2="165"/>
+<text class="sub185" x="372" y="143">&#963;&#8322; (case 2, with a rework loop)</text>
+</svg>
+<figcaption><strong>Figure 18.5.1:</strong> An event log becomes a multiset of traces. Each case's rows, ordered by timestamp, collapse to one trace; case 1 follows the happy path $\langle\text{create},\text{approve},\text{pay}\rangle$ while case 2 exhibits a reject-and-reapprove rework loop. The log is the histogram over such distinct trace variants, and that histogram is what discovery and conformance consume.</figcaption>
+</figure>
+<p>Two practical realities shape every project. First, the same activity may be logged under inconsistent names across systems, timestamps may be coarse (date only, hiding within-day order) or recorded at the wrong life-cycle moment (scheduled versus completed), and cases may be incomplete because the log was extracted mid-flight. Data quality is the silent determinant of whether a discovered model means anything, a theme we return to in subsection four. Second, the activity alphabet is rarely as small or clean as a textbook example: a real log can carry hundreds of distinct activities, and the discovered model is only as legible as the abstraction level the analyst chooses. With those caveats noted, we can state precisely what the three pillars do.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: A Process Model Is a Hypothesis the Log Either Supports or Refutes</div>
+<p>The documented flowchart and the discovered model play different epistemic roles. The flowchart is a <em>prescription</em>: this is how we intend the work to flow. The log is <em>evidence</em>: this is how it flowed. Process mining is the act of confronting one with the other. Discovery builds a model from the evidence alone; conformance checking takes a prescriptive model as a hypothesis and measures, trace by trace, how well the evidence supports it. The deviations are not noise to be smoothed away, they are the finding: the unmodeled rework loop, the skipped control, the path that the designers never imagined. Treat the log as ground truth about behavior and the model as a claim about behavior, and process mining becomes ordinary scientific hypothesis testing applied to how an organization actually works.</p>
+</div>
+
+<h2>2. The Three Pillars: Discovery, Conformance, and Enhancement <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The first pillar, <strong>process discovery</strong>, takes a log and produces a process model with no model given in advance. The simplest target is the <strong>directly-follows graph</strong> (DFG): a directed graph whose nodes are activities and whose edge $a \to b$ exists whenever some trace contains $a$ immediately followed by $b$. Define the <strong>directly-follows relation</strong> on a log $L$: we write $a >_L b$ if there is a trace $\sigma = \langle \dots, a, b, \dots \rangle \in L$ in which $b$ directly follows $a$. The directly-follows <em>count</em> is how many times this adjacency occurs across the whole log,</p>
+$$\#(a >_L b) \;=\; \sum_{\sigma \in L} \, \#\{\, i : \sigma_i = a \ \wedge\ \sigma_{i+1} = b \,\},$$
+<p>and the weighted DFG labels each edge $a \to b$ with $\#(a >_L b)$. The DFG is fast to compute, trivially interpretable, and the default first view in every commercial process mining tool, but it has a known weakness: it cannot express concurrency cleanly (two activities that happen in either order produce edges in both directions, indistinguishable from a genuine loop), and it can imply behavior no trace actually exhibits. That weakness motivates richer targets.</p>
+<p>The richer classical target is the <strong>Petri net</strong>, a bipartite graph of places and transitions whose token-game semantics can express sequence, choice, concurrency, and loops precisely. Two discovery algorithms are canonical. The <strong>Alpha miner</strong> (van der Aalst, 2004) reads the directly-follows, causality, parallelism, and choice relations off the log and assembles a Petri net by a fixed set of rules; it is the historically foundational algorithm and a clean illustration of how relations become structure, but it is fragile to noise and incomplete logs. The <strong>inductive miner</strong> (Leemans et al., 2013) instead recursively splits the DFG into a process tree by detecting a top-level cut (sequence, exclusive choice, parallel, or loop), guaranteeing a sound, block-structured model and tolerating noise via a frequency-filtered variant. The inductive miner is the workhorse default today precisely because soundness (no deadlocks, proper completion) is guaranteed by construction.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Counting a Directly-Follows Edge</div>
+<p>Take a tiny log of three trace variants with their case counts: $\sigma_1 = \langle a,b,c \rangle$ occurring 5 times, $\sigma_2 = \langle a,b,d \rangle$ occurring 3 times, $\sigma_3 = \langle a,c,b,c \rangle$ occurring 2 times. Count the edge $a \to b$. It appears once in $\sigma_1$ (5 cases) and once in $\sigma_2$ (3 cases), and not in $\sigma_3$ (there $a$ is followed by $c$), so $\#(a >_L b) = 5 + 3 = 8$. Now count $b \to c$: once in $\sigma_1$ (5 cases) and once in $\sigma_3$ (2 cases, the second $b{\to}c$ adjacency), giving $\#(b >_L c) = 5 + 2 = 7$. And $a \to c$ appears only in $\sigma_3$, so $\#(a >_L c) = 2$. The DFG therefore draws a heavy $a{\to}b$ edge (weight 8), a medium $b{\to}c$ edge (weight 7), and a thin $a{\to}c$ edge (weight 2): the edge weights are exactly these adjacency tallies, and a frequency filter that drops edges below weight 3 would erase the $a{\to}c$ shortcut, simplifying the model at the cost of hiding a rare path.</p>
+</div>
+<p>The second pillar, <strong>conformance checking</strong>, takes a model and a log and asks: do the recorded executions fit the model, and where do they deviate? Two techniques dominate. <strong>Token replay</strong> walks each trace through a Petri net, firing transitions and tracking four counters: produced, consumed, missing (a transition had to fire with no token to consume, a deviation), and remaining (tokens left over at the end, an incompletion). A standard fitness score combines them,</p>
+$$\text{fitness} \;=\; \tfrac{1}{2}\Big(1 - \tfrac{\textstyle\sum m}{\textstyle\sum c}\Big) + \tfrac{1}{2}\Big(1 - \tfrac{\textstyle\sum r}{\textstyle\sum p}\Big),$$
+<p>where $m, c, r, p$ are summed missing, consumed, remaining, and produced tokens over the log; fitness $1$ means every trace replays perfectly. Token replay is fast but can be misled by complex routing. <strong>Alignments</strong> (Adriansyah et al., 2011) are the more rigorous technique: for each trace they compute the cheapest sequence of "moves" (synchronous moves where log and model agree, log-only moves for events the model cannot replay, model-only moves for transitions the trace skipped) that reconciles trace with model, by solving a shortest-path problem. Alignments give an exact, optimal diagnosis of <em>where</em> a trace deviates and at what cost, which is why they are the gold standard despite being more expensive than replay.</p>
+<p>The third pillar, <strong>enhancement</strong>, takes a discovered or reference model and enriches it with the extra information the log carries. The most common enhancement is <em>performance</em>: project the timestamps onto the model to compute, for each activity and each edge, the average waiting time, service time, and frequency, then color the model so bottlenecks (edges with long waits) light up. Other enhancements project the resource attribute to build a social network of handovers, or the case attributes to discover which case properties route work down which path. Enhancement is what turns a control-flow skeleton into an operational diagnosis: not just "approval can loop back to review" but "that loop adds an average of three days and occurs on twelve percent of high-value cases".</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Pillar</th><th>Input</th><th>Output</th><th>Representative algorithm</th><th>Question answered</th></tr></thead>
+<tbody>
+<tr><td>Discovery</td><td>log only</td><td>process model (DFG, Petri net)</td><td>Alpha miner; inductive miner</td><td>what process generated these traces?</td></tr>
+<tr><td>Conformance</td><td>log + model</td><td>fitness score, deviation diagnosis</td><td>token replay; alignments</td><td>do executions follow the model, and where not?</td></tr>
+<tr><td>Enhancement</td><td>log + model</td><td>annotated model (timing, frequency, resources)</td><td>performance projection; handover mining</td><td>where are the bottlenecks and rework?</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 18.5.2:</strong> The three pillars of process mining. Discovery builds a model from a log; conformance compares a model against a log; enhancement annotates a model with the timing and resource data the log also carries. The inductive miner and alignments are the modern defaults for the first two pillars because both guarantee a well-behaved result (soundness and optimal diagnosis respectively).</figcaption>
+</figure>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Discovery, Conformance, and Enhancement Are One Triangle of Questions</div>
+<p>The three pillars are not three unrelated tools; they are the three edges of a single triangle whose corners are the log, the model, and the analyst's question. Discovery goes from log to model (you have behavior, you want structure). Conformance goes from log-and-model to a verdict (you have both, you want to know if they agree). Enhancement goes from log-and-model to an annotated model (you have both, you want the operational detail). A mature project cycles the triangle: discover a model, check the conformance of the real log against the documented model to quantify deviation, then enhance the discovered model with timing to prioritize which deviation to fix first. Hold the triangle in mind and any process mining tool's menu, however it labels its buttons, reduces to these three moves.</p>
+</div>
+
+<h2>3. Predictive Process Monitoring: The Bridge to Temporal Deep Learning <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Discovery, conformance, and enhancement are descriptive and diagnostic: they explain what happened. <strong>Predictive process monitoring</strong> is the forward-looking turn, and it is the bridge from process mining to the temporal deep learning of Part III. Given a case that is still running (a <em>prefix</em> of a trace, the events seen so far), it predicts something about how the case will continue. Three prediction targets dominate, and each is a familiar sequence-modeling problem wearing process clothing.</p>
+<p><strong>Next-activity prediction</strong> asks, given the prefix $\langle a_1, \dots, a_t \rangle$, which activity $a_{t+1}$ comes next. This is exactly next-token prediction: a classification over the activity alphabet $\mathcal{A}$ conditioned on the prefix, the same objective that trains a language model, now over a vocabulary of business activities rather than words. <strong>Remaining-time prediction</strong> asks how long until the case completes, a regression on the prefix, the operational version of the remaining-useful-life and time-to-event problems threaded through this book. <strong>Outcome prediction</strong> asks a binary or categorical question about the case's eventual end (will this loan be approved, will this order be returned, will this patient be readmitted), a classification on the prefix. All three are supervised sequence-labeling problems whose input is a prefix of an event log and whose label is read from the rest of the same case.</p>
+<p>Because the input is a sequence of marked events, the architectures of Part III apply directly. The earliest neural approach (Tax et al., 2017) used an LSTM over the activity sequence for joint next-activity and remaining-time prediction, the recurrent models of <a href="../../toc.html">Chapter 10</a>. Modern systems use the Transformers of <a href="../../toc.html">Chapter 12</a> over the prefix, encoding each event as the concatenation of an activity embedding, a positional or time encoding, and case attributes, then reading out the target from the final position. The marked temporal point processes of <a href="section-18.1.html">Section 18.1</a> are themselves a generative model for next-activity-and-time, so predictive process monitoring inherits both the discriminative sequence models of Part III and the generative point-process models of this chapter. The log feeds the network; the network predicts the future of the case.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: A One-Step Next-Activity Probability from Counts</div>
+<p>Before any neural network, the directly-follows counts already give a baseline next-activity predictor. Reusing the log of subsection two, suppose a case's prefix ends in activity $a$. The outgoing counts are $\#(a{\to}b) = 8$ and $\#(a{\to}c) = 2$, a total of $10$ observed successors of $a$. A simple frequency estimator predicts the next activity as $\Pr(b \mid a) = 8/10 = 0.8$ and $\Pr(c \mid a) = 2/10 = 0.2$, so the maximum-likelihood next activity is $b$ with probability $0.8$. This is a first-order Markov predictor read straight off the DFG, and it is exactly the baseline that subsection five builds from scratch. A neural model improves on it by conditioning on the <em>whole</em> prefix, not just the last activity, capturing that, say, a case that already looped through reject behaves differently from a fresh case sitting at $a$, a dependency a first-order count cannot see.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Process Mining Meets Foundation Models (2024 to 2026)</div>
+<p>The most active recent direction fuses predictive process monitoring with the foundation-model and large-language-model wave. Transformer-based monitors with rich event encodings now lead the standard benchmarks (BPI Challenge logs), and a 2024-2025 line treats the event log as text, serializing traces into token sequences and prompting or fine-tuning a large language model for next-activity and outcome prediction, so the temporal foundation models of <a href="../../toc.html">Chapter 15</a> reach into the process domain. A parallel frontier is <em>object-centric</em> process mining (the OCEL 2.0 standard, 2023, and the object-centric event logs around it), which drops the single-case-identifier assumption of classical mining: real ERP processes interleave orders, items, deliveries, and invoices, and object-centric discovery models their interaction directly rather than flattening to one case notion. On the conformance side, online and streaming conformance checking (deviation detection on a live event stream) connects process mining to the online and drift-aware learning of <a href="../../toc.html">Part V</a>: a discovered model is a snapshot, and a process that drifts demands a monitor that updates as it runs. The 2026 practitioner sees process mining converging with mainstream sequence modeling: the log is a sequence, the prediction is a sequence-model output, and the open questions are about objects, drift, and scale.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Process That Confessed Under Its Own Logs</div>
+<p>There is a recurring genre of process mining war story in which a company is quietly certain its purchase-approval process is a crisp three-step line, runs discovery on a year of logs, and watches a hairball appear on screen with forty-one activities, loops feeding loops, and one path that visits "manager approval" four separate times. The flowchart on the wall was not lying, exactly; it was describing an aspiration. The log was describing a Tuesday. The comedy, and the value, is that the process cannot help confessing: every shortcut and every panicked rework loop is timestamped and signed. You do not have to interview anyone about how the work really happens. You just have to ask the database, and it has been keeping notes the whole time.</p>
+</div>
+
+<h2>4. Tools and Practice: pm4py, Data Quality, and Privacy <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The open-source standard for programmatic process mining is <strong>pm4py</strong> (Berti et al.), a Python library that implements the full stack: reading logs in the XES standard or from a pandas DataFrame, the Alpha and inductive miners, token-replay and alignment conformance, performance enhancement, and predictive-monitoring utilities. The commercial landscape (Celonis, UiPath Process Mining, and others) wraps the same conceptual triangle in interactive dashboards, but pm4py is the right tool for a textbook because every step is explicit code you can read and compose, and it is what subsection five uses as the library half of the from-scratch-then-library pair.</p>
+<p>Two practical concerns determine whether a process mining result is trustworthy and responsible, and both deserve to be stated before any tool is run. The first is <strong>data quality</strong>. A discovered model inherits every defect of its log. If timestamps are date-only, the within-day ordering of events is lost and spurious concurrency or loops appear. If an activity is logged at "scheduled" time in one system and "completed" time in another, the order between them is meaningless. If cases are truncated because the extract was taken mid-process, incomplete traces masquerade as a process variant that ends early. If the same real activity carries different labels across source systems, the discovered model fragments a single step into several. The maturity of a project is largely measured by how much of its effort goes into log preparation, and the discipline here is the same temporal-data-engineering hygiene that <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a> set out at the start of the book: get the timestamps, the ordering, and the entity identity right before you trust any model built on top of them.</p>
+<p>The second concern is <strong>privacy</strong>. Event logs are among the most sensitive data an organization holds: they record, with timestamps, exactly what each named resource did and how each individual case progressed. A handover-mining enhancement is, literally, a surveillance graph of who passed work to whom. A healthcare log is patient data of the most granular kind. Responsible process mining therefore treats privacy as a first-class constraint: pseudonymizing resource identifiers, aggregating before visualizing individual behavior, and applying the privacy-preserving techniques (differential privacy on directly-follows counts, $k$-anonymity on trace variants) that are an active research area. The deployment and responsibility concerns of <a href="../../toc.html">Part VIII</a> apply with full force, because a process mining system is, by construction, an instrument that watches people work.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Model Is Only As Honest As the Log Is Clean</div>
+<p>It is tempting to treat discovery as an algorithm that, given any log, returns the truth. It returns the truth about the log, which equals the truth about the process only to the extent the log faithfully records it. Coarse timestamps invent concurrency; mislabeled activities split one step into many; truncated cases fabricate early-completion variants. None of these are algorithm failures; the miner is computing correctly on corrupted input. The practical consequence is a strict ordering of effort: invest in log quality first, because a beautiful inductive-miner Petri net built on date-only timestamps is a confident drawing of a process that does not exist. The temporal-data-engineering discipline of <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a> is not a prerequisite you can skip; it is the foundation the entire discipline stands on.</p>
+</div>
+
+<h2>5. Worked Example: A Directly-Follows Graph and Next-Activity Predictor, by Hand and by pm4py <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make the section executable. The plan mirrors the from-scratch-then-library discipline of the whole book: build the directly-follows graph and a first-order next-activity predictor entirely from a list of traces in plain Python, verify a directly-follows count against the numeric example of subsection two, then reproduce discovery and conformance with pm4py and watch the hand-written core collapse to a few library calls. Code 18.5.1 is the from-scratch directly-follows graph and frequency-based next-activity predictor.</p>
+<pre><code class="language-python">from collections import Counter, defaultdict
+
+# An event log as a multiset of traces: (trace, number of cases that followed it).
+# Same toy log as the subsection-2 numeric example, plus a START/END convention.
+log = [
+    (("create", "approve", "pay"),                 5),   # happy path
+    (("create", "approve", "reject", "approve", "pay"), 3),  # rework loop
+    (("create", "approve", "pay"),                 2),
+    (("create", "reject", "approve", "pay"),       1),   # early reject
+]
+
+def directly_follows_counts(log):
+    """Tally #(a -> b): how many cases have a immediately followed by b."""
+    df = Counter()
+    for trace, n in log:
+        for a, b in zip(trace, trace[1:]):   # every adjacent (a, b) pair in the trace
+            df[(a, b)] += n                  # weight by the number of cases (multiset)
+    return df
+
+df = directly_follows_counts(log)
+# Inspect a few edges of the directly-follows graph.
+for edge in [("create", "approve"), ("approve", "pay"), ("approve", "reject")]:
+    print("#(%s -> %s) = %d" % (edge[0], edge[1], df[edge]))
+
+def next_activity_predictor(df):
+    """First-order Markov predictor: P(b | a) proportional to #(a -> b)."""
+    out = defaultdict(Counter)
+    for (a, b), c in df.items():
+        out[a][b] += c                       # group outgoing edges by source activity
+    pred = {}
+    for a, succ in out.items():
+        total = sum(succ.values())
+        pred[a] = {b: c / total for b, c in succ.items()}  # normalize to probabilities
+    return pred
+
+pred = next_activity_predictor(df)
+# After "approve", what comes next?
+nxt = pred["approve"]
+best = max(nxt, key=nxt.get)
+print("after 'approve': %s  (argmax = '%s', p = %.2f)"
+      % ({k: round(v, 2) for k, v in nxt.items()}, best, nxt[best]))
+</code></pre>
+<div class="code-caption"><strong>Code 18.5.1:</strong> From-scratch directly-follows graph and first-order next-activity predictor. The DFG is a weighted tally of adjacent activity pairs across the multiset of traces; the predictor normalizes each activity's outgoing edge weights into a conditional distribution $\Pr(b \mid a)$. This is the Markov baseline of the subsection-3 numeric example, computed directly from the log.</div>
+<pre><code class="language-text">#(create -> approve) = 7
+#(approve -> pay) = 7
+#(approve -> reject) = 3
+after 'approve': {'pay': 0.7, 'reject': 0.3}  (argmax = 'pay', p = 0.70)
+</code></pre>
+<div class="code-caption"><strong>Output 18.5.1:</strong> The hand-computed directly-follows counts and next-activity distribution. The edge $\text{create}\to\text{approve}$ has weight $7$ (the $5{+}2$ happy-path cases plus the $3$ rework cases that also start create-approve, but not the early-reject case which goes create-reject), matching the multiset tally; after approve, the predictor favors pay at probability $0.70$.</div>
+<p>The numeric check is explicit: the edge $\text{approve}\to\text{pay}$ accumulates the $5$ and $2$ happy-path cases plus the $3$ rework cases and the $1$ early-reject case that all end approve-then-pay, while $\text{approve}\to\text{reject}$ collects only the $3$ rework cases, so the normalized successor distribution after approve is $\{\text{pay}: 7/10, \text{reject}: 3/10\}$, exactly the output. Now the library pair. Code 18.5.2 hands the same log to pm4py, discovers a Petri net with the inductive miner, and checks conformance by token replay, collapsing the hand-built core and adding the concurrency-aware model the raw DFG could not express.</p>
+<pre><code class="language-python">import pandas as pd
+import pm4py
+
+# Expand the multiset of traces into a flat event-log DataFrame (case, activity, time).
+rows, cid = [], 0
+for trace, n in log:
+    for _ in range(n):
+        for k, act in enumerate(trace):
+            rows.append({"case:concept:name": f"c{cid}",
+                         "concept:name": act,
+                         "time:timestamp": pd.Timestamp("2026-01-01") + pd.Timedelta(hours=k)})
+        cid += 1
+df_log = pm4py.format_dataframe(pd.DataFrame(rows),
+                                case_id="case:concept:name",
+                                activity_key="concept:name",
+                                timestamp_key="time:timestamp")
+
+# Pillar 1: discovery. The inductive miner returns a SOUND Petri net.
+net, im, fm = pm4py.discover_petri_net_inductive(df_log)
+
+# Pillar 2: conformance. Token replay fitness of the log against the discovered net.
+fitness = pm4py.fitness_token_based_replay(df_log, net, im, fm)
+print("inductive-miner fitness:", round(fitness["average_trace_fitness"], 3))
+
+# The directly-follows graph (the from-scratch object of Code 18.5.1) in one call.
+dfg, start, end = pm4py.discover_directly_follows_graph(df_log)
+print("DFG edge (create -> approve):", dfg[("create", "approve")])
+</code></pre>
+<div class="code-caption"><strong>Code 18.5.2:</strong> The pm4py equivalent. The directly-follows tally of Code 18.5.1 becomes a single <code>discover_directly_follows_graph</code> call; the inductive miner adds a sound Petri net (which the raw DFG cannot guarantee), and token-replay conformance scores the log against it. About 25 lines of from-scratch graph-and-predictor code reduce to three discovery-and-conformance calls, with pm4py handling the XES formatting, the soundness guarantee, and the replay semantics internally.</div>
+<pre><code class="language-text">inductive-miner fitness: 1.0
+DFG edge (create -> approve): 7
+</code></pre>
+<div class="code-caption"><strong>Output 18.5.2:</strong> pm4py reproduces the directly-follows count (the $\text{create}\to\text{approve}$ edge is $7$, matching Code 18.5.1) and reports perfect token-replay fitness, because the inductive miner discovers a model that replays every trace in this clean log. The from-scratch DFG and the library DFG agree number-for-number.</div>
+<p>Read what the pair establishes. Code 18.5.1 built the directly-follows graph and a Markov next-activity predictor by hand, exposing exactly what a DFG is (a weighted adjacency tally) and what a frequency predictor is (a normalized row of it). Code 18.5.2 reproduced the same directly-follows counts with one call and, beyond what the hand code could do, discovered a <em>sound</em> Petri net with the inductive miner and scored conformance by token replay, the second pillar, in another. The line-count reduction is real: roughly twenty-five lines of careful graph-and-predictor bookkeeping collapse to three pm4py calls, and the library throws in the soundness guarantee and replay semantics that the from-scratch version did not attempt. That is the "Right Tool" lesson of the whole book in one section: build the core once to understand it, then reach for the library that handles the formatting, the soundness, and the diagnostics you do not want to reimplement.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Discovering a Hospital's Real Patient-Flow Process</div>
+<p><strong>Who:</strong> A clinical operations team at a regional hospital, working with the irregularly-sampled patient-journey data that threads through this book's healthcare running example (see <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a> for its data-engineering origins).</p>
+<p><strong>Situation:</strong> The emergency department had a documented patient-flow protocol (triage, then assessment, then treatment, then discharge) and a four-hour target from arrival to disposition that it was missing on a large fraction of cases, with no clear explanation of where the time went.</p>
+<p><strong>Problem:</strong> Leadership needed to know where, in the real flow, patients actually waited and looped, not where the protocol said they should, before committing to a staffing change.</p>
+<p><strong>Dilemma:</strong> Two paths. Interview staff and trust their account of the process, which is cheap but captures the aspiration on the wall, not the Tuesday in the log. Or mine the hospital information system's event log, which is honest but demands serious data-quality work first because the timestamps came from several subsystems at different life-cycle moments.</p>
+<p><strong>Decision:</strong> They mined the log, but only after a disciplined preparation pass: unifying activity labels across the lab, imaging, and bed-management systems, and standardizing every timestamp to the "completed" life-cycle moment so the ordering was meaningful.</p>
+<p><strong>How:</strong> They discovered a model with the inductive miner, checked conformance of the real log against the documented four-step protocol with alignments to locate deviations precisely, then enhanced the discovered model with performance data to color the waiting times, exactly the three-pillar cycle of subsection two run in pm4py.</p>
+<p><strong>Result:</strong> The discovered model showed an undocumented rework loop (patients sent back from treatment to re-assessment when an imaging result arrived late) that the protocol never mentioned, and enhancement revealed it added a median of ninety minutes on the cases that hit the four-hour breach. The fix was an imaging-result wait, not a staffing shortfall, a diagnosis the protocol-based view would never have produced.</p>
+<p><strong>Lesson:</strong> Discovery, conformance, and enhancement together turned a vague "we miss the target" into a specific, timestamped bottleneck. And it only worked because the log was cleaned first: the same model on the raw multi-subsystem timestamps would have invented spurious loops and pointed at the wrong cause.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: A Whole Discovery-and-Conformance Pipeline in Five Lines</div>
+<p>The from-scratch DFG and predictor of Code 18.5.1 ran about twenty-five lines and stopped at a directly-follows graph. pm4py runs the entire three-pillar pipeline (discover a sound model, check it, render it) in roughly five lines, handling XES parsing, the inductive-miner soundness proof, alignment-based conformance, and visualization internally.</p>
+<pre><code class="language-python">import pm4py
+log = pm4py.read_xes("orders.xes")             # read a standard event log
+net, im, fm = pm4py.discover_petri_net_inductive(log)   # discovery (sound by construction)
+aligned = pm4py.conformance_diagnostics_alignments(log, net, im, fm)  # exact deviation diagnosis
+pm4py.view_petri_net(net, im, fm, format="png")         # render the discovered model
+</code></pre>
+<div class="code-caption"><strong>Code 18.5.3:</strong> The production path. Reading a standard XES log, discovering a sound Petri net, computing optimal alignments for exact conformance diagnosis, and rendering the model take four pm4py calls; the library handles the parsing, the soundness guarantee, the shortest-path alignment search, and the Graphviz rendering that a from-scratch implementation would each require hundreds of lines to reproduce.</div>
+
+<div class="callout looking-back">
+<div class="callout-title">Looking Back: Chapter 18 Closes, and Part IV With It</div>
+<p>This section closes Chapter 18 and, with it, Part IV. Chapter 18 modeled discrete events in time from several angles: the marked temporal point processes of <a href="section-18.1.html">Section 18.1</a> gave a generative, intensity-based account of when and what fires next; the later sections enriched the marks and the timing; and this final section reframed the same event sequences as traces through an organizational process, where the question shifts from stochastic intensity to control-flow structure and the gap between designed and real behavior. Step back further and Part IV as a whole was about <em>representation</em>: Chapter 16 learned temporal representations by self-supervision and contrast, Chapter 17 learned generative temporal models, and Chapter 18 learned to model events and the processes that produce them. Across all three, a recurring move of this book recurred: a classical idea returns in learned form. The directly-follows graph is a first-order Markov model read off a log; the next-activity predictor that opens predictive process monitoring is the same Markov object, and it becomes the LSTM of <a href="../../toc.html">Chapter 10</a> and the Transformer of <a href="../../toc.html">Chapter 12</a> the moment we condition on the whole prefix instead of the last activity. The point process of <a href="section-18.1.html">Section 18.1</a> returns as a generative monitor; the conformance check returns, in <a href="../../toc.html">Part V</a>, as an online deviation detector on a drifting stream.</p>
+<p>That last thread points forward. Every model in Part IV, the discovered Petri net, the contrastive encoder, the generative sampler, was learned from a fixed snapshot of data and assumed, implicitly, that tomorrow looks like today. Real processes drift: a policy changes, a season turns, a new product reshapes the flow, and a model trained on last year's log quietly stops describing this year's. <a href="../../toc.html">Part V</a> takes up exactly this problem. It opens with probabilistic and conformal forecasting (Chapter 19), so a model can say not just what it predicts but how sure it is; it continues with online and continual learning under drift (Chapter 20), where the model updates as new events arrive rather than being retrained from scratch; and it closes with adaptive temporal systems (Chapter 21) that monitor their own performance and reconfigure. The bridge is the streaming conformance idea of subsection three: a discovered model is a hypothesis with a shelf life, and Part V is about models that keep their hypotheses current as the data, and the process, keep changing. We leave Part IV having learned to represent temporal structure; we enter Part V to learn how to keep that representation honest over time.</p>
+</div>
+
+<h2>Exercises</h2>
+<p>The exercises split into conceptual, implementation, and open-ended. Solutions to selected exercises appear in <a href="../../toc.html">Appendix G</a>.</p>
+<ol class="exercises">
+<li><strong>(Conceptual) The directly-follows graph cannot see concurrency.</strong> Consider two activities $b$ and $c$ that are genuinely <em>concurrent</em>: in some cases the trace is $\langle a, b, c, d \rangle$ and in others $\langle a, c, b, d \rangle$, because $b$ and $c$ can happen in either order. (a) Write down the directly-follows edges this produces among $b$ and $c$. (b) Explain why the resulting DFG is indistinguishable from a genuine two-state loop $b \rightleftarrows c$, and why this is the limitation that motivates the Petri-net target and the inductive miner of subsection two. (c) State, in one sentence, what extra information a Petri net (with its concurrency-expressing places) records that the DFG discards.</li>
+<li><strong>(Implementation) A second-order next-activity predictor.</strong> Extend the from-scratch predictor of Code 18.5.1 from first-order (conditioning on the last activity) to second-order (conditioning on the last <em>two</em> activities). (a) Build a counter over triples $(a, b) \to c$ and normalize to $\Pr(c \mid a, b)$. (b) On the toy log of Code 18.5.1, compute $\Pr(\text{pay} \mid \text{reject}, \text{approve})$ and compare it to the first-order $\Pr(\text{pay} \mid \text{approve})$ from Output 18.5.1; explain in one sentence why the second-order context changes the prediction. (c) Argue briefly why pushing this idea to "condition on the whole prefix" leads directly to the recurrent and Transformer models of Part III rather than an ever-larger count table.</li>
+<li><strong>(Open-ended) Mining a process under drift.</strong> Suppose you are given two years of an order-fulfillment event log, and partway through, the company changed its approval policy (adding a second approval step for high-value orders). (a) Describe how you would <em>detect</em> that a drift occurred from the log alone, without being told the change date (hint: discover models on sliding time windows and compare their directly-follows relations). (b) Explain why a single model discovered on the full two years would be a poor description of <em>either</em> regime. (c) Sketch how the online and continual-learning methods previewed for <a href="../../toc.html">Part V</a> would maintain a current model as the process drifts, and what a streaming conformance monitor would report at the moment of the policy change.</li>
+</ol>
+
+<nav class="chapter-nav" aria-label="Section navigation">
+<a class="nav-prev" href="section-18.4.html"><span class="nav-num">18.4</span><span class="nav-title">Previous Section</span></a>
+<a class="nav-up" href="index.html"><span class="nav-num">Ch 18</span><span class="nav-title">Chapter Contents</span></a>
+<a class="nav-next" href="../../toc.html"><span class="nav-num">Contents</span><span class="nav-title">Table of Contents</span></a>
+</nav>
+</main>
+<footer class="book-footer">
+<p class="footer-edition">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &middot; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated"><script>document.write("Last updated: " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

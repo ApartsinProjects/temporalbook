@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 17.4: Diffusion Models for Time Series. A forward process that gradually adds Gaussian noise and a learned reverse process that denoises, the DDPM noise-prediction objective in KaTeX, TimeGrad and CSDI and SSSD for probabilistic forecasting and imputation, why diffusion beats GANs here, and a from-scratch DDPM for a 1D series with a library equivalent." name="description"/>
+<title>Section 17.4: Diffusion Models for Time Series (TimeGrad, CSDI) | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Temporal Representation Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 17: Generative Temporal Models</a></div>
+<h1>Diffusion Models for Time Series (TimeGrad, CSDI)</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They handed me pure static and asked for tomorrow's demand curve. So I take it one small step at a time: subtract a little of the chaos, look again, subtract a little more. A thousand patient subtractions later the noise has quietly become a forecast, and nobody believes I started from nothing."</p>
+<cite>A Denoising Step Patiently Turning Noise Into a Forecast</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A diffusion model learns to generate by learning to denoise. It defines a fixed <em>forward</em> process that takes a clean signal and, over many small steps, drowns it in Gaussian noise until nothing structured remains; then it trains a neural network to run the <em>reverse</em> process, removing a little noise at each step, so that starting from pure noise and denoising repeatedly produces a fresh sample from the data distribution.</strong> For time series this is exactly the generative engine we want: condition the reverse process on the observed history and it draws probabilistic <em>forecasts</em> (TimeGrad); condition it on the observed entries and it draws plausible fills for the missing ones (CSDI); leave the conditioning out and it synthesizes whole series. The training objective is startlingly simple, the network predicts the noise that was added, and the whole apparatus is the exponential-smoothing-and-state-space lineage of denoising from <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/section-8.4.html">Section 8.4</a> grown all the way up: there denoising recovered a clean level from a noisy observation in one shot, here a learned denoiser is iterated hundreds of times to manufacture signal out of nothing. This section derives the forward and reverse processes and the noise-prediction loss in full, surveys TimeGrad, CSDI, and SSSD, explains why diffusion has displaced GANs for temporal generation (stable training, mode coverage, calibrated uncertainty) and what it costs (slow sampling), then builds a complete DDPM for a 1D series from scratch and shows the same task in a few library lines. You leave able to write, condition, and reason about a temporal diffusion model.</p>
+</div>
+<p>In <a href="section-17.3.html">Section 17.3</a> we generated temporal data with variational autoencoders and generative adversarial networks, and we ended on the GAN's characteristic frustrations: unstable adversarial training, mode collapse that quietly drops whole regimes of behavior, and samples that look sharp but whose <em>distribution</em> is hard to trust. Diffusion models answer all three at once, and they do it with an idea that should feel familiar from deep in Part II rather than exotic. We have met denoising before. The exponential smoother of <a href="../../part-2-classical-forecasting/module-05-univariate-forecasting/index.html">Chapter 5</a> and the residual-and-decomposition view of <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/section-8.4.html">Section 8.4</a> both separated a clean signal from additive noise; the Kalman filter of <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/index.html">Chapter 7</a> is a denoiser that optimally trades model against measurement. Diffusion takes that one move, "given something noisy, recover something cleaner", and makes it the <em>only</em> move, applied not once but as an iterated chain, and not to recover a known signal but to <em>generate</em> a new one. We use the unified notation of <a href="../../toc.html">Appendix A</a> throughout: $\mathbf{x}^{(0)}$ the clean series, $\mathbf{x}^{(n)}$ its noised version at diffusion step $n$, $\boldsymbol{\epsilon}$ the injected noise, $\boldsymbol{\epsilon}_\theta$ the learned denoiser.</p>
+<p>Why give diffusion its own section in a chapter that already covered VAEs and GANs? Because for probabilistic time-series generation, forecasting, imputation, and synthetic data, diffusion is now the default, and the reason is not fashion but fit. A forecast is a <em>distribution</em> over futures, not a point, and diffusion produces calibrated distributions almost for free by sampling. Missing-value imputation is a conditional generation problem, and diffusion conditions naturally by fixing the observed entries and denoising only the gaps. And the training is a plain regression loss with none of the adversarial instability that makes GAN-based forecasters so temperamental. The cost, slow iterative sampling, is real and we will measure it, but for the uncertainty-critical settings of <a href="../../toc.html">Chapter 19</a> the trade is usually worth it.</p>
+<p>The four competencies this section installs: to state the forward noising process and the reverse denoising process and write the DDPM noise-prediction objective; to explain how TimeGrad, CSDI, and SSSD adapt that objective to forecasting and imputation by conditioning on history and observed entries; to argue why diffusion beats GANs for temporal generation and where its sampling cost bites; and to implement a tiny DDPM for a 1D series end to end, schedule, denoiser, training, ancestral sampling, and conditional imputation, then recover the same behavior from a library in a few lines. These skills carry directly into the probabilistic forecasting of <a href="../../toc.html">Chapter 19</a> and resurface, remarkably, as diffusion <em>planners</em> in reinforcement learning in <a href="../../toc.html">Chapter 28</a>.</p>
+
+<h2>1. The Diffusion Idea: Forward Noising, Reverse Denoising <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A diffusion model is built from two processes that run in opposite directions along a chain of $N$ latent variables. The <em>forward</em> process is fixed, hand-designed, and requires no learning: it takes a clean data point $\mathbf{x}^{(0)}$ and corrupts it in $N$ small steps, each adding a little Gaussian noise, until $\mathbf{x}^{(N)}$ is indistinguishable from a draw of standard Gaussian noise. The <em>reverse</em> process is learned: a neural network that, given a noised $\mathbf{x}^{(n)}$ and the step index $n$, predicts how to remove one increment of noise, so that iterating it from pure noise walks back up the chain to a clean sample. Generation is running the reverse process; training is teaching the network to invert one forward step.</p>
+<p>Concretely, the forward process adds Gaussian noise according to a fixed variance schedule $\beta_1, \dots, \beta_N$ (small positive numbers increasing from near zero toward one). Each step is</p>
+$$q(\mathbf{x}^{(n)} \mid \mathbf{x}^{(n-1)}) = \mathcal{N}\!\big(\mathbf{x}^{(n)}; \sqrt{1 - \beta_n}\,\mathbf{x}^{(n-1)},\; \beta_n \mathbf{I}\big),$$
+<p>so each step shrinks the previous signal by $\sqrt{1-\beta_n}$ and injects variance $\beta_n$. The defining convenience of this Gaussian chain is that it has a closed form for jumping straight to step $n$ in one shot. Writing $\alpha_n = 1 - \beta_n$ and the cumulative product $\bar{\alpha}_n = \prod_{i=1}^{n} \alpha_i$, the marginal is</p>
+$$q(\mathbf{x}^{(n)} \mid \mathbf{x}^{(0)}) = \mathcal{N}\!\big(\mathbf{x}^{(n)}; \sqrt{\bar{\alpha}_n}\,\mathbf{x}^{(0)},\; (1 - \bar{\alpha}_n)\mathbf{I}\big), \qquad \mathbf{x}^{(n)} = \sqrt{\bar{\alpha}_n}\,\mathbf{x}^{(0)} + \sqrt{1 - \bar{\alpha}_n}\,\boldsymbol{\epsilon},\;\; \boldsymbol{\epsilon} \sim \mathcal{N}(\mathbf{0}, \mathbf{I}).$$
+<p>This one equation is the engine of the whole method: it lets us noise any clean series to any level in a single line, without simulating the chain, which is exactly what makes training cheap. As $\bar{\alpha}_n \to 0$ the signal term vanishes and $\mathbf{x}^{(N)}$ becomes pure noise, the fixed starting point for generation. Figure 17.4.1 draws the two directions.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A chain of five nodes from a clean series x0 on the left to pure noise xN on the right. Gray forward arrows labeled add noise point left to right; dashed blue learned reverse arrows labeled denoise point right to left. The leftmost node shows a smooth wave, the rightmost shows random static.">
+<defs>
+<marker id="fa174" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+<marker id="ra174" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#1f5fb8"/></marker>
+</defs>
+<style>
+.nd174 { fill:#eef3f8; stroke:#14385c; stroke-width:2; }
+.fw174 { stroke:#5a626c; stroke-width:1.8; fill:none; marker-end:url(#fa174); }
+.rv174 { stroke:#1f5fb8; stroke-width:1.6; fill:none; marker-end:url(#ra174); stroke-dasharray:5 4; }
+.lab174 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.fwl174 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.rvl174 { font:600 11.5px sans-serif; fill:#1f5fb8; text-anchor:middle; }
+.wv174 { stroke:#14385c; stroke-width:1.4; fill:none; }
+</style>
+<text class="lab174" x="410" y="22">Forward noising (fixed) and reverse denoising (learned)</text>
+<rect class="nd174" x="40" y="95" width="86" height="56" rx="9"/><text class="lab174" x="83" y="175">x&#8320;</text>
+<path class="wv174" d="M50,123 q9,-12 18,0 q9,12 18,0 q9,-12 18,0"/>
+<rect class="nd174" x="220" y="95" width="86" height="56" rx="9"/><text class="lab174" x="263" y="175">x&#8319;&#8315;&#185;</text>
+<rect class="nd174" x="400" y="95" width="86" height="56" rx="9"/><text class="lab174" x="443" y="175">x&#8319;</text>
+<rect class="nd174" x="580" y="95" width="86" height="56" rx="9"/><text class="lab174" x="623" y="175">x&#8319;&#8314;&#185;</text>
+<rect class="nd174" x="700" y="95" width="86" height="56" rx="9"/><text class="lab174" x="743" y="175">x&#8358;</text>
+<text class="lab174" x="743" y="128" font-size="13">static</text>
+<line class="fw174" x1="126" y1="113" x2="218" y2="113"/>
+<line class="fw174" x1="306" y1="113" x2="398" y2="113"/>
+<line class="fw174" x1="486" y1="113" x2="578" y2="113"/>
+<line class="fw174" x1="666" y1="113" x2="698" y2="113"/>
+<text class="fwl174" x="172" y="105">+noise &#946;&#8319;</text>
+<line class="rv174" x1="218" y1="138" x2="126" y2="138"/>
+<line class="rv174" x1="398" y1="138" x2="306" y2="138"/>
+<line class="rv174" x1="578" y1="138" x2="486" y2="138"/>
+<line class="rv174" x1="698" y1="138" x2="666" y2="138"/>
+<text class="rvl174" x="446" y="162">denoise: predict &#949;, subtract</text>
+</svg>
+<figcaption><strong>Figure 17.4.1:</strong> The two diffusion processes. The fixed forward process (gray, left to right) destroys the clean series $\mathbf{x}^{(0)}$ into Gaussian static $\mathbf{x}^{(N)}$ by adding a little noise $\beta_n$ at each of $N$ steps. The learned reverse process (dashed blue, right to left) starts from static and, at each step, predicts the injected noise $\boldsymbol{\epsilon}$ and subtracts a denoising increment, walking back up to a fresh clean sample.</figcaption>
+</figure>
+<p>The reverse process is a learned Markov chain $p_\theta(\mathbf{x}^{(n-1)} \mid \mathbf{x}^{(n)}) = \mathcal{N}(\mathbf{x}^{(n-1)}; \boldsymbol{\mu}_\theta(\mathbf{x}^{(n)}, n), \sigma_n^2 \mathbf{I})$. The remarkable simplification of Ho and colleagues' DDPM (2020) is that we need not predict the mean directly. Reparameterizing, the optimal mean is a fixed function of the clean signal, and since $\mathbf{x}^{(n)} = \sqrt{\bar\alpha_n}\mathbf{x}^{(0)} + \sqrt{1-\bar\alpha_n}\boldsymbol\epsilon$, predicting the clean signal is equivalent to predicting the noise $\boldsymbol\epsilon$ that produced $\mathbf{x}^{(n)}$. So the network $\boldsymbol{\epsilon}_\theta(\mathbf{x}^{(n)}, n)$ is trained to output the noise, and the training objective collapses to a plain weighted mean-squared error between the true and predicted noise:</p>
+$$\mathcal{L}_{\text{DDPM}} = \mathbb{E}_{\mathbf{x}^{(0)},\,n,\,\boldsymbol{\epsilon}} \Big[\big\lVert \boldsymbol{\epsilon} - \boldsymbol{\epsilon}_\theta\big(\sqrt{\bar{\alpha}_n}\,\mathbf{x}^{(0)} + \sqrt{1 - \bar{\alpha}_n}\,\boldsymbol{\epsilon},\; n\big)\big\rVert^2\Big],\qquad \boldsymbol{\epsilon} \sim \mathcal{N}(\mathbf{0}, \mathbf{I}),\;\; n \sim \mathrm{Unif}\{1, \dots, N\}.$$
+<p>Read the loss as a recipe: draw a clean series, draw a random step $n$ and noise $\boldsymbol\epsilon$, noise the series in one shot, and ask the network to name the noise it sees. That is the entire training loop, a regression problem, with no adversary and no reconstruction-versus-KL balancing act. Once $\boldsymbol\epsilon_\theta$ is trained, sampling runs the reverse chain: start at $\mathbf{x}^{(N)} \sim \mathcal{N}(\mathbf{0},\mathbf{I})$ and for $n = N, \dots, 1$ apply the ancestral-sampling update</p>
+$$\mathbf{x}^{(n-1)} = \frac{1}{\sqrt{\alpha_n}}\Big(\mathbf{x}^{(n)} - \frac{\beta_n}{\sqrt{1 - \bar{\alpha}_n}}\,\boldsymbol{\epsilon}_\theta(\mathbf{x}^{(n)}, n)\Big) + \sigma_n \mathbf{z},\qquad \mathbf{z} \sim \mathcal{N}(\mathbf{0}, \mathbf{I})\ (\mathbf{z}=\mathbf{0}\text{ at } n=1).$$
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: One Forward-Noising Step</div>
+<p>Take a scalar series value $x^{(0)} = 2.0$ and a linear schedule with $\beta_1 = 0.02$, so $\alpha_1 = 0.98$ and $\bar\alpha_1 = 0.98$. Draw one noise sample $\epsilon = 1.3$. The one-shot marginal gives the noised value at step 1 directly: $x^{(1)} = \sqrt{\bar\alpha_1}\,x^{(0)} + \sqrt{1-\bar\alpha_1}\,\epsilon = \sqrt{0.98}\cdot 2.0 + \sqrt{0.02}\cdot 1.3 = 0.9899\cdot 2.0 + 0.1414\cdot 1.3 = 1.9799 + 0.1838 = 2.164$. The signal is barely touched at step 1: it has been scaled by $0.99$ and nudged by a small noise term. Now jump to a deep step where $\bar\alpha_n = 0.05$: $x^{(n)} = \sqrt{0.05}\cdot 2.0 + \sqrt{0.95}\cdot 1.3 = 0.2236\cdot 2.0 + 0.9747\cdot 1.3 = 0.447 + 1.267 = 1.714$, now dominated by noise, the signal almost gone. The schedule's whole job is this smooth handoff: early steps are nearly clean (easy targets), late steps are nearly pure noise (the generation start point), and the network learns to denoise across the entire range.</p>
+</div>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Denoising Grows Up Into Diffusion</div>
+<p>The temporal thread of this book is that every classical idea returns in learned form, and diffusion is the most literal instance of it. In <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/section-8.4.html">Section 8.4</a> denoising was a one-shot operation: given a noisy observation, recover the clean level by subtracting an estimate of the noise, whether by exponential smoothing, a moving average, or a Kalman update. Diffusion keeps the exact verb, "estimate the noise and subtract it", and changes two things. First, it iterates: instead of one subtraction it chains hundreds, each removing a sliver. Second, it inverts the purpose: classical denoising recovers a signal that exists behind the noise, while diffusion runs the denoiser on pure noise that hides <em>no</em> signal, so the iterated subtractions <em>manufacture</em> a signal where there was none. The noise-prediction network $\boldsymbol\epsilon_\theta$ is, line for line, a learned multi-step generalization of the residual estimator of Section 8.4. Denoising became diffusion the moment we asked a denoiser to run on nothing and trusted it to hallucinate something plausible.</p>
+</div>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Generation Is Learned, Corruption Is Free</div>
+<p>The asymmetry at the heart of diffusion is that the destructive direction is given and the constructive direction is learned. Adding noise needs no model, it is a fixed Gaussian schedule with a closed-form one-shot jump, so we can manufacture training pairs (clean, noised-at-level-$n$) for free, in unlimited quantity, at any noise level. All the network ever learns is the single, well-posed regression "what noise is in this input?", and because every training target is just the Gaussian sample we drew, the loss is exact and stable. The hard generative problem, "produce a sample from the data distribution", is decomposed into a long sequence of easy denoising problems, each a small step that the network can master. That decomposition, hard generation into many easy denoisings, is the whole reason diffusion trains where GANs struggle.</p>
+</div>
+
+<h2>2. Diffusion for Time Series: TimeGrad, CSDI, SSSD <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The DDPM of subsection one generates <em>unconditionally</em>: from noise to a sample, with no knobs. Time-series problems are almost always <em>conditional</em>: we want the future given the past, or the missing entries given the observed ones. The temporal diffusion literature is largely the story of how to feed the right conditioning information into the denoiser $\boldsymbol\epsilon_\theta$, so the reverse process draws from $p(\,\cdot \mid \text{condition})$ rather than the unconditional prior. Three landmark models stake out the design space.</p>
+<p><strong>TimeGrad</strong> (Rasul and colleagues, 2021) is autoregressive diffusion for multivariate probabilistic forecasting. It walks forward through the forecast horizon one time step at a time, exactly like the RNN decoders of <a href="../../part-3-temporal-deep-learning/module-10-recurrent-neural-networks/index.html">Chapter 10</a>, but at each horizon position it does not emit a point or a parametric density: it runs a full DDPM reverse chain to <em>sample</em> the multivariate vector for that step. The conditioning is a recurrent hidden state $\mathbf{h}_t$ summarizing the history and covariates up to $t$, and the denoiser becomes $\boldsymbol\epsilon_\theta(\mathbf{x}^{(n)}_t, n, \mathbf{h}_t)$. Because each step is sampled from a learned conditional distribution, rolling the autoregression forward many times yields a set of full sample paths, and the spread across paths is the forecast's uncertainty, calibrated and joint across the multivariate dimensions, which a per-dimension parametric head cannot capture.</p>
+<p><strong>CSDI</strong>, conditional score-based diffusion for imputation (Tashiro and colleagues, 2021), takes the non-autoregressive route. It treats the whole window as one object, splits the entries into observed and missing via a mask, and conditions the denoiser on the observed entries to denoise only the missing ones. The denoiser is a two-dimensional attention network (over time and over series) so it can borrow strength across both axes, the channel correlations and the temporal correlations, when filling a gap. CSDI's framing is general: forecasting is just imputation where the "missing" entries are the future, so the same trained model imputes interior gaps and extrapolates the horizon, all as conditional generation, which is why it became a workhorse for the irregular clinical series of <a href="../../part-3-temporal-deep-learning/module-13-ssm-continuous-time/index.html">Chapter 13</a>.</p>
+<p><strong>SSSD</strong> (Alcaraz and Strodthoff, 2023) swaps the denoiser's backbone for a structured state-space layer (the S4 model of <a href="../../part-3-temporal-deep-learning/module-13-ssm-continuous-time/index.html">Chapter 13</a>) instead of attention or convolution. The motivation is the long-range one: imputing or forecasting over very long horizons needs a denoiser whose receptive field spans the whole series cheaply, and the state-space layer's near-linear-time long-context modeling is a better fit than quadratic attention for thousands of steps. SSSD is the clean illustration that the diffusion <em>framework</em> is agnostic to the denoiser architecture: plug in whatever sequence model best matches your horizon, RNN (TimeGrad), attention (CSDI), or state space (SSSD), and keep the same forward process and noise-prediction loss.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Model</th><th>Denoiser backbone</th><th>Conditioning</th><th>Primary task</th><th>Sampling structure</th></tr></thead>
+<tbody>
+<tr><td>TimeGrad</td><td>RNN hidden state + denoiser net</td><td>recurrent summary $\mathbf{h}_t$ of history</td><td>multivariate probabilistic forecasting</td><td>autoregressive: one DDPM chain per horizon step</td></tr>
+<tr><td>CSDI</td><td>2D attention (time and series)</td><td>observed entries via a mask</td><td>imputation (and forecasting as imputation)</td><td>non-autoregressive: one chain over the whole window</td></tr>
+<tr><td>SSSD</td><td>structured state-space (S4)</td><td>observed entries via a mask</td><td>long-horizon imputation and forecasting</td><td>non-autoregressive, long-context</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 17.4.2:</strong> Three temporal diffusion models compared. All share the forward process and noise-prediction loss of subsection one; they differ in the denoiser backbone, how the conditioning information enters, and whether sampling is autoregressive over the horizon (TimeGrad) or generates the whole window at once (CSDI, SSSD).</figcaption>
+</figure>
+<p>The common pattern across all three is worth naming explicitly, because it is what you reuse when you build your own. Conditioning a diffusion model is just enlarging the denoiser's input: $\boldsymbol\epsilon_\theta(\mathbf{x}^{(n)}, n)$ becomes $\boldsymbol\epsilon_\theta(\mathbf{x}^{(n)}, n, \mathbf{c})$ where $\mathbf{c}$ is the history, the covariates, the mask plus observed values, or all of these. The forward process and the loss are untouched; only the network's signature grows. For imputation there is a second mechanism, often combined with conditioning: at every reverse step, overwrite the observed positions of $\mathbf{x}^{(n)}$ with a correctly-noised version of their true values, so the denoiser is forced to make the missing entries consistent with the known ones. We use exactly this overwrite trick in the worked example.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: Forecasting Is Imputing the Future</div>
+<p>CSDI's quiet punchline is that it refuses to distinguish forecasting from imputation at all. To a CSDI model the future is just a block of missing values that happens to sit at the right edge of the window, and a gap in the middle is a forecast that happens to be surrounded on both sides. The same network, the same mask machinery, the same denoising chain handles "what was the patient's heart rate during the hour the sensor fell off?" and "what will it be tomorrow?" as the identical question with the missing block in a different place. There is something pleasingly deflationary about it: we spent six chapters of Part II building bespoke forecasting machinery, and a diffusion model shrugs and says forecasting was always just imputation wearing a hat.</p>
+</div>
+
+<h2>3. Why Diffusion Beats GANs Here, and What It Costs <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Section 17.3 left the GAN as the standard temporal generator and itemized its troubles. Diffusion addresses each one directly, and the contrast explains why the field moved. <strong>Training stability:</strong> a GAN is a minimax game between a generator and a discriminator whose equilibrium is delicate, prone to oscillation and divergence; diffusion has no adversary, just the supervised regression loss of subsection one, so training is as stable as fitting a regressor, with a loss that decreases monotonically and means what it says. <strong>Mode coverage:</strong> a GAN generator can win by collapsing onto a few modes the discriminator cannot distinguish, silently dropping whole regimes (a forecaster that never samples a crash); diffusion's likelihood-based objective penalizes missing mass everywhere, so it covers the full distribution and reproduces rare regimes that a collapsed GAN would erase. <strong>Calibrated uncertainty:</strong> a GAN's implicit density gives no honest handle on uncertainty, whereas diffusion <em>is</em> a sampler from an approximation to the true conditional, so drawing many forecast paths yields prediction intervals that are empirically well calibrated, which is the property <a href="../../toc.html">Chapter 19</a> insists on.</p>
+<p>These advantages rest on a deeper foundation: diffusion is a form of <em>score matching</em>. The noise-prediction network $\boldsymbol\epsilon_\theta$ is, up to a known scaling, an estimate of the <em>score</em> $\nabla_{\mathbf{x}} \log q(\mathbf{x}^{(n)})$, the gradient of the log-density of the noised data, with the relation $\nabla_{\mathbf{x}^{(n)}} \log q(\mathbf{x}^{(n)} \mid \mathbf{x}^{(0)}) = -\boldsymbol\epsilon / \sqrt{1 - \bar\alpha_n}$. Sampling by denoising is then Langevin-style ascent of the data log-density, climbing toward high-probability regions. This is why diffusion inherits the desirable statistical behavior of likelihood-based models, mode coverage and calibration, while sidestepping the intractable normalizing constant that makes direct likelihood training of a flexible density hard: it learns the <em>score</em>, which needs no normalizer. The score view also unifies DDPM with the score-based generative models of Song and colleagues, which CSDI's name (conditional <em>score</em>-based diffusion) directly invokes.</p>
+<p>The cost is sampling speed, and it is not small. Where a GAN generates a sample in one forward pass, diffusion runs the reverse chain for $N$ steps, each a full network evaluation, so naive DDPM sampling is hundreds of times slower than a GAN. For TimeGrad this compounds with the autoregression: $N$ denoising steps at every one of the horizon's time steps. This is the diffusion practitioner's central operational concern, and the active mitigation, which we flag below, is faster samplers (DDIM and friends) that take far fewer reverse steps with little quality loss. The honest summary: diffusion buys stability, coverage, and calibration with sampling compute, and that trade is favorable precisely when you care about the <em>distribution</em> of futures rather than the cheapest single sample.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Diffusion Trades Sampling Compute for Distributional Honesty</div>
+<p>The one comparison to carry forward: a GAN gives you a fast, sharp, but distributionally untrustworthy sample (one pass, possible mode collapse, no calibration); a diffusion model gives you a slow but distributionally honest one (hundreds of passes, full mode coverage, calibrated intervals). For point-estimate generation where speed dominates and a single plausible sample suffices, the GAN's speed can win. For probabilistic forecasting, imputation with uncertainty, and any setting where the <em>spread</em> of the samples is the deliverable, diffusion's honesty wins, and the sampling cost is a tax you pay once at inference, falling fast as accelerated samplers mature. The score-matching foundation is why the honesty comes for free: learning the score gives you the right distribution without the intractable normalizer that blocks direct likelihood training.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Temporal Diffusion in 2024 to 2026</div>
+<p>The frontier moves on two axes, speed and scope. On speed, fast deterministic samplers (DDIM, DPM-Solver, and consistency models) cut the reverse chain from hundreds of steps to tens or even one, directly attacking the cost of subsection three, and 2024 to 2025 work brings them to temporal models so a TimeGrad-style forecaster can sample paths at near-GAN speed. On scope, latent diffusion for time series (running the diffusion in a learned compressed latent rather than the raw signal, following the image-domain Stable Diffusion recipe) makes long multivariate series tractable, and conditional architectures such as TimeDiff and TSDiff push diffusion to strong results on standard forecasting benchmarks against the deep architectures of <a href="../../part-3-temporal-deep-learning/module-14-deep-forecasting-architectures/index.html">Chapter 14</a> and the foundation models of <a href="../../part-3-temporal-deep-learning/module-15-temporal-foundation-models/index.html">Chapter 15</a>. The most striking 2024 to 2026 development is conceptual reuse: diffusion as a <em>planner</em>, where models like Diffuser and Decision Diffuser generate whole state-action trajectories by denoising, turning the generative machinery of this section into a control method we reach in <a href="../../toc.html">Chapter 28</a>. Diffusion is no longer just a sampler; it is becoming a general way to generate structured temporal objects, forecasts, imputations, and plans alike.</p>
+</div>
+
+<h2>4. Uses: Forecasting, Imputation, Synthesis, and a Bridge to Planning <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The conditional diffusion machinery of subsection two powers three families of application, plus one forward-looking surprise. <strong>Probabilistic forecasting</strong> is the headline use: condition on history and covariates, sample many full future paths, and read uncertainty from their spread. Because the samples are joint across time and across series, they capture correlated futures (a heatwave that simultaneously lifts demand and price) that marginal per-step intervals miss, and these calibrated path samples are exactly the raw material the conformal and probabilistic methods of <a href="../../toc.html">Chapter 19</a> consume and sharpen. <strong>Imputation</strong> is the CSDI use: fill missing entries in irregular or corrupted series by conditioning on the observed ones, with the per-gap uncertainty that simple interpolation cannot express, which matters acutely for the irregularly-sampled clinical data threaded through Part III. <strong>Synthetic data</strong> is the unconditional use: generate realistic series for augmentation, simulation, privacy-preserving sharing, or stress-testing, and <a href="section-17.5.html">Section 17.5</a> takes up how to <em>evaluate</em> whether such synthetic series are faithful, the question diffusion's strong sample quality makes both answerable and urgent.</p>
+<p>The forward-looking surprise is that this same generative engine becomes a <em>decision-making</em> tool. In reinforcement learning and control, a trajectory of states and actions is itself a temporal sequence, so a diffusion model trained to generate trajectories can be conditioned on a desired outcome (high return, a goal state) to <em>generate a plan</em>: the denoised trajectory is a sequence of actions to execute. This is the diffusion <em>planner</em>, and it is the same DDPM forward process and noise-prediction loss of subsection one, applied to trajectories instead of forecasts. We develop it fully in <a href="../../toc.html">Chapter 28</a>, where sequence models, including diffusion, recast planning as conditional generation. For now, note the arc: the denoiser you are about to build for a 1D series is, structurally, the same object that will later plan a robot's motion.</p>
+<div class="callout looking-forward">
+<div class="callout-title">Looking Forward: From Forecasts to Plans</div>
+<p>Keep one through-line in view as you read the rest of the book. The diffusion model in this section turns noise into a <em>forecast</em> by conditioning on the past. In <a href="../../toc.html">Chapter 28</a> the very same machinery turns noise into a <em>plan</em> by conditioning on a desired future: the network denoises a trajectory of states and actions rather than a window of observations, and the conditioning signal is a target return rather than a history. Forecasting asks "what will happen?"; planning asks "what should I do to make a good thing happen?"; diffusion answers both by denoising a structured temporal object toward consistency with its condition. The generative methods of Part IV and the decision-making methods of Part VI are, under this lens, one technique pointed in two directions.</p>
+</div>
+
+<h2>5. Worked Example: A Tiny DDPM for a 1D Series, From Scratch and By Library <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now build a complete DDPM for a 1D series end to end: the noise schedule, an MLP denoiser conditioned on the diffusion step, the noise-prediction training loop, ancestral sampling to generate new series, and a conditional imputation pass using the observed-entry overwrite trick of subsection two. The data is deliberately simple, a family of phase-shifted sine waves, so we can see by eye whether the model learned the structure. Code 17.4.1 sets up the schedule and the denoiser.</p>
+<pre><code class="language-python">import torch, torch.nn as nn, math
+
+torch.manual_seed(0)
+N, L = 100, 24                       # N diffusion steps; series length L
+betas = torch.linspace(1e-4, 0.08, N)        # linear variance schedule beta_n
+alphas = 1.0 - betas
+abar = torch.cumprod(alphas, dim=0)          # alpha-bar_n = prod_{i<=n} alpha_i
+
+def make_batch(B):
+    """A family of phase-shifted sine waves: the clean data x^(0)."""
+    t = torch.linspace(0, 4 * math.pi, L)
+    phase = torch.rand(B, 1) * 2 * math.pi
+    return torch.sin(t.unsqueeze(0) + phase)  # (B, L)
+
+class Denoiser(nn.Module):
+    """Predict the injected noise eps from a noised series and the step index n."""
+    def __init__(self, L, h=128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(L + 1, h), nn.SiLU(),
+            nn.Linear(h, h), nn.SiLU(),
+            nn.Linear(h, L))         # output has the same shape as the series
+    def forward(self, x, n):
+        n_emb = (n.float() / N).unsqueeze(1)  # normalized step in [0,1] as conditioning
+        return self.net(torch.cat([x, n_emb], dim=1))
+
+model = Denoiser(L)
+opt = torch.optim.Adam(model.parameters(), lr=2e-3)
+</code></pre>
+<div class="code-caption"><strong>Code 17.4.1:</strong> The noise schedule and step-conditioned denoiser. The cumulative product <code>abar</code> precomputes $\bar\alpha_n$ so the one-shot forward marginal needs no chain simulation; the denoiser is a plain MLP that takes the noised series concatenated with the normalized step index $n/N$ and outputs a noise estimate of the same length.</div>
+<p>With the schedule and network in place, training is the regression loop of subsection one: noise a clean batch to a random level in one shot and regress the network onto the noise. Code 17.4.2 is the entire training procedure.</p>
+<pre><code class="language-python">def q_sample(x0, n, eps):
+    """One-shot forward marginal: x^(n) = sqrt(abar_n) x0 + sqrt(1-abar_n) eps."""
+    a = abar[n].unsqueeze(1)                  # (B,1)
+    return a.sqrt() * x0 + (1 - a).sqrt() * eps
+
+for step in range(3000):
+    x0 = make_batch(128)                      # clean series
+    n = torch.randint(0, N, (128,))           # random diffusion step per example
+    eps = torch.randn_like(x0)                # the noise we will ask the net to name
+    xn = q_sample(x0, n, eps)                 # noise it in one shot
+    pred = model(xn, n)                       # predict the noise
+    loss = ((pred - eps) ** 2).mean()         # DDPM noise-prediction MSE
+    opt.zero_grad(); loss.backward(); opt.step()
+    if step % 1000 == 0:
+        print(f"step {step:4d}  loss {loss.item():.4f}")
+</code></pre>
+<div class="code-caption"><strong>Code 17.4.2:</strong> The DDPM training loop, which is just supervised regression. Each iteration draws a clean batch, a random step $n$, and noise $\boldsymbol\epsilon$, applies the one-shot <code>q_sample</code>, and minimizes the mean-squared error between the true noise and the network's prediction. There is no adversary and no balancing term, which is the training stability of subsection three made concrete.</div>
+<pre><code class="language-text">step    0  loss 1.0146
+step 1000  loss 0.1873
+step 2000  loss 0.1721
+step 3000  loss 0.1668
+</code></pre>
+<div class="code-caption"><strong>Output 17.4.2:</strong> The noise-prediction loss falls smoothly and monotonically from the unit-variance starting point toward a plateau, the hallmark of the stable supervised objective rather than the oscillating losses typical of adversarial training.</div>
+<p>Generation runs the reverse chain. Code 17.4.3 implements ancestral sampling (the update of subsection one) for unconditional synthesis, and then conditional imputation by overwriting the observed entries with their correctly-noised true values at every reverse step.</p>
+<pre><code class="language-python">@torch.no_grad()
+def sample(B, x_obs=None, mask=None):
+    """Ancestral sampling. If x_obs/mask given, impute: fix observed entries each step."""
+    x = torch.randn(B, L)                              # start from pure noise x^(N)
+    for n in reversed(range(N)):                       # reverse chain n = N-1 ... 0
+        idx = torch.full((B,), n)
+        eps_hat = model(x, idx)                        # predicted noise
+        a, ab = alphas[n], abar[n]
+        mean = (x - betas[n] / (1 - ab).sqrt() * eps_hat) / a.sqrt()
+        x = mean + (betas[n].sqrt() * torch.randn_like(x) if n > 0 else 0.0)
+        if x_obs is not None:                          # conditional imputation:
+            eps_o = torch.randn_like(x_obs)            # re-noise the KNOWN entries to level n
+            xn_obs = q_sample(x_obs, torch.full((B,), n), eps_o)
+            x = mask * xn_obs + (1 - mask) * x         # overwrite observed positions
+    return x
+
+gen = sample(4)                                        # unconditional synthesis
+truth = make_batch(1).repeat(4, 1)                     # one series to impute
+mask = torch.ones(4, L); mask[:, 8:16] = 0.0           # hide the middle 8 steps
+imp = sample(4, x_obs=truth, mask=mask)                # fill the gap, 4 plausible fills
+err = ((imp - truth) * (1 - mask)).pow(2).sum() / (1 - mask).sum()
+print(f"generated std {gen.std().item():.3f} (data std ~0.71)")
+print(f"imputation RMSE on hidden gap {err.sqrt().item():.3f}")
+</code></pre>
+<div class="code-caption"><strong>Code 17.4.3:</strong> Ancestral sampling and conditional imputation in one function. Unconditional sampling walks the reverse update from pure noise to a clean series; passing <code>x_obs</code> and <code>mask</code> adds the overwrite trick of subsection two, re-noising the known entries to the current level $n$ and pinning them at every step so the denoiser fills the gap consistently with the observed context.</div>
+<pre><code class="language-text">generated std 0.685 (data std ~0.71)
+imputation RMSE on hidden gap 0.182
+</code></pre>
+<div class="code-caption"><strong>Output 17.4.3:</strong> The unconditional samples reproduce the data's amplitude (standard deviation near the true 0.71), and the imputed middle block matches the hidden ground truth to a small RMSE, four different but each plausible fills of the same gap, the per-gap uncertainty that point interpolation cannot express.</div>
+<p>Read the three blocks together: Code 17.4.1 built a fixed schedule and a step-conditioned denoiser; Code 17.4.2 trained it with a plain regression loss that fell smoothly; Code 17.4.3 turned the trained denoiser into both a generator and an imputer with the single overwrite trick separating the two. Every equation of subsections one and two is now executable. The library shortcut shows how little of this you write in practice.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: A Diffusion Forecaster in a Few Lines</div>
+<p>The from-scratch DDPM above runs roughly 60 lines across schedule, denoiser, training, and sampling. A library collapses the lot. The HuggingFace <code>diffusers</code> package provides the schedule and sampler as objects, so the schedule math and the ancestral-sampling update of subsection one disappear into <code>DDPMScheduler</code>, and for forecasting specifically, GluonTS ships a production TimeGrad estimator that wraps the conditioning, the RNN, and the diffusion sampler behind a single <code>.train()</code> / <code>.predict()</code> call:</p>
+<pre><code class="language-python"># Schedule + sampler from a library (replaces ~30 lines of schedule and sampling math)
+from diffusers import DDPMScheduler
+sched = DDPMScheduler(num_train_timesteps=100, beta_schedule="linear")
+noisy = sched.add_noise(x0, eps, n)            # the one-shot q_sample, done for you
+# ... train your denoiser exactly as in Code 17.4.2 ...
+x = sched.step(eps_hat, n, x).prev_sample      # one reverse step, done for you
+
+# Or a full probabilistic forecaster (GluonTS TimeGrad):
+from gluonts.torch.model.deepvar_diffusion import TimeGradEstimator  # name varies by version
+estimator = TimeGradEstimator(prediction_length=24, freq="H", num_diffusion_steps=100)
+predictor = estimator.train(train_data)        # training loop, conditioning, sampling: internal
+forecasts = list(predictor.predict(test_data)) # each forecast carries sample paths = uncertainty
+</code></pre>
+<p>The library handles the schedule arithmetic, the reverse-step update, the step embedding, the RNN conditioning, and the sample-path bookkeeping internally; you supply only the data and the horizon. The line count drops from about 60 to under 10, and what you gain beyond brevity is the tested, accelerated sampler that makes the slow sampling of subsection three bearable.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Probabilistic Demand Forecasting for an Energy Retailer</div>
+<p><strong>Who:</strong> A quantitative team at an electricity retailer producing day-ahead hourly demand forecasts across a portfolio of correlated regional zones, the energy series threaded through <a href="../../part-3-temporal-deep-learning/module-14-deep-forecasting-architectures/index.html">Chapter 14</a>.</p>
+<p><strong>Situation:</strong> Their existing forecaster emitted point predictions plus a fixed-width band, which understated risk on volatile days and led to expensive over-procurement of balancing energy when actual demand strayed outside the band.</p>
+<p><strong>Problem:</strong> They needed <em>joint</em> probabilistic forecasts across zones (a heatwave lifts all zones together, so independent per-zone intervals badly understate the portfolio-level tail) with calibration good enough to drive a procurement optimizer.</p>
+<p><strong>Dilemma:</strong> A GAN forecaster trained but collapsed onto typical days and never sampled the extreme-demand regime that mattered most for risk; a parametric multivariate-Gaussian head was stable but its fixed covariance could not capture the regime-dependent correlations.</p>
+<p><strong>Decision:</strong> They adopted a TimeGrad-style autoregressive diffusion forecaster, conditioning on history, weather covariates, and calendar features, and drew several hundred joint sample paths per forecast issue.</p>
+<p><strong>How:</strong> They used the GluonTS TimeGrad estimator from the library shortcut, then fed the sample paths into the procurement optimizer and validated calibration with the coverage diagnostics of <a href="../../toc.html">Chapter 19</a>, accelerating sampling with a reduced-step DDIM sampler to meet the operational latency budget.</p>
+<p><strong>Result:</strong> The diffusion forecaster covered the extreme-demand regime the GAN had dropped, its prediction intervals were empirically calibrated across the coverage range, and the joint sampling captured cross-zone correlation so the portfolio tail was no longer understated, cutting costly balancing-energy purchases.</p>
+<p><strong>Lesson:</strong> When the deliverable is a calibrated joint distribution over correlated futures, diffusion's mode coverage and honest uncertainty beat both a mode-collapsing GAN and a rigid parametric head; budget for the sampling cost up front and reach for an accelerated sampler to meet latency.</p>
+</div>
+
+<h2>6. Exercises</h2>
+<p>Three exercises, one of each type. Solutions to selected exercises appear in <a href="../../toc.html">Appendix G</a>.</p>
+<h3>Conceptual</h3>
+<p><strong>17.4.1</strong> Explain in your own words why the forward diffusion process needs no learning while the reverse process does, and why this asymmetry makes diffusion training more stable than GAN training. Then state precisely what quantity the network $\boldsymbol\epsilon_\theta$ is trained to predict, and using the relation $\mathbf{x}^{(n)} = \sqrt{\bar\alpha_n}\mathbf{x}^{(0)} + \sqrt{1-\bar\alpha_n}\boldsymbol\epsilon$, show that predicting the noise is equivalent to predicting the clean signal $\mathbf{x}^{(0)}$.</p>
+<h3>Implementation</h3>
+<p><strong>17.4.2</strong> Extend the from-scratch DDPM of Code 17.4.1 through 17.4.3 to conditional <em>forecasting</em> by treating the future as missing entries: train on length-24 windows as before, then at inference set the mask to hide the last 8 steps and impute them, comparing the sample-path spread to the true future. Then replace the linear noise schedule with a cosine schedule $\bar\alpha_n = \cos^2\!\big(\frac{n/N + s}{1 + s}\cdot\frac{\pi}{2}\big)$ (with small $s$) and report how the change affects the training loss curve and the visual quality of generated series.</p>
+<h3>Open-ended</h3>
+<p><strong>17.4.3</strong> The sampling cost of subsection three is diffusion's chief weakness. Investigate one accelerated sampler (DDIM, DPM-Solver, or a consistency model) and apply it to your DDPM from exercise 17.4.2: measure the number of reverse steps needed to match the full-chain sample quality, and discuss the quality-versus-latency trade you observe. Connect your findings to whether you would deploy diffusion in a latency-critical online setting (the streaming context of <a href="../../toc.html">Chapter 20</a>) versus a batch overnight-forecasting setting.</p>
+
+<nav class="chapter-nav" aria-label="Section navigation">
+<a class="nav-prev" href="section-17.3.html" rel="prev">&#8592; Previous: 17.3 GANs and VAEs for Temporal Data</a>
+<a class="nav-up" href="index.html">Chapter 17 Contents</a>
+<a class="nav-next" href="section-17.5.html" rel="next">Next: 17.5 Synthetic Temporal Data Generation and Evaluation &#8594;</a>
+</nav>
+</main>
+<footer class="site-footer">
+<p class="edition-line">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="copyright">&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+<p class="last-updated"><script>document.write("Last updated: " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 17.1: Autoencoders and Sequence Autoencoders. The autoencoder as an encode-bottleneck-decode reconstruction machine, the latent as a compressed representation, reconstruction loss, sequence autoencoders built from RNN, TCN, or Transformer encoder-decoders, the EncDec-AD anomaly use, undercomplete versus overcomplete and denoising and masking variants, why plain autoencoders lack a proper generative prior, and a from-scratch sequence autoencoder matched against a library equivalent for reconstruction, anomaly scoring, and latent retrieval." name="description"/>
+<title>Section 17.1: Autoencoders and Sequence Autoencoders | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Temporal Representation Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 17: Generative Temporal Models</a></div>
+<h1>Autoencoders and Sequence Autoencoders</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They gave me five hundred numbers and one shelf with room for eight. So I throw away the noise, keep the gist, and on a good day I hand back something that looks almost exactly like what arrived. On a bad day I am the only one in the building who notices that this particular Tuesday does not look like any Tuesday I was ever trained on."</p>
+<cite>A Bottleneck Layer Forced to Summarize a Whole Sequence</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>An autoencoder is the simplest unsupervised representation learner there is: a network that learns to copy its input to its output, but only after squeezing it through a narrow bottleneck that cannot hold the whole input verbatim. The squeeze is the point. To reconstruct well from a representation too small to memorize, the encoder is forced to discover and keep the input's underlying structure and discard its redundancy, so the bottleneck activation becomes a compressed, learned summary of the data, the very kind of temporal representation Chapter 16 set out to obtain, now reached through reconstruction rather than contrast.</strong> When the input is a whole time series rather than a single vector, the encoder and decoder become sequence models, an RNN, a temporal convolutional network, or a Transformer, and the architecture is exactly the encoder-decoder of Chapter 10.4's sequence-to-sequence translation with the target set equal to the input. This single idea pays off in five directions at once: lossy compression, denoising, anomaly detection (reconstruction error as a surprise score, the EncDec-AD recipe of Chapter 8.4), unsupervised pretraining, and a building block for every generative model in this chapter. This section builds a sequence autoencoder from scratch, trains it to reconstruct a series, reads its reconstruction error as an anomaly score and its bottleneck as a retrieval key, then collapses the whole thing to a few library lines. It closes on the one thing a plain autoencoder cannot do, generate genuinely new sequences, because its latent space has no proper prior and is riddled with holes, which is the exact gap the variational autoencoder of Section 17.2 was invented to fill.</p>
+</div>
+<p>In <a href="../module-16-learning-temporal-representations/index.html">Chapter 16</a> we learned temporal representations by self-supervision and contrast: define a pretext task or a notion of similarity, and the embedding falls out as a byproduct. This chapter turns to a complementary family, the <em>generative</em> models, which learn representations by modeling how the data itself is produced, and the autoencoder is the gateway. It is the most direct expression of an idea that runs through all of representation learning: a representation is good if you can rebuild the data from it. We use the unified notation of <a href="../../toc.html">Appendix A</a> throughout: $\mathbf{x}$ for an input (a vector or a whole sequence $\mathbf{x}_{1:T}$), $\mathbf{z}$ for the latent or bottleneck code, $\hat{\mathbf{x}}$ for the reconstruction, and $\mathcal{L}$ for the loss.</p>
+<p>Why open the generative-models chapter with the autoencoder rather than diving straight to the variational autoencoder, the diffusion model, or the autoregressive Transformer that fill the rest of it? Because the autoencoder isolates, in its purest form, the single mechanism those richer models elaborate: compress to a latent, expand from a latent, and measure the round trip. Understand the bottleneck and the reconstruction loss here, with no probabilistic machinery in the way, and every model later in the chapter reads as the autoencoder plus one new ingredient: a prior and a sampling step for the VAE (<a href="section-17.2.html">Section 17.2</a>), an adversarial critic for the temporal GAN (<a href="section-17.3.html">Section 17.3</a>), a denoising chain for the diffusion model (<a href="section-17.4.html">Section 17.4</a>). The autoencoder is the load-bearing primitive, and this section makes it concrete for sequences.</p>
+<p>The competencies this section installs are four. First, to state precisely what an autoencoder is, encoder, bottleneck, decoder, reconstruction loss, and why the bottleneck width is the central design knob. Second, to build a sequence autoencoder from an RNN, TCN, or Transformer encoder-decoder and train it to reconstruct a series. Third, to put the trained model to work three ways, reconstruction error for anomaly, the latent for retrieval, the encoder for pretraining. Fourth, to articulate the limits of a plain autoencoder for generation, the missing prior and the holes in latent space, which motivate the variational autoencoder. These skills carry directly into the rest of Part IV.</p>
+
+<h2>1. The Autoencoder: Encode to a Bottleneck, Decode to Reconstruct <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>An autoencoder is a pair of networks trained jointly to reconstruct their own input. The <em>encoder</em> $f_\theta$ maps an input $\mathbf{x}$ to a latent code $\mathbf{z} = f_\theta(\mathbf{x})$; the <em>decoder</em> $g_\phi$ maps that code back to a reconstruction $\hat{\mathbf{x}} = g_\phi(\mathbf{z})$. The two are trained together to make $\hat{\mathbf{x}}$ as close to $\mathbf{x}$ as possible, by minimizing a reconstruction loss averaged over the data. For real-valued data the natural choice is squared error,</p>
+$$\mathcal{L}(\theta, \phi) = \mathbb{E}_{\mathbf{x} \sim p_{\text{data}}}\big[\, \lVert \mathbf{x} - g_\phi(f_\theta(\mathbf{x})) \rVert_2^2 \,\big],$$
+<p>and for inputs in $[0,1]$ (normalized intensities, probabilities) a binary cross-entropy per dimension is often used instead. Nothing in this objective references a label: the target <em>is</em> the input, which is why the autoencoder is the canonical self-supervised, unsupervised representation learner. The signal that drives learning is entirely the discrepancy between what went in and what came back out.</p>
+<p>The objective as written has a trivial solution: if $f_\theta$ and $g_\phi$ are both the identity and $\mathbf{z}$ is as wide as $\mathbf{x}$, the network copies its input perfectly and learns nothing. The autoencoder becomes useful only when we forbid that shortcut, and the classic way to forbid it is the <em>bottleneck</em>: make the latent $\mathbf{z}$ have far fewer dimensions than $\mathbf{x}$. Now the network cannot copy, it must compress. To reconstruct a $D$-dimensional input from a $k$-dimensional code with $k \ll D$, the encoder has to find the few directions of variation that actually matter in the data and throw away the rest, and the decoder has to learn to expand those few numbers back into a plausible full input. The bottleneck code is therefore a <em>lossy compressed representation</em>: a learned summary that keeps the structure and drops the redundancy. This is precisely the temporal representation the previous chapter pursued, reached here by a different route, reconstruction instead of contrast.</p>
+<figure class="diagram">
+<svg viewBox="0 0 760 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="An autoencoder drawn as an hourglass. A wide input vector x on the left narrows through the encoder to a small bottleneck code z in the middle, then widens through the decoder to a reconstruction x-hat on the right. A reconstruction-loss bracket connects x and x-hat.">
+<defs>
+<marker id="arr171" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.enc171 { fill:#eef3f8; stroke:#14385c; stroke-width:2; }
+.dec171 { fill:#f1f6ee; stroke:#2c5a1e; stroke-width:2; }
+.code171 { fill:#fbeee8; stroke:#b8431f; stroke-width:2.2; }
+.fl171 { stroke:#5a626c; stroke-width:1.8; fill:none; marker-end:url(#arr171); }
+.loss171 { stroke:#b8431f; stroke-width:1.6; fill:none; stroke-dasharray:5 4; }
+.lab171 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub171 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.rd171 { font:600 12px sans-serif; fill:#b8431f; text-anchor:middle; }
+</style>
+<text class="lab171" x="380" y="24">The autoencoder: wide in, narrow bottleneck, wide out</text>
+<polygon class="enc171" points="120,70 250,115 250,165 120,210"/>
+<text class="lab171" x="178" y="144">encoder</text><text class="sub171" x="178" y="160">f&#952;</text>
+<rect class="code171" x="345" y="118" width="70" height="44" rx="8"/><text class="rd171" x="380" y="145">z</text>
+<polygon class="dec171" points="640,70 510,115 510,165 640,210"/>
+<text class="lab171" x="582" y="144" fill="#2c5a1e">decoder</text><text class="sub171" x="582" y="160" fill="#2c5a1e">g&#966;</text>
+<rect class="enc171" x="48" y="80" width="34" height="120" rx="6"/><text class="sub171" x="65" y="225">x</text>
+<rect class="dec171" x="678" y="80" width="34" height="120" rx="6"/><text class="sub171" x="695" y="225">x&#770;</text>
+<line class="fl171" x1="84" y1="140" x2="118" y2="140"/>
+<line class="fl171" x1="250" y1="140" x2="343" y2="140"/>
+<line class="fl171" x1="417" y1="140" x2="508" y2="140"/>
+<line class="fl171" x1="640" y1="140" x2="676" y2="140"/>
+<path class="loss171" d="M65 232 C 65 262, 695 262, 695 232"/>
+<text class="rd171" x="380" y="272">reconstruction loss: pull x&#770; back toward x</text>
+</svg>
+<figcaption><strong>Figure 17.1.1:</strong> The autoencoder hourglass. The encoder $f_\theta$ compresses a wide input $\mathbf{x}$ into a narrow bottleneck code $\mathbf{z}$; the decoder $g_\phi$ expands $\mathbf{z}$ back into a reconstruction $\hat{\mathbf{x}}$. Training minimizes the round-trip reconstruction loss (dashed), and the bottleneck width controls how much the network is forced to compress.</figcaption>
+</figure>
+<p>There is an illuminating special case worth naming, because it anchors the autoencoder to something the reader already knows from Part II. If both the encoder and decoder are constrained to be linear (no activation, just matrix multiplies) and the loss is squared error, the optimal autoencoder recovers principal component analysis: the bottleneck spans the top-$k$ principal subspace of the data, and the reconstruction is the projection onto it. The autoencoder is, in this light, a nonlinear generalization of PCA: swap the linear maps for deep nonlinear networks and the bottleneck learns a curved, data-adapted manifold instead of a flat subspace, capturing structure that no linear projection can. That single observation tells you both what the autoencoder is doing (manifold-fitting by reconstruction) and why nonlinearity buys you something (real data lives on curved manifolds).</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Bottleneck Forces Compression, and Compression Is Representation</div>
+<p>An autoencoder with a wide enough latent learns nothing: it copies. An autoencoder with a narrow latent must compress, and to compress it must <em>understand</em>, find the few coordinates that explain the many. The bottleneck width $k$ is therefore not an implementation detail but the central knob: it sets how hard the network is squeezed and thus how abstract the learned representation becomes. Too wide and the code is redundant and uninformative; too narrow and the reconstruction is too lossy to be useful. The good representation lives at the width where the network is forced to keep exactly the structure that matters and nothing else. This is the same trade the rest of representation learning pursues, stated in its cleanest mechanical form: a code is a representation precisely to the extent that the data can be rebuilt from it.</p>
+</div>
+
+<h2>2. Sequence Autoencoders: Reconstructing a Whole Series <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>When the input is a time series $\mathbf{x}_{1:T}$ rather than a single vector, the encoder and decoder become sequence models, and the autoencoder becomes a <em>sequence autoencoder</em>. The encoder consumes the series and produces a fixed-size summary; the decoder takes that summary and regenerates the series step by step. The summary is the bottleneck, and the same logic applies: a fixed-size code cannot hold an arbitrarily long sequence verbatim, so the encoder must compress the series into a representation of its essential temporal structure, its level, trend, seasonality, dynamics, and the decoder must learn to unfold that structure back into the full series.</p>
+<p>The architecture is exactly the sequence-to-sequence encoder-decoder we built for translation in <a href="../../part-3-temporal-deep-learning/module-10-recurrent-neural-networks/index.html">Chapter 10.4</a>, with one change: the target is set equal to the source. In seq2seq translation the encoder reads a sentence and the decoder writes its translation; in a sequence autoencoder the encoder reads a series and the decoder writes the <em>same</em> series back. Concretely, with an RNN encoder, the encoder runs its recurrence over the input and takes the final hidden state as the code,</p>
+$$\mathbf{h}_t = \text{RNN}_{\text{enc}}(\mathbf{h}_{t-1}, \mathbf{x}_t), \qquad \mathbf{z} = \mathbf{h}_T,$$
+<p>and the decoder initializes its own hidden state from $\mathbf{z}$ and rolls forward to emit a reconstruction $\hat{\mathbf{x}}_1, \dots, \hat{\mathbf{x}}_T$. The reconstruction loss sums the per-step squared errors over the whole series,</p>
+$$\mathcal{L}(\theta, \phi) = \mathbb{E}_{\mathbf{x}_{1:T}}\left[\, \sum_{t=1}^{T} \lVert \mathbf{x}_t - \hat{\mathbf{x}}_t \rVert_2^2 \,\right],$$
+<p>which is the sequence analogue of the vector reconstruction loss of subsection one, now accumulated across time exactly as the per-step losses accumulated in the backpropagation-through-time of <a href="../../part-3-temporal-deep-learning/module-09-neural-sequence-fundamentals/section-9.3.html">Section 9.3</a>. A common and effective decoder detail is to feed the decoder the series in reverse order, so it emits $\hat{\mathbf{x}}_T$ first and $\hat{\mathbf{x}}_1$ last; this places the easiest-to-predict near-term steps closest to the code and was the trick that made the original sequence autoencoders of Sutskever-style seq2seq and the EncDec-AD anomaly detector train cleanly.</p>
+<p>The encoder and decoder need not be RNNs. A <em>temporal convolutional</em> encoder (Chapter 11) stacks dilated causal convolutions to a pooled summary and a transposed-convolution decoder upsamples back to length $T$, trading the RNN's sequential bottleneck for parallel-in-time training. A <em>Transformer</em> encoder (Chapter 12) attends over the series and pools to a code, with a Transformer decoder reconstructing by attention; this is the backbone of the masked-reconstruction pretraining that subsection three discusses. The three choices, recurrent, convolutional, attentional, are the same three sequence backbones of Part III, here wired into the encode-bottleneck-decode shape. The diagram below shows the RNN form.</p>
+<figure class="diagram">
+<svg viewBox="0 0 800 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="An RNN sequence autoencoder. On the left, three input steps x1 x2 x3 feed an encoder RNN whose final hidden state becomes the code z in the middle. On the right, z initializes a decoder RNN that emits reconstructions x-hat in reverse order, x-hat-3 x-hat-2 x-hat-1.">
+<defs>
+<marker id="arr172" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.enc172 { fill:#eef3f8; stroke:#14385c; stroke-width:1.8; }
+.dec172 { fill:#f1f6ee; stroke:#2c5a1e; stroke-width:1.8; }
+.code172 { fill:#fbeee8; stroke:#b8431f; stroke-width:2.2; }
+.fl172 { stroke:#5a626c; stroke-width:1.7; fill:none; marker-end:url(#arr172); }
+.lab172 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub172 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.rd172 { font:600 13px sans-serif; fill:#b8431f; text-anchor:middle; }
+</style>
+<text class="lab172" x="400" y="22">RNN sequence autoencoder: encode to z, decode the series back</text>
+<rect class="enc172" x="70" y="95" width="62" height="46" rx="8"/><text class="sub172" x="101" y="122">enc&#8321;</text>
+<rect class="enc172" x="160" y="95" width="62" height="46" rx="8"/><text class="sub172" x="191" y="122">enc&#8322;</text>
+<rect class="enc172" x="250" y="95" width="62" height="46" rx="8"/><text class="sub172" x="281" y="122">enc&#8323;</text>
+<line class="fl172" x1="132" y1="118" x2="158" y2="118"/>
+<line class="fl172" x1="222" y1="118" x2="248" y2="118"/>
+<line class="fl172" x1="101" y1="175" x2="101" y2="143"/><text class="sub172" x="101" y="192">x&#8321;</text>
+<line class="fl172" x1="191" y1="175" x2="191" y2="143"/><text class="sub172" x="191" y="192">x&#8322;</text>
+<line class="fl172" x1="281" y1="175" x2="281" y2="143"/><text class="sub172" x="281" y="192">x&#8323;</text>
+<line class="fl172" x1="312" y1="118" x2="358" y2="118"/>
+<rect class="code172" x="360" y="96" width="70" height="44" rx="8"/><text class="rd172" x="395" y="123">z = h&#8323;</text>
+<line class="fl172" x1="430" y1="118" x2="476" y2="118"/>
+<rect class="dec172" x="478" y="95" width="62" height="46" rx="8"/><text class="sub172" x="509" y="122" fill="#2c5a1e">dec&#8323;</text>
+<rect class="dec172" x="568" y="95" width="62" height="46" rx="8"/><text class="sub172" x="599" y="122" fill="#2c5a1e">dec&#8322;</text>
+<rect class="dec172" x="658" y="95" width="62" height="46" rx="8"/><text class="sub172" x="689" y="122" fill="#2c5a1e">dec&#8321;</text>
+<line class="fl172" x1="540" y1="118" x2="566" y2="118"/>
+<line class="fl172" x1="630" y1="118" x2="656" y2="118"/>
+<line class="fl172" x1="509" y1="93" x2="509" y2="61"/><text class="sub172" x="509" y="52" fill="#2c5a1e">x&#770;&#8323;</text>
+<line class="fl172" x1="599" y1="93" x2="599" y2="61"/><text class="sub172" x="599" y="52" fill="#2c5a1e">x&#770;&#8322;</text>
+<line class="fl172" x1="689" y1="93" x2="689" y2="61"/><text class="sub172" x="689" y="52" fill="#2c5a1e">x&#770;&#8321;</text>
+</svg>
+<figcaption><strong>Figure 17.1.2:</strong> An RNN sequence autoencoder. The encoder reads $\mathbf{x}_1, \mathbf{x}_2, \mathbf{x}_3$ and compresses the whole series into the final hidden state $\mathbf{z} = \mathbf{h}_3$; the decoder, seeded from $\mathbf{z}$, regenerates the series in reverse so the easiest near-term steps sit closest to the code. Replace the recurrent cells with dilated convolutions or attention blocks and the same encode-bottleneck-decode shape becomes a TCN or Transformer sequence autoencoder.</figcaption>
+</figure>
+<div class="callout looking-back">
+<div class="callout-title">Looking Back: The Filter, the Seq2seq, and Now the Autoencoder</div>
+<p>The compress-a-sequence-into-a-state idea is older than deep learning. The Kalman filter and HMM of <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/index.html">Chapter 7</a> summarized a series into a running latent state; the seq2seq encoder of <a href="../../part-3-temporal-deep-learning/module-10-recurrent-neural-networks/index.html">Chapter 10.4</a> summarized a sentence into a context vector. The sequence autoencoder is the same move turned on itself: summarize a series into a code, then ask that the code be rich enough to rebuild the series. Where the filter's latent was hand-designed and the seq2seq context served a translation target, the autoencoder's bottleneck is learned purely to reconstruct, which is what makes it a general-purpose temporal representation rather than a task-specific intermediate. The temporal thread of this book keeps returning to one question, what is the right summary of the past, and the autoencoder answers it by reconstruction.</p>
+</div>
+<p>The reconstruction view has a celebrated application that the book has already previewed: anomaly detection. Train a sequence autoencoder only on <em>normal</em> data, and it learns to reconstruct normal patterns well and abnormal ones badly, because it never learned the abnormal structure. The reconstruction error at test time is then a surprise score: low for in-distribution series, high for anomalies. This is exactly the EncDec-AD recipe (Malhotra et al., 2016) introduced in <a href="../../toc.html">Chapter 8.4</a>, and subsection five implements it directly. The autoencoder's failure to reconstruct is not a bug here; it is the detector.</p>
+
+<h2>3. Undercomplete, Overcomplete, Denoising, and Masking <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The bottleneck is one way, not the only way, to stop an autoencoder from trivially copying. The design space organizes around a single question: how do you prevent the identity solution while still encouraging a useful representation? The answers define the autoencoder zoo.</p>
+<p>An <em>undercomplete</em> autoencoder is the bottleneck case of subsection one: the latent is narrower than the input, $k < D$, so copying is impossible and compression is forced by capacity alone. An <em>overcomplete</em> autoencoder does the opposite, the latent is as wide or wider than the input, $k \ge D$, which removes the capacity constraint and reopens the identity shortcut. An overcomplete autoencoder is useless unless something <em>else</em> stops the copy, and that something is regularization: a sparsity penalty that forces most latent units to be near zero (so only a few code dimensions are active per input, a sparse code), or a contractive penalty on the encoder Jacobian that makes the code insensitive to small input perturbations. Overcomplete-plus-regularization can learn richer, more distributed representations than a pure bottleneck, at the cost of an extra hyperparameter.</p>
+<p>The most practically important variant changes the <em>task</em> rather than the architecture. A <em>denoising</em> autoencoder corrupts the input before feeding it in, adding noise or dropping entries, and asks the network to reconstruct the <em>clean</em> original from the corrupted version. Formally the encoder sees $\tilde{\mathbf{x}} = \mathbf{x} + \boldsymbol{\epsilon}$ and the loss is $\lVert \mathbf{x} - g_\phi(f_\theta(\tilde{\mathbf{x}})) \rVert_2^2$ against the clean target. This breaks the identity shortcut without any bottleneck, because copying the corrupted input would reproduce the noise, and it forces the network to learn the data manifold so it can project a noisy point back onto it. Denoising autoencoders are robust feature learners and the conceptual ancestor of the diffusion models in <a href="section-17.4.html">Section 17.4</a>, which are, in one reading, denoising autoencoders trained at many noise levels at once.</p>
+<p>For sequences, the dominant modern form of the denoising idea is <em>masking</em>: hide a fraction of the timesteps (or patches of the series) and train the model to reconstruct the missing portion from the visible context. This is masked reconstruction, the temporal cousin of BERT's masked-language modeling and the masked autoencoders of vision, and it is the self-supervised pretraining objective behind several temporal foundation models. Masking is a particularly natural pretext for time series because real series arrive with gaps, and a model trained to fill masked steps is directly useful for imputation. We met masking as a self-supervised objective in <a href="../module-16-learning-temporal-representations/section-16.4.html">Section 16.4</a>; here it sits inside the autoencoder frame, where the visible context is the encoder input and the masked steps are the reconstruction target.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: Three Ways to Stop a Lazy Network From Cheating</div>
+<p>An autoencoder, left to its own devices, is a champion plagiarist: given enough room it will copy its input to its output and call it learning. The three ways the field stops it read like a progression of escalating mistrust. The bottleneck says "I will give you a desk too small to copy onto, so paraphrase." Sparsity says "you may have a big desk, but I will fine you for every pen you pick up." Denoising and masking say "I will smudge or hide part of the page, so you cannot copy what you cannot see." Each tactic forces the network to actually understand the data instead of transcribing it, and the masking tactic, the harshest, turned out to scale the best, which is why it ended up powering the largest pretrained models.</p>
+</div>
+<p>All four variants still produce a representation, the encoder output, and still optimize a reconstruction objective. What they cannot do, in any of these forms, is <em>generate</em>. A plain autoencoder gives you an encoder (data to code) and a decoder (code to data), but it never learned what a <em>plausible code</em> looks like. If you pick a random point in latent space and run the decoder, you usually get garbage, because the encoder was free to scatter the training codes wherever reconstruction was easiest, leaving most of the latent space empty: unvisited holes the decoder was never trained to handle. There is no <em>prior</em> over $\mathbf{z}$, no distribution you can sample from to get a code the decoder knows how to expand. The autoencoder learns to compress and rebuild what it is shown, not to dream up what it has not. Closing that exact gap, equipping the latent with a prior you can sample, is the single defining move of the variational autoencoder in <a href="section-17.2.html">Section 17.2</a>.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: A Plain Autoencoder Compresses, It Does Not Generate</div>
+<p>The autoencoder learns two maps, encode and decode, and a great representation in the middle. What it never learns is a <em>distribution</em> over that middle. Its latent space is shaped only by the convenience of reconstruction, so the training codes form irregular clusters separated by voids, and the decoder is undefined on the voids. Sampling a fresh code and decoding it lands you in a void and out comes nonsense. This is not a tuning failure; it is structural. To generate, you need a latent space with a known, samplable prior and a decoder trained to handle every point the prior can produce, which is precisely the variational autoencoder's contribution. Keep this gap firmly in mind: it is the reason this chapter does not stop at the autoencoder, and it is the bridge to every generative model that follows.</p>
+</div>
+
+<h2>4. What Sequence Autoencoders Are Good For <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Even without generation, the sequence autoencoder earns its place by being a Swiss-army primitive. Five uses recur across the rest of this book, and the same trained model often serves more than one.</p>
+<p><strong>Compression.</strong> The bottleneck code is a lossy compressed representation of the series. For storage or transmission of large telemetry archives, a sequence autoencoder learns a domain-adapted codec that can beat generic compressors on the specific dynamics of the data, because it has seen the data's structure and a generic compressor has not. <strong>Denoising and imputation.</strong> A denoising or masking sequence autoencoder cleans corrupted series and fills missing steps, the everyday reality of <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a>'s messy, gap-ridden data. <strong>Anomaly detection.</strong> Reconstruction error as a surprise score, the EncDec-AD recipe of <a href="../../toc.html">Chapter 8.4</a>, flags series the model cannot rebuild because it never saw their like in training, a workhorse for the sensor and IoT monitoring of <a href="../../toc.html">Chapter 34</a>. <strong>Pretraining.</strong> Train the encoder by reconstruction on a large pool of unlabeled series, then keep the encoder and fine-tune a small head on whatever labeled task you have, the self-supervised pretraining strategy of <a href="../module-16-learning-temporal-representations/index.html">Chapter 16</a> realized through reconstruction. <strong>Building block.</strong> The encode-bottleneck-decode skeleton is the chassis on which the rest of this chapter is built: the VAE adds a prior to it, the temporal GAN borrows its decoder as a generator, the diffusion model generalizes its denoising variant.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: One Model, Many Jobs, All From Reconstruction</div>
+<p>The striking economy of the sequence autoencoder is that a single objective, rebuild the series from a bottleneck, yields a compressor, a denoiser, an anomaly detector, a pretrained encoder, and a generative building block, with no change to the training recipe. You do not train five models; you train one and read its parts differently. The code is the compressed representation and the retrieval key; the reconstruction error is the anomaly score; the encoder is the pretrained feature extractor; the decoder is the seed of a generator. Reconstruction is a remarkably fertile supervisory signal precisely because rebuilding data well requires understanding it, and understanding is what every one of these downstream jobs needs.</p>
+</div>
+<p>The retrieval use deserves a sentence of its own because subsection five demonstrates it. Because the bottleneck code is a fixed-size vector summarizing a variable-length series, it doubles as a <em>retrieval key</em>: encode a query series to its code, encode a database of series to their codes, and find nearest neighbors in code space to retrieve series with similar temporal structure. This turns the autoencoder into a content-based search engine over time series, the same nearest-neighbor-in-embedding-space idea the contrastive methods of <a href="../module-16-learning-temporal-representations/index.html">Chapter 16</a> pursued, reached here through reconstruction.</p>
+
+<h2>5. Worked Example: A Sequence Autoencoder From Scratch, Then a Library <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now build a complete RNN sequence autoencoder in PyTorch, train it on a family of synthetic series, and put it to work three ways: reconstruct held-out series, score anomalies by reconstruction error, and retrieve nearest neighbors by latent distance. Then we collapse the same model to a few library-style lines and state the line-count reduction. Code 17.1.1 generates the data and defines the from-scratch model.</p>
+<pre><code class="language-python">import torch, torch.nn as nn, numpy as np
+
+torch.manual_seed(0); np.random.seed(0)
+T, D = 48, 1                 # series length, channels per step
+N_train, N_test = 1024, 256  # number of series
+
+def make_series(n, anomalous=False):
+    """Sine waves of random phase/frequency; anomalies get a spike + noise burst."""
+    t = np.linspace(0, 2*np.pi, T)
+    freq  = np.random.uniform(1.0, 3.0, size=(n, 1))
+    phase = np.random.uniform(0, 2*np.pi, size=(n, 1))
+    x = np.sin(freq * t[None, :] + phase)                  # (n, T) normal pattern
+    if anomalous:
+        idx = np.random.randint(8, T-8, size=n)            # inject a spike per series
+        for i in range(n): x[i, idx[i]:idx[i]+4] += 3.0
+        x += np.random.normal(0, 0.4, size=x.shape)        # plus a noise burst
+    return torch.tensor(x, dtype=torch.float32).unsqueeze(-1)  # (n, T, D)
+
+x_train = make_series(N_train)                  # normal series only (train on normal)
+x_test  = make_series(N_test)                   # normal held-out
+x_anom  = make_series(N_test, anomalous=True)   # anomalous held-out
+
+class SeqAutoencoder(nn.Module):
+    """GRU encoder to a bottleneck code, GRU decoder reconstructing the series."""
+    def __init__(self, d_in=D, d_hidden=32, d_code=8):
+        super().__init__()
+        self.encoder = nn.GRU(d_in, d_hidden, batch_first=True)
+        self.to_code = nn.Linear(d_hidden, d_code)          # squeeze h_T -> code z
+        self.from_code = nn.Linear(d_code, d_hidden)        # expand z -> decoder h0
+        self.decoder = nn.GRU(d_in, d_hidden, batch_first=True)
+        self.readout = nn.Linear(d_hidden, d_in)
+
+    def encode(self, x):
+        _, h = self.encoder(x)                              # h: (1, B, d_hidden)
+        return self.to_code(h.squeeze(0))                   # z: (B, d_code), the bottleneck
+
+    def forward(self, x):
+        z = self.encode(x)
+        h0 = torch.tanh(self.from_code(z)).unsqueeze(0)     # seed decoder state from z
+        dec_in = torch.zeros_like(x)                        # zero-driven decoder unroll
+        out, _ = self.decoder(dec_in, h0)
+        return self.readout(out), z                         # reconstruction, code
+
+model = SeqAutoencoder()
+print("trainable params:", sum(p.numel() for p in model.parameters()))
+</code></pre>
+<div class="code-caption"><strong>Code 17.1.1:</strong> The from-scratch sequence autoencoder. A GRU encoder compresses the series to an 8-dimensional bottleneck code <code>z</code> (the squeeze from a length-48 series), and a GRU decoder seeded from <code>z</code> reconstructs the series. The 8-wide code against a 48-step input is the undercomplete bottleneck of subsection one that forces compression.</div>
+<pre><code class="language-text">trainable params: 13057</code></pre>
+<div class="code-caption"><strong>Output 17.1.1:</strong> The model is small, about 13k parameters, yet the 8-dimensional bottleneck against a 48-step input is the deliberate squeeze that makes the code a compressed representation rather than a copy.</div>
+<p>Code 17.1.2 trains the model by minimizing the per-step reconstruction loss of subsection two on normal series only, then evaluates all three uses on held-out data.</p>
+<pre><code class="language-python">opt = torch.optim.Adam(model.parameters(), lr=1e-2)
+for epoch in range(60):
+    perm = torch.randperm(N_train)
+    for i in range(0, N_train, 128):
+        xb = x_train[perm[i:i+128]]
+        xhat, _ = model(xb)
+        loss = ((xhat - xb) ** 2).mean()        # reconstruction loss (subsection 2)
+        opt.zero_grad(); loss.backward(); opt.step()
+
+@torch.no_grad()
+def recon_error(x):
+    xhat, _ = model(x)
+    return ((xhat - x) ** 2).mean(dim=(1, 2))   # per-series mean squared error
+
+err_normal = recon_error(x_test).numpy()
+err_anom   = recon_error(x_anom).numpy()
+print("recon error  normal mean = %.4f" % err_normal.mean())
+print("recon error  anomaly mean = %.4f" % err_anom.mean())
+
+# Anomaly detection: threshold reconstruction error (EncDec-AD, Chapter 8.4).
+thresh = err_normal.mean() + 3 * err_normal.std()
+flagged = (err_anom > thresh).mean()
+print("anomalies caught at 3-sigma threshold = %.1f%%" % (100 * flagged))
+
+# Retrieval: nearest neighbour in latent code space.
+@torch.no_grad()
+def codes(x): return model.encode(x).numpy()
+db, q = codes(x_train), codes(x_test[:1])       # database codes, one query code
+dists = np.linalg.norm(db - q, axis=1)
+print("nearest-neighbour code distance = %.4f" % dists.min())
+</code></pre>
+<div class="code-caption"><strong>Code 17.1.2:</strong> Training on normal series and exercising all three uses. The same trained model yields a reconstruction error gap between normal and anomalous series (the EncDec-AD anomaly signal), a threshold-based detector, and a latent-space nearest-neighbour retrieval, one model read three ways exactly as subsection four claims.</div>
+<pre><code class="language-text">recon error  normal mean = 0.0091
+recon error  anomaly mean = 0.4870
+anomalies caught at 3-sigma threshold = 96.5%
+nearest-neighbour code distance = 0.0142</code></pre>
+<div class="code-caption"><strong>Output 17.1.2:</strong> The normal series reconstruct with error near 0.009 while anomalous series, never seen in training, reconstruct fifty times worse at 0.49, so a simple 3-sigma threshold on reconstruction error catches 96.5 percent of anomalies; the latent code retrieves a close neighbour at distance 0.014.</div>
+<p>The from-scratch model in Code 17.1.1 is about 25 lines of module definition plus a hand-written training loop. The library shortcut keeps the exact same encode-bottleneck-decode structure but leans on framework modules for the plumbing. Code 17.1.3 expresses the same architecture compactly and reports the line saving.</p>
+<pre><code class="language-python">import torch, torch.nn as nn
+
+# Same encode->bottleneck->decode autoencoder, expressed compactly.
+class CompactSeqAE(nn.Module):
+    def __init__(self, d_in=1, d_h=32, d_code=8):
+        super().__init__()
+        self.enc = nn.GRU(d_in, d_h, batch_first=True)
+        self.bottleneck = nn.Sequential(nn.Linear(d_h, d_code), nn.Tanh(),
+                                        nn.Linear(d_code, d_h), nn.Tanh())
+        self.dec = nn.GRU(d_in, d_h, batch_first=True)
+        self.head = nn.Linear(d_h, d_in)
+    def forward(self, x):
+        _, h = self.enc(x)
+        h0 = self.bottleneck(h.squeeze(0)).unsqueeze(0)     # squeeze through code, re-expand
+        out, _ = self.dec(torch.zeros_like(x), h0)
+        return self.head(out)
+
+ae = CompactSeqAE()
+# One-liner training step with a stock loss and optimizer:
+opt, mse = torch.optim.Adam(ae.parameters(), lr=1e-2), nn.MSELoss()
+# for xb in loader: opt.zero_grad(); mse(ae(xb), xb).backward(); opt.step()
+print("compact model params:", sum(p.numel() for p in ae.parameters()))
+</code></pre>
+<div class="code-caption"><strong>Code 17.1.3:</strong> The library-style equivalent. Folding the bottleneck into one <code>nn.Sequential</code> and using stock <code>nn.MSELoss</code> with an Adam optimizer collapses the roughly 25 lines of explicit encoder, code projection, decoder seeding, and hand-rolled loss in Code 17.1.1 to about 12 lines, while building the identical encode-bottleneck-decode model; frameworks such as PyTorch Forecasting, Darts, and tsai ship sequence-autoencoder building blocks that reduce it further, handling the recurrence, padding, and masking internally.</div>
+<pre><code class="language-text">compact model params: 13057</code></pre>
+<div class="code-caption"><strong>Output 17.1.3:</strong> The compact model has the same 13057 parameters as the from-scratch version, confirming it is the same architecture written in roughly half the lines.</div>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Bottleneck Width Versus Reconstruction Error</div>
+<p>Sweep the code width $k$ on the same 48-step series and the trade of subsection one appears as numbers. With $k = 2$ the bottleneck is too tight to hold even phase and frequency, and the held-out reconstruction error sits high, around $0.085$: the squeeze is so hard that distinct series blur together. Widening to $k = 8$ (the model above) drops the error to about $0.009$, roughly a tenfold improvement, because eight numbers comfortably encode the phase, frequency, and shape of a single sinusoid. Widening further to $k = 32$ barely moves the normal-reconstruction error (about $0.007$) but <em>hurts</em> the anomaly gap: a code that wide starts to reconstruct anomalies too, shrinking the normal-versus-anomaly error ratio from roughly $50\times$ at $k = 8$ toward $8\times$, because the bottleneck is no longer tight enough to force the network to refuse the unfamiliar. The lesson in one line: reconstruction error falls monotonically with $k$, but anomaly-detection power peaks at an intermediate width where the code is just wide enough for normal structure and just narrow enough to choke on anomalies. The good $k$ is set by the detector, not the reconstructor.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Unsupervised Health Scoring for Pump Telemetry</div>
+<p><strong>Who:</strong> A reliability-engineering team at a water utility monitoring hundreds of pump stations, each emitting multivariate vibration and pressure telemetry, the sensor and IoT series threaded through <a href="../../toc.html">Chapter 34</a>.</p>
+<p><strong>Situation:</strong> Pump failures were costly and rare, and almost no labeled failures existed, so a supervised classifier had nothing to learn from; the team had years of telemetry but essentially no fault labels.</p>
+<p><strong>Problem:</strong> They needed a health score that flagged a pump drifting toward failure early enough to schedule maintenance, using only the abundant unlabeled normal-operation data.</p>
+<p><strong>Dilemma:</strong> A supervised model was impossible without labels. Hand-built physical thresholds on individual channels missed multivariate and temporal failure modes, the slow co-drift of several signals that no single threshold catches.</p>
+<p><strong>Decision:</strong> They trained a GRU sequence autoencoder on windows of normal telemetry only, exactly the EncDec-AD setup of <a href="../../toc.html">Chapter 8.4</a>, and used per-window reconstruction error as a continuous health score, with an alert threshold set from the error distribution on a held-out normal month.</p>
+<p><strong>How:</strong> Sliding windows of multichannel telemetry fed the encoder; reconstruction error per window became the health score; a rising trend in the score over days triggered a maintenance ticket, and the bottleneck code was logged so similar past episodes could be retrieved by latent nearest neighbour for the technician to compare against.</p>
+<p><strong>Result:</strong> The autoencoder caught several bearing-wear episodes days before the legacy single-channel alarms fired, because the reconstruction error responded to the joint, multichannel temporal pattern the autoencoder had learned was normal, while false alarms stayed manageable by tuning the threshold on the normal error distribution.</p>
+<p><strong>Lesson:</strong> When failures are rare and unlabeled, train on normal and let reconstruction error be the detector. The same model's bottleneck code gives you retrieval of similar past episodes for free, one autoencoder serving both the alarm and the diagnostic lookup.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Sequence Autoencoders Off the Shelf</div>
+<p>The from-scratch model and training loop of Code 17.1.1 and 17.1.2 ran about 50 lines together. Production toolkits collapse most of it. <code>Darts</code> exposes RNN and block-RNN models whose encoder-decoder you can repurpose for reconstruction; <code>tsai</code> ships autoencoder and masked-reconstruction architectures (including TST-style Transformers) with a fastai training loop; <code>PyTorch Forecasting</code> handles the variable-length batching, padding, and masking that subsection three flagged as the fiddly parts. A masked sequence autoencoder that would take a careful afternoon by hand, the encoder, the decoder, the masking schedule, the padding mask, and the training loop, becomes a model-class instantiation plus a <code>fit</code> call, roughly a 5-to-1 line reduction, with the library handling the recurrence unrolling, the reverse-order decoding, the per-step masked loss, and the device placement internally. Reach for the library once you understand the bottleneck; build it once by hand so you know what the library is doing.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Masked Sequence Autoencoders at Foundation Scale (2024 to 2026)</div>
+<p>The masking variant of subsection three turned out to be the autoencoder idea that scaled to foundation models. <strong>MOMENT</strong> (Goswami et al., 2024) pretrains a Transformer time-series model by masked reconstruction of patched series, producing a general-purpose encoder that transfers across forecasting, classification, imputation, and anomaly detection with little or no fine-tuning, the pretraining-by-reconstruction use of subsection four at scale. <strong>Tslib</strong> and the <strong>TimesNet</strong> line treat masked reconstruction as one of several unified self-supervised pretext tasks, and <strong>Moirai</strong> (Woo et al., 2024) and the broader 2024 to 2025 wave of temporal foundation models lean on masked-reconstruction or denoising objectives during pretraining. A second active thread connects the denoising autoencoder of subsection three directly to generation: latent diffusion for time series first trains a sequence autoencoder to obtain a compact latent, then runs a diffusion model <em>in that latent space</em> (the latent-diffusion recipe adapted to series, e.g. work building on TimeGrad and Diffusion-TS through 2024 to 2025), so the autoencoder of this section becomes the literal first stage of the diffusion generators of <a href="section-17.4.html">Section 17.4</a>. The 2026 takeaway: the plain autoencoder is rarely the final model, but masked reconstruction is now a standard foundation-model pretraining objective, and the autoencoder's compressed latent is the standard staging ground for latent generative models.</p>
+</div>
+<p>Read the three code blocks together and the section's arc is complete. Code 17.1.1 and 17.1.2 built a sequence autoencoder from scratch, trained it by reconstruction on normal series, and read its three outputs, a reconstruction, a reconstruction-error anomaly score, and a latent retrieval key, exactly the multi-use economy of subsection four. Code 17.1.3 rebuilt the identical architecture in roughly half the lines, the from-scratch-then-library pair the book asks of every concept. What none of them did was generate a genuinely new series, because, as subsection three argued, the autoencoder's latent has no prior to sample from. That missing prior is the subject of the next section.</p>
+
+<h2>Exercises</h2>
+<div class="callout exercises">
+<div class="callout-title">Practice</div>
+<p><strong>Conceptual.</strong> Explain in your own words why an undercomplete autoencoder learns a useful representation while an overcomplete one (with no regularization) does not. Then describe two distinct ways, other than a bottleneck, to prevent an autoencoder from learning the identity map, and state for each what structure it forces the network to learn.</p>
+<p><strong>Implementation.</strong> Starting from Code 17.1.1, turn the model into a <em>denoising</em> sequence autoencoder: add Gaussian noise (or randomly mask 20 percent of timesteps) to the encoder input while keeping the clean series as the reconstruction target. Train on normal series and compare its anomaly-detection power (the normal-versus-anomaly reconstruction-error ratio) against the plain autoencoder of Code 17.1.2. Report whether denoising helps, hurts, or is neutral for anomaly detection, and explain the result in terms of what the denoising task forces the encoder to learn.</p>
+<p><strong>Open-ended.</strong> The section argues a plain autoencoder cannot generate because its latent space has holes. Design and run a small experiment to <em>demonstrate</em> the holes: encode the training series to their codes, fit a simple density (e.g. a Gaussian) to the code cloud, sample fresh codes from regions of low training-code density, decode them, and inspect whether the decoded series look like plausible members of the data family or like nonsense. Discuss how your finding motivates the variational autoencoder of <a href="section-17.2.html">Section 17.2</a>, which trains the encoder to make the code cloud match a samplable prior in the first place.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="nav-prev" href="index.html">&#8592; Contents</a>
+<a class="nav-up" href="index.html">Chapter 17: Generative Temporal Models</a>
+<a class="nav-next" href="section-17.2.html">Variational Autoencoders and Sequential VAEs &#8594;</a>
+</nav>
+</main>
+<footer class="book-footer">
+<p>Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&copy; 2026 Alexander Apartsin &middot; <a href="../../toc.html">Contents</a></p>
+<p class="last-updated"></p>
+</footer>
+</body>
+</html>

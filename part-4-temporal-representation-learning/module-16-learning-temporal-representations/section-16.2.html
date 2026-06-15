@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 16.2: Self-Supervised Pretext Tasks for Time Series. How to invent a label from the data itself so an encoder learns temporal structure without annotations: a catalogue of pretext tasks (forecasting, masked reconstruction, imputation, order verification, transformation prediction, relative position), semantics-preserving augmentations, the pretrain-then-probe protocol, and a from-scratch masked-reconstruction pretrainer matched against a library SSL recipe with a mask-ratio versus probe-accuracy study." name="description"/>
+<title>Section 16.2: Self-Supervised Pretext Tasks for Time Series | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Temporal Representation Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 16: Learning Temporal Representations</a></div>
+<h1>Self-Supervised Pretext Tasks for Time Series</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They never told me what the series meant. So I made up a chore: hide a stretch of the signal and guess it back. I was only pretending to forecast, but somewhere between the third masked window and the ten-thousandth, I stopped guessing values and started seeing shapes. The label was a lie I told myself; the structure I learned was real."</p>
+<cite>A Pretext Task Pretending to Forecast So It Can Learn to See</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Self-supervised learning solves the labels-are-scarce problem by manufacturing a supervisory signal out of the unlabeled data itself. You delete part of a time series and ask a network to fill it back in, or you scramble the order of two windows and ask which came first, or you scale a segment and ask by how much. None of these "pretext" answers is what you ultimately care about, but to answer them well the network is forced to discover the same temporal structure (trend, seasonality, local dynamics, cross-channel coupling) that a downstream task will need. Once trained on the pretext, the encoder is frozen or finetuned and a tiny labeled head is fitted on top.</strong> This is the engine underneath the temporal foundation models of <a href="../../part-3-temporal-deep-learning/module-15-temporal-foundation-models/index.html">Chapter 15</a>: pretrain a large encoder on oceans of unlabeled series with a pretext objective, then adapt it cheaply to any specific task. This section lays out the self-supervised idea and why labels are uniquely scarce for time series, catalogues the temporal pretext tasks (forecasting, masked reconstruction, imputation, order verification, transformation prediction, relative position) with the masked-reconstruction loss written out, explains which data augmentations preserve temporal semantics and which quietly destroy them, formalizes the pretrain-then-linear-probe protocol that connects a pretext task to a downstream metric, and finally implements a masked-reconstruction pretrainer from scratch, evaluates it with a linear probe, reproduces it with a library SSL recipe, and measures how mask ratio trades against probe accuracy. You leave able to design a pretext task, pick safe augmentations, and read the SSL recipes that the rest of Part IV builds on.</p>
+</div>
+<p>In <a href="section-16.1.html">Section 16.1</a> we framed representation learning as the search for an encoder $f_\theta$ that maps a raw series window $\mathbf{x}_{1:T}$ to a vector $\mathbf{z} \in \mathbb{R}^{d}$ in which downstream tasks become easy, ideally linearly separable. We left open the central practical question: how do we train $f_\theta$ when we have millions of series and almost no labels? This section gives the dominant answer. Rather than wait for annotations that may never come, we invent a task whose answer is already latent in the data, a <em>pretext</em> task, and we train the encoder to solve it. The bet is that an encoder good at the invented task must have learned features that transfer to the real task. The next section, <a href="section-16.3.html">Section 16.3</a>, sharpens this idea into contrastive learning, where the pretext is "tell apart views of the same window from views of different windows". Here we study the broader family of pretext objectives and the protocol that turns any of them into a usable representation.</p>
+<p>Why does this deserve a full section rather than a remark that "you just train on unlabeled data"? Because the choice of pretext task and the choice of augmentation are the two design decisions that decide whether the learned representation is worth anything, and both are subtle for time series in ways they are not for images. An image can be flipped, cropped, and color-jittered almost freely; a time series carries an arrow of time and a physical scale that many image-style transforms violate, so the augmentation that works on a photo can teach a forecaster something false. Get the pretext and the augmentations right and a frozen encoder plus a linear probe matches a fully supervised network using a fraction of the labels; get them wrong and you have spent a thousand GPU-hours learning to denoise noise. We use the unified notation of <a href="../../toc.html">Appendix A</a> throughout: $\mathbf{x}_{1:T}$ the input window, $\mathbf{z} = f_\theta(\mathbf{x}_{1:T})$ the representation, $\mathcal{M}$ a set of masked positions, $g_\phi$ a decoder or task head.</p>
+<p>The competencies this section installs are four: to articulate the self-supervised principle and why time-series labels are scarce; to name and distinguish the standard temporal pretext tasks and write the masked-reconstruction loss; to choose augmentations that preserve the semantics of a given kind of series; and to run the pretrain-then-probe protocol end to end, measuring how a pretext hyperparameter (the mask ratio) moves the downstream metric. These are the load-bearing skills for the contrastive methods of <a href="section-16.3.html">Section 16.3</a> and the generative models of <a href="../../toc.html">Chapter 17</a>.</p>
+
+<h2>1. The Self-Supervised Idea: Inventing a Label From the Data <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Supervised learning needs pairs $(\mathbf{x}, y)$ where $y$ is an annotation produced by a human or an instrument. Self-supervised learning needs only $\mathbf{x}$: it constructs the pair $(\tilde{\mathbf{x}}, y)$ from $\mathbf{x}$ alone by hiding, corrupting, or transforming part of the data and letting the hidden, original, or transformation-defining quantity be the label. The encoder never sees an external annotation. It learns by repeatedly solving a self-generated puzzle whose answer the construction procedure already knows. The word "pretext" captures the trick exactly: the task is a pretext, an excuse, a chore invented so that solving it forces the network to internalize structure we actually want.</p>
+<p>The reason this works is a transfer argument. A pretext task is useful precisely when its solution is <em>impossible without</em> the structure the downstream task also needs. To fill in a masked stretch of an electrocardiogram you must have learned the shape of a heartbeat; to decide whether a window of energy demand has been time-reversed you must have learned that load ramps up in the morning and down at night, an asymmetry only a model that understands daily dynamics can detect. The pretext answer is discarded, but the features that made it answerable remain in $f_\theta$, and those features are what a downstream classifier or forecaster reuses. Self-supervision is therefore a way of converting cheap unlabeled data into expensive-feeling supervision, by spending the structure already present in the signal.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: A Good Pretext Task Is One You Cannot Solve Without the Features You Want</div>
+<p>The whole art of self-supervision is choosing a pretext whose solution is bottlenecked on useful structure. A trivial pretext (predict the next value of a constant series) teaches nothing because it can be solved by a constant function. A well-designed pretext (reconstruct a masked window of a multivariate sensor stream) cannot be solved without modeling trend, seasonality, and cross-channel coupling, so an encoder that solves it has, as a side effect, learned those things. Ask of any candidate pretext: "what must the network understand to answer this, and is that what my downstream task needs?" If the honest answer is "nothing useful", change the pretext. This single test, far more than the exact loss function, decides whether self-supervised pretraining helps.</p>
+</div>
+<p>Why are labels uniquely scarce for time series, more so than for images or text? Three reasons compound. First, labeling a time series often requires an expert watching the series evolve: a cardiologist annotating arrhythmia onsets, a technician marking the exact tick where a bearing began to fail, an economist dating a recession. The label is an event embedded in a long stream, and finding it is slow, costly, and frequently ambiguous even to experts. Second, many of the most valuable labels are <em>future</em> events that simply have not happened yet: you cannot label a machine as "will fail within 30 days" until 30 days have elapsed, so labeled failure data accrues at the speed of real time and is rare by construction. Third, time-series data is enormous and continuous: a single factory emits billions of sensor readings a year, and labeling even a fraction is infeasible. The unlabeled stream, by contrast, is essentially free and unbounded. Self-supervision is the lever that turns that free, unbounded stream into a trained encoder.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Crossword Theory of Learning</div>
+<p>A pretext task is a crossword you write for yourself by erasing words from a page you already own. You do not need an answer key, because you are the one who erased the words, so you can always check your guess. The clever part is that you cannot fill in "___ pressure rising before the valve trips" unless you have actually learned how the plant behaves, so by the thousandth puzzle you have absorbed the physics whether you meant to or not. The puzzles are disposable; the understanding is not. This is why people only half-joke that self-supervised learning is the closest thing machine learning has to studying for an exam nobody is going to give.</p>
+</div>
+
+<h2>2. A Catalogue of Temporal Pretext Tasks <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The space of pretext tasks for time series is organized by what you hide and what you ask the network to recover. Six families cover almost everything in current practice, and the differences between them are differences in the inductive bias they impose. We name each, say what label it invents, and note what structure it forces the encoder to learn.</p>
+<p><strong>Forecasting / next-step prediction.</strong> Hide the future and predict it: split a window into a context $\mathbf{x}_{1:t}$ and a horizon $\mathbf{x}_{t+1:T}$, and train the encoder so a head reconstructs the horizon from the context. The label is just the (already observed) future. This is the oldest and most natural temporal pretext, and it is exactly the objective that pretrains the autoregressive foundation models of <a href="../../part-3-temporal-deep-learning/module-15-temporal-foundation-models/index.html">Chapter 15</a>. It forces the encoder to model dynamics, because you cannot extrapolate a series whose evolution you do not understand. Its weakness is that it only ever conditions on the past, so it learns causal but not bidirectional context.</p>
+<p><strong>Masked reconstruction.</strong> Hide an interior subset of the series and reconstruct it from both sides. This is the temporal analogue of the masked-language-modeling objective that, as <a href="../../part-3-temporal-deep-learning/module-15-temporal-foundation-models/index.html">Section 15.1</a> discussed for foundation models, made bidirectional pretraining dominant. Unlike forecasting, masked reconstruction sees context on both sides of the gap, so it learns bidirectional structure, and it is the workhorse pretext we implement in subsection five. We write its loss out below.</p>
+<p><strong>Gap filling / imputation.</strong> A close cousin of masking aimed specifically at the missing-data problem ubiquitous in real series (sensor dropouts, irregular clinical sampling). The pretext deletes runs of timesteps that mimic realistic missingness patterns and trains the encoder to impute them, so the learned representation is robust to exactly the gaps the deployment data will contain. It is masked reconstruction with a missingness-aware mask distribution.</p>
+<p><strong>Temporal order verification.</strong> Present two or more windows (or shuffled segments of one window) and ask the network to recover their correct chronological order, or simply to answer the binary question "is this sequence in order or shuffled?". The label is the true ordering, known for free. This forces the encoder to learn the <em>arrow of time</em>, the directional dynamics that distinguish a series from its reverse, without needing to reconstruct any values.</p>
+<p><strong>Transformation prediction.</strong> Apply a known transformation (time-reversal, a scaling by a known factor, a fixed time-warp) and ask the network which transformation was applied, a classification pretext. The label is the transformation identity. To tell a reversed heartbeat from a forward one, or a doubled-amplitude segment from the original, the encoder must understand the transformed property (direction, scale), so the pretext injects exactly that invariance or equivariance into the representation.</p>
+<p><strong>Relative-position prediction.</strong> Sample two patches from a series and ask the network to predict their temporal offset (how many steps apart, or which is earlier). The label is the known separation. This teaches a sense of temporal distance and is the pretext most directly analogous to the spatial-context tasks that launched self-supervised vision. Figure 16.2.1 lays the six families side by side.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Six panels each showing a short time series and the pretext label it invents: forecasting hides the right tail, masked reconstruction hides an interior block, imputation hides scattered runs, order verification shows two shuffled segments, transformation prediction shows a reversed copy, relative position shows two patches with an offset.">
+<defs>
+<marker id="ar162" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.sig162 { stroke:#14385c; stroke-width:2; fill:none; }
+.hid162 { stroke:#b8431f; stroke-width:2; fill:none; stroke-dasharray:4 3; }
+.box162 { fill:#fbeee8; stroke:#b8431f; stroke-width:1.4; }
+.tt162 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.st162 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+</style>
+<text class="tt162" x="135" y="22">Forecasting</text>
+<polyline class="sig162" points="40,70 60,55 80,75 100,50 120,65"/>
+<polyline class="hid162" points="120,65 140,48 160,70 180,52 200,66"/>
+<text class="st162" x="160" y="92">hide the future, predict it</text>
+<text class="tt162" x="410" y="22">Masked reconstruction</text>
+<polyline class="sig162" points="315,70 335,52 355,72 480,48 500,66"/>
+<rect class="box162" x="370" y="44" width="95" height="32" rx="4"/>
+<polyline class="hid162" points="375,68 395,50 415,70 435,52 455,66"/>
+<text class="st162" x="417" y="92">hide an interior block, fill from both sides</text>
+<text class="tt162" x="690" y="22">Imputation</text>
+<polyline class="sig162" points="600,70 615,55 630,72 645,52 660,68 675,55 690,70 705,52 720,68 735,55 750,70 765,55 780,68"/>
+<rect class="box162" x="640" y="46" width="18" height="32" rx="3"/>
+<rect class="box162" x="700" y="46" width="18" height="32" rx="3"/>
+<text class="st162" x="690" y="92">hide scattered runs, mimic dropouts</text>
+<text class="tt162" x="135" y="150">Order verification</text>
+<rect class="box162" x="50" y="172" width="70" height="34" rx="4"/><text class="st162" x="85" y="193">segment B</text>
+<rect class="box162" x="150" y="172" width="70" height="34" rx="4"/><text class="st162" x="185" y="193">segment A</text>
+<text class="st162" x="135" y="224">in order or shuffled?</text>
+<text class="tt162" x="410" y="150">Transformation</text>
+<polyline class="sig162" points="320,200 340,182 360,202 380,184 400,198"/>
+<polyline class="hid162" points="420,198 440,184 460,202 480,182 500,200"/>
+<text class="st162" x="410" y="224">forward vs reversed / scaled?</text>
+<text class="tt162" x="690" y="150">Relative position</text>
+<rect class="box162" x="600" y="180" width="40" height="26" rx="4"/><text class="st162" x="620" y="197">patch i</text>
+<rect class="box162" x="740" y="180" width="40" height="26" rx="4"/><text class="st162" x="760" y="197">patch j</text>
+<line class="sig162" x1="640" y1="193" x2="738" y2="193" marker-end="url(#ar162)"/>
+<text class="st162" x="690" y="224">how many steps apart?</text>
+<text class="st162" x="410" y="300">Each panel hides something the encoder must understand to recover (orange dashed = the invented label).</text>
+</svg>
+<figcaption><strong>Figure 16.2.1:</strong> The six temporal pretext families, each defined by what it hides (orange dashed) and what the encoder must learn to recover it. Forecasting and masked reconstruction recover values; order verification, transformation prediction, and relative position recover structure-defining metadata. The choice imposes a different inductive bias on the representation.</figcaption>
+</figure>
+<p>The masked-reconstruction loss makes the value-recovery family precise. Let $\mathcal{M} \subset \{1, \dots, T\}$ be the set of masked positions, $\tilde{\mathbf{x}}$ the series with those positions replaced by a mask token, $f_\theta$ the encoder and $g_\phi$ a lightweight decoder. The objective minimizes the reconstruction error on the masked positions only:</p>
+$$\mathcal{L}_{\text{MR}}(\theta, \phi) = \mathbb{E}_{\mathbf{x},\,\mathcal{M}} \left[ \frac{1}{|\mathcal{M}|} \sum_{t \in \mathcal{M}} \big\| \, [g_\phi(f_\theta(\tilde{\mathbf{x}}))]_t - \mathbf{x}_t \, \big\|_2^2 \right].$$
+<p>Two design choices are visible in the formula. The sum runs over $\mathcal{M}$ only, so the network is scored solely on positions it could not see, which prevents the trivial solution of copying visible inputs. And $\mathcal{M}$ is resampled per example (the expectation over $\mathcal{M}$), so the encoder must reconstruct any part of the series from any other, not memorize a fixed hole. The mask ratio $|\mathcal{M}| / T$ is the single most important pretext hyperparameter, and subsection five measures its effect on downstream accuracy directly.</p>
+<div class="callout looking-back">
+<div class="callout-title">Looking Back: Forecasting Was a Pretext All Along</div>
+<p>The classical forecasting models of <a href="../../part-2-classical-forecasting/module-05-univariate-forecasting/index.html">Chapter 5</a> fit a model to predict the next value, then used the fitted dynamics. Reframed through this section, those models were running the forecasting pretext, learning structure by predicting the future, except they kept the prediction as the product rather than discarding it to keep the representation. Self-supervision inverts the priority: the prediction is the disposable byproduct and the learned encoder is the prize. The same loss, a different thing kept.</p>
+</div>
+
+<h2>3. Designing Augmentations That Preserve Semantics <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Most pretext tasks, and all of the contrastive methods of <a href="section-16.3.html">Section 16.3</a>, rely on <em>augmentations</em>: random transformations applied to a window to create varied training views. An augmentation is only valid if it preserves the semantic label of the series, the thing a downstream task cares about. For images this constraint is forgiving; for time series it is sharp, because a transform that looks innocent can destroy the very property being learned. The governing principle: an augmentation is safe for a task if and only if it leaves the downstream label invariant. Here are the standard temporal augmentations and the conditions under which each is safe.</p>
+<p><strong>Jitter (additive noise).</strong> Add small Gaussian noise to each value. Safe almost everywhere, because real sensors are already noisy and small perturbations rarely change a class or a trend. The only danger is setting the noise scale above the signal's own fine structure, which erases the features you want.</p>
+<p><strong>Scaling (amplitude).</strong> Multiply the whole window by a random factor. Safe when the downstream label is scale-invariant (a heartbeat is a heartbeat at any recording gain), and unsafe when the label depends on magnitude (a temperature of 40 degrees versus 20 degrees is a different clinical state, so scaling corrupts the label). For the finance volatility series of <a href="../../part-2-classical-forecasting/module-05-univariate-forecasting/index.html">Chapter 5</a>, amplitude <em>is</em> the signal, so scaling is dangerous.</p>
+<p><strong>Time-warping.</strong> Locally stretch and compress the time axis with a smooth warp. Safe when the label is invariant to speed (a gesture is the same gesture performed slightly faster), and unsafe when timing is the label (an arrhythmia is defined by interval lengths, which warping alters).</p>
+<p><strong>Permutation (segment shuffling).</strong> Split the window into segments and shuffle their order. This is aggressive: it explicitly destroys long-range temporal order, so it is unsafe for any task that depends on the arrow of time or global trend, and it is in direct tension with the order-verification pretext, which exists to teach exactly the order permutation destroys. Use it only when local patterns matter and global order does not.</p>
+<p><strong>Cropping (random sub-window).</strong> Take a random contiguous sub-window. Safe and widely used, since a sub-window of a class is usually the same class, and it is the backbone of contrastive view generation. The risk is cropping out the discriminative event entirely (a crop that misses the arrhythmia mislabels the view).</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Augmentation</th><th>What it changes</th><th>Safe when the label is...</th><th>Breaks</th></tr></thead>
+<tbody>
+<tr><td>Jitter</td><td>adds value noise</td><td>noise-robust (almost always)</td><td>fine micro-structure if noise too large</td></tr>
+<tr><td>Scaling</td><td>amplitude</td><td>scale-invariant</td><td>magnitude-defined labels (volatility, vitals)</td></tr>
+<tr><td>Time-warp</td><td>local time speed</td><td>speed-invariant</td><td>interval-defined labels (arrhythmia timing)</td></tr>
+<tr><td>Permutation</td><td>segment order</td><td>order-irrelevant (local only)</td><td>trend, seasonality, arrow of time</td></tr>
+<tr><td>Cropping</td><td>window extent</td><td>event present in every crop</td><td>labels tied to a rare localized event</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 16.2.2:</strong> Temporal augmentations and their safety conditions. Each row states what the transform perturbs, the label property it leaves invariant, and the structure it destroys when misapplied. Picking augmentations is choosing which invariances to bake into the representation, so the choice must match the downstream task.</figcaption>
+</figure>
+<p>The unifying lesson is that an augmentation choice is a statement of which invariances you want the representation to have. Scaling teaches scale-invariance; if your task needs scale-sensitivity, you have taught the wrong thing. There is no universally safe augmentation set for time series, because different domains define their labels by different properties, magnitude here, timing there, order elsewhere. This is the single biggest difference from image self-supervision, where a near-universal augmentation recipe exists, and it is why every strong time-series SSL method (including the TS2Vec and TF-C methods of <a href="section-16.3.html">Section 16.3</a>) is careful and explicit about its augmentations.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Augmentations Are Assumptions, Not Free Lunch</div>
+<p>Every augmentation you apply asserts "the downstream label is invariant to this transform". That assertion is an assumption about the task, and it can be wrong. Image SSL got away with a fixed recipe because most visual labels really are invariant to crop, flip, and color jitter. Time series have no such luck: amplitude, timing, and order are each the load-bearing label for some task and discardable noise for another. So the right augmentation set is task-dependent, and the safest default is to start with the mildest transforms (small jitter, cropping) and add an aggressive one (scaling, warping, permutation) only after confirming the downstream label tolerates it. When in doubt, prefer masked reconstruction, which needs no augmentation at all, only a mask.</p>
+</div>
+
+<h2>4. From Pretext to Downstream: Probe, Finetune, and the Foundation-Model Link <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A pretext task is only a means; the end is a representation that makes a real task easy. The protocol that connects the two has two stages. <em>Stage one, pretraining:</em> train the encoder $f_\theta$ on the pretext objective over the large unlabeled pool, with no downstream labels in sight. <em>Stage two, adaptation:</em> take the trained encoder and fit a small head on the (now small) labeled set, in one of two modes.</p>
+<p><strong>Linear probing</strong> freezes the encoder entirely and fits only a linear classifier or regressor on top of the frozen features $\mathbf{z} = f_\theta(\mathbf{x})$. Because the only trainable part is linear, a high linear-probe score is strong evidence that the <em>pretext alone</em> already organized the data well, the representation is doing the work, not the head. Linear probing is the standard, honest measure of representation quality, and it is what we use to score the pretrainer in subsection five.</p>
+<p><strong>Finetuning</strong> instead unfreezes the encoder and trains it together with the head on the labeled set, usually with a small learning rate. It typically reaches higher accuracy than probing because the features adapt to the task, but it needs more labels and more compute and it can overfit small labeled sets. The practical rule: probe when labels are very scarce or you want to measure representation quality, finetune when you have enough labels to adapt safely and you want the last few points of accuracy.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two-stage pipeline. Stage one: a large unlabeled pool feeds a pretext task that trains the encoder. Stage two: the trained encoder feeds a small labeled set into either a frozen linear probe or a finetuned head, producing the downstream model.">
+<defs>
+<marker id="ar163" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.bx163 { fill:#eef3f8; stroke:#14385c; stroke-width:1.8; }
+.bx163b { fill:#fbeee8; stroke:#b8431f; stroke-width:1.8; }
+.fl163 { stroke:#5a626c; stroke-width:1.8; fill:none; marker-end:url(#ar163); }
+.t163 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s163 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.hd163 { font:600 12px sans-serif; fill:#b8431f; text-anchor:middle; }
+</style>
+<text class="hd163" x="200" y="22">STAGE 1: pretrain on unlabeled data</text>
+<text class="hd163" x="620" y="22">STAGE 2: adapt with few labels</text>
+<rect class="bx163" x="40" y="50" width="120" height="50" rx="8"/><text class="s163" x="100" y="72">large unlabeled</text><text class="s163" x="100" y="88">series pool</text>
+<rect class="bx163b" x="210" y="50" width="110" height="50" rx="8"/><text class="s163" x="265" y="72">pretext task</text><text class="s163" x="265" y="88">(mask, forecast...)</text>
+<rect class="bx163" x="370" y="50" width="100" height="50" rx="8"/><text class="t163" x="420" y="80">encoder f</text>
+<line class="fl163" x1="160" y1="75" x2="208" y2="75"/>
+<line class="fl163" x1="320" y1="75" x2="368" y2="75"/>
+<line class="fl163" x1="420" y1="100" x2="420" y2="140"/>
+<rect class="bx163" x="370" y="140" width="100" height="44" rx="8"/><text class="t163" x="420" y="167">frozen f</text>
+<rect class="bx163" x="520" y="120" width="120" height="44" rx="8"/><text class="s163" x="580" y="142">linear probe</text><text class="s163" x="580" y="157">(frozen f)</text>
+<rect class="bx163" x="520" y="178" width="120" height="44" rx="8"/><text class="s163" x="580" y="200">finetune head</text><text class="s163" x="580" y="215">(unfrozen f)</text>
+<line class="fl163" x1="470" y1="155" x2="518" y2="142"/>
+<line class="fl163" x1="470" y1="162" x2="518" y2="195"/>
+<rect class="bx163b" x="690" y="148" width="100" height="46" rx="8"/><text class="s163" x="740" y="170">downstream</text><text class="s163" x="740" y="185">model</text>
+<line class="fl163" x1="640" y1="142" x2="688" y2="165"/>
+<line class="fl163" x1="640" y1="200" x2="688" y2="178"/>
+</svg>
+<figcaption><strong>Figure 16.2.3:</strong> The pretrain-then-adapt protocol. Stage one trains the encoder on a pretext task over the unlabeled pool; stage two reuses the encoder, either frozen under a linear probe (measures representation quality) or unfrozen under finetuning (squeezes out more accuracy at the cost of labels and compute). The encoder is the bridge that carries unlabeled structure into the labeled task.</figcaption>
+</figure>
+<p>This two-stage protocol is exactly the recipe behind the temporal foundation models of <a href="../../part-3-temporal-deep-learning/module-15-temporal-foundation-models/index.html">Chapter 15</a>, scaled up. A foundation model such as Moirai, MOMENT, or Chronos is nothing more than a very large encoder pretrained with a pretext objective (masked reconstruction or autoregressive forecasting) on an enormous and diverse corpus of series, then offered for zero-shot use or cheap finetuning. The difference between the toy pretrainer of subsection five and a foundation model is scale (parameters, data, compute) and engineering, not principle: the same masked-reconstruction loss, the same frozen-encoder-plus-head adaptation. Understanding the protocol here is understanding the machinery that makes <a href="../../part-3-temporal-deep-learning/module-15-temporal-foundation-models/index.html">Chapter 15</a> possible.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Pretext Tasks at Scale (2024 to 2026)</div>
+<p>The frontier is which pretext objective scales best for time-series foundation models, and the field has not converged. MOMENT (Goswami et al., 2024) pretrains a family of encoders with masked reconstruction over a broad corpus and reports strong linear-probe and zero-shot results, the masked-patch pretext of subsection five at scale. Chronos (Ansari et al., 2024) instead tokenizes series and pretrains with an autoregressive (forecasting) pretext borrowed wholesale from language models, while Moirai (Woo et al., 2024) uses masked prediction with multi-patch-size inputs for any-frequency data. A 2024 to 2025 thread asks whether the image-SSL lesson (reconstruction-style masked autoencoders versus contrastive learning) transfers to time series, with patch-based masked modeling (PatchTST-style, Nie et al., 2023) emerging as a strong and simple default. Two open questions dominate 2026: whether a single pretext can serve all temporal domains given the augmentation-is-task-dependent obstacle of subsection three, and how to combine pretexts (masking plus contrastive plus order) into one objective without their inductive biases fighting. The masked-reconstruction pretrainer you build next is the unscaled core of this entire research program.</p>
+</div>
+
+<h2>5. Worked Example: A Masked-Reconstruction Pretrainer, Then a Linear Probe <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now build the whole protocol end to end. The plan: generate a labeled synthetic dataset of two classes of series (so we have ground truth to probe against, but the pretrainer never sees the labels); implement a patch-masking masked-reconstruction pretrainer from scratch in PyTorch and train its encoder with no labels; freeze the encoder and fit a linear probe on a small labeled subset to measure representation quality; then sweep the mask ratio and watch the probe accuracy respond. Finally we show the library-shortcut equivalent. Code 16.2.1 builds the data and the from-scratch pretrainer.</p>
+<pre><code class="language-python">import torch, torch.nn as nn, numpy as np
+torch.manual_seed(0); np.random.seed(0)
+
+T, P = 96, 8                      # series length T, patch length P  -> 12 patches
+n_patch = T // P
+
+def make_series(n):
+    """Two classes: class 0 = low-freq sine, class 1 = high-freq sine, both noisy."""
+    X, y = [], []
+    for _ in range(n):
+        c = np.random.randint(2)
+        freq = 2.0 if c == 0 else 6.0          # the ONLY discriminative feature: frequency
+        t = np.linspace(0, 2*np.pi, T)
+        s = np.sin(freq * t) + 0.25*np.random.randn(T)
+        X.append(s); y.append(c)
+    return torch.tensor(np.array(X), dtype=torch.float32), torch.tensor(y)
+
+X_unlab, _      = make_series(4000)            # large UNLABELED pool (labels discarded)
+X_tr, y_tr      = make_series(200)             # small labeled set for the probe
+X_te, y_te      = make_series(1000)            # held-out test set
+
+class MaskedPretrainer(nn.Module):
+    """Patch-embed, encode, decode masked patches back to raw values."""
+    def __init__(self, d=64):
+        super().__init__()
+        self.embed   = nn.Linear(P, d)                 # raw patch -> token
+        self.mask_tok = nn.Parameter(torch.zeros(d))   # learned mask token
+        self.encoder = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(d, nhead=4, dim_feedforward=128,
+                                       batch_first=True), num_layers=2)
+        self.decoder = nn.Linear(d, P)                 # token -> reconstructed patch
+
+    def patchify(self, x):                             # (B,T) -> (B, n_patch, P)
+        return x.view(x.size(0), n_patch, P)
+
+    def encode(self, x):                               # representation = mean over patch tokens
+        tok = self.embed(self.patchify(x))
+        return self.encoder(tok).mean(dim=1)           # (B, d) pooled representation z
+
+    def forward(self, x, mask_ratio):
+        B = x.size(0)
+        tok = self.embed(self.patchify(x))             # (B, n_patch, d)
+        n_mask = max(1, int(mask_ratio * n_patch))
+        idx = torch.rand(B, n_patch).argsort(dim=1)[:, :n_mask]   # random masked patches
+        m = torch.zeros(B, n_patch, dtype=torch.bool)
+        m.scatter_(1, idx, True)                       # m[b,p]=True where patch is hidden
+        tok = torch.where(m.unsqueeze(-1), self.mask_tok, tok)    # replace masked tokens
+        rec = self.decoder(self.encoder(tok))          # (B, n_patch, P) reconstruction
+        target = self.patchify(x)
+        loss = ((rec - target)**2)[m].mean()           # MSE on MASKED patches only
+        return loss
+</code></pre>
+<div class="code-caption"><strong>Code 16.2.1:</strong> The masked-reconstruction pretrainer from scratch. Series are split into patches, masked patches are replaced by a learned mask token, a tiny Transformer encoder plus linear decoder reconstructs them, and the loss is mean-squared error on the masked patches only, the $\mathcal{L}_{\text{MR}}$ of subsection two. The two synthetic classes differ only in frequency, the structure the pretext must learn to reconstruct masked patches.</div>
+<p>With the model defined, Code 16.2.2 runs the unlabeled pretraining loop, then freezes the encoder and fits a linear probe on the 200-example labeled set, reporting test accuracy. The encoder never touches a label during pretraining.</p>
+<pre><code class="language-python">def pretrain(mask_ratio=0.5, epochs=15):
+    model = MaskedPretrainer()
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    for _ in range(epochs):
+        perm = torch.randperm(X_unlab.size(0))
+        for i in range(0, X_unlab.size(0), 256):       # minibatches over the UNLABELED pool
+            b = X_unlab[perm[i:i+256]]
+            opt.zero_grad(); loss = model(b, mask_ratio); loss.backward(); opt.step()
+    return model
+
+def linear_probe(model):
+    """Freeze encoder, fit ONE linear layer on frozen features, report test accuracy."""
+    with torch.no_grad():
+        Z_tr = model.encode(X_tr); Z_te = model.encode(X_te)   # frozen representations
+    clf = nn.Linear(Z_tr.size(1), 2)
+    opt = torch.optim.Adam(clf.parameters(), lr=1e-2)
+    for _ in range(300):
+        opt.zero_grad()
+        nn.functional.cross_entropy(clf(Z_tr), y_tr).backward(); opt.step()
+    acc = (clf(Z_te).argmax(1) == y_te).float().mean().item()
+    return acc
+
+model = pretrain(mask_ratio=0.5)
+print("linear-probe test accuracy (mask 0.5): %.3f" % linear_probe(model))
+</code></pre>
+<div class="code-caption"><strong>Code 16.2.2:</strong> Pretrain on unlabeled data, then probe. The encoder is trained purely on the masked-reconstruction pretext over <code>X_unlab</code> with no labels; the probe then fits a single frozen-feature linear layer on just 200 labeled examples. A high accuracy from a linear head certifies that the pretext alone organized the representation, the honest measure of subsection four.</div>
+<pre><code class="language-text">linear-probe test accuracy (mask 0.5): 0.978
+</code></pre>
+<div class="code-caption"><strong>Output 16.2.1:</strong> A linear probe on the frozen self-supervised encoder reaches 97.8 percent test accuracy from only 200 labels, because masked reconstruction forced the encoder to encode frequency, the one feature that separates the classes. The labels were never seen during pretraining.</div>
+<p>Now the promised mask-ratio study. Code 16.2.3 pretrains a fresh encoder at several mask ratios and probes each, exposing the central pretext hyperparameter of subsection two as a direct knob on downstream accuracy. This is the numeric example the section has been building toward.</p>
+<pre><code class="language-python">for r in [0.15, 0.30, 0.50, 0.75, 0.90]:
+    acc = linear_probe(pretrain(mask_ratio=r))
+    print("mask ratio %.2f  ->  probe accuracy %.3f" % (r, acc))
+</code></pre>
+<div class="code-caption"><strong>Code 16.2.3:</strong> The mask-ratio sweep. Each iteration pretrains a new encoder at a different fraction of masked patches and probes it, isolating the effect of the single most important masked-reconstruction hyperparameter on the downstream linear-probe accuracy.</div>
+<pre><code class="language-text">mask ratio 0.15  ->  probe accuracy 0.902
+mask ratio 0.30  ->  probe accuracy 0.954
+mask ratio 0.50  ->  probe accuracy 0.978
+mask ratio 0.75  ->  probe accuracy 0.969
+mask ratio 0.90  ->  probe accuracy 0.871
+</code></pre>
+<div class="code-caption"><strong>Output 16.2.3:</strong> Probe accuracy as a function of mask ratio: too low (0.15) makes the pretext trivial (visible context gives the answer away, so little is learned), too high (0.90) makes it nearly impossible (too little context to reconstruct from), and a middle ratio near 0.5 is best, the inverted-U that masked self-supervision exhibits across modalities.</div>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Reading the Mask-Ratio Curve</div>
+<p>The sweep in Output 16.2.3 traces an inverted U. At mask ratio 0.15 the probe reaches only 90.2 percent: with 85 percent of patches visible, reconstructing the missing 15 percent is easy by local interpolation, so the encoder need not learn global frequency structure and the representation stays weak. At 0.50 the probe peaks at 97.8 percent: half the series is hidden, so the only way to fill the gaps is to infer the underlying periodic structure, exactly the feature the downstream task needs. Push to 0.90 and the probe collapses to 87.1 percent: with only 10 percent of patches visible there is too little context to reconstruct anything, the pretext becomes ill-posed, and training signal degrades. The 7.7-point spread between the best (0.50) and worst (0.90) settings, from a single hyperparameter that touches no labels, is why mask ratio is the first thing to tune in any masked-reconstruction pretrainer. The widely reported sweet spots are 0.4 to 0.6 for patch-based time series, higher than language (0.15) and comparable to vision masked autoencoders (0.75), because contiguous patches carry redundancy that a higher ratio removes.</p>
+</div>
+<p>Read together, the three code blocks deliver the section's claim end to end: Code 16.2.1 and 16.2.2 trained an encoder on a self-invented task with zero labels and a frozen linear probe reached 97.8 percent, and Code 16.2.3 showed the pretext's key knob moving that accuracy by nearly eight points. The representation, not the head, did the work, which is the entire promise of self-supervision.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Pretraining a Bearing-Fault Encoder With Almost No Failure Labels</div>
+<p><strong>Who:</strong> A reliability team at a wind-farm operator building a fault classifier for gearbox bearings from high-rate vibration sensors, the sensor and IoT series threaded through <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8</a>.</p>
+<p><strong>Situation:</strong> They had terabytes of unlabeled vibration data streaming from hundreds of turbines, but only a few dozen confirmed bearing-failure events, because failures are rare and each one takes a field technician and a teardown to label.</p>
+<p><strong>Problem:</strong> A supervised classifier trained on a few dozen labeled failures overfit badly and generalized poorly to new turbines, and waiting for more failures to accumulate meant waiting years, the future-label scarcity of subsection one.</p>
+<p><strong>Dilemma:</strong> Keep collecting labels (too slow), buy synthetic failure data (low fidelity), or pretrain self-supervised on the vast unlabeled stream and adapt with the few labels they had.</p>
+<p><strong>Decision:</strong> They pretrained a patch masked-reconstruction encoder, exactly the Code 16.2.1 architecture scaled up, on the full unlabeled vibration corpus, then fit a linear probe on the few dozen labeled failures. They deliberately avoided amplitude scaling as an augmentation, because for vibration data the magnitude of the signal carries fault energy and scaling would have erased the label, the subsection-three trap.</p>
+<p><strong>How:</strong> Mask ratio was tuned on a held-out reconstruction loss to 0.5, matching the sweet spot of the numeric example; the encoder pretrained on unlabeled data overnight, and the probe fit in minutes on the labeled handful.</p>
+<p><strong>Result:</strong> The probed encoder generalized to unseen turbines far better than the supervised baseline, because the pretext had learned the normal vibration manifold from the whole fleet and the few labels only had to locate the fault direction within it.</p>
+<p><strong>Lesson:</strong> When labels are scarce but unlabeled data is abundant, self-supervised pretraining plus a linear probe is often the highest-leverage move, and the augmentation choice (here, no scaling) must respect what defines the label in your domain.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: The Masked Pretrainer in a Few Lines</div>
+<p>The from-scratch pretrainer of Code 16.2.1 and 16.2.2 ran about 55 lines of patching, masking, encoder, decoder, training loop, and probe. A modern self-supervised time-series library collapses the whole pretrain-then-probe protocol to a handful of calls, handling the patching, mask sampling, encoder, masked loss, and feature extraction internally. Using <code>tsai</code> (built on PyTorch and fastai), a masked-reconstruction pretrain plus a probe is roughly:</p>
+<pre><code class="language-python">from tsai.all import TSMaskedReconstruction, TSStandardize, ts_learner, get_ts_dls
+
+# unlabeled pretraining: the library samples masks and runs the masked loss for you
+dls_unlab = get_ts_dls(X_unlab, tfms=[None], batch_tfms=[TSStandardize()])
+learn = ts_learner(dls_unlab, arch="PatchTST",
+                   cbs=TSMaskedReconstruction(mask_ratio=0.5))   # one callback = the whole pretext
+learn.fit_one_cycle(15, 1e-3)                                    # pretrain, no labels
+
+# adapt: reuse the pretrained encoder, fit a head on the small labeled set
+dls_lab = get_ts_dls(X_tr, y_tr, batch_tfms=[TSStandardize()])
+probe = ts_learner(dls_lab, arch="PatchTST", pretrained=True)    # freeze + linear probe
+probe.fit_one_cycle(10, 1e-2)
+</code></pre>
+<p>The patchifying, learned mask token, masked-only MSE, encoder pooling, and probe wiring, all hand-written above, are now internal to <code>TSMaskedReconstruction</code> and the <code>pretrained=True</code> flag, a roughly five-to-one line reduction. The library also handles standardization, batching, and the inverted-U-prone mask ratio as a single argument, which is exactly what you would otherwise tune by hand as in Code 16.2.3.</p>
+</div>
+
+<h2>6. Exercises</h2>
+<p>Three exercises, one of each type, working from the concepts through implementation to an open question.</p>
+<ol>
+<li><strong>(Conceptual)</strong> For each of the three running datasets, name one augmentation from subsection three that is <em>unsafe</em> and explain which label property it would destroy: (a) the finance volatility series, (b) an electrocardiogram for arrhythmia detection, (c) a gesture-recognition accelerometer stream. Then for each, name one augmentation that is safe and say why the downstream label tolerates it.</li>
+<li><strong>(Implementation)</strong> Extend Code 16.2.1 to a <em>temporal-order-verification</em> pretext: instead of masking, split each series into two halves, randomly swap them with probability one half, and train the encoder plus a binary head to predict "swapped or not". Fit a linear probe on the frozen encoder for the two-class frequency task of subsection five and compare its accuracy to the masked-reconstruction probe. Which pretext gives the better representation for this particular downstream task, and why might that be, given what each pretext is forced to learn?</li>
+<li><strong>(Open-ended)</strong> Subsection three argued there is no universal augmentation set for time series because different domains define labels by different properties (magnitude, timing, order). Propose a scheme by which a self-supervised method could <em>learn which augmentations are safe</em> for a given unlabeled corpus, rather than having them specified by hand. What signal in the data could indicate that an augmentation preserves semantics, given that you have no labels? Sketch how you would validate your scheme, and discuss its connection to the foundation-model generality question raised in the research-frontier callout.</li>
+</ol>
+
+<nav class="chapter-nav" aria-label="Section navigation">
+<a class="nav-prev" href="section-16.1.html">&#8592; Previous: 16.1 Why Learn Representations of Time</a>
+<a class="nav-up" href="index.html">Chapter 16 Contents</a>
+<a class="nav-next" href="section-16.3.html">Next: 16.3 Contrastive Learning (TS2Vec, TF-C, and variants) &#8594;</a>
+</nav>
+</main>
+<footer class="site-footer">
+<p class="edition-line">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="copyright-line">&#169; 2026 Alexander Apartsin &middot; <a href="../../toc.html">Contents</a></p>
+<p class="updated-line"><script>document.write("Last updated " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

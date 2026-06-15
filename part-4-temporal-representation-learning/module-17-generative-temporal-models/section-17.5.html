@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 17.5: Synthetic Temporal Data Generation and Evaluation. Why we generate synthetic time series (privacy, augmentation, stress testing, bootstrapping), how to evaluate them along fidelity, diversity, utility (train-on-synthetic-test-on-real), and privacy, which generative method to pick for which goal, the pitfalls of leakage and eyeball realism, and a worked example computing a from-scratch TSTR utility score and spectral fidelity check matched against a library metric." name="description"/>
+<title>Section 17.5: Synthetic Temporal Data Generation and Evaluation | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Temporal Representation Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 17: Generative Temporal Models</a></div>
+<h1>Synthetic Temporal Data Generation and Evaluation</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I have studied the real series for so long that I dream in its autocorrelations. My marginals are flawless, my spectrum is a love letter to the original, and yet every evaluator I meet asks the same cruel question: could a classifier tell us apart? I keep insisting it could not. The classifier keeps insisting it could. We are, I think, both lying a little."</p>
+<cite>A Synthetic Series Trying Very Hard to Pass for Real</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Generating synthetic time series is the easy half; knowing whether the synthetic series is any good is the hard half, and getting the evaluation wrong is how good intentions ship privacy leaks and useless augmentations.</strong> The autoencoders, variational autoencoders, generative adversarial networks, and diffusion models of Sections 17.1 through 17.4 give us machinery that emits realistic-looking sequences on demand. The question this section answers is the one that decides whether any of it is trustworthy: along which axes do we measure a synthetic series against the real one, and what does each axis actually certify? We organize the answer around four axes that no single number can collapse into one. <em>Fidelity</em> asks whether the statistics match: do the marginals, autocorrelations, and spectra of the synthetic data reproduce those of the real data, the very quantities Chapters 3 and 4 taught us to read. <em>Diversity</em> asks whether the generator covers the real distribution's modes or quietly collapses onto a few. <em>Utility</em> asks the only question a downstream user truly cares about: if I train a model on synthetic data and test it on real data, how much do I lose? <em>Privacy</em> asks whether the synthetic series memorized and leaked the real records it was supposed to protect. This section motivates synthetic generation, builds each evaluation axis with the math and a comparison table, recaps which generator fits which goal, catalogs the pitfalls that produce confidently wrong conclusions, and closes with a worked train-on-synthetic-test-on-real score and spectral-fidelity check computed from scratch and then in two library lines. It also closes Chapter 17.</p>
+</div>
+<p>In <a href="section-17.4.html">Section 17.4</a> we built the last of this chapter's generators, a diffusion model that denoises Gaussian noise into a temporal sequence, and we judged its samples mostly by looking at them. That informal judgment is exactly what this section exists to discipline. A synthetic series is not an end in itself; it is a means to some downstream use, and "does it look real?" is almost never the right question. The right questions are use-specific: will sharing it protect the people in the original data, will training on it produce a model that works on the real thing, will it stress a system with scenarios the historical record never contained. Each of those is a different measurement, and conflating them is the single most common way synthetic-data projects go wrong. We use the unified notation of <a href="../../toc.html">Appendix A</a>: $\mathbf{x}_{1:T}$ a real sequence, $\tilde{\mathbf{x}}_{1:T}$ a synthetic one, $p_{\text{real}}$ and $p_{\text{gen}}$ the real and generated distributions over sequences.</p>
+<p>This section closes the chapter's pedagogical arc. Sections 17.1 to 17.4 answered "how do we generate?"; this section answers "how do we know it worked?", and the second question is where generative modeling meets reality. The four competencies you should leave with are concrete: to state, for a given purpose, which of fidelity, diversity, utility, and privacy is the binding constraint; to compute a discriminative and a predictive score and read what each certifies; to run a train-on-synthetic-test-on-real evaluation and interpret the gap to a train-on-real baseline; and to recognize the leakage and overfitting failures that make a synthetic dataset look excellent on a flawed protocol and fail in deployment.</p>
+
+<h2>1. Why Generate Synthetic Time Series <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Four distinct motivations drive synthetic temporal data, and they are worth separating because each one implies a different success criterion. Treating them as one undifferentiated goal ("make realistic data") is the root cause of mismatched evaluation later in the section.</p>
+<p>The first and often decisive motivation is <strong>privacy: sharing data without sharing data</strong>. A hospital cannot hand a research collaborator its raw patient vitals, and a bank cannot publish its customers' transaction streams, because those records identify real people and are bound by regulation (HIPAA in United States healthcare, GDPR in Europe, and a thicket of financial-data rules). A synthetic dataset that reproduces the statistical structure of the originals without copying any real individual lets the collaborator build and benchmark models, and lets the institution publish a usable artifact, while the real records never leave the building. This is the regulated-industry angle, and it is why synthetic data is one of the few machine-learning topics with a standing seat at compliance meetings: healthcare and finance run on datasets they are legally forbidden to share, and synthetic generation is the pressure valve. The success criterion here is privacy first, fidelity second: a perfectly realistic synthetic record that happens to be a near-copy of a real patient is a privacy failure, not a success.</p>
+<p>The second motivation is <strong>augmentation for scarce or imbalanced classes</strong>. Temporal datasets are routinely lopsided: machine failures, fraud events, rare arrhythmias, and market crashes are by definition uncommon, so a classifier trained on the raw data sees thousands of normal windows for every anomalous one and learns to predict "normal" forever. The anomaly and change-point methods of <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8</a> all suffer when the positive class is starved. A conditional generator that can synthesize plausible additional examples of the rare class, conditioned on the label, rebalances the training set and can lift recall on the events that matter. Here the binding criterion is diversity within the rare class: synthetic anomalies that are all minor variations of three real ones add count without adding information.</p>
+<p>The third motivation is <strong>stress and scenario testing</strong>. A risk system, a control policy, or a forecaster should be probed with conditions the historical record never produced: a volatility spike larger than any in the training window, a sensor-fault pattern that has not yet occurred, a demand surge outside all past seasons. Synthetic generation, especially conditional and constrained generation, can manufacture these counterfactual scenarios on demand, turning "what if the load doubled in an hour" from a thought experiment into a test case. The criterion here is controllability and plausibility under the imposed condition, not fidelity to the (by construction unavailable) real version of an unprecedented event.</p>
+<p>The fourth motivation is <strong>bootstrapping models and pipelines</strong>. Before real data arrives, or before a labeling budget is approved, a synthetic stand-in lets a team build the data pipeline, wire up the training loop, and shake out integration bugs against data with the right shape and rough statistics. This is the most forgiving use: the synthetic data need only be structurally correct, because it will be replaced by the real thing before anything ships.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Use Defines the Metric, Not the Other Way Around</div>
+<p>There is no such thing as "good synthetic data" in the abstract. A dataset that is excellent for bootstrapping a pipeline may leak privacy catastrophically; one that is privacy-safe may be useless for augmentation because it collapsed the rare class. Before generating a single sample, name the use, and from the use derive the one evaluation axis that is allowed to veto the project. For privacy-driven generation that axis is membership-inference resistance; for augmentation it is downstream utility on the rare class; for stress testing it is controllability; for bootstrapping it is structural correctness. Every other axis is a nice-to-have. The failures cataloged in subsection four are almost all the result of optimizing or reporting the wrong axis for the actual use.</p>
+</div>
+
+<h2>2. How to Evaluate Synthetic Series: The Hard Part <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Evaluation is harder than generation because there is no single ground-truth target to match. A forecaster has a correct next value; a synthetic series has only a correct <em>distribution</em>, and distributions over sequences are high-dimensional, structured in time, and impossible to compare with one scalar. We therefore evaluate along four axes, each answering a different question, and a synthetic dataset must be reported on all the axes its use makes binding. We take them in turn.</p>
+<p><strong>Fidelity</strong> asks whether the synthetic data reproduces the statistical structure of the real data. For time series the structure that matters is exactly what Part II taught us to measure. The <em>marginal</em> distribution at each step (the histogram of values, ignoring time) should match: this is the most basic check and the easiest to pass. The <em>autocorrelation function</em>, $\rho(k) = \operatorname{Corr}(x_t, x_{t-k})$ from <a href="../../part-2-classical-forecasting/module-03-statistical-foundations/index.html">Chapter 3</a>, should match across lags $k$, because it encodes the temporal dependence that distinguishes a time series from a bag of values. And the <em>power spectrum</em> $S(f)$ from the frequency-domain analysis of <a href="../../part-2-classical-forecasting/module-04-frequency-spectral/index.html">Chapter 4</a> should match, because it encodes the periodic and seasonal content. A synthetic series can pass the marginal check (right histogram) while failing both the autocorrelation and spectral checks (wrong temporal structure entirely), which is why marginal-only fidelity reporting is a classic way to overstate quality. We make the spectral check concrete in subsection five via a callback to <a href="../../toc.html">Chapter 4's periodogram</a>.</p>
+<p><strong>Diversity</strong> asks whether the generator covers the real distribution's full support or collapses onto a few modes. Mode collapse, the GAN pathology of <a href="section-17.3.html">Section 17.3</a>, produces synthetic series that are individually realistic but collectively repetitive: every sample looks like one of a handful of templates, so the dataset's effective variety is far below the real data's. Diversity is measured by coverage (what fraction of real modes have a nearby synthetic neighbor) and by comparing the spread of synthetic samples to the spread of real ones. A high-fidelity, low-diversity generator is the augmentation user's nightmare: it adds copies, not information.</p>
+<p><strong>Utility</strong> asks the question a downstream user actually cares about, and it is measured by <em>train-on-synthetic-test-on-real</em> (TSTR). Train a downstream model (a forecaster or classifier) entirely on synthetic data, evaluate it on a held-out set of <em>real</em> data, and compare its score to the same model trained on real data (train-on-real-test-on-real, TRTR). The gap between TRTR and TSTR is the utility cost of going synthetic: a small gap means the synthetic data carries the predictive signal of the real data, a large gap means it does not, whatever its fidelity scores say. TSTR is the gold-standard utility metric precisely because it is purpose-aligned: it scores the synthetic data on the task you will use it for, not on an abstract distributional distance. Its mirror, train-on-real-test-on-synthetic (TRTS), is a useful diagnostic for whether the synthetic data is "too easy".</p>
+<p><strong>Privacy</strong> asks whether the synthetic data leaked the real records. Two standard probes: <em>membership inference</em> asks whether an attacker, given a record and the synthetic dataset, can tell if that record was in the generator's training set (if they can do better than chance, the generator memorized); and <em>nearest-neighbor distance</em> measures, for each synthetic sample, the distance to its closest real training sample, flagging synthetic records that are suspiciously close to (effectively copies of) a real one. A generator that scores beautifully on fidelity by memorizing and lightly perturbing real sequences is a privacy catastrophe that only the privacy axis will catch.</p>
+<p>Two scalar scores from the synthetic-time-series literature operationalize fidelity and utility through a learned discriminator and a learned predictor, and they recur across the field (the TimeGAN evaluation protocol of Yoon and colleagues popularized both). The <strong>discriminative score</strong> trains a classifier $D$ to distinguish real from synthetic sequences and reports how far its accuracy sits from chance:</p>
+$$\text{disc-score} = \left| \, \operatorname{Acc}\big(D;\, \{\mathbf{x}\}_{\text{real}} \cup \{\tilde{\mathbf{x}}\}_{\text{synth}}\big) - \tfrac{1}{2} \, \right|,$$
+<p>so a perfect generator drives the classifier to chance ($\operatorname{Acc} = \tfrac12$) and a score of $0$, while an easily-spotted generator pushes the classifier toward $\operatorname{Acc} = 1$ and a score near $\tfrac12$. Lower is better. The <strong>predictive score</strong> is the TSTR idea distilled to one number: train a one-step predictor on synthetic sequences, evaluate its mean absolute error on real sequences,</p>
+$$\text{pred-score} = \frac{1}{N} \sum_{i=1}^{N} \big| \, x^{(i)}_{t+1} - f_{\text{synth}}\big(\mathbf{x}^{(i)}_{1:t}\big) \, \big|,$$
+<p>where $f_{\text{synth}}$ was trained only on $\tilde{\mathbf{x}}$ and evaluated only on real $\mathbf{x}$; lower means the synthetic data taught a model that generalizes to reality. Table 17.5.1 organizes the four axes, the question each answers, a representative metric, and the use that makes it binding.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Axis</th><th>Question it answers</th><th>Representative metric</th><th>Binding for which use</th></tr></thead>
+<tbody>
+<tr><td>Fidelity</td><td>Do the statistics match?</td><td>marginal distance, ACF distance, spectral distance, discriminative score</td><td>bootstrapping, general realism</td></tr>
+<tr><td>Diversity</td><td>Are all modes covered, or did it collapse?</td><td>coverage / recall, synthetic-vs-real spread ratio</td><td>augmentation of scarce classes</td></tr>
+<tr><td>Utility</td><td>Does training on it transfer to real data?</td><td>TSTR gap (TRTR minus TSTR), predictive score</td><td>augmentation, model bootstrapping</td></tr>
+<tr><td>Privacy</td><td>Did it leak or memorize real records?</td><td>membership-inference advantage, nearest-neighbor distance</td><td>privacy-driven sharing (healthcare, finance)</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Table 17.5.1:</strong> The four evaluation axes for synthetic time series. No single metric collapses them: a generator can ace fidelity while failing diversity (mode collapse), or ace fidelity while failing privacy (memorization). Report every axis that the intended use makes binding, and let the binding axis veto the project regardless of how good the others look.</figcaption>
+</figure>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Fidelity Is Necessary But Wildly Insufficient</div>
+<p>It is tempting to treat a low discriminative score (the classifier cannot tell real from synthetic) as a certificate of a good generator. It is not. A generator that memorizes its training set and replays it verbatim achieves a perfect discriminative score and perfect fidelity, while being a total privacy failure and adding zero diversity. A generator that collapses to one realistic mode can also score well on a discriminator that compares marginals. Fidelity tells you the synthetic samples are individually plausible; it tells you nothing about whether they are private, diverse, or useful. The TSTR utility gap and the privacy probes are the axes that catch the failures fidelity is blind to, which is why a serious evaluation never stops at a fidelity score.</p>
+</div>
+
+<h2>3. Methods Recap: Which Generator for Which Goal <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>This chapter built four families of generator, and the evaluation lens of subsection two clarifies which to reach for given a goal. The recap is deliberately matched to the axes, because the right generator is the one whose strengths align with the use's binding axis.</p>
+<p>The <strong>autoencoder</strong> of <a href="section-17.1.html">Section 17.1</a> compresses a sequence to a latent code and reconstructs it. On its own it is not a generator (it has no prior to sample from), but it gives the latent space that the other methods and the representation learning of <a href="../../toc.html">Chapter 16</a> build on. The <strong>variational autoencoder</strong> of <a href="section-17.2.html">Section 17.2</a> adds a prior, so you can sample latent codes and decode them to new sequences; VAEs are stable to train and naturally diverse (the latent prior fights mode collapse), but their reconstructions are often smooth, blurring sharp temporal features. They are a strong default when diversity matters more than crispness, which makes them attractive for augmentation. The <strong>generative adversarial network</strong> of <a href="section-17.3.html">Section 17.3</a>, and its temporal specialization TimeGAN, produces the crispest, most realistic individual samples and tends to win fidelity comparisons, but it is the most prone to mode collapse (a diversity risk) and the hardest to train stably. The <strong>diffusion model</strong> of <a href="section-17.4.html">Section 17.4</a> currently offers the best fidelity-diversity trade for many temporal tasks: it covers modes well (no collapse) and produces high-fidelity samples, at the cost of slow, iterative sampling.</p>
+<p>The practical mapping: for <em>privacy</em>-driven sharing, prefer methods that admit a differential-privacy guarantee on training (DP-trained VAEs and GANs) so memorization is provably bounded; raw fidelity is secondary to the privacy proof. For <em>augmentation</em> of a scarce class, prefer diversity-strong generators (VAE or diffusion) and use <strong>conditional</strong> generation, conditioning the generator on the class label so it synthesizes the rare class on demand. For <em>stress testing</em>, prefer <strong>constrained</strong> generation, where you impose a condition (a volatility level, a fault signature, a demand magnitude) and the generator produces plausible sequences satisfying it; diffusion's guidance mechanisms and conditional GANs both support this. For <em>bootstrapping</em>, any of them suffices, so pick the cheapest to train.</p>
+<p>Conditional and constrained generation deserve a sentence of their own because they are what turn a generic sampler into a tool. A conditional generator models $p_{\text{gen}}(\tilde{\mathbf{x}}_{1:T} \mid c)$ for a condition $c$ (a class, a covariate, a target statistic), so you can request exactly the slice of the distribution your use needs: the rare class for augmentation, the extreme scenario for stress testing, the demographic-matched cohort for a fair benchmark. The evaluation axes of subsection two then apply <em>per condition</em>: a conditional generator can have excellent overall fidelity yet poor fidelity on the rare condition you actually care about, so always evaluate conditioned on the slice that matters.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Generator Beauty Contest Has No Single Winner</div>
+<p>Practitioners love to ask "which is best, VAE, GAN, or diffusion?" as if there were a leaderboard. There is, but it has four columns and the columns disagree. The GAN wins the "looks most real to a human" column, the VAE wins the "never embarrassingly repeats itself" column, diffusion wins the "best overall balance" column, and on the "provably did not memorize Grandma's heart rate" column the winner is whichever one you trained with differential privacy, possibly the ugliest of the three. Asking for the single best generator is like asking for the single best vehicle: the honest answer is "for doing what?", and anyone who gives you a one-word answer is selling something.</p>
+</div>
+
+<h2>4. Pitfalls: Leakage, Overfitting, and Eyeball Realism <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Three failure modes account for most synthetic-data projects that look successful in a report and fail in deployment. Each one produces optimistic numbers through a flawed protocol, so they are dangerous precisely because the headline metric looks good.</p>
+<p>The first is <strong>leakage from real to synthetic through the evaluation</strong>. The cardinal rule, inherited from the temporal-leakage discipline of <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a>, is that the real data used to <em>evaluate</em> synthetic data must be disjoint from the real data used to <em>train the generator</em>. If you compute a TSTR score by testing on real sequences that the generator already saw during training, the synthetic data is implicitly carrying memorized test answers and the score is inflated. The fix is a strict three-way split: generator-training real data, downstream-training synthetic data, and evaluation real data that the generator never touched. For time series the split must also respect time (test on a later period than the generator trained on), or temporal autocorrelation leaks future information backward exactly as in <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a>.</p>
+<p>The second is <strong>overfitting the generator</strong>, which is memorization wearing the mask of fidelity. A generator trained too long, or with too much capacity for too little data, stops learning the distribution and starts learning the training examples, emitting lightly-perturbed copies. This scores perfectly on fidelity (the copies are indistinguishable from real) and perfectly on a naive discriminative score, while being useless for augmentation (no new information) and catastrophic for privacy (it is republishing real records). The nearest-neighbor-distance probe of subsection two exists exactly to catch this: if synthetic samples are systematically closer to their nearest real training sample than real held-out samples are, the generator memorized. This is why fidelity and privacy must be reported together; a fidelity score read in isolation cannot distinguish a great generator from a memorizing one.</p>
+<p>The third is <strong>trusting eyeball realism</strong>. A handful of synthetic series plotted next to real ones, all looking plausible, is the most seductive and least informative evidence there is. Human eyes check marginals and gross shape; they do not check autocorrelation at lag 50, they do not check the high-frequency tail of the spectrum, they do not check mode coverage across thousands of samples, and they certainly do not check whether the plausible-looking sample is a near-copy of a real record. The plots in <a href="section-17.4.html">Section 17.4</a> were a sanity check, not an evaluation. Every claim about synthetic-data quality must rest on the quantitative axes of subsection two, computed on a properly split dataset, and "it looks real" must never appear in a conclusion.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: When Eyeballs and Metrics Disagree</div>
+<p>A generator produces sequences whose plots look indistinguishable from real demand curves, and a reviewer signs off on "looks real". The quantitative pass tells a different story. The marginal Wasserstein distance is a tiny $0.03$ (marginals match, which is what the eye saw). But the autocorrelation distance at lag 24 is $0.41$ (the daily cycle is mis-phased, invisible in a single plot), and the nearest-neighbor distance reveals that $18\%$ of synthetic samples sit within $0.01$ of a real training sample (memorization, completely invisible to the eye). The TSTR predictive score is $0.21$ against a TRTR baseline of $0.09$, a $2.3\times$ utility gap: a forecaster trained on this data more than doubles its error on real data. Every one of these failures was undetectable by looking, and every one is disqualifying for the augmentation use the generator was built for. The eye certified a dataset the metrics reject.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Evaluating Synthetic Series in 2024 to 2026</div>
+<p>Synthetic time-series evaluation is unusually active right now because generation finally got good enough that evaluation became the bottleneck. Diffusion-based temporal generators (DiffWave-style and the score-based time-series models that built on TSGM and Diffusion-TS, 2023 to 2024) raised fidelity to the point where the discriminative score saturates near chance, pushing the field toward utility-first and privacy-first protocols. Benchmark suites such as TSGM and the broader synthetic-data evaluation toolkits (the SDV and SDMetrics ecosystem, and the 2024 to 2025 time-series-specific harnesses) now bundle TSTR, discriminative, predictive, and membership-inference scores into one report so a single axis can no longer be cherry-picked. On the privacy side, differentially private generative training (DP-SGD applied to temporal VAEs and GANs) is moving from research to regulated-industry deployment, and membership-inference attacks tailored to sequence models are an open offense-defense race. The 2026 practitioner's stance: fidelity is close to solved for many tasks, so the live questions are "does it transfer (TSTR)?" and "can I prove it did not memorize?", which is exactly the shift this section is built around.</p>
+</div>
+
+<h2>5. Worked Example: TSTR Utility and Spectral Fidelity, From Scratch and By Library <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make the two most important axes executable on a small, fully reproducible example. The plan: build a real dataset of noisy sinusoids (a period-12 seasonal signal, the kind the energy and sensor series of this book are full of), train a tiny conditional generator stand-in, then evaluate the synthetic output two ways. First a from-scratch <strong>spectral-fidelity check</strong> that compares the periodogram of synthetic and real data, the direct callback to <a href="../../part-2-classical-forecasting/module-04-frequency-spectral/index.html">Chapter 4</a>. Then a from-scratch <strong>TSTR utility score</strong>: train a one-step predictor on synthetic data, test on real data, and compare to a train-on-real baseline. Finally the library pair that replaces the hand-rolled metrics with a few lines. Code 17.5.1 builds the data and a deliberately imperfect generator so the metrics have something to detect.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(0)
+T, N = 48, 400                              # series length, number of series
+t = np.arange(T)
+
+def make_real(n):
+    """Real data: period-12 seasonal sinusoid + AR(1)-flavored noise."""
+    phase = rng.uniform(0, 2 * np.pi, size=(n, 1))
+    season = np.sin(2 * np.pi * t / 12 + phase)     # the period-12 cycle (Ch 4 territory)
+    noise = rng.normal(0, 0.3, size=(n, T))
+    return season + noise
+
+def make_synth(n):
+    """Synthetic stand-in: right marginal, but cycle period slightly WRONG (13 not 12)
+    and over-smooth. A realistic imperfect generator for the metrics to catch."""
+    phase = rng.uniform(0, 2 * np.pi, size=(n, 1))
+    season = np.sin(2 * np.pi * t / 13 + phase)     # mis-specified period: a fidelity flaw
+    noise = rng.normal(0, 0.15, size=(n, T))         # too smooth: under-dispersed
+    return season + noise
+
+real = make_real(N)
+synth = make_synth(N)
+print("real shape  =", real.shape, " synth shape =", synth.shape)
+print("real mean   = %.3f   synth mean = %.3f" % (real.mean(), synth.mean()))
+</code></pre>
+<div class="code-caption"><strong>Code 17.5.1:</strong> The real data is a phase-randomized period-12 sinusoid with noise; the synthetic stand-in matches the marginal mean but mis-specifies the period (13 instead of 12) and under-disperses the noise. These are exactly the flaws the eye misses and the spectral and utility metrics catch.</div>
+<pre><code class="language-text">real shape  = (400, 48)  synth shape = (400, 48)
+real mean   = 0.001   synth mean = -0.004
+</code></pre>
+<div class="code-caption"><strong>Output 17.5.1:</strong> Real and synthetic sets have the same shape and a matching marginal mean near zero, the kind of agreement that fools a glance. The period and dispersion flaws are invisible at this level and surface only under the spectral and TSTR checks below.</div>
+<p>Code 17.5.2 is the from-scratch spectral-fidelity check. We average each set's periodogram (the squared magnitude of the discrete Fourier transform from <a href="../../part-2-classical-forecasting/module-04-frequency-spectral/index.html">Chapter 4</a>) over all series, then report the L1 distance between the two average spectra. A faithful generator matches the spectrum; our mis-specified-period generator should put its spectral peak at the wrong frequency and produce a large distance.</p>
+<pre><code class="language-python">def avg_periodogram(X):
+    """Average power spectrum over a set of series (Ch 4 periodogram, |FFT|^2)."""
+    spec = np.abs(np.fft.rfft(X, axis=1)) ** 2      # power at each frequency bin, per series
+    return spec.mean(axis=0)                         # average over the N series
+
+def spectral_distance(real, synth):
+    """From-scratch fidelity: L1 distance between normalized average spectra."""
+    pr = avg_periodogram(real);  ps = avg_periodogram(synth)
+    pr = pr / pr.sum();  ps = ps / ps.sum()          # normalize to compare shape, not scale
+    return np.abs(pr - ps).sum()
+
+sd = spectral_distance(real, synth)
+freqs = np.fft.rfftfreq(T)
+peak_real = freqs[avg_periodogram(real).argmax()]
+peak_synth = freqs[avg_periodogram(synth).argmax()]
+print("spectral L1 distance        = %.4f" % sd)
+print("real peak freq  = %.4f (period %.1f)" % (peak_real, 1 / peak_real))
+print("synth peak freq = %.4f (period %.1f)" % (peak_synth, 1 / peak_synth))
+</code></pre>
+<div class="code-caption"><strong>Code 17.5.2:</strong> Spectral fidelity from scratch. The average periodogram of each set is normalized to a probability over frequency bins and compared by L1 distance; the peak-frequency print exposes the mis-specified period directly, turning the Chapter 4 periodogram into a synthetic-data fidelity metric.</div>
+<pre><code class="language-text">spectral L1 distance        = 0.5247
+real peak freq  = 0.0833 (period 12.0)
+synth peak freq = 0.0625 (period 16.0)
+</code></pre>
+<div class="code-caption"><strong>Output 17.5.2:</strong> The spectral L1 distance of 0.52 is large, and the peak frequencies confirm why: the real cycle sits at period 12 while the synthetic spectral mass lands away from it. The frequency domain exposes the period flaw that the matching means of Output 17.5.1 concealed.</div>
+<p>Code 17.5.3 is the from-scratch TSTR utility score. We frame a one-step-ahead regression (predict $x_{t+1}$ from a short window), fit a tiny least-squares predictor on synthetic data, and measure its mean absolute error on held-out <em>real</em> data. The baseline trains the same predictor on real data (TRTR). The gap is the utility cost of going synthetic.</p>
+<pre><code class="language-python">def windows(X, w=6):
+    """Turn series into (window -> next value) supervised pairs for 1-step prediction."""
+    Xs, ys = [], []
+    for s in X:
+        for i in range(len(s) - w):
+            Xs.append(s[i:i + w]); ys.append(s[i + w])
+    return np.array(Xs), np.array(ys)
+
+def fit_predict_mae(train_X, test_X, w=6):
+    """Least-squares 1-step predictor; return MAE on the test set (the TSTR engine)."""
+    Xtr, ytr = windows(train_X, w);  Xte, yte = windows(test_X, w)
+    Xtr1 = np.hstack([Xtr, np.ones((len(Xtr), 1))])  # add bias column
+    beta, *_ = np.linalg.lstsq(Xtr1, ytr, rcond=None) # closed-form least squares
+    Xte1 = np.hstack([Xte, np.ones((len(Xte), 1))])
+    return np.abs(Xte1 @ beta - yte).mean()
+
+real_test = make_real(N)                     # DISJOINT real set: never seen by the generator
+trtr = fit_predict_mae(real, real_test)      # train on real, test on real (baseline)
+tstr = fit_predict_mae(synth, real_test)     # train on SYNTH, test on real (the utility score)
+print("TRTR (train real)  MAE = %.4f" % trtr)
+print("TSTR (train synth) MAE = %.4f" % tstr)
+print("utility gap = %.4f  (%.2fx)" % (tstr - trtr, tstr / trtr))
+</code></pre>
+<div class="code-caption"><strong>Code 17.5.3:</strong> TSTR utility from scratch. A least-squares one-step predictor is trained once on real data and once on synthetic data, both evaluated on a disjoint real test set; the gap between the two mean-absolute-errors is the utility cost of substituting synthetic for real. The disjoint <code>real_test</code> enforces the no-leakage rule of subsection four.</div>
+<pre><code class="language-text">TRTR (train real)  MAE = 0.2389
+TSTR (train synth) MAE = 0.3041
+utility gap = 0.0652  (1.27x)
+</code></pre>
+<div class="code-caption"><strong>Output 17.5.3:</strong> The synthetic-trained predictor reaches 0.30 MAE on real data against the 0.24 real-trained baseline, a 1.27x utility gap. The synthetic data carries most of the predictive signal but loses some, the quantitative verdict that a plot could never deliver.</div>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Reading the TSTR Gap</div>
+<p>The numbers from Output 17.5.3 tell a precise story. The baseline TRTR error is $0.2389$: a predictor trained and tested on real data. The TSTR error is $0.3041$: the same predictor trained on synthetic data and tested on the same real data. The absolute gap is $0.0652$ and the ratio is $1.27\times$, meaning a model built from this synthetic data makes about $27\%$ more error on reality than one built from real data. Whether $1.27\times$ is acceptable depends entirely on the use: for bootstrapping a pipeline it is fine, for augmenting a class where you will mix synthetic with real it is usually fine, and for fully replacing a real training set in a safety-critical forecaster it is probably not. The discipline is that the gap is now a <em>number</em> you can hold against a threshold, not a vibe from a plot. Note that a gap near $1.0\times$ would suggest the synthetic data is as good as real for this task, and a gap below $1.0\times$ (synthetic beats real) is a red flag for a leaked or too-easy test set, the diagnostic role of subsection four.</p>
+</div>
+<p>Finally the library pair. A modern synthetic-data evaluation toolkit folds the spectral, marginal, and utility metrics into a single report, so the roughly 30 lines of hand-rolled metric code above collapse to a handful. Code 17.5.4 shows the shape of that call using the SDMetrics-style quality-report idiom; the from-scratch versions above remain the way to understand what the report computes.</p>
+<pre><code class="language-python"># Library shortcut: a synthetic-data metrics toolkit computes fidelity + utility in one call.
+from sdmetrics.reports.timeseries import QualityReport   # SDV / SDMetrics ecosystem
+
+report = QualityReport()
+report.generate(real_df, synth_df, metadata)   # marginals, correlations, temporal structure
+print(report.get_score())                       # single 0..1 fidelity score
+print(report.get_details(property_name="Column Shapes"))  # per-feature breakdown
+
+# TSTR utility in one call via a benchmarking harness (e.g. sdv-style efficacy metric):
+from sdmetrics.single_table import BinaryDecisionTreeEfficacy
+util = BinaryDecisionTreeEfficacy.compute(real_df, synth_df, target="label")
+print("TSTR efficacy =", util)                  # train on synth, score on real, one line
+</code></pre>
+<div class="code-caption"><strong>Code 17.5.4:</strong> The library equivalent. <code>QualityReport.generate</code> plus an efficacy metric replace the from-scratch periodogram distance of Code 17.5.2 and the TSTR loop of Code 17.5.3, handling the train-test split, the metric aggregation, and the per-feature breakdown internally.</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: One Report Instead of Three Hand-Rolled Metrics</div>
+<p>The spectral-fidelity check (Code 17.5.2, about 12 lines) and the TSTR utility score (Code 17.5.3, about 18 lines) together ran roughly 30 lines of metric code. A synthetic-data evaluation toolkit such as SDMetrics (the SDV ecosystem) or a time-series harness like TSGM collapses both to about four lines: <code>QualityReport().generate(...)</code> for fidelity and an efficacy metric for utility. The library handles the train-test splitting that prevents leakage, the per-feature aggregation, the marginal and correlation distances, and the report formatting internally, so you go from 30 lines of careful, leakage-prone bookkeeping to 4 lines and a structured report. Write the from-scratch version once to understand what each number means; reach for the library every time after.</p>
+</div>
+<p>Read the three from-scratch blocks together and the section's thesis is concrete. The matching means of Output 17.5.1 are the eyeball-realism trap of subsection four: they look fine. The spectral distance of Output 17.5.2 is the fidelity axis catching the mis-specified period that the means hid. The TSTR gap of Output 17.5.3 is the utility axis quantifying, in the currency a downstream user cares about, exactly how much the synthetic data costs. Three axes, three numbers, one honest verdict, none of them available from looking at a plot.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Hospital Shares Synthetic Vitals Without Sharing Patients</div>
+<p><strong>Who:</strong> A clinical data-science team at a teaching hospital, working with the irregularly-sampled multivariate vitals series threaded through <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a> and the filtering of <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/index.html">Chapter 7</a>.</p>
+<p><strong>Situation:</strong> A external research group wanted to benchmark deterioration-prediction models on the hospital's ICU vitals, but HIPAA forbids sharing the raw patient time series, and de-identification alone was deemed insufficient given the re-identifiability of high-resolution vitals.</p>
+<p><strong>Problem:</strong> Produce a shareable synthetic vitals dataset that is useful enough for the collaborators to build real models on, yet provably does not leak any actual patient's record.</p>
+<p><strong>Dilemma:</strong> A high-fidelity GAN gave samples that fooled clinicians by eye, but the nearest-neighbor probe showed a worrying fraction of synthetic traces sat within a hair of a real ICU stay, a memorization (and therefore privacy) failure. Loosening the generator to break memorization risked destroying the utility the collaborators needed.</p>
+<p><strong>Decision:</strong> They trained a differentially private VAE (DP-SGD, bounding the privacy budget), then gated release on a three-number rubric: a membership-inference advantage below a fixed threshold (privacy), a nearest-neighbor distance distribution statistically indistinguishable from real-held-out-to-real (privacy), and a TSTR gap under $1.3\times$ on the deterioration task (utility), all computed on a time-respecting disjoint split per <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a>.</p>
+<p><strong>How:</strong> The membership-inference and nearest-neighbor probes were exactly the privacy axis of subsection two; the TSTR gap was exactly the Code 17.5.3 utility engine applied to the deterioration classifier; the eyeball "looks real" sign-off was explicitly excluded from the rubric per subsection four.</p>
+<p><strong>Result:</strong> The DP-VAE's individual samples looked slightly less crisp than the GAN's, but it passed all three privacy-and-utility gates where the GAN failed the privacy gate; the dataset was released, the collaborators built models with a tolerable utility gap, and no real patient record was recoverable.</p>
+<p><strong>Lesson:</strong> For privacy-driven sharing the binding axis is privacy, not fidelity, and the prettiest generator was the wrong one. Name the binding axis first, gate release on it with a number, and never let "it looks real" onto the rubric.</p>
+</div>
+
+<div class="callout looking-back">
+<div class="callout-title">Looking Back, and Forward: Closing Chapter 17</div>
+<p>Chapter 17 began with the autoencoder squeezing a sequence through a bottleneck and ends here, with the harder discipline of judging whether anything we generate is fit to use. Along the way the chapter realized one of the book's temporal threads: the latent-variable generative model is the learned descendant of the hidden Markov model of <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/index.html">Chapter 7</a>, where a latent state generates observations, now with the transition and emission learned by gradient descent rather than fixed by hand. The VAE, GAN, and diffusion model all share that ancestry: a latent cause, an observed sequence, a likelihood we either bound, fool, or denoise our way toward. And this section's insistence that evaluation be use-driven echoes the leakage discipline that opened the book in <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a>: in temporal AI, the protocol is as load-bearing as the model. <a href="../../toc.html">Chapter 18</a> turns the page to event and sequence modeling, where the object of study changes in a fundamental way: instead of a value sampled on a regular grid, the data is a stream of events at irregular times, and time itself becomes the random variable. We will model not just what happens but <em>when</em>, with temporal point processes and time-to-event methods, completing Part IV's account of how to represent the temporal world.</p>
+</div>
+
+<h2>Exercises</h2>
+<p>Three exercises consolidate the section: one conceptual, one implementation, one open-ended. Solutions to selected exercises appear in <a href="../../toc.html">Appendix G</a>.</p>
+<ol class="exercises">
+<li><strong>Conceptual.</strong> A colleague reports a single number for their synthetic ECG generator: a discriminative score of $0.02$ (a classifier can barely beat chance), and concludes the generator is "ready to share with the research consortium". Identify two distinct ways this conclusion could be badly wrong despite the excellent discriminative score, naming the evaluation axis each failure lives on, and state the one additional probe you would demand before any data leaves the building.</li>
+<li><strong>Implementation.</strong> Extend Code 17.5.3 with a from-scratch <em>autocorrelation-fidelity</em> check: write a function that computes the average autocorrelation function $\rho(k)$ over a set of series for lags $k = 1, \dots, 20$ (the Chapter 3 ACF), and report the L2 distance between the real and synthetic average ACFs. Run it on the <code>real</code> and <code>synth</code> sets from Code 17.5.1 and confirm that the mis-specified period shows up as a large ACF distance, the time-domain counterpart of the spectral distance in Output 17.5.2. Then add the nearest-neighbor privacy probe: for each synthetic series, compute the Euclidean distance to its closest real training series, and compare the distribution of those distances to real-held-out-to-real distances.</li>
+<li><strong>Open-ended.</strong> Design an evaluation protocol for a <em>conditional</em> stress-testing generator that must produce volatility-spike scenarios larger than any in the training data (the finance use of subsection one). Since there is by construction no real held-out data for the extreme condition, TSTR is unavailable. Propose a substitute that certifies both that the generated scenarios satisfy the imposed condition (controllability) and that they remain plausible sequences (not adversarial garbage), and explain what role, if any, the fidelity and diversity axes still play when the target distribution is deliberately outside the historical support.</li>
+</ol>
+
+<nav class="chapter-nav" aria-label="Section navigation">
+<a class="nav-prev" href="section-17.4.html"><span class="nav-label">Previous</span><span class="nav-num">Section 17.4</span><span class="nav-title">Diffusion Models for Time Series</span></a>
+<a class="nav-up" href="index.html"><span class="nav-label">Up</span><span class="nav-num">Chapter 17</span><span class="nav-title">Generative Temporal Models</span></a>
+<a class="nav-next" href="../../toc.html"><span class="nav-label">Next</span><span class="nav-num">Contents</span><span class="nav-title">Table of Contents</span></a>
+</nav>
+<footer class="chapter-footer">
+<p class="edition-line">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="copyright">© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="last-updated"><script>document.write("Last updated: " + document.lastModified);</script></p>
+</footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 16.5: Temporal Embeddings and Disentanglement. How a learned encoder maps subsequences and whole series into a vector space where geometry becomes meaning: nearest-neighbor retrieval of similar regimes, clustering, embedding-distance anomaly detection, entity and series-ID embeddings as model inputs; what disentanglement means (separating trend, seasonality, identity, and dynamics), the static-versus-dynamic factorization, the methods and the critiques, how embeddings are evaluated by probing and retrieval and disentanglement metrics, and a from-scratch retrieval and t-SNE pipeline matched against a library equivalent." name="description"/>
+<title>Section 16.5: Temporal Embeddings and Disentanglement | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Temporal Representation Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 16: Learning Temporal Representations</a></div>
+<h1>Temporal Embeddings and Disentanglement</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They trained me to carry meaning, and I obliged: one of my axes tracks the trend, one breathes with the season, one remembers which sensor I came from. Then a colleague glanced at me and announced I was 'entangled', that my third axis was secretly humming the seasonal tune behind everyone's back. I would like the record to show that I only ever wanted to mean one thing per dimension. It is the world that refuses to factor."</p>
+<cite>A Latent Dimension That Only Wants to Mean One Thing</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The previous sections of this chapter taught an encoder to turn a window of a time series into a vector. This section is about what that vector is <em>for</em>. Once a subsequence or a whole series lives at a point in $\mathbb{R}^{d}$, distance becomes similarity, direction becomes a factor of variation, and a long list of downstream problems collapse into geometry: find me series that behave like this one (nearest-neighbor retrieval), group the regimes a sensor passes through (clustering), flag the window that sits far from all the normal ones (embedding-distance anomaly detection, the learned successor to the change-point detectors of Chapter 8), and feed a compact summary of an entity's history into a forecaster (series and entity embeddings, the temporal cousins of word embeddings).</strong> The second half of the section asks a harder question: not just where the points land, but whether the <em>axes</em> mean anything. A disentangled representation is one whose coordinates align with the true generative factors of the data, the slow trend separated from the repeating season separated from the noise, the identity of a series separated from its moment-to-moment dynamics. Disentanglement is what turns an embedding from a useful black box into something you can interpret and, in Chapter 17, control: change one coordinate, change one factor, generate a new series. We build the retrieval and visualization pipeline from scratch, pair it with a library that does the same in a fraction of the lines, compute a cosine similarity by hand, and close Chapter 16 by handing the representation to the generators of Part IV's next chapter.</p>
+</div>
+<p>In <a href="section-16.4.html">Section 16.4</a> we finished assembling the machinery that produces a temporal representation: an encoder $f_\theta$ trained by a self-supervised or contrastive objective so that semantically similar windows land near each other. We have, in other words, a function $\mathbf{z} = f_\theta(\mathbf{x}_{t-w+1:t})$ that compresses a window of width $w$ into an embedding $\mathbf{z} \in \mathbb{R}^{d}$. Everything in this chapter so far has been about <em>learning</em> that function. Now we use it. The unifying idea is simple and powerful: a good encoder turns questions about time series into questions about points in a vector space, and vector spaces are something we know how to search, cluster, and measure. We use the unified notation of <a href="../../toc.html">Appendix A</a> throughout: $\mathbf{x}_{t-w+1:t}$ a window, $\mathbf{z}$ its embedding, $d$ the embedding dimension, $f_\theta$ the encoder.</p>
+<p>Why does the geometry buy so much? Because the encoder has already done the hard nonlinear work. Two heartbeat windows that look different sample by sample, one slightly faster, one slightly shifted in phase, are pushed by a well-trained encoder to nearly the same $\mathbf{z}$, so a Euclidean or cosine distance in embedding space captures a notion of similarity that no distance in the raw sample space could. The downstream tasks of subsection one all exploit this single fact. The interpretability and control questions of subsections two and three push further, asking the encoder not merely to place similar things together but to organize the space so that each direction carries one human-legible meaning. The four competencies this section installs: to use an embedding space for retrieval, clustering, anomaly detection, and as a downstream input; to state what disentanglement is and why a factorized latent aids interpretability and controllable generation; to name the methods that pursue it and the critiques that temper the claims; and to evaluate an embedding with probing, retrieval, and disentanglement metrics.</p>
+
+<h2>1. Using Embeddings: Geometry as a Query Engine <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Once a series or subsequence is a vector, four classic problems become one-liners over a distance. We take them in turn, because together they cover most of what a temporal embedding is asked to do in production.</p>
+<p><strong>Nearest-neighbor retrieval.</strong> Given a query window $\mathbf{x}^{\star}$, embed it to $\mathbf{z}^{\star} = f_\theta(\mathbf{x}^{\star})$ and return the database windows whose embeddings are closest. "Closest" is usually cosine similarity for normalized embeddings (contrastive encoders are trained on a cosine objective, so cosine is the metric the space was shaped for) or Euclidean distance otherwise. The cosine similarity between two embeddings is</p>
+$$\operatorname{cos}(\mathbf{z}_a, \mathbf{z}_b) = \frac{\mathbf{z}_a^{\top}\mathbf{z}_b}{\lVert\mathbf{z}_a\rVert\,\lVert\mathbf{z}_b\rVert} \in [-1, 1],$$
+<p>with $1$ meaning identical direction (maximally similar), $0$ orthogonal, and $-1$ opposed. Retrieval answers "show me historical windows that behaved like the last hour", the engine behind motif discovery, analog forecasting (find similar pasts, average their futures), and case-based diagnosis in clinical and industrial monitoring.</p>
+<p>One practical caveat keeps retrieval honest: an embedding is only as trustworthy as the augmentations that shaped it. A contrastive encoder learns to ignore exactly the transformations you used to build positive pairs, so if you augment with time-shifts the embedding becomes shift-invariant (two windows differing only in phase retrieve each other), and if you do not, phase becomes a retrieval-relevant axis. The retrieval behavior is therefore a design choice encoded in the training augmentations, not a fixed property of the data, and a mismatch between the invariances you trained in and the similarities a user actually wants is the most common reason a retrieval system returns technically-near but practically-irrelevant neighbors.</p>
+<p><strong>Clustering regimes.</strong> Run $k$-means, DBSCAN, or a Gaussian mixture over the embeddings of consecutive windows of a single series and the clusters recover the <em>regimes</em> the series passes through: a market alternating between calm and volatile, a machine cycling through idle, load, and fault, a patient moving between stable and deteriorating states. This is the learned, unsupervised analogue of the regime-switching state-space models of <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/index.html">Chapter 7</a>: there we posited discrete states and fit them; here we let the encoder discover the geometry and let clustering read the states off it. A subtlety unique to the temporal setting is that consecutive windows overlap and so their embeddings move smoothly, which means a clustering that ignores time can fragment a single regime into several clusters at its boundaries; a transition-aware method (or simply smoothing the cluster assignment over time) recovers the discrete regime sequence the change-point detectors of Chapter 8 were built to find.</p>
+<p><strong>Anomaly via embedding distance.</strong> Fit the embeddings of normal windows, then score a new window by its distance to that normal set, its distance to the nearest normal neighbor, its distance to the nearest cluster centroid, or its density under a fitted model. A window whose embedding sits far from everything the encoder considers normal is anomalous. This is the representation-space successor to the classical detectors of <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8</a>: where Chapter 8 measured surprise in the raw signal or its forecast residual, here we measure surprise in a learned space where the encoder has already discounted the variation it considers normal, so subtle anomalies that are invisible in the raw series can become large displacements in the embedding.</p>
+<p><strong>Embeddings as downstream inputs.</strong> A frozen encoder is a feature extractor. Embed every window and feed the vectors to a small classifier, regressor, or forecaster. Because the encoder did the representation learning, the downstream head can be tiny and trained on little labeled data, the transfer-learning payoff that motivates the whole chapter. The arithmetic of this payoff is worth making explicit: a raw window of width $w$ across $c$ channels is a $w \cdot c$-dimensional input, often hundreds or thousands of numbers, and learning a forecaster directly on it demands enough labeled examples to fit that many input weights without overfitting. The same window compressed to a $d$-dimensional embedding (with $d$ a few dozen) lets a downstream head fit only $d$ weights per output, so the label budget needed to train it drops by the same ratio. The encoder spent the unlabeled data to buy the labeled data's leverage, which is exactly why a frozen embedding plus a linear head is the standard recipe when labels are scarce but raw series are abundant, the usual situation in clinical monitoring, industrial telemetry, and finance.</p>
+<p>It helps to see the four uses as a single workflow rather than four disconnected tools, because in a deployed system they almost always coexist. A monitoring service embeds each incoming window once; that one embedding is then routed simultaneously to a nearest-neighbor index (so an operator can pull up similar historical episodes), to a running clustering or density model (so the current regime is named and tracked), to an anomaly score (so an out-of-distribution window raises an alarm), and to a small predictive head (so the next value or a risk label is forecast). The encoder is the expensive, shared component computed once per window; the four queries are cheap reads over its output. This is the architecture the practical example at the end of the section describes, and it is the reason the chapter spent so long on the encoder: the encoder is the leverage point that every downstream capability inherits.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 290" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="One encoder feeding four downstream uses. On the left, a time-series window passes through an encoder f-theta to produce an embedding z. From z, four arrows fan out to four boxes: nearest-neighbor retrieval, clustering of regimes, anomaly by embedding distance, and a downstream model head.">
+<defs>
+<marker id="arr165" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.box165 { fill:#eef3f8; stroke:#14385c; stroke-width:1.8; }
+.use165 { fill:#fbeee8; stroke:#b8431f; stroke-width:1.6; }
+.fl165 { stroke:#5a626c; stroke-width:1.7; fill:none; marker-end:url(#arr165); }
+.t165 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s165 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.u165 { font:600 12px sans-serif; fill:#b8431f; text-anchor:middle; }
+</style>
+<text class="t165" x="410" y="22">One encoder, four geometric uses of the embedding z</text>
+<rect class="box165" x="30" y="115" width="70" height="50" rx="8"/><text class="s165" x="65" y="144">window</text>
+<rect class="box165" x="150" y="110" width="78" height="60" rx="9"/><text class="t165" x="189" y="138">f&#952;</text><text class="s165" x="189" y="156">encoder</text>
+<circle class="box165" cx="320" cy="140" r="30"/><text class="t165" x="320" y="145">z</text>
+<line class="fl165" x1="100" y1="140" x2="148" y2="140"/>
+<line class="fl165" x1="228" y1="140" x2="288" y2="140"/>
+<rect class="use165" x="430" y="40" width="170" height="40" rx="7"/><text class="u165" x="515" y="65">nearest-neighbor retrieval</text>
+<rect class="use165" x="430" y="100" width="170" height="40" rx="7"/><text class="u165" x="515" y="125">clustering of regimes</text>
+<rect class="use165" x="430" y="160" width="170" height="40" rx="7"/><text class="u165" x="515" y="185">anomaly by distance</text>
+<rect class="use165" x="430" y="220" width="170" height="40" rx="7"/><text class="u165" x="515" y="245">downstream model head</text>
+<line class="fl165" x1="350" y1="128" x2="428" y2="62"/>
+<line class="fl165" x1="350" y1="135" x2="428" y2="118"/>
+<line class="fl165" x1="350" y1="148" x2="428" y2="178"/>
+<line class="fl165" x1="350" y1="155" x2="428" y2="238"/>
+</svg>
+<figcaption><strong>Figure 16.5.1:</strong> A single trained encoder $f_\theta$ turns a window into an embedding $\mathbf{z}$, and four downstream uses all read off the same geometry: retrieval ranks by distance, clustering groups by proximity, anomaly scores by displacement from the normal set, and a small head consumes $\mathbf{z}$ as a feature. The encoder is trained once; the geometry is reused everywhere.</figcaption>
+</figure>
+<p><strong>Entity and series embeddings.</strong> A distinct and widely deployed idea: instead of (or alongside) embedding the <em>signal</em>, embed the <em>identity</em>. Give every series, store, sensor, or patient an integer ID and learn a dense vector for each, exactly as word embeddings learn a vector per word. The ID embedding is a lookup-table row trained end to end with the forecaster, so the model discovers that store 14 behaves like store 88 by placing their vectors close, sharing statistical strength across similar entities without any hand-coded similarity. This is standard in global forecasting models (DeepAR, Temporal Fusion Transformer, and the deep forecasters of <a href="../../part-3-temporal-deep-learning/module-14-deep-forecasting-architectures/index.html">Chapter 14</a>), where one model serves thousands of related series and the entity embedding is how it tells them apart while still sharing what they have in common.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Distance Is the Interface</div>
+<p>Retrieval, clustering, anomaly detection, and feature transfer look like four different problems, but to a good embedding they are one problem asked four ways: <em>what is near what?</em> The encoder's entire job is to make Euclidean or cosine distance in $\mathbb{R}^{d}$ agree with the semantic similarity you care about. Once it does, you do not build four systems; you build one embedding and four thin queries over its distance function. This is why representation quality, not algorithmic cleverness in the downstream task, is usually the thing worth improving: a better encoder lifts all four uses at once, while a fancier clustering algorithm over a bad embedding lifts none.</p>
+</div>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Cosine Similarity of Two Subsequences</div>
+<p>Take two three-dimensional embeddings of two short subsequences (tiny $d$ so we can do it by hand): $\mathbf{z}_a = (2, 1, 2)$ and $\mathbf{z}_b = (1, 0, 2)$. The dot product is $\mathbf{z}_a^{\top}\mathbf{z}_b = 2\cdot 1 + 1\cdot 0 + 2\cdot 2 = 2 + 0 + 4 = 6$. The norms are $\lVert\mathbf{z}_a\rVert = \sqrt{4+1+4} = \sqrt{9} = 3$ and $\lVert\mathbf{z}_b\rVert = \sqrt{1+0+4} = \sqrt{5} \approx 2.236$. So $\operatorname{cos}(\mathbf{z}_a, \mathbf{z}_b) = 6 / (3 \cdot 2.236) = 6 / 6.708 \approx 0.894$, a high similarity (the angle between them is $\arccos 0.894 \approx 26.6^{\circ}$). Now a third subsequence embeds to $\mathbf{z}_c = (-2, 1, -1)$; then $\mathbf{z}_a^{\top}\mathbf{z}_c = -4 + 1 - 2 = -5$, $\lVert\mathbf{z}_c\rVert = \sqrt{6} \approx 2.449$, and $\operatorname{cos}(\mathbf{z}_a, \mathbf{z}_c) = -5/(3\cdot 2.449) \approx -0.680$, pointing in nearly the opposite direction. A retrieval query for $\mathbf{z}_a$ ranks $b$ far above $c$. The lesson in three numbers: cosine reads off direction, ignores magnitude, and is exactly the score a nearest-neighbor index sorts by.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Index That Knew Too Much</div>
+<p>There is a recurring comedy in retrieval systems: build a nearest-neighbor index over embeddings of windows from a single long sensor stream, query with the most recent window, and the top neighbor it proudly returns is, almost always, the window immediately before the query. The encoder is not wrong; consecutive windows really are the most similar things in the database, because they overlap by all but one sample. It is just spectacularly unhelpful to be told that the best analogue for the last hour is the hour before it. The fix is a small one (exclude a temporal neighborhood of the query from the candidate set), but the lesson is larger: a distance can be perfectly faithful and perfectly useless at the same time, and the difference is entirely in which candidates you let it rank.</p>
+</div>
+
+<h2>2. Disentanglement: One Axis, One Meaning <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Subsection one used the embedding's <em>geometry</em> (what is near what) without ever asking what its individual coordinates mean. Disentanglement asks exactly that further question. A representation is <em>disentangled</em> when its latent dimensions align with the true, independent factors that generated the data, so that changing one underlying factor of the world moves one coordinate of $\mathbf{z}$ and leaves the others fixed. For time series the factors that beg to be separated are familiar from the very first decompositions of <a href="../../part-2-classical-forecasting/module-03-statistical-foundations/index.html">Chapter 3</a>: the slow <em>trend</em>, the repeating <em>seasonality</em>, and the residual <em>noise</em>; and, in the richer framings, the <em>content</em> of a series versus its <em>style</em>, or the series' fixed <em>identity</em> versus its time-varying <em>dynamics</em>.</p>
+<p>The vocabulary here is worth pinning down because it is used loosely in the literature. A <em>factor of variation</em> is an underlying knob of the data-generating process: turn it and the observed series changes in one coherent way. A representation is <em>entangled</em> when a single factor is spread across many coordinates, or a single coordinate responds to many factors, so no axis has a clean meaning. It is <em>disentangled</em> when the map between factors and axes is one-to-one. For time series the catalogue of plausible factors is unusually rich: amplitude, phase, frequency, trend slope, noise level, the identity of the source, and the operating regime are all candidate factors, and a useful disentangled latent need not separate all of them, only the ones a downstream task wants to read or control. The point of naming the factors first is that disentanglement is always relative to a chosen factorization; there is no model-free notion of "the" factors, which is the first crack through which the identifiability problem of subsection three will enter.</p>
+<p>The cleanest way to write the goal is as a factorized latent. Suppose the data is generated from independent factors $\mathbf{v} = (v_1, v_2, \dots, v_K)$ (one for trend, one for seasonal amplitude, one for the series identity, and so on) through some generative process $\mathbf{x} = g(\mathbf{v})$. A perfectly disentangled encoder recovers a latent whose posterior factorizes across those factors,</p>
+$$q_\phi(\mathbf{z}\mid\mathbf{x}) = \prod_{k=1}^{K} q_\phi(z_k \mid \mathbf{x}), \qquad \text{with each } z_k \text{ encoding one factor } v_k,$$
+<p>so the prior and posterior both treat the coordinates as independent and each coordinate is a one-to-one image of a single generative factor. The independence of the prior $p(\mathbf{z}) = \prod_k p(z_k)$ is the pressure that, when it survives into the posterior, gives each axis its own job.</p>
+<p>Why pursue this beyond aesthetics? Two payoffs. First, <strong>interpretability</strong>: if axis 3 is "seasonal amplitude", you can read a series' seasonality straight off coordinate 3, audit what a model attends to, and explain a forecast in human terms, the kind of transparency the responsible-AI chapter (<a href="../../toc.html">Chapter 33</a>) will demand. Second, and the reason this section sits where it does in the book, <strong>controllable generation</strong>: if the factors are separated, you can <em>intervene</em>, hold identity fixed and turn up the trend coordinate to generate the same entity with a rising trend, or swap the dynamics latent between two series to transfer a behavior. That intervention is precisely what the generative temporal models of <a href="../../toc.html">Chapter 17</a> do, and a disentangled latent is what makes the knob turn one thing at a time instead of smearing the whole output.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Geometry Places Points, Disentanglement Labels Axes</div>
+<p>Subsection one needed only that <em>similar things land near each other</em>; it never cared which direction meant what, because a nearest-neighbor query is invariant to any rotation of the space. Disentanglement is a strictly stronger demand: it fixes the orientation of the axes so each coordinate carries a single factor. You can have a perfectly useful retrieval embedding that is hopelessly entangled (rotate a disentangled space and retrieval is unchanged but interpretability is gone), and that is exactly why disentanglement needs its own objectives and its own metrics rather than coming free with a good encoder. The progression of this chapter is therefore: first make distances meaningful, then, if you need to read or steer the factors, make axes meaningful too.</p>
+</div>
+
+<h2>3. Methods and Their Limits <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Three families of method pursue the factorized latent of subsection two, and one body of critique tempers the claims of all three.</p>
+<p><strong>Independence pressure (beta-VAE-style).</strong> The most direct route adds a penalty that pushes the aggregate posterior toward a factorized prior. The $\beta$-VAE of Higgins and colleagues simply up-weights the Kullback-Leibler term of the variational autoencoder objective,</p>
+$$\mathcal{L}_{\beta} = \underbrace{\mathbb{E}_{q_\phi(\mathbf{z}\mid\mathbf{x})}\big[\log p_\theta(\mathbf{x}\mid\mathbf{z})\big]}_{\text{reconstruction}} - \beta\,\underbrace{D_{\mathrm{KL}}\!\big(q_\phi(\mathbf{z}\mid\mathbf{x}) \,\Vert\, p(\mathbf{z})\big)}_{\text{push toward factorized prior}},$$
+<p>with $\beta > 1$ trading reconstruction fidelity for stronger statistical independence among the latent coordinates. The full mechanics of this objective, and the variants (FactorVAE, $\beta$-TCVAE) that isolate the total-correlation term it really wants to penalize, are the subject of <a href="../../toc.html">Section 17.2</a>, where the VAE is introduced as a generative model in its own right; here we note only that "turn up the pressure for independent axes" is the lever, and that it costs reconstruction quality, the central tension of the whole approach.</p>
+<p><strong>Sequential disentanglement (static versus dynamic).</strong> Time series have a factorization no static image has: a part of the series that <em>does not change over time</em> (the identity of the sensor, the genre of the music, the speaker) and a part that <em>does</em> (the moment-to-moment dynamics). Sequential models exploit this by splitting the latent into a single time-invariant vector $\mathbf{z}_{\text{static}}$ shared across the whole sequence and a sequence of time-varying vectors $\mathbf{z}_{\text{dyn},1:T}$,</p>
+$$p(\mathbf{x}_{1:T}, \mathbf{z}_{\text{static}}, \mathbf{z}_{\text{dyn},1:T}) = p(\mathbf{z}_{\text{static}})\,\prod_{t=1}^{T} p(\mathbf{z}_{\text{dyn},t}\mid \mathbf{z}_{\text{dyn},<t})\,p(\mathbf{x}_t \mid \mathbf{z}_{\text{static}}, \mathbf{z}_{\text{dyn},t}),$$
+<p>so $\mathbf{z}_{\text{static}}$ is forced to absorb everything constant (who) and the dynamic latents carry everything that moves (what they are doing now). Models in this family (DSVAE and its descendants, and the contrastive sequential disentanglement work of the early 2020s) let you do content/style transfer on sequences: keep one series' static code and another's dynamics, generate a hybrid. This static/dynamic split is the temporal specialization that makes disentanglement genuinely useful for series rather than a borrowed image idea.</p>
+<p><strong>The limits and the critique.</strong> Honesty about this literature is mandatory. The influential analysis of Locatello and colleagues (2019) proved that <em>unsupervised</em> disentanglement is fundamentally unidentifiable without inductive biases or some supervision: for any disentangled representation there are infinitely many equally-good entangled ones related by a transformation the data cannot distinguish, so no purely unsupervised objective can be guaranteed to find the axes you want. In practice this means disentanglement results are sensitive to random seed and hyperparameters, the headline metrics vary widely across runs, and a little weak supervision or a structural bias (like the static/dynamic split above, which <em>is</em> an inductive bias) does far more than any amount of independence penalty alone. The working stance for 2026: treat strong unsupervised disentanglement claims with skepticism, lean on structural biases and weak labels when you need separated factors, and measure rather than assume.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Axis That Moonlights</div>
+<p>The quiet embarrassment of disentanglement research is the latent dimension that swears it encodes "trend" on the training set and then, on a fresh batch, is caught moonlighting as "seasonal phase" whenever the trend happens to be flat. Because the data cannot tell a clean factor from a sneaky rotation of two factors, an axis is free to take a second job the moment its first one has nothing to do. This is the identifiability problem made vivid: you did not hire one worker per task, you hired a committee that quietly reassigns itself behind your back, and the only way to keep everyone honest is to nail down the org chart in advance with a structural prior or a few labeled examples.</p>
+</div>
+
+<h2>4. Evaluating Embeddings <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>An embedding is only as good as what it lets you do, so evaluation is never a single number. Three complementary families of metric answer three different questions.</p>
+<p><strong>Probing</strong> asks: <em>how much task-relevant information does the embedding contain?</em> Freeze the encoder, train a deliberately simple head (linear or a shallow MLP) on top of the embeddings to predict a property of interest (a label, a regime, a future value), and report the head's accuracy. A linear probe is the standard because a high <em>linear</em> accuracy shows the information is not merely present but laid out in a linearly accessible way; if you need a deep probe to extract a property, the embedding has it but has not organized it well. Probing is the workhorse evaluation for self-supervised representations across the field.</p>
+<p><strong>Retrieval metrics</strong> ask: <em>does distance agree with relevance?</em> Using labels as ground truth, embed a query, rank the database by embedding distance, and score the ranking. Precision@k (fraction of the top $k$ that share the query's label), recall@k, and mean average precision (mAP) are the standard scores, and they directly measure the property subsection one depends on, that near in embedding space means similar in reality.</p>
+<p><strong>Disentanglement metrics</strong> ask: <em>does each axis carry one factor?</em> These require known generative factors (so they live on synthetic or carefully-labeled data). The Mutual Information Gap (MIG) measures, for each true factor, the gap in mutual information between its top-two most-informative latent dimensions: a large gap means one dimension dominates (good, one axis owns the factor), a small gap means the factor is smeared across dimensions (entangled). Written out, for a factor $v_k$ and latent coordinates $z_j$, MIG normalizes by the factor's entropy $H(v_k)$ and reads</p>
+$$\text{MIG} = \frac{1}{K}\sum_{k=1}^{K} \frac{1}{H(v_k)}\Big( \max_{j} I(z_j; v_k) - \operatorname*{second\,max}_{j} I(z_j; v_k) \Big),$$
+<p>so a score near one means each factor is captured by a single, clearly dominant latent and a score near zero means the information is split. The complementary SAP score and the DCI triple (Disentanglement, Completeness, Informativeness) measure the same idea from the angles of axis-to-factor and factor-to-axis mappings: DCI in particular separates <em>disentanglement</em> (each latent informs at most one factor) from <em>completeness</em> (each factor is informed by at most one latent), two properties that can fail independently and that a single scalar like MIG blurs together. Because subsection three warned that these scores swing with the seed, the honest protocol is to report them as a distribution over many runs, not a single best value, and to fix the random seed and hyperparameters before, not after, looking at the metric.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Metric family</th><th>Question it answers</th><th>Needs labels?</th><th>Typical score</th></tr></thead>
+<tbody>
+<tr><td>Probing (linear / MLP)</td><td>Is task-relevant info present and accessible?</td><td>task labels</td><td>probe accuracy / $R^2$</td></tr>
+<tr><td>Retrieval</td><td>Does distance track relevance?</td><td>relevance labels</td><td>precision@k, mAP</td></tr>
+<tr><td>Disentanglement</td><td>Does one axis carry one factor?</td><td>known generative factors</td><td>MIG, SAP, DCI</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 16.5.2:</strong> Three evaluation families for a temporal embedding. Probing tests whether information is present and linearly accessible, retrieval tests whether the distance function is trustworthy, and disentanglement tests whether the axes are individually meaningful. They are complementary: an embedding can probe well yet be entangled, or retrieve well yet hide a property a deep probe would find.</figcaption>
+</figure>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Embeddings and Disentanglement in the Foundation-Model Era (2024 to 2026)</div>
+<p>Two currents define the recent work. First, the temporal foundation models of <a href="../../part-3-temporal-deep-learning/module-15-temporal-foundation-models/index.html">Chapter 15</a> are increasingly used as <em>off-the-shelf embedders</em>: MOMENT (Goswami and colleagues, 2024) is explicitly positioned as a general-purpose time-series representation evaluated by linear probing across classification, anomaly, and imputation, and the encoders of Moirai and TimesFM are mined for embeddings the same way a vision practitioner mines a pretrained backbone. The open question is whether one frozen foundation embedding can beat a task-specific contrastive encoder across domains, and the 2024 to 2025 benchmarks suggest "often, but not always". Second, the disentanglement line has matured from the seed-sensitive VAE metrics toward <em>weakly-supervised and causal</em> framings: methods that use a handful of factor labels, known interventions, or the structural static/dynamic prior to sidestep the Locatello impossibility, and an active 2024 to 2026 thread connecting disentangled temporal latents to causal representation learning (the causality material of <a href="../../toc.html">Chapter 30</a>), where the factors are not just statistically independent but causally meaningful. The practitioner's takeaway for 2026: reach first for a pretrained foundation embedding and a linear probe, and treat strong disentanglement as something you engineer with structure and weak labels, not something you hope an unsupervised loss will hand you.</p>
+</div>
+
+<h2>5. Worked Example: An Embedding Space, From Scratch and From a Library <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now build the full pipeline of subsection one end to end: train a tiny encoder, embed a database of windows, do nearest-neighbor retrieval, and visualize the space with t-SNE, all by hand so the structure is exposed, then collapse the embedding and retrieval to a few library lines. The data is a synthetic mixture of three regime types (a flat-noise regime, a trend regime, and a seasonal regime) so that "did the embedding separate the regimes?" has a checkable answer. Code 16.5.1 builds the data and a small contrastive-style encoder.</p>
+<pre><code class="language-python">import numpy as np
+import torch
+import torch.nn as nn
+
+rng = np.random.default_rng(0)
+torch.manual_seed(0)
+W, N_PER = 64, 200          # window width; windows per regime
+t = np.linspace(0, 1, W)
+
+def make_window(regime):
+    """Three regime types: 0 = flat noise, 1 = trend, 2 = seasonal."""
+    noise = rng.normal(0, 0.15, size=W)
+    if regime == 0:
+        return noise
+    if regime == 1:
+        slope = rng.uniform(1.0, 3.0)
+        return slope * t + noise                 # rising trend
+    freq = rng.uniform(3.0, 6.0)
+    return np.sin(2 * np.pi * freq * t) + noise   # seasonal
+
+X = np.stack([make_window(r) for r in range(3) for _ in range(N_PER)])
+labels = np.array([r for r in range(3) for _ in range(N_PER)])  # ground-truth regime
+Xt = torch.tensor(X, dtype=torch.float32)
+
+class Encoder(nn.Module):
+    """A small MLP encoder mapping a width-W window to a d-dim L2-normalized embedding."""
+    def __init__(self, w=W, d=8):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(w, 32), nn.ReLU(), nn.Linear(32, d))
+    def forward(self, x):
+        z = self.net(x)
+        return z / z.norm(dim=-1, keepdim=True).clamp_min(1e-8)  # unit sphere -> cosine
+
+enc = Encoder()
+print("data:", X.shape, "| embedding dim:", enc.net[-1].out_features)
+</code></pre>
+<div class="code-caption"><strong>Code 16.5.1:</strong> Synthetic three-regime data and a small L2-normalized encoder. Normalizing the embedding to the unit sphere makes Euclidean nearest-neighbor search and cosine-similarity ranking equivalent, so the retrieval of Code 16.5.3 can use either distance interchangeably.</div>
+<pre><code class="language-text">data: (600, 64) | embedding dim: 8
+</code></pre>
+<div class="code-caption"><strong>Output 16.5.1:</strong> Six hundred windows (two hundred per regime), each width 64, encoded into an 8-dimensional embedding. The ground-truth <code>labels</code> array is held out of training and used only to score whether the unsupervised geometry recovers the regimes.</div>
+<p>We train the encoder with a from-scratch contrastive loss: build positive pairs by augmenting each window (add jitter, the simplest time-series augmentation) and pull each window's two views together while pushing different windows apart. Code 16.5.2 is the InfoNCE training loop written by hand so the objective is visible.</p>
+<pre><code class="language-python">def augment(x):
+    """Cheap positive-pair augmentation: add small Gaussian jitter."""
+    return x + 0.10 * torch.randn_like(x)
+
+def info_nce(za, zb, tau=0.2):
+    """Contrastive loss: za[i] and zb[i] are a positive pair; all others are negatives."""
+    logits = za @ zb.t() / tau                  # cosine sims (z already unit norm) / temperature
+    targets = torch.arange(za.size(0))          # the matching index is the positive
+    return nn.functional.cross_entropy(logits, targets)
+
+opt = torch.optim.Adam(enc.parameters(), lr=1e-3)
+for step in range(400):
+    idx = torch.randint(0, Xt.size(0), (128,))  # a minibatch of windows
+    batch = Xt[idx]
+    za, zb = enc(augment(batch)), enc(augment(batch))   # two augmented views
+    loss = info_nce(za, zb)
+    opt.zero_grad(); loss.backward(); opt.step()
+    if step % 100 == 0:
+        print("step %3d  contrastive loss = %.4f" % (step, loss.item()))
+
+with torch.no_grad():
+    Z = enc(Xt).numpy()                         # the embedding database
+</code></pre>
+<div class="code-caption"><strong>Code 16.5.2:</strong> From-scratch InfoNCE training. Each window is augmented twice to form a positive pair; the cross-entropy over the cosine-similarity matrix pulls positives together and pushes the rest apart, the contrastive mechanics of <a href="section-16.4.html">Section 16.4</a> reused here purely to produce a usable embedding space.</div>
+<pre><code class="language-text">step   0  contrastive loss = 4.8742
+step 100  contrastive loss = 0.6113
+step 200  contrastive loss = 0.4359
+step 300  contrastive loss = 0.3717
+</code></pre>
+<div class="code-caption"><strong>Output 16.5.2:</strong> The contrastive loss falls steadily as the encoder learns to map the two augmented views of each window to nearby points, the prerequisite for the regimes to separate in the embedding database <code>Z</code>.</div>
+<p>Now the two payoff queries, both written from scratch. Code 16.5.3 does nearest-neighbor retrieval by sorting cosine similarities, then measures retrieval quality (precision@10) and clustering quality (does $k$-means on the embeddings recover the three regimes?) against the held-out labels.</p>
+<pre><code class="language-python">from sklearn.cluster import KMeans
+
+# --- nearest-neighbor retrieval, from scratch ---
+def retrieve(query_i, k=10):
+    sims = Z @ Z[query_i]                         # cosine sims (Z is unit norm)
+    order = np.argsort(-sims)                     # descending similarity
+    return order[1:k + 1]                         # exclude the query itself
+
+# precision@10 averaged over a sample of queries: fraction of neighbors sharing the label
+p_at_10 = np.mean([
+    np.mean(labels[retrieve(i)] == labels[i])
+    for i in rng.choice(len(Z), size=100, replace=False)
+])
+print("retrieval precision@10 = %.3f" % p_at_10)
+
+# --- clustering regimes, from scratch geometry handed to k-means ---
+km = KMeans(n_clusters=3, n_init=10, random_state=0).fit(Z)
+# purity: how cleanly each cluster maps to one true regime
+purity = np.mean([
+    np.bincount(labels[km.labels_ == c]).max() / np.sum(km.labels_ == c)
+    for c in range(3)
+])
+print("cluster purity = %.3f" % purity)
+
+# --- cosine similarity of two specific subsequences (numeric-example, in code) ---
+i_trend, i_seasonal = np.where(labels == 1)[0][0], np.where(labels == 2)[0][0]
+print("cos(trend, seasonal) = %.3f" % (Z[i_trend] @ Z[i_seasonal]))
+print("cos(trend, trend')   = %.3f" % (Z[i_trend] @ Z[np.where(labels == 1)[0][1]]))
+</code></pre>
+<div class="code-caption"><strong>Code 16.5.3:</strong> Retrieval, clustering, and a cosine comparison, all read off the same embedding. Retrieval sorts cosine similarities; precision@10 and cluster purity score the geometry against the held-out regime labels; the two cosine prints confirm a within-regime pair scores far higher than a cross-regime pair.</div>
+<pre><code class="language-text">retrieval precision@10 = 0.981
+cluster purity = 1.000
+cos(trend, seasonal) = 0.118
+cos(trend, trend')   = 0.964
+</code></pre>
+<div class="code-caption"><strong>Output 16.5.3:</strong> The unsupervised embedding recovers the regimes almost perfectly: retrieval returns same-regime neighbors 98 percent of the time, $k$-means separates the three regimes cleanly (purity 1.0), and a within-regime cosine (0.964) towers over a cross-regime one (0.118), the numeric-example of subsection one reproduced on learned vectors.</div>
+<p>Finally the visualization and the library pair. Code 16.5.4 projects the 8-dimensional embeddings to two dimensions with t-SNE for a picture of the space, then shows that the entire embed-and-retrieve pipeline of Codes 16.5.1 to 16.5.3 reduces, when a pretrained representation is acceptable, to a few lines.</p>
+<pre><code class="language-python">from sklearn.manifold import TSNE
+
+# --- visualize the structure (t-SNE projection to 2D) ---
+emb2d = TSNE(n_components=2, perplexity=30, random_state=0).fit_transform(Z)
+print("t-SNE projection:", emb2d.shape, "(plot emb2d colored by labels to see 3 islands)")
+
+# --- the library pair: embedding + retrieval in a handful of lines ---
+# tslearn provides distance-based time-series retrieval without a hand-built encoder;
+# here we use a KNN over the learned embedding to make the line-count point concrete.
+from sklearn.neighbors import NearestNeighbors
+index = NearestNeighbors(n_neighbors=11, metric="cosine").fit(Z)   # build the index
+_, nbrs = index.kneighbors(Z[[i_trend]])                            # query in one call
+print("library retrieval neighbors share regime:",
+      np.mean(labels[nbrs[0][1:]] == labels[i_trend]))
+</code></pre>
+<div class="code-caption"><strong>Code 16.5.4:</strong> t-SNE visualization plus the library shortcut. The from-scratch retrieval of Code 16.5.3 (the manual cosine sort, the argsort, the self-exclusion) collapses to a fitted <code>NearestNeighbors</code> index queried in one <code>kneighbors</code> call, and t-SNE turns the 8-dimensional space into a 2-D picture of three islands.</div>
+<pre><code class="language-text">t-SNE projection: (600, 2) (plot emb2d colored by labels to see 3 islands)
+library retrieval neighbors share regime: 1.0
+</code></pre>
+<div class="code-caption"><strong>Output 16.5.4:</strong> t-SNE reduces the embedding to two dimensions (three well-separated islands, one per regime) and the library index reproduces the from-scratch retrieval exactly, returning all same-regime neighbors. The hand-written retrieve-and-rank logic becomes two library calls.</div>
+<p>Step back and read the four code blocks as one argument. Code 16.5.1 and 16.5.2 trained an encoder; Code 16.5.3 turned its output into retrieval, clustering, and a cosine comparison purely through distance; Code 16.5.4 visualized the space and showed the same retrieval in a couple of library lines. The whole of subsection one is in those numbers: a single embedding, four geometric uses, near-perfect because the encoder made distance mean similarity.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Retrieving Look-Alike Patients in an ICU Monitor</div>
+<p><strong>Who:</strong> A clinical-informatics team building a decision-support tool over an intensive-care unit's multivariate vital-sign streams, the healthcare series threaded through <a href="../../part-3-temporal-deep-learning/module-13-ssm-continuous-time/index.html">Chapter 13</a> and <a href="../../toc.html">Chapter 18</a>.</p>
+<p><strong>Situation:</strong> Clinicians wanted, at the bedside, to see "patients in our historical database whose last six hours looked like this patient's last six hours", as evidence for what might come next and which interventions helped.</p>
+<p><strong>Problem:</strong> Raw six-hour windows of heart rate, blood pressure, and oxygen saturation are high-dimensional and noisy, and a naive Euclidean distance on the raw signal matched on irrelevant detail (a momentary motion artifact) while missing the clinically similar trajectory shifted by an hour.</p>
+<p><strong>Dilemma:</strong> Hand-engineer similarity features (brittle, and every clinician disagreed on which features mattered), or learn an embedding and trust its geometry (powerful, but a black box a clinician must be persuaded to trust).</p>
+<p><strong>Decision:</strong> They trained a contrastive encoder on unlabeled historical windows exactly as in Code 16.5.2, built a nearest-neighbor index over the embeddings as in Code 16.5.4, and surfaced the top-five look-alike windows with their subsequent outcomes.</p>
+<p><strong>How:</strong> They earned trust by validating the embedding two ways before deployment: a linear probe (subsection four) showing the embedding predicted known deterioration labels, and a clinician review of retrieved neighbors confirming they were judged similar by eye. Anomaly monitoring came free: a window far from every normal neighbor (the embedding-distance score of subsection one) raised an early-warning flag, the learned successor to the <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8</a> detectors.</p>
+<p><strong>Result:</strong> Retrieval returned clinically plausible matches that a clinician panel rated more relevant than the feature-engineered baseline, and the same embedding powered retrieval, the early-warning flag, and a small downstream risk head, three uses from one encoder.</p>
+<p><strong>Lesson:</strong> A learned embedding earns deployment not by its loss curve but by passing the evaluations of subsection four: probe it for the information you need, have an expert audit the retrieved neighbors, and only then trust the geometry at the bedside.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Embedding and Retrieval Without the Encoder Loop</div>
+<p>The from-scratch pipeline of Codes 16.5.1 to 16.5.3 ran about 45 lines: a model class, a hand-written InfoNCE loop, a training loop, and a manual cosine-sort retriever. When a pretrained representation is acceptable, the whole thing collapses to a handful of lines. A temporal foundation model (MOMENT, or a Chronos/Moirai encoder from <a href="../../part-3-temporal-deep-learning/module-15-temporal-foundation-models/index.html">Chapter 15</a>) supplies the embedding with no training loop at all, and a vector index supplies retrieval with no manual sort:</p>
+<pre><code class="language-python"># Pretrained embedder + a vector index: no training loop, no hand-written retriever.
+from momentfm import MOMENTPipeline        # a pretrained time-series foundation model
+from sklearn.neighbors import NearestNeighbors
+
+model = MOMENTPipeline.from_pretrained(    # frozen general-purpose encoder
+    "AutonLab/MOMENT-1-large", model_kwargs={"task_name": "embedding"})
+Z = model.embed(windows).embeddings        # (N, d) embeddings in one call
+index = NearestNeighbors(metric="cosine").fit(Z)
+neighbors = index.kneighbors(Z[[query_i]], n_neighbors=10)[1]   # retrieval in one call
+</code></pre>
+<p>About 45 lines of encoder, contrastive loss, training loop, and manual retriever become roughly 6: the library handles the pretraining, the embedding, and the indexed nearest-neighbor search internally, and a production vector database (FAISS, Annoy, hnswlib) scales the same query to millions of series. You write the from-scratch version once to understand what distance means; you ship the library version.</p>
+</div>
+<div class="callout looking-back">
+<div class="callout-title">Looking Back: Chapter 16 Closes, and the Representation Becomes a Generator</div>
+<p>This chapter set out to make time series <em>learnable as representations</em>. We built encoders with self-supervised and contrastive objectives, and in this final section we cashed the representation in: a window or a series becomes a vector, distance becomes similarity, and one embedding drives retrieval, clustering, anomaly detection, and downstream prediction at once. We then asked the harder question of whether the <em>axes</em> mean anything, and found that disentanglement, separating trend from season, identity from dynamics, content from style, is what turns a useful embedding into an interpretable and steerable one, while honestly noting that strong unsupervised disentanglement is unidentifiable and must be engineered with structure and weak labels. Notice the door this leaves open. Throughout, we treated the encoder $f_\theta: \mathbf{x} \to \mathbf{z}$ as the object of interest and the decoder, where there was one, as a means to an end. <a href="../../toc.html">Chapter 17</a> turns the picture around and makes the <em>decoder</em> the star: once a latent space is organized, especially a disentangled one, you can sample from it and generate new series, intervene on one factor and generate the same entity under a different trend, or learn the latent dynamics and roll them forward. The variational autoencoder whose objective we previewed in subsection three becomes a full generative model in Section 17.2; the static/dynamic split becomes a controllable sequence generator; the representation we learned to <em>read</em> in Chapter 16 becomes a representation we learn to <em>write</em> in Chapter 17. The temporal thread continues: the latent-variable models of <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/index.html">Chapter 7</a> returned here as learned encoders, and they return again next as learned generators.</p>
+</div>
+
+<h2>Exercises</h2>
+<ol class="exercises">
+<li><strong>Conceptual.</strong> Subsection two argues that a retrieval embedding can be perfectly useful yet "hopelessly entangled", and that rotating a disentangled space leaves retrieval unchanged but destroys interpretability. Explain precisely why nearest-neighbor retrieval is invariant to an orthogonal rotation of the embedding space, and use that fact to argue that a high retrieval precision@k tells you nothing about whether the embedding is disentangled. Then state one task from subsection one that <em>is</em> sensitive to the orientation of the axes and one that is not.</li>
+<li><strong>Implementation.</strong> Extend the worked example so that disentanglement is measurable. Generate the seasonal regime in Code 16.5.1 with two independent known factors per window (seasonal amplitude and seasonal frequency, both recorded), retrain the encoder, and compute the Mutual Information Gap (MIG) between each true factor and the eight latent dimensions: estimate the mutual information between each factor and each latent (discretize and use a histogram estimator, or <code>sklearn.feature_selection.mutual_info_regression</code>), then for each factor take the gap between its top two most-informative latents. Report MIG for the raw windows versus the learned embedding, and discuss whether the contrastive objective (which never asked for disentanglement) produced any.</li>
+<li><strong>Open-ended.</strong> The Locatello (2019) impossibility says unsupervised disentanglement is unidentifiable without inductive bias. The static/dynamic split of subsection three <em>is</em> an inductive bias. Design (in pseudocode or prose) a sequential encoder that splits the latent into a single static vector and per-step dynamic vectors for a dataset where the static factor is the identity of a sensor and the dynamic factor is its current operating regime, then propose a concrete experiment, using the static/dynamic codes of two different sensors, that would demonstrate content/style transfer (generate sensor A's identity carrying out sensor B's regime) and an evaluation that would convince a skeptic the split actually separated identity from dynamics rather than smearing them. What would failure look like in your evaluation?</li>
+</ol>
+
+<nav class="chapter-nav">
+<a class="nav-prev" href="section-16.4.html"><span class="nav-label">Previous</span><span class="nav-num">Section 16.4</span><span class="nav-title">Self-Supervised and Contrastive Methods</span></a>
+<a class="nav-up" href="index.html"><span class="nav-label">Up</span><span class="nav-num">Chapter 16</span><span class="nav-title">Learning Temporal Representations</span></a>
+<a class="nav-next" href="../../toc.html"><span class="nav-label">Next</span><span class="nav-num">Contents</span><span class="nav-title">Table of Contents</span></a>
+</nav>
+</main>
+<footer class="book-footer">
+<p class="footer-edition">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &middot; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated"><script>document.write("Last updated: " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 18.3: Temporal and Dynamic Graphs. Discrete-time snapshot graphs versus continuous-time timed-edge streams, a self-contained message-passing primer, snapshot models (EvolveGCN) and continuous-time models (TGAT, TGN with memory), temporal neighborhood sampling, dynamic link prediction, and a from-scratch temporal message-passing layer matched against a PyTorch-Geometric-Temporal equivalent." name="description"/>
+<title>Section 18.3: Temporal and Dynamic Graphs | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Temporal Representation Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 18: Event and Sequence Modeling</a></div>
+<h1>Temporal and Dynamic Graphs</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"On Monday these two accounts had never met. By Tuesday afternoon they had transacted four times, and by Wednesday the edge between them was gone again, as if it had never existed. My job is to represent a friendship that lasts a single business day. A static graph would insist they are connected forever; I insist they were connected on Tuesday, which is the only truth that matters."</p>
+<cite>An Edge That Only Exists on Tuesdays</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Most of the world's interaction data is a graph that will not hold still. Accounts transact, then stop; users follow, then unfollow; roads congest, then clear; sensors fail, then recover. A static graph neural network sees a single frozen adjacency and is structurally blind to <em>when</em> each connection existed, yet "when" is exactly the signal that distinguishes a money-laundering ring from ordinary commerce, a viral cascade from background chatter, and an imminent traffic jam from a quiet afternoon.</strong> This section equips the graph neural network with a clock. We separate the two ways a graph evolves: the <em>discrete-time dynamic graph</em>, a sequence of snapshots sampled on a regular grid, and the <em>continuous-time dynamic graph</em>, a raw stream of timed edge events whose exact timestamps carry the information. We give a compact, self-contained message-passing primer so the section stands alone, then add time two ways: stacking a graph network across snapshots with a recurrence (EvolveGCN), and processing the event stream directly with temporal attention and a per-node memory (TGAT and TGN). We close by implementing one temporal message-passing layer and a snapshot graph-plus-GRU model from scratch, then collapsing the whole thing to a few lines of PyTorch Geometric Temporal, doing dynamic link prediction along the way. You leave able to choose the right representation for an evolving graph and to read, build, and train a dynamic graph neural network.</p>
+</div>
+<p>In <a href="section-18.2.html">Section 18.2</a> we modeled an event stream attached to a single entity, the temporal point process whose intensity says how likely the next event is and when. This section keeps the event stream but spreads it across a <em>population</em> of interacting entities: each event is now an edge, a timed interaction between two nodes, and the object we model is the whole evolving network of who-touched-whom-and-when. The point process of <a href="section-18.2.html">Section 18.2</a> describes one node's event clock; the dynamic graph describes the entire relational fabric those clocks weave together. We will use the unified notation of <a href="../../toc.html">Appendix A</a> throughout: $\mathcal{G}$ a graph, $\mathcal{V}$ its node set, $\mathcal{E}$ its edges, $\mathbf{h}_v$ the embedding of node $v$, and $t$ the time at which a structure or an embedding is read.</p>
+<p>Why give evolving graphs their own section rather than treating them as "graphs, plus a timestamp column"? Because the timestamp changes the modeling object at the root. A static graph neural network assumes the adjacency is a fixed fact about the world; a dynamic graph denies that assumption, and every design choice (how to aggregate neighbors, how to encode time, what to predict) follows from how literally you take the denial. Take it loosely and you snapshot the graph onto a grid and run a sequence model over the frames. Take it literally and you never form a frozen graph at all, you process the timed edge stream event by event and let each node carry a memory of its own history. These two postures, the snapshot view and the event view, organize the entire field and the entire section.</p>
+<p>The four competencies this section installs are: to tell a discrete-time dynamic graph from a continuous-time one and pick the representation a problem actually needs; to run message passing on a static graph and then extend it with time, both by stacking snapshots (EvolveGCN) and by attending over a timed neighborhood (TGAT, TGN); to sample a temporal neighborhood correctly so no future edge leaks into a past prediction; and to implement a dynamic graph network from scratch and recognize the few-line library equivalent. These are the load-bearing skills for the spatio-temporal forecasting of <a href="../../toc.html">Chapter 32</a>, where the graph is a road or sensor network and the task is to predict its future state.</p>
+
+<h2>1. Graphs That Change Over Time <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>An evolving graph can be recorded in two fundamentally different ways, and the choice is not cosmetic: it decides what your model can see. The first way is the <strong>discrete-time dynamic graph</strong> (DTDG), a finite sequence of static snapshots $\mathcal{G}_1, \mathcal{G}_2, \dots, \mathcal{G}_K$, each a frozen graph $\mathcal{G}_k = (\mathcal{V}_k, \mathcal{E}_k)$ observed at a regular sampling time $t_k$. You build a DTDG by binning all interactions into fixed windows (an hour, a day, a week), drawing an edge in window $k$ if the interaction occurred during that window, and treating the result as a movie of frames. The second way is the <strong>continuous-time dynamic graph</strong> (CTDG), a stream of timed edge events</p>
+$$\mathcal{S} = \big\{ (u_1, v_1, t_1, \mathbf{e}_1),\; (u_2, v_2, t_2, \mathbf{e}_2),\; \dots \big\}, \qquad t_1 \le t_2 \le \cdots,$$
+<p>where each tuple says node $u_i$ interacted with node $v_i$ at the exact time $t_i$ carrying edge feature $\mathbf{e}_i$. The CTDG never forms a frozen adjacency; it keeps the raw, irregularly spaced timestamps and lets the model decide what "the graph at time $t$" means by reading whatever events happened before $t$.</p>
+<p>The two representations sit at opposite ends of a precision-versus-convenience trade. The snapshot view is convenient: every frame is an ordinary static graph, so any static graph neural network and any sequence model can be bolted together with no new machinery. But binning destroys information. All events in a window collapse to one frame, so the <em>order</em> of interactions inside the window and the <em>exact spacing</em> between them are lost, and the bin width is an arbitrary hyperparameter that, chosen too wide, blurs fast dynamics and, chosen too narrow, leaves most frames empty. The event view keeps every timestamp, so it can model that account $u$ paid $v$ three seconds before $v$ paid $w$, a temporal-causal hint a daily snapshot erases entirely. The cost is that there is no static graph to run a standard layer on; you need machinery built for the stream. The rule of thumb: reach for snapshots when interactions are dense and slow relative to your time resolution (monthly trade networks, yearly citation graphs), and for the event stream when timing is the signal (payment fraud, where the seconds between transactions matter).</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Left panel: a discrete-time dynamic graph drawn as three stacked snapshot frames at times t1, t2, t3, each a small static graph with a different edge set. Right panel: a continuous-time dynamic graph drawn as a horizontal timeline with timed edge events plotted as labeled points at irregular positions.">
+<defs>
+<marker id="arr183" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.nd183 { fill:#eef3f8; stroke:#14385c; stroke-width:1.8; }
+.eg183 { stroke:#5a626c; stroke-width:1.8; }
+.ev183 { fill:#b8431f; }
+.tl183 { stroke:#14385c; stroke-width:1.8; marker-end:url(#arr183); }
+.lab183 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub183 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.evl183 { font:600 11px sans-serif; fill:#b8431f; text-anchor:middle; }
+</style>
+<text class="lab183" x="200" y="22">Discrete-time: a sequence of snapshots</text>
+<text class="lab183" x="620" y="22">Continuous-time: a stream of timed edges</text>
+<!-- three snapshot frames -->
+<rect x="60" y="44" width="120" height="100" rx="8" fill="none" stroke="#9aa6b2" stroke-dasharray="4 3"/>
+<text class="sub183" x="120" y="160">snapshot t&#8321;</text>
+<circle class="nd183" cx="90" cy="74" r="11"/><circle class="nd183" cx="150" cy="74" r="11"/><circle class="nd183" cx="120" cy="120" r="11"/>
+<line class="eg183" x1="101" y1="74" x2="139" y2="74"/>
+<rect x="210" y="44" width="120" height="100" rx="8" fill="none" stroke="#9aa6b2" stroke-dasharray="4 3"/>
+<text class="sub183" x="270" y="160">snapshot t&#8322;</text>
+<circle class="nd183" cx="240" cy="74" r="11"/><circle class="nd183" cx="300" cy="74" r="11"/><circle class="nd183" cx="270" cy="120" r="11"/>
+<line class="eg183" x1="251" y1="74" x2="289" y2="74"/><line class="eg183" x1="246" y1="84" x2="264" y2="110"/>
+<rect x="60" y="184" width="120" height="100" rx="8" fill="none" stroke="#9aa6b2" stroke-dasharray="4 3"/>
+<text class="sub183" x="120" y="300">snapshot t&#8323;</text>
+<circle class="nd183" cx="90" cy="214" r="11"/><circle class="nd183" cx="150" cy="214" r="11"/><circle class="nd183" cx="120" cy="260" r="11"/>
+<line class="eg183" x1="96" y1="224" x2="114" y2="250"/><line class="eg183" x1="144" y1="224" x2="126" y2="250"/>
+<!-- timeline -->
+<line class="tl183" x1="460" y1="150" x2="790" y2="150"/>
+<text class="sub183" x="788" y="172">time</text>
+<circle class="ev183" cx="490" cy="150" r="5"/><text class="evl183" x="490" y="135">(a,b,t&#8321;)</text>
+<circle class="ev183" cx="540" cy="150" r="5"/><text class="evl183" x="540" y="178">(b,c,t&#8322;)</text>
+<circle class="ev183" cx="610" cy="150" r="5"/><text class="evl183" x="610" y="135">(a,c,t&#8323;)</text>
+<circle class="ev183" cx="640" cy="150" r="5"/><text class="evl183" x="640" y="178">(d,a,t&#8324;)</text>
+<circle class="ev183" cx="720" cy="150" r="5"/><text class="evl183" x="720" y="135">(c,d,t&#8325;)</text>
+</svg>
+<figcaption><strong>Figure 18.3.1:</strong> The two representations of an evolving graph. The discrete-time view (left) bins interactions into regularly spaced snapshot frames, each an ordinary static graph but blind to within-bin ordering. The continuous-time view (right) keeps every interaction as a timed edge event at its exact, irregularly spaced timestamp, preserving the order and spacing that binning destroys.</figcaption>
+</figure>
+<p>The applications span every domain this book touches. In <strong>finance</strong>, a transaction network is a CTDG par excellence: each payment is a timed directed edge, and fraud rings reveal themselves through bursts and cycles whose timing a daily snapshot would smear away. In <strong>social</strong> platforms, follows, likes, and messages form an evolving graph where cascade speed predicts virality. In <strong>traffic</strong>, the road network is structurally static but its edge weights (travel times) evolve continuously, the spatio-temporal setting of <a href="../../toc.html">Chapter 32</a>. In <strong>sensor networks</strong>, the industrial-telemetry thread of <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8</a>, sensors form a graph by physical proximity and their correlations shift as machines change operating regime. Each of these is naturally one representation or the other, and getting the choice right is the first modeling decision.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Snapshots Bin Time, Streams Keep It</div>
+<p>The discrete-time and continuous-time views are not two notations for one thing; they are two different commitments about what is observable. A snapshot graph has already <em>decided</em> that time is quantized into bins and that within-bin order is unobservable, so no model built on it can ever recover sub-bin timing, no matter how clever. A continuous-time stream makes the opposite commitment: every timestamp is real and exact, and the model is free to use the precise spacing $t_i - t_j$ between any two events. You can always coarsen a stream into snapshots (project the CTDG onto a grid), but you can never refine snapshots back into a stream (the timing is gone). Choose the representation at least as fine as the finest dynamics you need to model, then coarsen only for convenience.</p>
+</div>
+<div class="callout" id="callout-18-1">
+<div class="callout-title">Callback 18.1: Marked Events Become Marked Edges</div>
+<p>In <a href="section-18.2.html">Section 18.2</a> a <em>marked</em> temporal point process emitted events $(t_i, m_i)$ where the mark $m_i$ labeled the event type. A continuous-time dynamic graph is exactly a marked point process whose mark is a pair of nodes: the event $(u_i, v_i, t_i, \mathbf{e}_i)$ is an arrival at time $t_i$ marked by the interacting pair $(u_i, v_i)$ and the edge feature $\mathbf{e}_i$. So the intensity machinery of <a href="section-18.2.html">Section 18.2</a> carries straight over: one can write an intensity $\lambda_{uv}(t)$ for the rate at which the specific edge $(u, v)$ fires, and a dynamic graph model that predicts the next interaction is, underneath, predicting which mark the point process emits next. The CTDG is the point process of <a href="section-18.2.html">Section 18.2</a> with structured marks, which is why this section sits in the same chapter.</p>
+</div>
+
+<h2>2. A Message-Passing Primer, Then Adding Time <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>To keep the section self-contained we recall how a graph neural network computes on a <em>static</em> graph, because every dynamic model below is this computation with a clock attached. The unifying abstraction is <strong>message passing</strong>: each node updates its embedding by gathering ("aggregating") messages from its neighbors and combining them with its own state. One layer of message passing, for a node $v$ with neighbor set $\mathcal{N}(v)$, is</p>
+$$\mathbf{m}_v^{(\ell)} = \operatorname*{\textstyle\bigoplus}_{u \in \mathcal{N}(v)} \phi\big(\mathbf{h}_u^{(\ell-1)}, \mathbf{h}_v^{(\ell-1)}, \mathbf{e}_{uv}\big), \qquad \mathbf{h}_v^{(\ell)} = \psi\big(\mathbf{h}_v^{(\ell-1)}, \mathbf{m}_v^{(\ell)}\big),$$
+<p>where $\phi$ is a message function, $\bigoplus$ a permutation-invariant aggregator (sum, mean, or max), and $\psi$ an update function. Stacking $L$ layers lets information flow $L$ hops across the graph, so a node's final embedding summarizes its $L$-hop neighborhood. The canonical instance is the graph convolutional network (GCN), whose layer is a symmetric-normalized neighbor average followed by a linear map and nonlinearity:</p>
+$$\mathbf{h}_v^{(\ell)} = \sigma\!\Big( \mathbf{W}^{(\ell)} \!\!\sum_{u \in \mathcal{N}(v) \cup \{v\}} \frac{1}{\sqrt{d_v\, d_u}}\, \mathbf{h}_u^{(\ell-1)} \Big),$$
+<p>with $d_v = |\mathcal{N}(v)| + 1$ the degree (including the self-loop) and $\mathbf{W}^{(\ell)}$ the layer's learned weight. The normalization $1/\sqrt{d_v d_u}$ keeps the scale of the aggregated message stable across nodes of wildly different degree. This single layer, "average your neighbors, transform, activate", is the atom we will make temporal.</p>
+<p>There are exactly three places to inject time into this atom, and the dynamic models of the next subsection differ only in which they choose. (1) Make the <em>weights</em> time-varying: let $\mathbf{W}^{(\ell)}$ become $\mathbf{W}^{(\ell)}_t$ and evolve it across snapshots with a recurrence, which is EvolveGCN. (2) Make the <em>neighborhood</em> time-aware: restrict $\mathcal{N}(v)$ to neighbors reached by edges <em>before</em> time $t$, and weight each neighbor by how long ago its edge fired, which is temporal neighborhood sampling and time encoding, the heart of TGAT. (3) Give each node a <em>memory</em> that persists across events and is updated whenever the node participates in an interaction, which is the memory module of TGN. The static layer above is the common ancestor; the three injections are the three branches of the family.</p>
+<p>The second injection needs a way to turn a real-valued time gap into a feature vector, because a raw scalar $\Delta t = t - t_j$ is a poor input to a neural network (its scale is arbitrary and a single number cannot express periodicity). The standard device, borrowed from the positional encodings of <a href="../../part-3-temporal-deep-learning/module-12-attention-transformers/index.html">Chapter 12</a>, is a learnable <strong>functional time encoding</strong> that maps a scalar gap to a vector of sinusoids:</p>
+$$\Phi(\Delta t) = \sqrt{\tfrac{1}{d}}\,\big[\cos(\omega_1 \Delta t),\, \sin(\omega_1 \Delta t),\, \dots,\, \cos(\omega_{d/2} \Delta t),\, \sin(\omega_{d/2} \Delta t)\big],$$
+<p>with learnable frequencies $\omega_1, \dots, \omega_{d/2}$. This is the Time2Vec / Bochner construction TGAT introduced: the dot product of two such encodings depends only on the gap between their times, so the network can learn to be sensitive to "how long ago" at multiple time scales at once. We use exactly this $\Phi$ in the worked code of subsection five.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: A Graph Network Is a Very Sociable Averaging Machine</div>
+<p>Strip away the matrices and a message-passing layer is gossip with bookkeeping: every node shouts its current state to its neighbors, listens to everyone shouting back, averages what it hears, and updates its opinion. Do this $L$ times and a rumor reaches everyone within $L$ handshakes. The dynamic version simply adds a rule that you are only allowed to listen to gossip you could actually have heard <em>by now</em>, and that you trust recent gossip more than stale gossip. Almost every sophisticated dynamic graph model is, at heart, this same sociable averaging machine with a wristwatch and a slightly suspicious attitude toward old news.</p>
+</div>
+
+<h2>3. Dynamic Graph Neural Networks: Snapshots and Streams <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The two representations of subsection one each have a matching family of models. On the snapshot side live the <strong>snapshot models</strong>, which run a graph neural network on each frame and tie the frames together with a sequence model. The cleanest design stacks a GCN over time and lets a recurrent network carry information between frames. There are two ways to combine them. The naive way embeds each snapshot with a (shared) GCN and feeds the resulting node embeddings into a GRU, so the GCN sees structure and the GRU sees time. The more elegant <strong>EvolveGCN</strong> (Pareja et al., 2020) inverts the relationship: it does not push node embeddings through the recurrence, it pushes the <em>GCN weights themselves</em>. A recurrent unit takes the GCN weight matrix $\mathbf{W}^{(\ell)}_{k-1}$ used at snapshot $k-1$ and produces the weight $\mathbf{W}^{(\ell)}_k$ for snapshot $k$:</p>
+$$\mathbf{W}^{(\ell)}_k = \operatorname{GRU}\big(\mathbf{W}^{(\ell)}_{k-1},\, \text{snapshot summary}_k\big), \qquad \mathbf{H}^{(\ell)}_k = \sigma\!\big(\hat{\mathbf{A}}_k\, \mathbf{H}^{(\ell-1)}_k\, \mathbf{W}^{(\ell)}_k\big),$$
+<p>where $\hat{\mathbf{A}}_k$ is the normalized adjacency of snapshot $k$. Evolving the weights rather than the embeddings means the model handles nodes that appear and disappear gracefully (a node absent in frame $k$ simply contributes nothing that frame, but the shared evolving weights still adapt), which is why EvolveGCN is a strong default for snapshot sequences with changing node sets.</p>
+<p>On the stream side live the <strong>continuous-time models</strong>, which never form a snapshot and instead compute a node's embedding on demand at a query time $t$ from the timed edges that preceded it. <strong>TGAT</strong> (Temporal Graph Attention, Xu et al., 2020) computes $\mathbf{h}_v(t)$ by attending over $v$'s temporal neighborhood: it gathers the neighbors $u$ that interacted with $v$ at times $t_j < t$, forms for each a key/value enriched with the functional time encoding $\Phi(t - t_j)$ of subsection two, and applies multi-head self-attention with $v$'s own state as the query. Because the time encoding is inside the attention, the model learns to weight a neighbor by both <em>what</em> it is and <em>how long ago</em> it last interacted. <strong>TGN</strong> (Temporal Graph Networks, Rossi et al., 2020) adds the third time-injection: a per-node <strong>memory</strong> vector $\mathbf{s}_v$ that summarizes everything node $v$ has ever done. When an event $(u, v, t, \mathbf{e})$ arrives, TGN computes a message for both endpoints, updates their memories with a recurrent cell, and reads out embeddings by running a TGAT-style attention over the memories of the temporal neighborhood:</p>
+$$\mathbf{s}_v \leftarrow \operatorname{mem}\!\big(\mathbf{s}_v,\, \mathsf{msg}(\mathbf{s}_v, \mathbf{s}_u, \Delta t, \mathbf{e})\big), \qquad \mathbf{h}_v(t) = \operatorname{attn}\big(\mathbf{s}_v,\, \{\mathbf{s}_u, \Phi(t - t_j)\}_{u \in \mathcal{N}_t(v)}\big).$$
+<p>The memory is what lets TGN react to an event instantly (the memory updates the moment the event is seen) while still attending over structure, and it is the single most important reason TGN tends to lead the accuracy tables on streaming benchmarks. The memory is the relational cousin of the RNN hidden state of <a href="../../part-3-temporal-deep-learning/module-10-recurrent-neural-networks/index.html">Chapter 10</a> and the belief state of <a href="../../toc.html">Chapter 23</a>: a recurrently updated summary of the past, here carried per node.</p>
+<p>All three stream models depend on <strong>temporal neighborhood sampling</strong>, and getting it right is where dynamic graphs differ most sharply from static ones. To compute $\mathbf{h}_v(t)$ you must gather only neighbors reached by edges with timestamp strictly less than $t$; an edge at time $\ge t$ is a future event and using it is temporal leakage, the dynamic-graph form of the train-test leakage warned about in <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a>. Because a popular node may have thousands of past edges, implementations sample a fixed number of them (the most recent $k$, or $k$ drawn uniformly from the past), which bounds compute and acts as a regularizer. The sampling must be causal: sort edges by time, and for a query at $t$ slice the neighbor list to the prefix ending just before $t$.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Where You Put the Clock Defines the Model</div>
+<p>The whole zoo of dynamic graph models is organized by one question: where does time enter the static message-passing layer? Put it in the <em>weights</em> and evolve them across frames, and you get snapshot models like EvolveGCN. Put it in the <em>neighborhood</em>, restricting and time-encoding who you attend to, and you get TGAT. Put it in a persistent per-node <em>memory</em> updated on every event, and you get TGN. These are not competing tricks but three orthogonal slots, and the strongest models fill more than one: TGN uses both a time-aware neighborhood and a memory. When you read a new dynamic-graph paper, find its clock first, then everything else falls into place.</p>
+</div>
+
+<h2>4. Tasks on Dynamic Graphs <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Three tasks dominate, and each is the temporal version of a familiar static-graph task. <strong>Dynamic link prediction</strong> asks: given the graph's history up to time $t$, will edge $(u, v)$ exist (or fire) just after $t$? This is the canonical benchmark for the stream models, and it doubles as a self-supervised pretext, since every real future edge is a positive example and any non-edge a negative, no labels required. Concretely you score a candidate pair by a function of the two time-aware embeddings, $p\big((u,v) \text{ at } t\big) = \operatorname{sigmoid}\big(\mathbf{g}([\mathbf{h}_u(t),\, \mathbf{h}_v(t)])\big)$, and train with binary cross-entropy against sampled negatives. Predicting the next interaction is, by Callback 18.1, predicting the next mark of the underlying point process.</p>
+<p><strong>Node classification over time</strong> asks for a label on a node that may itself change: is this account fraudulent <em>as of</em> time $t$, is this user a bot this week? The node embedding $\mathbf{h}_v(t)$ is read at the query time and fed to a classifier, and because the embedding moves as the graph evolves, the predicted label can flip when the node's behavior flips, which is exactly what you want for fraud or abuse detection. <strong>Edge or graph regression over time</strong> predicts a continuous quantity, most importantly the future <em>weight</em> of an edge: the travel time on a road segment, the load on a power line, the correlation between two sensors. When the graph is a fixed spatial network whose edge or node signals evolve, this regression <em>is</em> spatio-temporal forecasting, the bridge to <a href="../../toc.html">Chapter 32</a>.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: From Dynamic Graphs to Spatio-Temporal Forecasting</div>
+<p>This section's continuous-time models and <a href="../../toc.html">Chapter 32</a>'s spatio-temporal forecasters are two readings of one object, the graph that carries a time-varying signal. Here the graph's <em>structure</em> changes (edges appear and vanish) and the headline task is link prediction. In <a href="../../toc.html">Chapter 32</a> the structure is usually fixed (a road or sensor network) and the <em>signal on it</em> changes, so the task is to forecast each node's future value, and the workhorse models (DCRNN, Graph WaveNet, STGCN) are message passing fused with the temporal convolutions of <a href="../../part-3-temporal-deep-learning/module-11-temporal-convolutional-networks/index.html">Chapter 11</a> or the recurrences of <a href="../../part-3-temporal-deep-learning/module-10-recurrent-neural-networks/index.html">Chapter 10</a>. The message-passing-plus-recurrence pattern you build by hand in subsection five is the direct ancestor of those forecasters; <a href="../../toc.html">Chapter 32</a> changes what the graph carries, not how the messages flow.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Dynamic Graph Learning (2024 to 2026)</div>
+<p>The frontier has moved in three directions since the TGAT/TGN era. First, the field discovered that <em>simple</em> baselines were being underrated: GraphMixer (Cong et al., 2023) showed an MLP-mixer over recent edges, with no attention and no memory, rivals TGN on the standard link-prediction benchmarks, prompting a hard rethink of what complexity actually buys. The 2023 Temporal Graph Benchmark (TGB) and its 2024 multi-relational extension TGB 2.0 (Gastinger et al.) then standardized evaluation with realistic negative sampling, exposing that several reported gains were artifacts of easy negatives. Second, <em>scale</em> arrived: DyGFormer (Yu et al., 2023) and follow-on Transformer-style models patchify a node's interaction history and attend over it, pushing context lengths up. Third, and most active in 2025 to 2026, <em>temporal graph foundation models</em> aim to pretrain one model transferable across dynamic graphs, echoing the temporal foundation models of <a href="../../part-3-temporal-deep-learning/module-15-temporal-foundation-models/index.html">Chapter 15</a>. The 2026 practitioner's takeaway: benchmark against GraphMixer and a recency heuristic before reaching for a memory module, and evaluate with TGB-style hard negatives or your numbers will not survive contact with a real fraud queue.</p>
+</div>
+
+<h2>5. Worked Example: A Temporal Graph Network, From Scratch and From a Library <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now build a dynamic graph model and verify it does dynamic link prediction. The plan mirrors the section's two postures. First, from scratch in PyTorch, we implement one temporal message-passing layer (a GCN-style aggregation with a functional time encoding gating each neighbor) and wrap a snapshot temporal-GNN around it: a GCN applied per snapshot whose pooled output drives a GRU over frames, the message-passing-plus-recurrence pattern of subsection three. Second, we rebuild a continuous-time event-stream model in a handful of lines with PyTorch Geometric Temporal, and state the line-count reduction. Code 18.3.1 is the from-scratch temporal message-passing step.</p>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+torch.manual_seed(0)
+
+class TimeEncoder(nn.Module):
+    """Functional (Bochner) time encoding: scalar gap -> vector of sinusoids (TGAT)."""
+    def __init__(self, dim):
+        super().__init__()
+        self.w = nn.Linear(1, dim)          # learnable frequencies + phases
+    def forward(self, dt):                  # dt: (...,) time gaps t - t_j
+        return torch.cos(self.w(dt.unsqueeze(-1)))   # (..., dim)
+
+class TemporalMessageLayer(nn.Module):
+    """One message-passing layer: time-gated, degree-normalized neighbor aggregation."""
+    def __init__(self, in_dim, out_dim, time_dim):
+        super().__init__()
+        self.time_enc = TimeEncoder(time_dim)
+        self.lin_self = nn.Linear(in_dim, out_dim)
+        self.lin_msg  = nn.Linear(in_dim + time_dim, out_dim)  # neighbor + time feature
+    def forward(self, h, edge_index, edge_dt, num_nodes):
+        src, dst = edge_index                       # message flows src -> dst
+        tfeat = self.time_enc(edge_dt)              # (E, time_dim): "how long ago"
+        msg = self.lin_msg(torch.cat([h[src], tfeat], dim=-1))  # (E, out_dim)
+        agg = torch.zeros(num_nodes, msg.size(-1))  # aggregate by summing into dst
+        agg.index_add_(0, dst, msg)                 # permutation-invariant SUM aggregator
+        deg = torch.zeros(num_nodes).index_add_(    # degree for mean normalization
+            0, dst, torch.ones(dst.size(0)))
+        agg = agg / deg.clamp(min=1).unsqueeze(-1)  # mean of time-gated neighbor messages
+        return torch.relu(self.lin_self(h) + agg)   # combine self-state with aggregate
+
+# A tiny 4-node graph with timed edges; dt = (query time) - (edge time).
+h = torch.randn(4, 8)                               # node features, dim 8
+edge_index = torch.tensor([[0, 1, 2, 0], [1, 2, 3, 3]])  # 4 directed edges
+edge_dt = torch.tensor([0.1, 0.5, 0.2, 2.0])        # recent edge (0.1) vs stale edge (2.0)
+layer = TemporalMessageLayer(in_dim=8, out_dim=8, time_dim=4)
+h_next = layer(h, edge_index, edge_dt, num_nodes=4)
+print("updated embeddings shape:", tuple(h_next.shape))
+print("node 3 embedding (first 4 dims):", h_next[3, :4].detach().numpy().round(4))
+</code></pre>
+<div class="code-caption"><strong>Code 18.3.1:</strong> One temporal message-passing layer from scratch. Each neighbor message is built from the source embedding concatenated with a functional time encoding of its edge's age, summed into the destination with <code>index_add_</code> (a permutation-invariant aggregator), degree-normalized to a mean, then combined with the node's own transformed state. This is the static GCN atom of subsection two with time injected into the neighborhood, the TGAT posture.</div>
+<pre><code class="language-text">updated embeddings shape: (4, 8)
+node 3 embedding (first 4 dims): [0.     0.6113 0.     1.2294]
+</code></pre>
+<div class="code-caption"><strong>Output 18.3.1:</strong> Node 3 receives messages from nodes 2 and 0 (its two in-edges); the ReLU has zeroed two coordinates, and the nonzero values reflect the time-gated, degree-normalized aggregate. Node 3's update is the numeric example of subsection three made concrete: two neighbor messages, time-weighted and averaged.</div>
+<p>The numeric example callout below traces a single coordinate of that node-3 update by hand so the aggregation is fully transparent. Then Code 18.3.2 wraps the layer into a snapshot temporal-GNN and trains dynamic link prediction.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: One Node Update by Hand</div>
+<p>Take node 3 in Code 18.3.1. It has two incoming edges: from node 2 (edge age $\Delta t = 0.2$) and from node 0 (edge age $\Delta t = 2.0$). Suppose, for a single output coordinate, the time-gated, transformed messages came out as $m_{2 \to 3} = 0.9$ (recent neighbor, age 0.2) and $m_{0 \to 3} = 0.3$ (stale neighbor, age 2.0). The aggregator sums them, $0.9 + 0.3 = 1.2$, and the mean normalization divides by the in-degree $2$, giving $0.6$. Add the node's own transformed state for that coordinate, say $0.1$, to get $0.7$, then apply ReLU to get $\max(0, 0.7) = 0.7$. Had node 0's stale edge instead aged to $\Delta t = 10$, the learned time encoding would typically shrink $m_{0 \to 3}$ toward zero, pulling the aggregate down: the model literally trusts the recent neighbor more. One node update is one time-weighted average plus a self-term plus a nonlinearity, nothing more.</p>
+</div>
+<pre><code class="language-python">class SnapshotTemporalGNN(nn.Module):
+    """GCN per snapshot -> pooled summary -> GRU over frames -> link predictor."""
+    def __init__(self, in_dim, hid, time_dim):
+        super().__init__()
+        self.layer = TemporalMessageLayer(in_dim, hid, time_dim)
+        self.gru = nn.GRUCell(hid, hid)             # carries state ACROSS snapshots
+        self.score = nn.Linear(2 * hid, 1)          # link score from node-pair embeddings
+
+    def forward(self, snapshots):
+        num_nodes = snapshots[0]["h"].size(0)
+        gru_state = torch.zeros(num_nodes, self.gru.hidden_size)
+        per_node = None
+        for snap in snapshots:                       # walk frames k = 1 ... K in time order
+            z = self.layer(snap["h"], snap["edge_index"],
+                           snap["edge_dt"], num_nodes)
+            gru_state = self.gru(z, gru_state)        # evolve each node's state over time
+            per_node = gru_state                      # latest temporal node embeddings
+        return per_node
+
+    def link_logit(self, emb, pairs):                # pairs: (P, 2) candidate edges
+        cat = torch.cat([emb[pairs[:, 0]], emb[pairs[:, 1]]], dim=-1)
+        return self.score(cat).squeeze(-1)            # logit for "edge exists next"
+
+# Two snapshots of a 4-node graph; predict the edge that appears in the future.
+snap1 = {"h": torch.randn(4, 8),
+         "edge_index": torch.tensor([[0, 1], [1, 2]]),
+         "edge_dt": torch.tensor([0.3, 0.4])}
+snap2 = {"h": torch.randn(4, 8),
+         "edge_index": torch.tensor([[1, 2], [2, 3]]),
+         "edge_dt": torch.tensor([0.2, 0.1])}
+model = SnapshotTemporalGNN(in_dim=8, hid=8, time_dim=4)
+opt = torch.optim.Adam(model.parameters(), lr=0.05)
+
+pos = torch.tensor([[0, 3]])                          # future positive edge to predict
+neg = torch.tensor([[0, 2]])                          # sampled negative (non-edge)
+for step in range(60):
+    emb = model([snap1, snap2])
+    logit_pos = model.link_logit(emb, pos)
+    logit_neg = model.link_logit(emb, neg)
+    logits = torch.cat([logit_pos, logit_neg])
+    labels = torch.tensor([1.0, 0.0])                 # 1 = real future edge, 0 = negative
+    loss = nn.functional.binary_cross_entropy_with_logits(logits, labels)
+    opt.zero_grad(); loss.backward(); opt.step()
+
+print("final loss          : %.4f" % loss.item())
+print("P(future edge 0-3)  : %.3f" % torch.sigmoid(model.link_logit(emb, pos)).item())
+print("P(non-edge   0-2)   : %.3f" % torch.sigmoid(model.link_logit(emb, neg)).item())
+</code></pre>
+<div class="code-caption"><strong>Code 18.3.2:</strong> A snapshot temporal-GNN doing dynamic link prediction from scratch. The temporal message layer embeds each frame, a <code>GRUCell</code> carries each node's state across frames (the message-passing-plus-recurrence pattern of subsection three), and a pair scorer is trained with binary cross-entropy to separate a real future edge from a sampled negative. The whole stack, layer plus recurrence plus predictor, is roughly 45 lines.</div>
+<pre><code class="language-text">final loss          : 0.0212
+P(future edge 0-3)  : 0.982
+P(non-edge   0-2)   : 0.019
+</code></pre>
+<div class="code-caption"><strong>Output 18.3.2:</strong> After training, the model assigns the true future edge (0,3) probability 0.982 and the sampled negative (0,2) probability 0.019, a clean separation. The snapshot temporal-GNN has learned to predict the next link from the two-frame history.</div>
+<p>The from-scratch stack of Code 18.3.1 and Code 18.3.2 totals roughly 80 lines including the time encoder, the message layer, the GRU-over-snapshots wrapper, and the training loop. PyTorch Geometric Temporal provides continuous-time event-stream models (TGN, plus snapshot models like EvolveGCN and DCRNN) as off-the-shelf modules, so the equivalent event-stream link predictor is a few lines. Code 18.3.3 is the library version.</p>
+<pre><code class="language-python"># pip install torch-geometric-temporal
+from torch_geometric_temporal.nn.recurrent import EvolveGCNH
+import torch.nn as nn
+
+class EvolveLinkPredictor(nn.Module):
+    """EvolveGCN over snapshots + a pair scorer, in a handful of lines."""
+    def __init__(self, num_nodes, feat_dim):
+        super().__init__()
+        self.recurrent = EvolveGCNH(num_nodes, feat_dim)   # evolves GCN WEIGHTS across frames
+        self.score = nn.Linear(2 * feat_dim, 1)
+    def forward(self, snapshots, pairs):
+        for x, edge_index in snapshots:                    # x: node feats, edge_index per frame
+            h = torch.relu(self.recurrent(x, edge_index))  # one evolved-weight GCN step
+        cat = torch.cat([h[pairs[:, 0]], h[pairs[:, 1]]], dim=-1)
+        return self.score(cat).squeeze(-1)                 # link logits
+</code></pre>
+<div class="code-caption"><strong>Code 18.3.3:</strong> The PyTorch Geometric Temporal equivalent. <code>EvolveGCNH</code> implements the weight-evolving recurrence of subsection three (the GRU-over-weights of EvolveGCN) as a single module, so the entire from-scratch snapshot stack of Code 18.3.1 and Code 18.3.2 (about 80 lines of time encoding, aggregation, and recurrence bookkeeping) collapses to roughly 12 lines: a line-count reduction of about 7x. The library also ships TGN, TGAT, DCRNN, and the temporal neighborhood samplers, all internally.</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Dynamic Graphs in a Dozen Lines</div>
+<p>The from-scratch implementation of Code 18.3.1 plus Code 18.3.2 ran about 80 lines: a hand-written functional time encoder, a degree-normalized message-passing layer with manual <code>index_add_</code> scatter, a GRU-over-snapshots wrapper, and a training loop. PyTorch Geometric Temporal collapses the snapshot path to about 12 lines (Code 18.3.3), an roughly 7x reduction, and its <code>torch_geometric.nn.models.TGN</code> does the same for the continuous-time event stream, handling the memory module, the message aggregation, the temporal neighbor loader, and the causal time slicing internally. What the library manages for you is exactly the error-prone part: the causal neighborhood sampling that prevents future-edge leakage, the time encoding, and the per-node memory state. Build one by hand to understand it; reach for the library to ship it.</p>
+</div>
+<p>Read the three code blocks together and the section's argument is complete in software. Code 18.3.1 made one temporal message-passing layer concrete, time-gating each neighbor exactly as TGAT prescribes. Code 18.3.2 wrapped it in a recurrence over snapshots and trained dynamic link prediction to a clean positive-negative separation, the snapshot posture realized. Code 18.3.3 rebuilt the model in a dozen library lines with the weights evolving across frames, the EvolveGCN idea. From-scratch for understanding, library for production: the same discipline that runs through every chapter of this book, now applied to the graph that will not hold still.</p>
+
+<h2>6. Exercises</h2>
+<p>Work these before moving on; they are split into conceptual, implementation, and open-ended, and they reinforce the snapshot-versus-stream distinction that organizes the section.</p>
+<ol>
+<li><strong>(Conceptual.)</strong> A colleague proposes modeling a high-frequency payment network by binning transactions into one-hour snapshots and running EvolveGCN. Using the precision-versus-convenience argument of subsection one and Callback 18.1, explain one fraud pattern this representation cannot detect and state what changing to a continuous-time stream would recover. Then describe a different network where the one-hour snapshot is the <em>correct</em> choice and say why.</li>
+<li><strong>(Implementation.)</strong> Extend the <code>TemporalMessageLayer</code> of Code 18.3.1 to enforce strict causality: add a <code>query_time</code> argument and, inside <code>forward</code>, mask out every edge whose absolute timestamp is $\ge$ the query time before aggregating (you will need to pass absolute edge times, not just gaps). Verify on a tiny example that a future edge added to <code>edge_index</code> leaves the embeddings unchanged. Explain how this masking is the temporal neighborhood sampling of subsection three and how omitting it reproduces the leakage of <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a>.</li>
+<li><strong>(Open-ended.)</strong> The 2024 frontier (subsection four) reports that GraphMixer, with no attention and no memory, rivals TGN. Design an experiment on a transaction dataset that fairly compares a recency-only heuristic ("predict the most recently seen partners"), GraphMixer, and TGN under TGB-style hard negative sampling. State your evaluation metric, how you will construct hard negatives, and what result would justify the memory module's extra cost. Connect your metric choice to the dynamic-link-prediction setup of subsection four.</li>
+</ol>
+
+<nav class="chapter-nav">
+<a class="nav-prev" href="section-18.2.html">&#8592; 18.2 Temporal Point Processes</a>
+<a class="nav-up" href="index.html">Chapter 18 Contents</a>
+<a class="nav-next" href="section-18.4.html">18.4 Event Prediction and Time-to-Event Modeling &#8594;</a>
+</nav>
+</main>
+<footer class="book-footer">
+<p>Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&copy; 2026 Alexander Apartsin &middot; <a href="../../toc.html">Contents</a></p>
+<p><script>document.write("Last updated " + document.lastModified.split(" ")[0]);</script></p>
+</footer>
+</body>
+</html>

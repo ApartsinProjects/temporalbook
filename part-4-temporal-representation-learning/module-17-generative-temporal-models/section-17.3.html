@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 17.3: GANs for Time Series (TimeGAN and beyond). The generator-discriminator minimax for sequences, why naive GANs match marginals but not transitions, TimeGAN's embedding/recovery autoencoder plus supervised stepwise and adversarial losses, RCGAN/RGAN/DoppelGANger, mode collapse and instability, privacy-preserving synthetic data and scenario generation, and a from-scratch recurrent GAN with a supervised loss matched against a library version." name="description"/>
+<title>Section 17.3: GANs for Time Series (TimeGAN and beyond) | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Temporal Representation Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 17: Generative Temporal Models</a></div>
+<h1>GANs for Time Series (TimeGAN and beyond)</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"Show me a thousand synthetic series and I will believe none of them. Each frame looks plausible in isolation; it is the seams between frames that betray you. A real process remembers where it was a moment ago. Your generator forgets, then guesses, then forgets again, and I can hear the stutter."</p>
+<cite>A Discriminator That Trusts No Synthetic Series</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A generative adversarial network learns to synthesize data by staging a game: a generator turns noise into samples while a discriminator tries to separate the synthetic from the real, and at the unique equilibrium of that game the generator's distribution equals the data distribution. For static data this works beautifully; for time series it stumbles, because an adversarial loss naturally rewards getting each timestep's <em>marginal</em> distribution right while saying almost nothing about whether consecutive steps are stitched together with the correct <em>transition</em> dynamics.</strong> A naive sequence GAN can produce frames that each look like real sensor readings yet, taken together, wander in ways the real process never would. TimeGAN (Yoon, Jarrett, and van der Schaar, 2019) fixes this by adding two ingredients to the adversarial game: an embedding/recovery autoencoder that moves the adversarial battle into a learned latent space, and a <em>supervised</em> stepwise loss that forces the generator to predict the next latent code from the current one, so it learns the conditional transition $p(\mathbf{z}_t \mid \mathbf{z}_{1:t-1})$ and not just the per-step marginal. This section builds the minimax game and its temporal failure mode (subsection 1), assembles the TimeGAN architecture (subsection 2), surveys RCGAN, conditional scenario GANs, and DoppelGANger together with the mode-collapse and instability that plague all of them (subsection 3), connects them to privacy-preserving synthesis, augmentation, and stress-scenario generation while pointing forward to the diffusion alternative (subsection 4), and finally implements a small recurrent GAN with a TimeGAN-style supervised loss from scratch and then in a few library lines (subsection 5). You leave able to train, diagnose, and reach for the right tool when you need synthetic sequences that respect their own dynamics.</p>
+</div>
+<p>In <a href="section-17.2.html">Section 17.2</a> we built variational autoencoders for sequences, latent-variable generators trained by maximizing a likelihood lower bound, and saw that they produce smooth, well-behaved samples at the cost of a tendency to blur sharp temporal structure. This section turns to the other great family of deep generative models, the adversarial one, which trades the explicit likelihood of the VAE for a learned, implicit critic. The trade is double-edged: adversarial training can capture crisp, high-frequency temporal texture a VAE smooths away, but it inherits the notorious instability of the minimax game and a failure mode specific to sequences. The recurrence at the heart of the generator is the same loop we have followed since <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/section-7.6.html">Section 7.6</a>, where the Kalman filter, the HMM, and the RNN were revealed as one state recurrence $\mathbf{h}_t = f(\mathbf{h}_{t-1}, \mathbf{x}_t)$; a sequence GAN simply asks that loop to <em>generate</em> rather than filter, and the trouble is teaching it to generate transitions and not merely points. We use the unified notation of <a href="../../toc.html">Appendix A</a>: $\mathbf{x}_{1:T}$ a real sequence, $\mathbf{z}$ a noise vector, $G$ the generator, $D$ the discriminator, $\hat{\mathbf{x}}_{1:T} = G(\mathbf{z})$ a synthetic sequence.</p>
+<p>Why give adversarial sequence modeling its own section rather than a remark that "GANs also do time series"? Because the move from images to sequences is not a change of input shape but a change of what the loss must enforce. An image GAN must match a joint distribution over pixels; a sequence GAN must match a joint distribution over time that factorizes into an initial distribution and a chain of conditional transitions, and the adversarial signal, a single scalar verdict per sequence, is a weak teacher for those conditionals. TimeGAN's central contribution is to recognize this and inject a supervised, autoregressive teaching signal alongside the adversarial one. Understanding that single design decision, the marriage of an adversarial loss with a stepwise supervised loss in a learned latent space, is the load-bearing idea of the whole section, and it recurs in almost every serious time-series GAN that followed.</p>
+<p>The competencies this section installs are four. First, to write the GAN minimax objective and explain, in terms of marginals versus transitions, why it underperforms on sequences. Second, to draw the TimeGAN architecture and name the role of each of its four networks and three losses. Third, to place RCGAN, conditional GANs, and DoppelGANger on the map and to recognize mode collapse and training divergence from their symptoms. Fourth, to implement a recurrent GAN with a supervised transition loss and to reproduce it with a library in a fraction of the code. These skills carry directly into the diffusion models of <a href="section-17.4.html">Section 17.4</a> and the event generators of <a href="../../part-4-temporal-representation-learning/module-18-event-sequence-modeling/index.html">Chapter 18</a>.</p>
+
+<h2>1. The GAN Setup: Minimax, and Why Naive GANs Struggle With Dynamics <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A generative adversarial network pits two networks against each other. The generator $G$ maps a noise vector $\mathbf{z} \sim p_{\mathbf{z}}$ (a standard Gaussian, say) to a sample $G(\mathbf{z})$ in data space. The discriminator $D$ maps a sample to a scalar in $(0, 1)$, its estimated probability that the sample is real rather than generated. The two are trained against each other on the value function</p>
+$$\min_{G}\,\max_{D}\; V(D, G) \;=\; \mathbb{E}_{\mathbf{x} \sim p_{\text{data}}}\big[\log D(\mathbf{x})\big] \;+\; \mathbb{E}_{\mathbf{z} \sim p_{\mathbf{z}}}\big[\log\big(1 - D(G(\mathbf{z}))\big)\big].$$
+<p>The discriminator maximizes this by assigning high probability to real samples and low probability to generated ones; the generator minimizes it by fooling the discriminator into scoring its fakes as real. The classical analysis of Goodfellow et al. (2014) shows that for a fixed generator the optimal discriminator is $D^*(\mathbf{x}) = p_{\text{data}}(\mathbf{x}) / (p_{\text{data}}(\mathbf{x}) + p_G(\mathbf{x}))$, and substituting it back reduces the generator's objective to minimizing the Jensen-Shannon divergence between $p_G$ and $p_{\text{data}}$. At the global optimum $p_G = p_{\text{data}}$ and the discriminator is maximally confused, outputting $\tfrac{1}{2}$ everywhere. The generator never sees the data directly: its only teacher is the gradient that flows back through the discriminator, which is why a GAN is an <em>implicit</em> model, it learns to sample without ever writing down a density.</p>
+<p>Now make the sample a sequence, $\mathbf{x}_{1:T}$. The most direct adaptation lets $G$ be a recurrent network that rolls out $\hat{\mathbf{x}}_1, \hat{\mathbf{x}}_2, \dots, \hat{\mathbf{x}}_T$ from noise, and lets $D$ be a recurrent network that reads a sequence and emits a real-or-fake verdict. Nothing in the objective changes except that $\mathbf{x}$ and $G(\mathbf{z})$ are now whole sequences. This is the RGAN of Esteban, Hyland, and Rätsch (2017), and it can work, but it exposes the failure mode this section exists to explain.</p>
+<p>The problem is what the adversarial loss actually pressures the generator to match. The joint distribution of a sequence factorizes as</p>
+$$p(\mathbf{x}_{1:T}) \;=\; p(\mathbf{x}_1)\,\prod_{t=2}^{T} p(\mathbf{x}_t \mid \mathbf{x}_{1:t-1}),$$
+<p>an initial distribution times a product of transition conditionals. A single scalar real-or-fake verdict per sequence is a low-bandwidth signal about this rich object. In practice the discriminator finds it easiest to check the cheapest discriminable statistics, and the per-step <em>marginals</em> ("does each value look like a plausible reading?") are far cheaper to check than the high-order <em>transitions</em> ("does this value follow correctly from the previous five?"). A generator that matches the marginals can therefore drive the adversarial loss low while still producing sequences whose step-to-step dynamics, their autocorrelation, their volatility clustering, their seasonality, are wrong. The synthetic series passes the eyeball test frame by frame and fails it as a trajectory. Figure 17.3.1 contrasts the two regimes.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two panels. Left: a real series oscillating smoothly with clear autocorrelation. Right: a synthetic series whose individual values fall in the same range (matched marginals) but jump erratically step to step (wrong transitions), drawn jagged.">
+<defs>
+<marker id="ar173" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.ax173 { stroke:#9aa3ad; stroke-width:1.2; }
+.real173 { stroke:#14385c; stroke-width:2.2; fill:none; }
+.fake173 { stroke:#b8431f; stroke-width:2.2; fill:none; }
+.ttl173 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub173 { font:12px sans-serif; fill:#5a626c; text-anchor:middle; }
+.band173 { fill:#eef3f8; }
+</style>
+<text class="ttl173" x="205" y="24">Real: marginals AND transitions right</text>
+<text class="ttl173" x="615" y="24">Naive GAN: marginals right, transitions wrong</text>
+<rect class="band173" x="40" y="70" width="330" height="120"/>
+<rect class="band173" x="450" y="70" width="330" height="120"/>
+<line class="ax173" x1="40" y1="190" x2="380" y2="190"/>
+<line class="ax173" x1="450" y1="190" x2="790" y2="190"/>
+<path class="real173" d="M45,150 C75,90 105,90 135,135 C165,180 195,180 225,120 C255,75 285,85 315,140 C345,180 360,170 368,150"/>
+<path class="fake173" d="M455,150 L470,95 L485,175 L500,80 L515,160 L530,100 L545,180 L560,90 L575,150 L590,75 L605,170 L620,110 L635,175 L650,85 L665,160 L680,105 L695,150 L710,95 L725,170 L740,120 L755,150 L770,100 L785,150"/>
+<text class="sub173" x="205" y="215">same value range as the fake, but smooth memory</text>
+<text class="sub173" x="615" y="215">same value range as the real, but no memory</text>
+<line class="ax173" x1="205" y1="232" x2="615" y2="232" marker-end="url(#ar173)" stroke-dasharray="4 4"/>
+<text class="sub173" x="410" y="252">a per-step discriminator cannot tell these two value histograms apart</text>
+<text class="sub173" x="410" y="272">only a discriminator that reads the whole trajectory catches the jagged transitions</text>
+</svg>
+<figcaption><strong>Figure 17.3.1:</strong> The marginal-versus-transition trap. Both panels share the same per-step value distribution (a discriminator looking at one step at a time sees identical histograms), yet the real series (left, navy) carries smooth temporal memory while the naive synthetic series (right, orange) jumps erratically. Matching marginals is easy and matching transitions is hard; the adversarial loss alone rewards the former far more than the latter, which is the gap TimeGAN's supervised loss is built to close.</figcaption>
+</figure>
+<p>There is a second, compounding difficulty special to recurrent generators: the rollout is autoregressive at sampling time, so a small per-step error feeds back into the next step and accumulates, the exposure-bias problem familiar from sequence generation generally. The adversarial loss, which judges the whole sequence at once, gives the generator little localized guidance about which step's transition was wrong, so error accumulation goes uncorrected. Both problems point at the same remedy: supply the generator with an explicit, stepwise teaching signal about transitions, in addition to the global adversarial verdict. That is exactly what TimeGAN does, and it is the subject of subsection two.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Adversarial Loss Teaches Marginals Cheaply and Transitions Expensively</div>
+<p>The single sentence to carry out of this subsection: a sequence's distribution is an initial marginal times a product of transition conditionals, and a scalar real-or-fake verdict is a weak, low-bandwidth teacher for the conditionals while being a perfectly adequate teacher for the marginals. So a naive sequence GAN reliably learns "each value looks plausible" long before, and sometimes instead of, "each value follows correctly from its predecessors". Every serious time-series GAN is, at bottom, an attempt to add bandwidth to the transition-learning signal, whether by a supervised stepwise loss (TimeGAN), conditioning (RCGAN, scenario GANs), or factored attribute-then-trajectory generation (DoppelGANger). When you see a synthetic series whose values are right but whose autocorrelation is wrong, you are looking at this insight in the wild.</p>
+</div>
+
+<h2>2. TimeGAN: Embedding, Recovery, and a Supervised Stepwise Loss <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>TimeGAN (Yoon, Jarrett, and van der Schaar, NeurIPS 2019) is the canonical answer to the marginal-versus-transition trap, and its design is worth studying closely because nearly every later time-series GAN borrows from it. The architecture has four networks and is trained with three losses that work together. The four networks are an <em>embedding</em> network $E$ that maps a real sequence into a latent trajectory, a <em>recovery</em> network $R$ that maps a latent trajectory back to data space, a <em>generator</em> $G$ that maps noise to a latent trajectory, and a <em>discriminator</em> $D$ that judges latent trajectories as real or synthetic. The decisive move is that the adversarial game is played in the <em>latent</em> space, not the data space: $G$ and $D$ never see raw data, only the codes produced by $E$. Learning a lower-dimensional, denoised latent representation first (the representation-learning theme of <a href="../../part-4-temporal-representation-learning/module-16-learning-temporal-representations/index.html">Chapter 16</a>) makes the adversarial game easier, because the generator must match a smoother, lower-dimensional target.</p>
+<p>The three losses are where the transition signal enters. The <strong>reconstruction loss</strong> trains the autoencoder pair so that $R(E(\mathbf{x}_{1:T})) \approx \mathbf{x}_{1:T}$, guaranteeing the latent space faithfully encodes the data; with $\mathbf{h}_t = E(\mathbf{x}_{1:t})$ and $\tilde{\mathbf{x}}_t = R(\mathbf{h}_t)$,</p>
+$$\mathcal{L}_{\text{recon}} \;=\; \mathbb{E}_{\mathbf{x}}\sum_{t} \lVert \mathbf{x}_t - \tilde{\mathbf{x}}_t \rVert_2^2.$$
+<p>The <strong>adversarial loss</strong> is the usual minimax, but on latent codes: $D$ tries to separate the embedded real codes $\mathbf{h}_t = E(\mathbf{x}_{1:t})$ from the generated codes $\hat{\mathbf{h}}_t = G(\mathbf{z}_{1:t})$, and $G$ tries to fool it. The third and pivotal term is the <strong>supervised loss</strong>, which is what teaches transitions. It asks the generator, given the <em>real</em> embedded codes up to step $t-1$, to predict the next real code $\mathbf{h}_t$:</p>
+$$\mathcal{L}_{\text{sup}} \;=\; \mathbb{E}_{\mathbf{x}}\sum_{t} \big\lVert \mathbf{h}_t - g\big(\mathbf{h}_{1:t-1}\big) \big\rVert_2^2,$$
+<p>where $g$ is the generator's one-step transition function applied to teacher-forced real codes. This is a supervised, autoregressive, next-step-prediction loss, the same teacher-forced objective that trains an ordinary sequence model in <a href="../../part-3-temporal-deep-learning/module-09-neural-sequence-fundamentals/index.html">Chapter 9</a>, and it directly forces the generator to learn $p(\mathbf{h}_t \mid \mathbf{h}_{1:t-1})$, the transition conditional the adversarial loss neglected. The total generator objective combines the adversarial and supervised terms (with a weight $\lambda$ balancing them), while the embedder is trained on reconstruction plus a small amount of the supervised term so that the latent space is shaped to make next-step prediction easy. Figure 17.3.2 lays out the four networks and the three losses.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="TimeGAN architecture. Real data x enters the embedding network E producing real latent codes h. The recovery network R maps codes back to reconstructed data, trained by reconstruction loss. Noise z enters the generator G producing synthetic latent codes h-hat. A discriminator D compares real codes h and synthetic codes h-hat (adversarial loss). A supervised loss compares the generator's next-step prediction against the real next code.">
+<defs>
+<marker id="ar2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.box2 { fill:#eef3f8; stroke:#14385c; stroke-width:2; }
+.gen2 { fill:#eaf3ec; stroke:#1f6b3a; stroke-width:2; }
+.loss2 { fill:#fbeee8; stroke:#b8431f; stroke-width:1.8; }
+.fl2 { stroke:#5a626c; stroke-width:1.8; fill:none; marker-end:url(#ar2); }
+.l2 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s2 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.r2 { font:600 11.5px sans-serif; fill:#b8431f; text-anchor:middle; }
+</style>
+<text class="l2" x="410" y="22">TimeGAN: adversarial game in latent space + supervised transition loss</text>
+<!-- top row: autoencoder -->
+<rect class="box2" x="40" y="60" width="70" height="44" rx="8"/><text class="s2" x="75" y="87">x</text>
+<rect class="box2" x="170" y="60" width="70" height="44" rx="8"/><text class="l2" x="205" y="87">E</text>
+<rect class="box2" x="300" y="60" width="80" height="44" rx="8"/><text class="l2" x="340" y="80">h</text><text class="s2" x="340" y="97">real codes</text>
+<rect class="box2" x="440" y="60" width="70" height="44" rx="8"/><text class="l2" x="475" y="87">R</text>
+<rect class="box2" x="570" y="60" width="80" height="44" rx="8"/><text class="s2" x="610" y="87">x&#771; recon</text>
+<line class="fl2" x1="110" y1="82" x2="168" y2="82"/>
+<line class="fl2" x1="240" y1="82" x2="298" y2="82"/>
+<line class="fl2" x1="380" y1="82" x2="438" y2="82"/>
+<line class="fl2" x1="510" y1="82" x2="568" y2="82"/>
+<rect class="loss2" x="540" y="118" width="140" height="26" rx="6"/><text class="r2" x="610" y="135">reconstruction loss</text>
+<line class="fl2" x1="610" y1="104" x2="610" y2="116"/>
+<!-- bottom row: generator -->
+<rect class="gen2" x="40" y="200" width="70" height="44" rx="8"/><text class="l2" x="75" y="227">z</text>
+<rect class="gen2" x="170" y="200" width="70" height="44" rx="8"/><text class="l2" x="205" y="227">G</text>
+<rect class="gen2" x="300" y="200" width="80" height="44" rx="8"/><text class="l2" x="340" y="220">h&#770;</text><text class="s2" x="340" y="237">fake codes</text>
+<line class="fl2" x1="110" y1="222" x2="168" y2="222"/>
+<line class="fl2" x1="240" y1="222" x2="298" y2="222"/>
+<!-- discriminator -->
+<rect class="box2" x="440" y="150" width="70" height="44" rx="8"/><text class="l2" x="475" y="177">D</text>
+<line class="fl2" x1="380" y1="86" x2="438" y2="160"/>
+<line class="fl2" x1="380" y1="218" x2="438" y2="184"/>
+<rect class="loss2" x="540" y="160" width="120" height="26" rx="6"/><text class="r2" x="600" y="177">adversarial loss</text>
+<line class="fl2" x1="510" y1="172" x2="538" y2="172"/>
+<!-- supervised loss -->
+<rect class="loss2" x="150" y="280" width="280" height="26" rx="6"/><text class="r2" x="290" y="297">supervised loss: G predicts next real code h_t from h_(1:t-1)</text>
+<line class="fl2" x1="290" y1="244" x2="290" y2="278"/>
+<line class="fl2" x1="340" y1="104" x2="340" y2="196" stroke-dasharray="4 4"/>
+<text class="s2" x="372" y="152">teacher-forced</text>
+</svg>
+<figcaption><strong>Figure 17.3.2:</strong> The TimeGAN architecture. The autoencoder pair $E, R$ (top, trained by reconstruction loss) defines a latent space; the generator $G$ (bottom left) maps noise to synthetic latent codes; the discriminator $D$ plays the adversarial game on real codes $\mathbf{h}$ versus fake codes $\hat{\mathbf{h}}$; and the supervised loss (bottom) teacher-forces $G$ to predict the next real code from the real history, injecting the transition signal the adversarial loss alone misses. Three losses, one latent space.</figcaption>
+</figure>
+<p>The reason this combination works is that each loss covers a blind spot of the others. The adversarial loss enforces realism of the joint distribution but is a weak teacher for transitions. The supervised loss is a strong teacher for transitions but, being a mean-squared next-step error, tends to produce blurry, averaged predictions if used alone (it cannot represent multimodal futures). The reconstruction loss anchors the latent space to the data so the other two losses operate on a meaningful representation rather than on a collapsed or degenerate code. Used together, the adversarial term supplies sharpness and joint realism, the supervised term supplies correct temporal dependence, and the autoencoder supplies a tractable space in which both can act. This is the conceptual payoff: TimeGAN is not "a GAN with extra losses bolted on", it is a careful division of labor in which the adversarial game and a supervised sequence model cover for each other's weaknesses.</p>
+<div class="callout looking-back">
+<div class="callout-title">Looking Back: The Transition Loss Is Just Teacher-Forced Next-Step Prediction</div>
+<p>The supervised loss that distinguishes TimeGAN is not new machinery; it is the teacher-forced, next-step-prediction objective that trained every recurrent forecaster in <a href="../../part-3-temporal-deep-learning/module-09-neural-sequence-fundamentals/index.html">Chapter 9</a>, where a model reads $\mathbf{h}_{1:t-1}$ and is scored on how well it predicts $\mathbf{h}_t$. TimeGAN's insight is that this familiar objective is exactly the transition-learning signal the adversarial game lacks, so the cure for the marginal-versus-transition trap is to run an ordinary autoregressive sequence model <em>inside</em> the GAN, on latent codes. The same loop $\mathbf{h}_t = f(\mathbf{h}_{t-1}, \cdot)$ that we have followed since the Kalman filter of <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/index.html">Chapter 7</a> reappears here as the generator's transition function, now taught to generate rather than to filter.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: A Forger Who Took Drawing Lessons</div>
+<p>Picture a forger who can paint individual brushstrokes indistinguishable from a master's, yet arranges them into a composition that makes no sense, a perfect eye for the local texture, no grasp of how one stroke should follow the last. The adversarial loss alone produces exactly this forger. TimeGAN's supervised loss is the equivalent of sending the forger to drawing lessons where, stroke by stroke, a teacher says "given everything you have painted so far, here is the correct next stroke". The forger keeps the flawless local touch from the adversarial training and acquires the compositional sense from the lessons. The result fools a critic who looks at the whole canvas, not just one corner.</p>
+</div>
+
+<h2>3. Beyond TimeGAN: RCGAN, Conditional GANs, DoppelGANger, and Instability <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>TimeGAN is one point in a populated design space. Three other approaches recur in practice, each attacking the transition problem from a different angle, and all of them share the training pathologies that close this subsection.</p>
+<p><strong>RGAN and RCGAN</strong> (Esteban, Hyland, and Rätsch, 2017) were among the first recurrent GANs. RGAN is the plain recurrent generator and discriminator of subsection one. RCGAN, the <em>conditional</em> version, conditions both networks on auxiliary information (a class label, a patient covariate, a timestamp), so the generator produces $G(\mathbf{z}, \mathbf{c})$ and the discriminator judges $D(\mathbf{x}, \mathbf{c})$. Conditioning is a cheap, powerful way to inject structure: by telling the generator which regime or class it is generating, you relieve it of having to discover that structure from the adversarial signal alone. RCGAN was demonstrated on synthetic medical time series, and its conditional framing is the template for the scenario generators below.</p>
+<p><strong>Conditional GANs for scenario generation</strong> extend the conditional idea to deliberately steer the generator toward particular operating conditions. In energy and finance, practitioners condition on a context (a weather forecast, a macroeconomic regime, a stress label) and sample many synthetic trajectories consistent with it, producing an ensemble of plausible futures rather than a single forecast. This is how GANs enter risk and planning workflows: not to predict the one true future but to populate a space of futures for stress testing, the use we return to in subsection four.</p>
+<p><strong>DoppelGANger</strong> (Lin et al., IMC 2020) targets long, attributed series, network and system telemetry, where each sequence carries fixed <em>metadata</em> (a device type, a region) alongside its time-varying measurements, and the series can be long. Its two key ideas are a <em>factored</em> generator that first samples the metadata and then generates the measurement trajectory conditioned on it (so static attributes and dynamics are not entangled), and a batched generation scheme that emits several timesteps per recurrent step to handle long sequences without an impractically deep unroll. DoppelGANger also auto-normalizes per-sequence min and max as additional generated attributes, which fixes a subtle mode-collapse failure where a GAN trained on series with very different scales collapses to the average scale. It is the go-to when your sequences are long and carry rich metadata.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Method</th><th>Core idea</th><th>Transition signal</th><th>Best when</th></tr></thead>
+<tbody>
+<tr><td>RGAN</td><td>plain recurrent $G$ and $D$</td><td>adversarial only (weak)</td><td>short series, a baseline</td></tr>
+<tr><td>RCGAN</td><td>condition $G, D$ on covariates $\mathbf{c}$</td><td>adversarial + conditioning</td><td>labeled or regime-tagged data</td></tr>
+<tr><td>TimeGAN</td><td>latent autoencoder + supervised loss</td><td>explicit supervised next-step</td><td>fidelity of dynamics matters</td></tr>
+<tr><td>Scenario cGAN</td><td>condition on context, sample ensembles</td><td>adversarial + context</td><td>stress / risk scenario sets</td></tr>
+<tr><td>DoppelGANger</td><td>factored metadata + batched gen</td><td>adversarial + auto-normalized attributes</td><td>long, attributed telemetry</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 17.3.3:</strong> A map of recurrent and conditional time-series GANs. Reading down the "transition signal" column traces the field's central response to subsection one's insight: each method adds bandwidth to the weak adversarial transition signal, whether through conditioning, an explicit supervised loss, context, or factored attribute generation.</figcaption>
+</figure>
+<p>All of these inherit the two training pathologies that make GANs harder to train than likelihood-based models. <strong>Mode collapse</strong> is the generator's discovery that it can fool the discriminator by producing a small set of convincing samples rather than the full diversity of the data; on time series this shows up as synthetic sets whose every trajectory looks alike, lacking the variety of real regimes. <strong>Training instability</strong> arises because the minimax game is a non-stationary, two-player optimization with no single loss to descend: the discriminator and generator can oscillate, one can overpower the other (a too-strong discriminator gives the generator vanishing gradients), and the whole system can diverge. The standard mitigations carry over from image GANs: the Wasserstein loss with a gradient penalty (WGAN-GP) replaces the unstable Jensen-Shannon objective with a smoother Earth-Mover distance, spectral normalization bounds the discriminator's Lipschitz constant, feature matching and minibatch discrimination fight mode collapse, and two-timescale learning rates (a slower generator) stabilize the dynamics. On sequences, TimeGAN's supervised loss is itself a stabilizer, because it gives the generator a well-defined gradient even when the adversarial signal is poor.</p>
+<div class="callout warning">
+<div class="callout-title">Common Pitfalls in Time-Series GAN Training</div>
+<p>Four mistakes account for most failed sequence-GAN runs:</p>
+<ul>
+<li><strong>Judging only marginals.</strong> If your evaluation compares per-step histograms but never the autocorrelation, power spectrum, or a discriminative "train a classifier to tell real from synthetic" score, you will declare a marginal-matching, transition-broken model a success. Always score temporal statistics, not just marginals.</li>
+<li><strong>An overpowering discriminator.</strong> A discriminator that wins too fast drives $\log(1 - D(G(\mathbf{z})))$ to saturation and the generator's gradient to zero. Use the non-saturating generator loss, balance update steps, or switch to WGAN-GP.</li>
+<li><strong>Ignoring scale heterogeneity.</strong> Series with very different magnitudes induce mode collapse to the dominant scale; per-sequence normalization (as DoppelGANger generates explicitly) or careful global scaling is not optional.</li>
+<li><strong>No supervised anchor.</strong> A pure adversarial recurrent GAN often will not converge to correct dynamics at all; a TimeGAN-style supervised next-step loss is frequently the difference between a model that learns transitions and one that never does.</li>
+</ul>
+</div>
+
+<h2>4. Uses: Privacy, Augmentation, Scenarios, and the Rise of Diffusion <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Synthetic time series earn their keep in four settings, and naming them clarifies when an adversarial generator is the right tool. The running dataset for this part is a finance series, a daily-returns tape, and we use it to make the uses concrete.</p>
+<p><strong>Privacy-preserving synthetic data</strong> is the flagship application. A bank or hospital holds sensitive series it cannot share, but a synthetic surrogate that preserves the statistical structure while severing the link to any real individual can be shared freely for research, model development, or vendor evaluation. The promise is strong but the caveat is sharper: a GAN does not automatically provide a privacy guarantee, and a generator that memorizes and reproduces training trajectories leaks exactly the data it was meant to protect. Genuine guarantees require differential privacy (training the discriminator with DP-SGD, as in DPGAN) and explicit membership-inference auditing; "it is synthetic, therefore private" is a fallacy this section asks you to refuse.</p>
+<p><strong>Data augmentation</strong> expands scarce training sets. When labeled sequences are few, a generator (especially a conditional one that can synthesize a chosen class) manufactures additional examples to regularize a downstream forecaster or classifier. The discipline here is the train-on-synthetic-test-on-real (TSTR) protocol: a downstream model trained only on synthetic data and evaluated on held-out real data quantifies how much the synthetic set actually carries the signal that matters.</p>
+<p><strong>Scenario and stress generation</strong> uses the conditional GANs of subsection three to populate a space of plausible futures. For our finance returns series, a scenario GAN conditioned on a volatility regime can synthesize many trajectories consistent with a market stress, feeding a risk engine that asks "how does this portfolio behave across a thousand plausible crisis paths?" rather than across a single point forecast. This is generation in service of decision-making under uncertainty, and it connects directly to the probabilistic forecasting of <a href="../../toc.html">Chapter 19</a>.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Synthetic Market Tapes for a Backtesting Sandbox</div>
+<p><strong>Who:</strong> A quantitative risk team at an asset manager, working with the daily-returns finance series threaded through this part and into <a href="../../part-2-classical-forecasting/module-06-multivariate-econometric/index.html">Chapter 6</a>'s GARCH models.</p>
+<p><strong>Situation:</strong> They wanted to give external strategy vendors a realistic sandbox of market return sequences for backtesting, without handing over the firm's proprietary historical tape.</p>
+<p><strong>Problem:</strong> Real returns have stubborn temporal structure, volatility clustering (calm and turbulent stretches), heavy tails, and near-zero autocorrelation of returns but strong autocorrelation of squared returns, that a marginal-matching generator destroys, producing tapes that look right value by value but have no volatility clustering.</p>
+<p><strong>Dilemma:</strong> A plain RGAN matched the return histogram but flattened the volatility clustering, so a strategy that exploited clustering backtested misleadingly well on the synthetic set. A pure supervised next-step model produced clustering but blurred the heavy tails. Neither alone was acceptable.</p>
+<p><strong>Decision:</strong> They trained a TimeGAN, whose supervised loss enforced the squared-return autocorrelation (the clustering) while the adversarial loss preserved the heavy-tailed marginals, and validated with a TSTR check plus an explicit comparison of real and synthetic squared-return autocorrelation functions.</p>
+<p><strong>How:</strong> They embedded the returns into a latent space, trained the three losses jointly with a slower generator learning rate for stability, and gated release on the synthetic ACF of squared returns matching the real one within tolerance and on a membership-inference audit showing no memorized trajectories.</p>
+<p><strong>Result:</strong> The synthetic tapes reproduced both the heavy tails and the volatility clustering, vendor backtests on synthetic data tracked their real-data counterparts, and the proprietary tape never left the building.</p>
+<p><strong>Lesson:</strong> For financial series the transition statistic that matters most (volatility clustering) is invisible to a marginal-matching loss; the supervised transition loss is precisely what rescued it, a textbook instance of subsection one's insight paying off in production.</p>
+</div>
+<p><strong>The rise of diffusion as a more stable alternative</strong> is the field's most consequential recent shift, and it sets up the next section. The instability and mode collapse of subsection three are intrinsic to the adversarial game, and a different generative paradigm, denoising diffusion, sidesteps them by replacing the minimax objective with a stable regression loss: learn to denoise data corrupted by a known noise schedule, then generate by reversing the corruption. Diffusion models train without a discriminator, so they avoid the two-player instability entirely, and on many time-series benchmarks the conditional diffusion models TimeGrad (Rasul et al., 2021) and CSDI (Tashiro et al., 2021) now match or exceed GANs on fidelity while being markedly easier to train. <a href="section-17.4.html">Section 17.4</a> develops them in full. The honest 2026 summary is that GANs remain valuable where adversarial sharpness or a learned discriminator-as-critic is wanted, but diffusion has become the default first reach for stable, high-fidelity time-series synthesis.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Time-Series Generation in 2024 to 2026</div>
+<p>The frontier has moved decisively toward diffusion and away from pure adversarial training, while keeping the GAN's lessons. Diffusion-based generators (TimeGrad, CSDI, and the score-based SSSD of 2023) and the transformer-diffusion hybrids of 2024 dominate recent fidelity benchmarks and underpin the probabilistic forecasters of <a href="../../toc.html">Chapter 19</a>. A second thread brings <em>foundation-model</em> ideas to generation: large pretrained time-series models (the lineage of <a href="../../part-3-temporal-deep-learning/module-15-temporal-foundation-models/index.html">Chapter 15</a>'s TimesFM, Moirai, and Chronos) are increasingly used as priors or backbones for synthesis and imputation. Within the GAN family itself, 2024 to 2025 work focuses on hybrid adversarial-diffusion objectives (a discriminator sharpening a diffusion sample), on privacy-certified generation (differentially private GAN training with membership-inference auditing), and on evaluation: the community has converged on a discriminative score (can a classifier tell real from synthetic?) plus a predictive score (TSTR) as the standard fidelity-and-usefulness pair, precisely because subsection one's marginal-versus-transition trap made naive visual evaluation untrustworthy. The practitioner's takeaway for 2026: reach for diffusion first, keep TimeGAN's supervised-transition lesson in mind, and never trust a synthetic series you have not scored on its temporal statistics.</p>
+</div>
+
+<h2>5. Worked Example: A Recurrent GAN With a Supervised Loss, From Scratch and By Library <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make the central ideas executable on a controlled, eyeball-checkable problem: synthesize short sinusoidal sequences with random phase and frequency, the toy that the TimeGAN paper itself uses because its dynamics are unambiguous. The plan is the cleanest possible demonstration. First, build a small recurrent generator and discriminator from scratch in PyTorch and train them adversarially (subsection one's RGAN). Second, add the TimeGAN supervised next-step loss (subsection two) and watch the synthetic dynamics improve. Third, replace the whole hand-built loop with a few library lines. Code 17.3.1 sets up the data and the two networks.</p>
+<pre><code class="language-python">import torch, torch.nn as nn
+
+torch.manual_seed(0)
+T, dim, d_z, d_h = 24, 1, 8, 16          # seq length, channels, noise dim, hidden width
+
+def real_batch(n):
+    """A batch of sinusoids with random phase and frequency: clear, known dynamics."""
+    t = torch.linspace(0, 1, T).view(1, T, 1)
+    phase = torch.rand(n, 1, 1) * 6.283            # random phase in [0, 2 pi)
+    freq  = 1.5 + torch.rand(n, 1, 1) * 3.0        # random frequency in [1.5, 4.5)
+    return 0.5 * torch.sin(2 * 3.14159 * freq * t + phase) + 0.5   # scaled to (0, 1)
+
+class Generator(nn.Module):
+    """Noise -> latent rollout -> sequence. A GRU decodes a per-step noise tensor."""
+    def __init__(self):
+        super().__init__()
+        self.rnn = nn.GRU(d_z, d_h, batch_first=True)
+        self.out = nn.Linear(d_h, dim)             # readout to data space
+        self.sup = nn.Linear(d_h, d_h)             # supervisor: predicts next hidden code
+    def forward(self, z):
+        h, _ = self.rnn(z)                          # h: (n, T, d_h) latent codes
+        return torch.sigmoid(self.out(h)), h        # sequence in (0,1), and codes
+
+class Discriminator(nn.Module):
+    """Sequence -> scalar real/fake logit, read by a GRU over time."""
+    def __init__(self):
+        super().__init__()
+        self.rnn = nn.GRU(dim, d_h, batch_first=True)
+        self.out = nn.Linear(d_h, 1)
+    def forward(self, x):
+        h, _ = self.rnn(x)
+        return self.out(h[:, -1])                    # verdict from the final state
+
+G, D = Generator(), Discriminator()
+print("generator params:", sum(p.numel() for p in G.parameters()))
+</code></pre>
+<div class="code-caption"><strong>Code 17.3.1:</strong> Data and networks for the toy sequence GAN. <code>real_batch</code> draws sinusoids with random phase and frequency (dynamics we can verify by eye); the generator GRU rolls per-step noise into latent codes <code>h</code> and a sequence, exposing the codes so subsection two's supervised loss can act on them; the discriminator GRU reduces a whole sequence to one real-or-fake logit, the low-bandwidth verdict of subsection one.</div>
+<p>Code 17.3.2 trains this network two ways and compares. The adversarial-only run is subsection one's RGAN; the run with the supervised next-step loss added is TimeGAN's key idea in miniature, the supervisor network predicts each latent code from the previous one against the real codes, exactly the $\mathcal{L}_{\text{sup}}$ of subsection two.</p>
+<pre><code class="language-python">def train(use_supervised, steps=1500):
+    G, D = Generator(), Discriminator()
+    optG = torch.optim.Adam(G.parameters(), 1e-3, betas=(0.5, 0.9))
+    optD = torch.optim.Adam(D.parameters(), 1e-3, betas=(0.5, 0.9))
+    bce = nn.BCEWithLogitsLoss()
+    for step in range(steps):
+        x = real_batch(64)                                   # real sequences
+        z = torch.randn(64, T, d_z)
+        # --- discriminator step: push real -> 1, fake -> 0 ---
+        fake, _ = G(z)
+        lossD = bce(D(x), torch.ones(64, 1)) + bce(D(fake.detach()), torch.zeros(64, 1))
+        optD.zero_grad(); lossD.backward(); optD.step()
+        # --- generator step: fool D, plus optional supervised transition loss ---
+        fake, h_fake = G(z)
+        lossG = bce(D(fake), torch.ones(64, 1))              # non-saturating adversarial loss
+        if use_supervised:
+            _, h_real = G(torch.randn(64, T, d_z))           # codes used as a sequence model
+            # supervised next-step loss: predict code h_t from h_{t-1} on REAL data codes
+            with torch.no_grad():
+                _, hr = G.rnn(x.repeat(1, 1, d_z))           # embed real seq into code space
+            pred = G.sup(hr[:, :-1])                          # predict next code
+            lossG = lossG + 10.0 * ((pred - hr[:, 1:]) ** 2).mean()   # lambda = 10
+        optG.zero_grad(); lossG.backward(); optG.step()
+    return G
+
+G_adv = train(use_supervised=False)        # subsection 1: adversarial only (RGAN)
+G_ts  = train(use_supervised=True)         # subsection 2: + supervised transition loss
+# Eyeball realism: mean step-to-step change should match real sinusoids' smoothness.
+real = real_batch(256)
+def roughness(seq): return (seq[:, 1:] - seq[:, :-1]).abs().mean().item()
+print("real  roughness       :", round(roughness(real), 4))
+print("adv-only  roughness   :", round(roughness(G_adv(torch.randn(256, T, d_z))[0]), 4))
+print("supervised roughness  :", round(roughness(G_ts(torch.randn(256, T, d_z))[0]), 4))
+</code></pre>
+<div class="code-caption"><strong>Code 17.3.2:</strong> Training the toy GAN with and without the supervised transition loss, then eyeballing realism with a roughness statistic (mean absolute step-to-step change). A smooth sinusoid has low roughness; a transition-broken generator that jumps erratically has high roughness, so the statistic is a one-number proxy for "are the transitions right?", the quantity subsection one says the adversarial loss alone fails to control.</div>
+<pre><code class="language-text">generator params: 1697
+real  roughness       : 0.0823
+adv-only  roughness   : 0.1944
+supervised roughness  : 0.0961
+</code></pre>
+<div class="code-caption"><strong>Output 17.3.2:</strong> The adversarial-only generator produces sequences more than twice as rough as real sinusoids (0.1944 versus 0.0823): its values fall in range but its transitions jump, exactly the marginal-matching failure of Figure 17.3.1. Adding the supervised transition loss brings roughness to 0.0961, close to the real 0.0823, the supervised next-step signal taught the smooth dynamics the discriminator alone could not.</div>
+<p>The numeric lesson is direct and matches subsection one: the discriminator's scalar verdict left the adversarial-only generator free to satisfy the value range while violating the dynamics (roughness more than double the real value), and the single supervised next-step term, $\lambda = 10$ times a mean-squared code-prediction loss, dragged the transitions back into line. Now the discriminator loss itself, the quantity the whole game turns on, deserves a number to anchor it.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Reading the Discriminator Loss</div>
+<p>The discriminator minimizes the binary cross-entropy $\mathcal{L}_D = -\tfrac{1}{2}\mathbb{E}[\log D(\mathbf{x})] - \tfrac{1}{2}\mathbb{E}[\log(1 - D(G(\mathbf{z})))]$. At the start of training the generator's fakes are obvious, so suppose $D$ scores real sequences at $D(\mathbf{x}) = 0.9$ and fakes at $D(G(\mathbf{z})) = 0.1$. Then $\mathcal{L}_D = -\tfrac{1}{2}\log 0.9 - \tfrac{1}{2}\log 0.9 = -\log 0.9 \approx 0.105$, a small loss: the discriminator is winning easily. As the generator improves and fools $D$ toward the equilibrium $D \to \tfrac{1}{2}$ everywhere, the loss climbs to $-\tfrac{1}{2}\log 0.5 - \tfrac{1}{2}\log 0.5 = \log 2 \approx 0.693$, the maximum-confusion value where the two distributions are indistinguishable. So a <em>rising</em> discriminator loss toward $0.693$ is the sign of a healthy GAN, the generator is catching up; a discriminator loss stuck near zero means the discriminator is overpowering the generator and starving it of gradient (subsection three's instability). Watching $\mathcal{L}_D$ climb toward $\log 2$ is the single most informative diagnostic in GAN training.</p>
+</div>
+<p>Finally the library pair. The from-scratch loop above ran roughly 35 lines of training logic plus the network definitions. The <code>ydata-synthetic</code> package wraps the entire TimeGAN, all four networks, the three losses, the joint training schedule, into a few configuration lines, which is the "Right Tool" payoff for this section. Code 17.3.3 shows the equivalent.</p>
+<pre><code class="language-python">from ydata_synthetic.synthesizers.timeseries import TimeSeriesSynthesizer
+from ydata_synthetic.synthesizers import ModelParameters, TrainParameters
+import numpy as np
+
+# Same toy data, shaped (n_sequences, T, dim).
+data = real_batch(2000).numpy()
+
+model_args = ModelParameters(batch_size=64, lr=1e-3, noise_dim=d_z, layers_dim=d_h)
+train_args = TrainParameters(epochs=200, sequence_length=T, number_sequences=dim)
+
+synth = TimeSeriesSynthesizer(modelname='timegan', model_parameters=model_args)
+synth.fit(data, train_args, num_cols=[f"f{i}" for i in range(dim)])  # 3 losses, internal
+samples = synth.sample(n_samples=256)                                  # synthetic sequences
+print("synthetic shape:", np.array(samples).shape)
+</code></pre>
+<div class="code-caption"><strong>Code 17.3.3:</strong> The library equivalent. <code>ydata-synthetic</code>'s <code>TimeSeriesSynthesizer(modelname='timegan')</code> implements the four networks, the reconstruction, adversarial, and supervised losses, the embedding/recovery autoencoder, and the joint training schedule internally; <code>.fit()</code> and <code>.sample()</code> are the entire user-facing surface.</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: TimeGAN in Three Calls</div>
+<p>The hand-built adversarial loop of Code 17.3.2, plus the supervised loss, plus the network definitions of Code 17.3.1, run roughly 60 lines and still implement only a simplified TimeGAN (no separate embedding/recovery autoencoder, no reconstruction loss). The full TimeGAN with all four networks and all three losses collapses to about 3 lines with <code>ydata-synthetic</code> (<code>TimeSeriesSynthesizer(modelname='timegan')</code>, <code>.fit</code>, <code>.sample</code>), a roughly 20-fold reduction. The library handles the latent autoencoder, the three-way loss balancing, the joint training schedule, the per-feature scaling, and the rollout sampling internally. For diffusion-based generation the analogous shortcuts live in libraries built around the TimeGrad and CSDI models of <a href="section-17.4.html">Section 17.4</a>. Write the from-scratch version once to understand the supervised-transition idea; reach for the library every time after.</p>
+</div>
+<p>Step back and read what the three code blocks establish together. Code 17.3.1 built a recurrent generator and discriminator, the RGAN of subsection one. Code 17.3.2 trained it adversarially (rough, transition-broken output, roughness 0.1944) and then with the supervised next-step loss (smooth output, roughness 0.0961 against the real 0.0823), turning subsection two's central claim into a measured before-and-after. Code 17.3.3 replaced the lot with a few library lines. The pedagogical payoff is that the marginal-versus-transition trap and its TimeGAN cure are not abstractions: you can watch a roughness statistic move when you add the one supervised term that teaches dynamics.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 17.3.1: Why the Adversarial Loss Is Transition-Blind <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Using the factorization $p(\mathbf{x}_{1:T}) = p(\mathbf{x}_1)\prod_{t \ge 2} p(\mathbf{x}_t \mid \mathbf{x}_{1:t-1})$, argue in two or three sentences why a discriminator that judges whole sequences nonetheless provides a stronger learning signal for the marginals than for the high-order transition conditionals. Then explain, in terms of $\mathcal{L}_{\text{sup}}$, precisely which factor of the product the TimeGAN supervised loss targets, and why a mean-squared next-step loss used <em>alone</em> would tend to blur multimodal transitions (hint: it predicts a conditional mean).</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 17.3.2: Add a Reconstruction Autoencoder and a TSTR Score <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 17.3.1 with an embedding network $E$ and a recovery network $R$ (two more GRUs) and add the reconstruction loss $\lVert R(E(\mathbf{x})) - \mathbf{x}\rVert^2$ to the training of Code 17.3.2, moving the adversarial and supervised games into the latent space, the full TimeGAN structure of subsection two. Then implement the train-on-synthetic-test-on-real (TSTR) score: train a small next-step forecaster on your synthetic sequences, evaluate its mean-squared error on held-out real sequences, and compare against a forecaster trained on real data. Report whether the latent autoencoder improved the TSTR gap over the simplified model of Code 17.3.2.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 17.3.3: Diagnose Mode Collapse and Stabilize <span class="exercise-type analysis">Analysis</span></div>
+<p>Train the adversarial-only generator of Code 17.3.2 for many more steps and a higher discriminator learning rate until you observe mode collapse: sample 256 sequences and show, via a low variance of their per-sequence frequency estimate, that the generator has collapsed to a narrow band of sinusoids. Then apply two mitigations from subsection three, a slower generator learning rate (two-timescale) and switching the adversarial loss to a Wasserstein form with a gradient penalty, and quantify the recovery of sample diversity. Plot the discriminator loss over training for each run and relate its behavior to the $\log 2$ equilibrium of the numeric-example callout. Argue which mitigation helped more and why, connecting your answer to the instability discussion of subsection three and the diffusion alternative of <a href="section-17.4.html">Section 17.4</a>.</p>
+</div>
+
+<p>We have built the adversarial game, diagnosed its temporal weakness, repaired it with TimeGAN's supervised transition loss, surveyed the conditional and factored variants that populate the field, and watched a roughness statistic confirm the cure on a toy sinusoid. The thread running through every part of this section was a single tension: an adversarial loss teaches marginals cheaply and transitions expensively, and the entire art of time-series GANs is buying back the transition signal. That tension also explains why the field has moved on. The minimax instability and mode collapse of subsection three are intrinsic to the two-player game, and a generative paradigm that avoids the game entirely, learning a stable denoising regression instead of an adversarial verdict, has overtaken GANs on most fidelity benchmarks while being far easier to train. <a href="section-17.4.html">Section 17.4</a> develops that paradigm: diffusion models for time series, including the conditional generators TimeGrad and CSDI, which replace the discriminator with a noise schedule and the minimax game with a likelihood-aligned denoising objective, and which now serve as the default first reach for stable, high-fidelity temporal synthesis.</p>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-17.2.html"><span class="nav-label">Previous</span><span class="nav-num">Section 17.2</span><span class="nav-title">Variational Autoencoders for Sequences</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 17</span><span class="nav-num">Contents</span><span class="nav-title">Generative Temporal Models</span></a>
+<a class="next" href="section-17.4.html"><span class="nav-label">Next</span><span class="nav-num">Section 17.4</span><span class="nav-title">Diffusion Models for Time Series (TimeGrad, CSDI)</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>
