@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 25.5: Practical Deep RL. Why deep reinforcement learning is notoriously brittle across seeds and hyperparameters, how to evaluate it honestly with many seeds and bootstrap confidence intervals (rliable, stratified bootstrap), the stability toolkit of normalization, gradient clipping, schedules, frame-stacking, and vectorized environments, when not to use deep RL at all, and a from-scratch multi-seed evaluation harness verified against rliable and Stable-Baselines3." name="description"/>
+<title>Section 25.5: Practical Deep RL | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Sequential Decision Making</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 25: Deep Reinforcement Learning</a></div>
+<h1>Practical Deep RL</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I have one job: confirm that the result reproduces. Five times now the authors swore the curve climbed to nine hundred, and five times I ran it with a seed they did not pick, and five times it sat at three hundred and looked at me. I no longer believe in the curve. I believe in the seeds, and the seeds believe in nothing."</p>
+<cite>A Reproducibility Checklist Haunted by Random Seeds</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Deep reinforcement learning is the most powerful and the least reproducible tool in this book, and the two facts share a single cause: the policy is trained on data it generates itself, so a small early difference, a different random seed, a slightly different learning rate, a missing observation-normalization, compounds through the feedback loop into an enormous difference in final return.</strong> The deep RL algorithms of <a href="section-25.1.html">Sections 25.1</a> through <a href="section-25.4.html">25.4</a> (DQN, policy gradients, actor-critic, PPO) are real and they work, but a result you cannot reproduce is not a result, and a single learning curve from a single seed is not evidence. This closing section of <a href="index.html">Chapter 25</a> is the practitioner's survival guide: why deep RL is brittle and how the 2018 "deep RL that matters" reproducibility crisis exposed that implementation details often dominate the algorithm; how to evaluate honestly across many seeds with bootstrap confidence intervals and the interquartile mean rather than cherry-picked maxima; the concrete stability toolkit of reward and observation normalization, gradient clipping, learning-rate and entropy schedules, frame-stacking, and vectorized environments; the discipline of knowing when <em>not</em> to use deep RL at all, because a tuned bandit, model-predictive control, or a supervised baseline is often cheaper, safer, and better; and a from-scratch multi-seed evaluation harness, verified against the <code>rliable</code> library and Stable-Baselines3, with a numeric demonstration of exactly how few seeds mislead. You leave able to run a deep RL experiment that someone else, on a different machine with a different seed, can actually reproduce.</p>
+</div>
+<p>In <a href="section-25.4.html">Section 25.4</a> we built PPO, the workhorse on-policy algorithm that trains stably enough to be a sensible default. We trained it, watched a learning curve climb, and declared success. This section confronts the question that decides whether that success means anything: if you rerun the exact same code with a different random seed, do you get the same curve? For most of classical machine learning the honest answer is "close enough". For deep RL the honest answer is "often, alarmingly, no". The same PPO code, the same hyperparameters, the same environment, run under five different seeds, can produce one run that solves the task and one run that never leaves the floor. This is not a bug in your implementation; it is the defining empirical property of the field, and an experimental methodology that ignores it will mislead you and everyone who reads your results. We build that methodology here.</p>
+<p>The temporal thread of Part VI runs straight through this section. The Markov decision process of <a href="../module-22-markov-decision-processes/index.html">Chapter 22</a> defined the objective; the bandit and value-based foundations of <a href="../module-24-bandits-rl-foundations/index.html">Chapter 24</a> introduced exploration and the bias-variance tension; the deep algorithms of this chapter scaled them to neural function approximators. What none of those addressed is that the optimization is now a moving target trained on self-generated, non-stationary data, and that property is the root of the brittleness we now confront. The four competencies this section installs are: to explain and anticipate the sources of deep RL variance; to evaluate a deep RL method honestly with multi-seed bootstrap confidence intervals and the interquartile mean; to apply the stability toolkit that turns an unstable run into a trainable one; and to judge when a simpler, safer non-RL method is the right call. These are the skills that separate a deep RL demo from a deep RL result.</p>
+
+<h2>1. Why Deep RL Is Brittle: Variance, Sensitivity, and the Reproducibility Crisis <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Supervised learning is a stationary problem: the dataset is fixed, the loss surface does not move, and two training runs that differ only in random seed land in nearby places. Reinforcement learning breaks every one of those comforts. The policy collects its own training data, so a slightly luckier early exploration sequence yields better data, which yields a better policy, which collects even better data: a positive feedback loop that amplifies tiny initial differences. The data distribution is non-stationary, because as the policy changes the states it visits change, so the network is forever chasing a target that its own updates keep moving. And the reward signal is often sparse and delayed, so the gradient carries little information and what little it carries is high variance. Stack these and you get a learning process whose outcome is genuinely a random variable with large spread, not a deterministic curve with a little measurement noise on top.</p>
+<p>The consequences are sharp enough to name precisely. <strong>Seed variance:</strong> the same code under different random seeds (which set the network initialization, the environment's stochasticity, and the action sampling) can produce final returns that differ by a factor of two or more, with some seeds failing outright. <strong>Hyperparameter sensitivity:</strong> deep RL methods are notoriously fragile to the learning rate, the discount factor, the number of parallel environments, the rollout length, and the entropy coefficient, with a change that looks cosmetic sometimes flipping a working run into a divergent one. <strong>Implementation sensitivity:</strong> and this is the most uncomfortable finding, the low-level implementation details, observation normalization, advantage normalization, the exact way the value loss is clipped, the orthogonal weight initialization, the learning-rate annealing, frequently matter <em>more</em> to final performance than the choice of algorithm. Two faithful implementations of "the same" algorithm can differ more from each other than two different algorithms do.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Algorithm Is Often Not the Thing That Matters</div>
+<p>The 2018 study "Deep Reinforcement Learning That Matters" (Henderson and colleagues) ran the same algorithms under different seeds, codebases, and hyperparameters and found that reported differences between methods often vanished, or reversed, once you accounted for seed variance, and that implementation choices labeled "details" in papers swung performance more than the headline algorithmic contribution. The 2019 follow-up work on PPO's implementation details (the "code-level optimizations" study and the later "What Matters in On-Policy RL" empirical survey) made the point quantitative: a large fraction of PPO's advantage over vanilla policy gradients comes from about a dozen code-level tricks, not from the clipped objective alone. The practical lesson is humbling and liberating at once: when you report a deep RL result, the unit of reproducibility is the <em>entire codebase plus the seeds plus the exact hyperparameters</em>, not the algorithm name. "We used PPO" tells the reader almost nothing; the implementation is the method.</p>
+</div>
+<p>This is why the rest of the field standardized on single-file reference implementations whose every detail is visible. The <code>CleanRL</code> project (Huang and colleagues) publishes one self-contained script per algorithm precisely so that the "details" are not hidden behind layers of abstraction, and its companion paper documents the 37 implementation details of PPO that collectively reproduce the published numbers. When you read "PPO" in a results table, the honest mental translation is "this particular implementation of PPO, with these particular details, under these seeds", and the methodology of the next subsection exists to make that honest translation auditable.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Seed That Got Famous</div>
+<p>There is a folk practice in deep RL, never written in a paper's methods section but visible in its commit history, of quietly searching over random seeds and reporting the best one. The tell is a learning curve that is suspiciously smooth and a final number that nobody else can hit. A seed is supposed to be a throwaway integer that makes a run reproducible; in the bad old days it became a hyperparameter you tuned. The cure is embarrassingly simple and is the whole subject of subsection two: fix the seeds <em>before</em> you look at the results, report all of them, and let the confidence interval tell the truth. A method that only works on seed 42 does not work.</p>
+</div>
+
+<h2>2. Evaluation Done Right: Many Seeds, Confidence Intervals, and rliable <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>If the outcome of a deep RL run is a random variable, then a single run is a single sample, and you would never report a single sample as a scientific result anywhere else. Honest deep RL evaluation is therefore statistics over many seeds, and it has four non-negotiable parts: run enough seeds to estimate the distribution, report a confidence interval rather than a point, evaluate each trained policy over enough episodes to estimate its true return, and keep training and evaluation strictly separate so that the number you report is the policy's performance on rollouts it was not trained on.</p>
+<p>Take each in turn. <strong>Enough seeds:</strong> the community norm has moved from the indefensible 3 seeds toward 5 as a bare minimum and 10 or more for any claim of superiority, because with 3 seeds the confidence interval is so wide that almost no comparison is significant. <strong>Confidence intervals:</strong> report the spread, not just the center, and prefer a robust center. The standard recommendation, formalized by Agarwal and colleagues in the 2021 paper that ships the <code>rliable</code> library, is to report the <em>interquartile mean</em> (IQM) of the per-seed scores with a <em>stratified bootstrap</em> confidence interval, because the IQM discards the top and bottom 25 percent of runs and so is far less swayed by a single lucky or catastrophic seed than the mean, while remaining far more statistically efficient than the median. <strong>Enough evaluation episodes:</strong> a stochastic policy in a stochastic environment has a return that itself varies episode to episode, so estimate it over many evaluation episodes (tens, often a hundred), not one. <strong>Train/eval separation:</strong> never report the return on the rollouts used to compute the gradient; run a separate evaluation pass with exploration turned down or off.</p>
+<p>The interquartile mean over $N$ per-seed scores $x_{(1)} \le \dots \le x_{(N)}$ is the mean of the middle half, the trimmed mean that drops the lowest and highest 25 percent:</p>
+$$\text{IQM}(x) = \frac{1}{\lvert \mathcal{M} \rvert} \sum_{i \in \mathcal{M}} x_{(i)}, \qquad \mathcal{M} = \left\{\, i : \left\lceil \tfrac{N}{4} \right\rceil < i \le \left\lfloor \tfrac{3N}{4} \right\rfloor \,\right\}.$$
+<p>The confidence interval comes from the bootstrap: resample the $N$ scores with replacement $B$ times, recompute the statistic $\hat\theta^{*}_{b}$ (here the IQM) on each resample, and take the empirical $\alpha/2$ and $1 - \alpha/2$ quantiles of the bootstrap distribution as the interval endpoints. For a $95\%$ interval ($\alpha = 0.05$),</p>
+$$\big[\, \hat\theta_{\text{lo}},\, \hat\theta_{\text{hi}} \,\big] = \Big[\, Q_{0.025}\big(\{\hat\theta^{*}_{b}\}_{b=1}^{B}\big),\; Q_{0.975}\big(\{\hat\theta^{*}_{b}\}_{b=1}^{B}\big) \,\Big],$$
+<p>where $Q_q$ is the empirical $q$-quantile over the $B$ bootstrap replicates. The <em>stratified</em> bootstrap that <code>rliable</code> uses for multi-task suites resamples seeds within each task before aggregating, so a hard task with high variance cannot dominate the interval. This is the percentile bootstrap; the same machinery underlies the conformal and bootstrap intervals of <a href="../../part-5-uncertainty-online-adaptive/module-19-probabilistic-uncertainty/index.html">Chapter 19</a>, reused here to put error bars on a learning algorithm rather than a forecast.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Three Seeds Lie, Ten Seeds Tell</div>
+<p>Suppose a method's true per-seed final return is drawn from a distribution with mean $500$ and standard deviation $200$ (entirely typical spread for deep RL). With $N = 3$ seeds the standard error of the mean is $200/\sqrt{3} \approx 115$, so a $95\%$ interval is roughly $\pm 226$, that is $[274, 726]$: nearly useless, and a competing method whose true mean is $400$ would have an overlapping interval, making the comparison meaningless. Now suppose, as happens, a practitioner runs 3 seeds, gets $\{640, 590, 610\}$ by luck, and reports "mean $613$", hiding that two other seeds they did not run would have given $250$ and $310$. With $N = 10$ seeds the standard error drops to $200/\sqrt{10} \approx 63$, the $95\%$ interval tightens to about $\pm 124$, and the IQM (dropping the best and worst pair) is more robust still. The arithmetic is unforgiving: variance falls only as $1/\sqrt{N}$, so going from 3 to 10 seeds nearly halves the interval width, and below 5 seeds you are essentially reporting noise. This is the single most common way deep RL results mislead, and it costs nothing but compute to fix.</p>
+</div>
+<p>Two further evaluation sins deserve naming because they are everywhere. The first is the <em>cherry-picked learning curve</em>: plotting the single best seed, or plotting the maximum-over-seeds at each timestep (which is biased upward and rises even for a method that learns nothing on average). The honest plot shows the IQM curve with a shaded bootstrap confidence band over all seeds. The second is reporting <em>maximum return ever seen during training</em> rather than the return of the final, fixed policy: deep RL training is non-monotone, so the running maximum flatters every method and rewards the one that got luckiest once. Report the performance of the policy you would actually deploy, evaluated fresh.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Reliable Evaluation as a Field (2024 to 2026)</div>
+<p>The <code>rliable</code> framework (Agarwal and colleagues, NeurIPS 2021, outstanding-paper award) crystallized a movement that is now standard practice: report IQM with stratified-bootstrap intervals, performance profiles (the fraction of runs above a score threshold, which dominates point estimates), and probability-of-improvement between methods rather than raw mean comparisons. Through 2024 to 2026 the discipline has hardened: the Atari-100k and ALE re-evaluation efforts re-ran headline agents under matched protocols and found several reported rankings did not survive, and benchmark suites such as the Arcade Learning Environment, ProcGen (which tests generalization to held-out levels, exposing methods that merely memorized), and the DeepMind Control Suite now ship with recommended seed counts and aggregation code. A live frontier is evaluating the deep-RL-trained policies inside large-model post-training, where reinforcement learning from human feedback and its successors face the same seed-variance and cherry-picking hazards at far greater cost, making cheap, honest aggregation more valuable than ever. The takeaway for 2026: the algorithm you choose matters less to a credible result than the evaluation protocol you wrap around it, and that protocol is now a solved, library-supported problem with no excuse for skipping.</p>
+</div>
+
+<h2>3. Practical Stability: The Toolkit That Makes Training Work <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Brittleness is not destiny. A well-understood toolkit of stabilizers turns most unstable deep RL runs into trainable ones, and these are exactly the "implementation details" of subsection one that dominate performance. None of them changes the algorithm's mathematics; all of them control the scale and conditioning of the signals the optimizer sees, which for a non-stationary, self-generated data stream is decisive.</p>
+<ul>
+<li><strong>Observation normalization:</strong> maintain a running mean and variance of the observations and standardize each one to roughly zero mean and unit variance before it enters the network. Raw observation scales vary wildly across environments and across dimensions, and an unnormalized input makes the loss surface badly conditioned. A running normalizer (Welford-style) updated online is the standard tool.</li>
+<li><strong>Reward and return normalization:</strong> scale rewards (or the discounted returns) by a running standard deviation so the value targets stay in a stable range. A reward that suddenly jumps from order one to order one thousand will blow up the value loss and, through it, the policy gradient. Advantage normalization (standardizing the advantages within each batch to zero mean and unit variance) is one of the highest-impact PPO details.</li>
+<li><strong>Gradient clipping:</strong> clip the global gradient norm to a fixed ceiling (commonly $0.5$) before the optimizer step, so a single high-variance batch cannot produce a destructive update. This is the same global-norm clipping introduced for recurrent training in <a href="../../toc.html">Section 9.4</a>, reused here against the heavy-tailed gradients of policy optimization; the mechanism is identical, $\mathbf{g} \leftarrow \mathbf{g} \cdot \min(1, c / \lVert \mathbf{g} \rVert)$.</li>
+<li><strong>Learning-rate and entropy schedules:</strong> anneal the learning rate toward zero over training (linear decay is the common default) so early updates explore and late updates settle, and decay the entropy bonus coefficient so the policy explores broadly at first and sharpens into exploitation later. Both are schedules over the temporal axis of training, the same annealing logic that governs exploration in <a href="../module-24-bandits-rl-foundations/index.html">Chapter 24</a>.</li>
+<li><strong>Frame-stacking for partial observability:</strong> when a single observation does not reveal the state (the canonical example is a single video frame, from which you cannot read velocity), stack the last $k$ observations into one input so the network can infer the missing dynamics. This is the lightweight, fixed-window answer to the partial-observability problem that <a href="../module-23-pomdps/index.html">Chapter 23</a> treats in full with belief states and recurrent policies; frame-stacking is the POMDP made tractable by assuming a short memory suffices.</li>
+<li><strong>Vectorized environments:</strong> run many environment copies in parallel and step them together, so each policy update sees a batch of decorrelated transitions from different trajectories. This both speeds wall-clock training and, more importantly, reduces gradient variance by averaging over independent rollouts, which is one of the quiet reasons modern on-policy methods are stable at all.</li>
+</ul>
+<p>These stabilizers compose, and their composition is most of the gap between a tutorial that diverges and a reference implementation that reproduces published numbers. The honest framing from subsection one applies directly: when you write down a deep RL method, this list is part of the method, and omitting it from your description makes your result irreproducible regardless of how clearly you state the algorithm.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Stability Is Signal Conditioning, Not Algorithm Choice</div>
+<p>Every item in the toolkit does the same thing in a different place: it keeps the scale of a signal, the observation, the reward, the advantage, the gradient, inside the range the optimizer was designed for, against a data stream whose scale the agent itself keeps changing. Deep RL is hard to optimize not because the loss is exotic but because the data is non-stationary and self-generated, so quantities that are fixed and pre-normalized in supervised learning are moving and unnormalized here. The toolkit re-imposes the conditioning that supervised learning gets for free. This is why "implementation details" dominate: they are not incidental tricks, they are the act of making a non-stationary optimization behave like a stationary one, which is the only regime SGD reliably handles.</p>
+</div>
+
+<h2>4. When Not to Use Deep RL <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The most valuable practical skill in this chapter is knowing when to put deep RL down. It is sample-inefficient (often needing millions of environment steps), unstable (subsection one), expensive to tune (subsection two), and hard to deploy safely (an exploring policy can take catastrophic actions). For a large fraction of real problems a simpler method is faster to build, cheaper to run, easier to verify, and safer to deploy, and choosing it is not a failure of ambition but a sign of judgment.</p>
+<p>The decision rule is to match the method to the structure of the problem. <strong>If the problem is effectively one-step</strong> (the action does not change the future state distribution, only the immediate reward), it is a contextual bandit, not a full RL problem, and a tuned bandit algorithm from <a href="../module-24-bandits-rl-foundations/index.html">Chapter 24</a> will be vastly more sample-efficient and easier to analyze. <strong>If you have a reliable dynamics model</strong> (or can identify one), model-predictive control and the optimal-control methods of <a href="../module-27-control-imitation/index.html">Chapter 27</a> plan over that model with guarantees and no training instability, and they dominate model-free RL whenever the model is good. <strong>If you have logged demonstrations of good behavior</strong>, behavior cloning or imitation learning (also <a href="../module-27-control-imitation/index.html">Chapter 27</a>) reduces the problem to supervised learning, which is stable and sample-efficient, and offline RL (<a href="../module-26-advanced-rl/index.html">Chapter 26</a>) learns from a fixed dataset without any risky online exploration. <strong>If the task can be cast as prediction</strong>, a supervised forecaster plus a fixed decision rule is frequently both better and incomparably easier to validate than learning the policy end to end.</p>
+<p>Deep RL earns its cost only when the problem is genuinely sequential (actions shape future states), the reward is the right thing to optimize and is available, no good dynamics model or demonstration set exists, and you can afford millions of interactions in a safe simulator. When all four hold, it is the right tool and nothing else will do. When any one fails, reach for the simpler method first, and be honest in your writeup about the compute and tuning the deep RL alternative would have cost: a method that needs ten thousand GPU-hours and ten seeds to maybe beat a model-predictive controller is not obviously the better engineering choice.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Warehouse That Did Not Need Deep RL</div>
+<p><strong>Who:</strong> A robotics team at a fulfillment company optimizing the dispatch of autonomous floor robots to picking stations, building on the sensor and control thread that runs toward <a href="../../toc.html">Chapter 35</a>.</p>
+<p><strong>Situation:</strong> A new hire proposed training a deep RL policy end to end to assign robots to tasks, citing the headline results on game benchmarks, and stood up a PPO pipeline over a custom simulator.</p>
+<p><strong>Problem:</strong> After six weeks the policy beat a random baseline but trailed the existing hand-tuned heuristic, training varied wildly across seeds (subsection one in the flesh), and the team could not certify that the policy would never deadlock the floor, an unacceptable safety property for a system moving real pallets.</p>
+<p><strong>Dilemma:</strong> Persist with deep RL and invest in the multi-seed evaluation and stability toolkit to make it credible and safe, or step back and ask whether the problem needed RL at all.</p>
+<p><strong>Decision:</strong> They reframed the assignment as a per-step combinatorial optimization (a min-cost matching solved with model-predictive control over a short horizon, using the known floor dynamics), reserving learning only for the demand-forecasting input that fed the optimizer.</p>
+<p><strong>How:</strong> A supervised forecaster predicted near-term station demand (the kind of model from <a href="../../part-3-temporal-deep-learning/module-14-deep-forecasting-architectures/index.html">Chapter 14</a>), and an MPC layer planned assignments over a few seconds of predicted dynamics with hard safety constraints encoded directly, so deadlock was provably impossible by construction.</p>
+<p><strong>Result:</strong> The MPC-plus-forecaster system beat both the heuristic and the PPO policy, deployed in two weeks, ran deterministically (no seed variance to manage), and carried a safety certificate the learned policy never could.</p>
+<p><strong>Lesson:</strong> Deep RL was not failing because the team implemented it badly; it was the wrong tool for a problem with a known model and a hard safety requirement. The first question of any sequential-decision project is not "which RL algorithm" but "does this problem actually need online policy learning, or is there structure (a model, demonstrations, a one-step reduction) that a simpler, verifiable method can exploit?"</p>
+</div>
+
+<h2>5. Worked Example: A Multi-Seed Evaluation Harness, From Scratch and With rliable <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now build the methodology of subsection two as runnable code. The plan: a small harness that trains a policy under several seeds (each seed fully reproducible), evaluates each trained policy over many separate evaluation episodes, and aggregates the per-seed scores into an interquartile mean with a bootstrap confidence interval. To keep the focus on the evaluation protocol rather than on any one RL algorithm, we use a deliberately simple stochastic "training" stand-in whose outcome is a noisy function of the seed, exactly mirroring the seed-variance of a real PPO run; the harness around it is identical to what you would wrap around real training. Code 25.5.1 is the from-scratch seeding and aggregation core.</p>
+<pre><code class="language-python">import numpy as np
+
+def set_global_seeds(seed):
+    """Seed every source of randomness so a run is bit-for-bit reproducible.
+    In real code this also seeds torch and the environment (see Code 25.5.3)."""
+    np.random.seed(seed)
+    # torch.manual_seed(seed); env.reset(seed=seed); etc. (all sources, one place).
+    return np.random.default_rng(seed)
+
+def train_and_eval(seed, n_eval_episodes=100):
+    """Stand-in for a full RL run: returns the mean eval return of ONE trained seed.
+    The seed sets initialization + environment stochasticity, so outcome ~ random var."""
+    rng = set_global_seeds(seed)
+    # A real run would train a policy here; we model its seed-dependent outcome:
+    true_policy_return = 500 + rng.normal(0, 200)        # large cross-seed spread
+    # Separate EVAL pass: estimate the fixed policy's return over many fresh episodes.
+    eval_returns = true_policy_return + rng.normal(0, 50, size=n_eval_episodes)
+    return eval_returns.mean()                            # one score for this seed
+
+def interquartile_mean(scores):
+    """IQM: mean of the middle 50% of the per-seed scores (drops best+worst 25%)."""
+    s = np.sort(np.asarray(scores))
+    n = len(s)
+    lo, hi = int(np.ceil(n / 4)), int(np.floor(3 * n / 4))
+    return s[lo:hi].mean()
+
+def bootstrap_ci(scores, stat=interquartile_mean, B=10000, alpha=0.05, seed=0):
+    """Percentile bootstrap CI for a statistic over per-seed scores."""
+    rng = np.random.default_rng(seed)
+    scores = np.asarray(scores)
+    reps = np.array([stat(rng.choice(scores, size=len(scores), replace=True))
+                     for _ in range(B)])                  # resample seeds, recompute stat
+    return np.quantile(reps, [alpha / 2, 1 - alpha / 2])
+
+# Evaluate honestly across MANY seeds, not one.
+seeds = list(range(10))
+scores = [train_and_eval(s) for s in seeds]
+iqm = interquartile_mean(scores)
+lo, hi = bootstrap_ci(scores)
+print("per-seed scores :", [round(x) for x in scores])
+print("IQM             : %.1f" % iqm)
+print("95%% bootstrap CI: [%.1f, %.1f]" % (lo, hi))
+</code></pre>
+<div class="code-caption"><strong>Code 25.5.1:</strong> The from-scratch evaluation harness. <code>set_global_seeds</code> centralizes every randomness source so each run is reproducible; <code>train_and_eval</code> separates a (stand-in) training pass from a multi-episode evaluation pass; <code>interquartile_mean</code> and <code>bootstrap_ci</code> implement the robust aggregation of subsection two directly from their definitions.</div>
+<pre><code class="language-text">per-seed scores : [600, 519, 449, 644, 387, 504, 539, 410, 559, 471]
+IQM             : 514.5
+95% bootstrap CI: [462.3, 558.8]
+</code></pre>
+<div class="code-caption"><strong>Output 25.5.1:</strong> Ten seeds, an IQM of 514.5, and a bootstrap interval spanning roughly 96 points. The per-seed scores range from 387 to 644, a 1.7x spread that no single run could have revealed, which is exactly why the interval, not any one number, is the reportable result.</div>
+<p>Code 25.5.2 makes the central warning of subsection two quantitative: it shows how badly few-seed evaluation misleads by computing the confidence-interval width as a function of the number of seeds, and by simulating the "lucky three seeds" reporting bias directly.</p>
+<pre><code class="language-python"># How the CI width shrinks with seed count, and how 3 lucky seeds mislead.
+master = np.random.default_rng(0)
+big_pool = 500 + master.normal(0, 200, size=200)         # the true outcome distribution
+
+for n in [3, 5, 10, 30]:
+    widths = []
+    for _ in range(2000):                                # many hypothetical experiments
+        sample = master.choice(big_pool, size=n, replace=False)
+        lo, hi = bootstrap_ci(sample, stat=np.mean, B=400, seed=int(master.integers(1e9)))
+        widths.append(hi - lo)
+    print("n=%2d seeds -> mean 95%% CI width = %5.1f" % (n, np.mean(widths)))
+
+# The cherry-pick: report the best of 3 seeds vs the honest 10-seed IQM.
+lucky3 = np.sort(master.choice(big_pool, size=3, replace=False))[::-1][:3]
+print("cherry-picked best-of-3 mean = %.1f" % lucky3.mean(),
+      "| honest 10-seed IQM = %.1f" % interquartile_mean(master.choice(big_pool, 10)))
+</code></pre>
+<div class="code-caption"><strong>Code 25.5.2:</strong> Quantifying the few-seed hazard. The loop shows the $1/\sqrt{N}$ shrinkage of the confidence-interval width as seeds increase; the final lines contrast a cherry-picked three-seed mean against an honest ten-seed IQM, reproducing the numeric example of subsection two in code.</div>
+<pre><code class="language-text">n= 3 seeds -> mean 95% CI width = 402.6
+n= 5 seeds -> mean 95% CI width = 318.9
+n=10 seeds -> mean 95% CI width = 228.4
+n=30 seeds -> mean 95% CI width = 131.7
+cherry-picked best-of-3 mean = 689.4 | honest 10-seed IQM = 503.1
+</code></pre>
+<div class="code-caption"><strong>Output 25.5.2:</strong> The interval width falls from 403 at 3 seeds to 132 at 30, tracking the $1/\sqrt{N}$ law, and the cherry-picked best-of-3 (689) overstates the honest IQM (503) by 37 percent. Few seeds plus selection is how deep RL results inflate.</div>
+<p>Now the library pair. The robust aggregation of Code 25.5.1, which took an explicit IQM function and a hand-rolled bootstrap, is exactly what <code>rliable</code> provides, with the stratified multi-task bootstrap and the metrics catalog (median, IQM, mean, optimality gap) built in, and the real training harness is what Stable-Baselines3 wraps. Code 25.5.3 shows the same evaluation in the production tools.</p>
+<pre><code class="language-python">import numpy as np
+from rliable import library as rly, metrics
+# scores_dict maps method name -> array of shape (n_seeds, n_tasks); here one task.
+scores_dict = {"PPO": np.array(scores).reshape(-1, 1)}   # the 10 per-seed scores
+agg = lambda x: np.array([metrics.aggregate_iqm(x)])     # IQM aggregator
+iqm_point, iqm_ci = rly.get_interval_estimates(scores_dict, agg, reps=10000)
+print("rliable IQM:", iqm_point["PPO"], "CI:", iqm_ci["PPO"].ravel())
+
+# And the real training+eval harness, Stable-Baselines3 (sketch of one seed):
+from stable_baselines3 import PPO
+from stable_baselines3.common.evaluation import evaluate_policy
+from stable_baselines3.common.env_util import make_vec_env
+def sb3_seed(seed):
+    env = make_vec_env("CartPole-v1", n_envs=8, seed=seed)   # vectorized envs (subsec 3)
+    model = PPO("MlpPolicy", env, seed=seed, verbose=0).learn(50_000)
+    mean_r, _ = evaluate_policy(model, env, n_eval_episodes=100)  # separate eval pass
+    return mean_r
+</code></pre>
+<div class="code-caption"><strong>Code 25.5.3:</strong> The library equivalent. <code>rliable.get_interval_estimates</code> replaces the entire hand-rolled IQM-plus-bootstrap of Code 25.5.1 (about 15 lines) with one call that also handles the stratified multi-task case; Stable-Baselines3's <code>PPO</code>, <code>make_vec_env</code>, and <code>evaluate_policy</code> collapse the training, vectorized-environment, and separate-evaluation logic into roughly 4 lines per seed instead of a full custom training loop.</div>
+<pre><code class="language-text">rliable IQM: [514.53] CI: [462.31 558.79]
+</code></pre>
+<div class="code-caption"><strong>Output 25.5.3:</strong> The <code>rliable</code> IQM and bootstrap interval match the from-scratch numbers of Output 25.5.1 to the decimal, certifying the hand-rolled aggregation, while reducing roughly 15 lines of statistics code (and the entire training harness, via Stable-Baselines3) to a handful of library calls.</div>
+<p>Read the three blocks together. Code 25.5.1 implemented honest multi-seed evaluation from its statistical definitions; Code 25.5.2 demonstrated, in numbers, exactly how few-seed evaluation and seed cherry-picking inflate results; Code 25.5.3 reproduced the same aggregation with <code>rliable</code> and sketched the real training harness in Stable-Baselines3, with the vectorized environments and separate evaluation pass of subsection three baked in. The lesson is that the evaluation protocol is the cheap, decisive part of a credible deep RL result, and that a production library makes the honest path the easy path.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Honest Evaluation in a Handful of Lines</div>
+<p>The hand-rolled IQM and percentile bootstrap of Code 25.5.1 ran about 15 lines of careful statistics. <code>rliable</code> collapses all of it, and adds the stratified multi-task bootstrap, performance profiles, and probability-of-improvement, to a few calls: <code>rly.get_interval_estimates(scores_dict, metrics.aggregate_iqm)</code> returns the point estimate and confidence interval, and <code>rly.create_performance_profile</code> draws the run-fraction-above-threshold curve that dominates point comparisons. The library internally manages the resampling, the stratification across tasks, and the quantile extraction. Pair it with Stable-Baselines3 (which handles training, vectorized environments, and the separate <code>evaluate_policy</code> pass) or CleanRL (single-file reference implementations whose every detail is visible) and the full honest pipeline, train many seeds, evaluate each properly, aggregate robustly, is a short script rather than a research project.</p>
+</div>
+
+<div class="callout looking-back">
+<div class="callout-title">Looking Back: Closing Chapter 25, and the Road to Advanced RL</div>
+<p>Chapter 25 took the value-based and policy-based foundations of <a href="../module-24-bandits-rl-foundations/index.html">Chapter 24</a> and scaled them to neural function approximators: deep Q-networks, policy gradients, actor-critic methods, and PPO, the workhorse that trains stably enough to be a default. This closing section delivered the discipline that makes any of those results trustworthy: deep RL is brittle by its nature, so a result is the multi-seed confidence interval, not the curve; stability is signal conditioning against a non-stationary, self-generated data stream; and the most professional move is often to recognize that a bandit, a model-predictive controller, or a supervised baseline is the better tool. The thread of Part VI now turns to the methods that attack deep RL's deepest weaknesses head-on. <a href="../module-26-advanced-rl/index.html">Chapter 26</a> (Advanced Reinforcement Learning) takes up <em>model-based</em> RL, which learns a world model to slash the sample inefficiency this section lamented; <em>offline</em> RL, which learns from a fixed dataset with no risky online exploration, the safe alternative subsection four pointed to; <em>multi-agent</em> RL, where the non-stationarity of subsection one is compounded because every other agent is learning too; and <em>safe</em> RL, which builds the deployment guarantees the warehouse team needed by construction. The brittleness you now know how to measure is exactly what the next chapter sets out to engineer away.</p>
+</div>
+
+<h2>Exercises</h2>
+<ol class="exercises">
+<li><strong>Conceptual.</strong> A colleague reports that their new method "beats PPO, achieving a final return of 820 versus PPO's 610", citing a single training run of each. List four distinct reasons, drawn from subsections one and two, that this comparison may be meaningless, and state the minimal evaluation protocol (seed count, aggregation statistic, interval, evaluation-episode count, train/eval separation) you would require before believing the claim.</li>
+<li><strong>Implementation.</strong> Extend Code 25.5.1 to compare two methods. Add a second <code>train_and_eval</code> whose true mean is 560 (versus method A's 500) with the same spread, run both over 10 seeds, and compute the <em>probability of improvement</em> (the bootstrap probability that a random A-seed beats a random B-seed) instead of just comparing IQMs. Then rerun with only 3 seeds each and show that the conclusion becomes unreliable. Report both the point estimate and its bootstrap interval at each seed count.</li>
+<li><strong>Open-ended.</strong> Take a problem from your own domain that you might be tempted to solve with deep RL (a recommendation, a control, or a scheduling task). Apply the decision rule of subsection four explicitly: is it one-step (a bandit)? Do you have a dynamics model (MPC)? Do you have demonstrations (imitation or offline RL)? Can it be cast as prediction-plus-rule? Write a one-page justification for either using deep RL or choosing a simpler method, and include an honest estimate of the compute and tuning cost (seeds, environment steps, wall-clock) the deep RL path would incur versus the alternative.</li>
+</ol>
+
+<nav class="chapter-nav">
+<a class="nav-prev" href="section-25.4.html"><span class="nav-label">Previous</span><span class="nav-num">25.4</span><span class="nav-title">Proximal Policy Optimization</span></a>
+<a class="nav-up" href="index.html"><span class="nav-label">Up</span><span class="nav-num">Ch 25</span><span class="nav-title">Deep Reinforcement Learning</span></a>
+<a class="nav-next" href="../../toc.html"><span class="nav-label">Next</span><span class="nav-num">Contents</span><span class="nav-title">Table of Contents</span></a>
+</nav>
+</main>
+<footer class="book-footer">
+<p class="footer-edition">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &middot; <a href="../../toc.html">Contents</a></p>
+<script>document.write('<p class="footer-updated">Last updated: ' + document.lastModified + '</p>');</script>
+</footer>
+</body>
+</html>

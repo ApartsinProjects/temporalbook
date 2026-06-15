@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 25.2: Policy Gradient Methods. Directly parameterizing and optimizing a stochastic policy pi_theta(a|s) instead of a value function, the policy gradient theorem and REINFORCE, variance reduction with baselines and the advantage function, the on-policy sample-inefficiency that motivates actor-critic, and a from-scratch REINFORCE-with-baseline on a Gymnasium task matched against a library policy-gradient agent." name="description"/>
+<title>Section 25.2: Policy Gradient Methods | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Sequential Decision Making</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 25: Deep Reinforcement Learning</a></div>
+<h1>Policy Gradient Methods</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I never learned what any state was worth. I only learned to want certain actions a little more and others a little less, and to nudge those wants in the direction the reward was pointing. Give me enough episodes and my hesitations harden into habits; give me too few and I commit, confidently, to nonsense."</p>
+<cite>A Policy Nudging Its Own Probabilities Toward Reward</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Value-based reinforcement learning, the deep Q-network of <a href="section-25.1.html">Section 25.1</a>, learns how good each action is and then acts greedily; policy gradient methods skip the middle step and learn the behavior itself, parameterizing a stochastic policy $\pi_\theta(a \mid s)$ and pushing its parameters $\theta$ directly up the gradient of expected return.</strong> The single equation that makes this possible is the policy gradient theorem: the gradient of an expectation over trajectories, an object you cannot differentiate naively because the distribution being averaged over itself depends on $\theta$, rewrites exactly as an expectation of $\nabla_\theta \log \pi_\theta(a \mid s)$ weighted by return. That "score-function" trick turns an intractable derivative of an integral into a plain Monte Carlo average over sampled episodes, and REINFORCE is nothing more than that average plugged into stochastic gradient ascent. The estimator is unbiased but notoriously high-variance, so most of this section is about taming the variance with a baseline and the advantage function (a subtraction that provably leaves the gradient unbiased), and about the on-policy sample inefficiency that follows from throwing every episode away after one update, the weakness that the actor-critic methods of <a href="section-25.3.html">Section 25.3</a> were built to fix. You will derive the theorem from first principles, implement REINFORCE with a baseline from scratch on a Gymnasium task, watch its return curve climb, then reproduce the agent in a few library lines, and read a single grad-log-pi update off by hand.</p>
+</div>
+<p>In <a href="section-25.1.html">Section 25.1</a> we learned to estimate $Q(s, a)$, the value of taking action $a$ in state $s$, with a deep network, and then acted by choosing the highest-valued action. That is the value-based route to a policy: the policy is implicit, a greedy read-off from a learned value function. This section takes the opposite and equally fundamental route. Instead of learning values and deriving behavior from them, we parameterize the behavior directly, writing the policy as a differentiable function $\pi_\theta(a \mid s)$ with parameters $\theta$ (the weights of a neural network), and we optimize $\theta$ to maximize expected return by gradient ascent. The reinforcement-learning foundations of <a href="../module-24-bandits-rl-foundations/index.html">Chapter 24</a> gave us the objective, expected return in a Markov decision process (<a href="../module-22-markov-decision-processes/index.html">Chapter 22</a>); this section gives us a way to differentiate that objective with respect to the parameters of the policy itself. We use the unified notation of <a href="../../toc.html">Appendix A</a>: $s_t$ the state, $a_t$ the action, $r_t$ the reward, $\tau$ a trajectory, $\gamma$ the discount, and $\pi_\theta$ the parameterized policy.</p>
+<p>Why pursue a separate family of algorithms when value-based methods already produce policies? Because directly parameterizing the policy unlocks settings where the value-based route is awkward or impossible, and because the resulting gradient is so clean that it underlies nearly every modern deep-RL algorithm of practical importance, from A2C and PPO through to the policy-optimization step inside reinforcement learning from human feedback. The continuous-action robotics of <a href="../module-27-control-imitation/index.html">Chapter 27</a> and the stochastic exploration that solves partially observed problems (<a href="../module-23-pomdps/index.html">Chapter 23</a>) both want a policy that emits a probability distribution over actions, something a $Q$-function with a discrete argmax cannot naturally provide. Policy gradients give exactly that.</p>
+<p>The four competencies this section installs: to state precisely why and when a directly parameterized policy beats a value-based one; to derive the policy gradient theorem and recognize REINFORCE as its Monte Carlo estimate; to reduce the estimator's variance with a baseline and the advantage function, and to prove the subtraction does not bias the gradient; and to implement, train, and debug REINFORCE with a baseline on a real Gymnasium environment, then recognize the same algorithm inside a library. These are the load-bearing skills for everything in the rest of <a href="index.html">Chapter 25</a> and the advanced methods of <a href="../module-26-advanced-rl/index.html">Chapter 26</a>.</p>
+
+<h2>1. Parameterizing the Policy Directly <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>A value-based agent answers the question "how good is each action here?" and lets the answer dictate behavior. A policy-based agent answers a different question directly: "what is the probability I should take each action here?" Formally it carries a parameterized conditional distribution $\pi_\theta(a \mid s)$, a function that maps a state to a probability distribution over actions, with the parameters $\theta$ being the weights of a neural network. For a discrete action space the network emits one logit per action and a softmax turns the logits into probabilities; for a continuous action space the network emits the mean (and often the log-standard-deviation) of a Gaussian from which the action is sampled. In both cases the policy is differentiable in $\theta$, which is the entire point: we can compute $\nabla_\theta$ of things that depend on the policy and ascend it.</p>
+<p>The objective we maximize is the expected return under the policy, the same return that defines value in <a href="../module-22-markov-decision-processes/index.html">Chapter 22</a>. Writing a trajectory $\tau = (s_0, a_0, r_0, s_1, a_1, \dots)$ generated by running $\pi_\theta$ in the environment, and $R(\tau) = \sum_{t \ge 0} \gamma^t r_t$ its discounted return, the objective is</p>
+$$J(\theta) \;=\; \mathbb{E}_{\tau \sim \pi_\theta}\!\big[R(\tau)\big] \;=\; \mathbb{E}_{\tau \sim \pi_\theta}\!\Big[\textstyle\sum_{t \ge 0} \gamma^t r_t\Big].$$
+<p>The expectation is taken over trajectories drawn by sampling actions from $\pi_\theta$, which is what makes $\theta$ enter $J$ in two coupled places: it shapes which actions are chosen, and through them which states are visited. That coupling is precisely why differentiating $J$ is not a one-line application of the chain rule, and resolving it is the work of subsection two.</p>
+<p>Why is this direct parameterization natural, indeed often necessary, where value-based methods strain? Three reasons recur, and each maps to a setting elsewhere in this book.</p>
+<ul>
+<li><strong>Stochastic policies are first-class.</strong> A policy gradient learns a genuine distribution over actions, so a stochastic optimum (mixed strategies in games, exploration under partial observability as in <a href="../module-23-pomdps/index.html">Chapter 23</a>) is representable directly. A greedy value-based policy is deterministic by construction and can only fake stochasticity with an external $\epsilon$-greedy hack.</li>
+<li><strong>Continuous action spaces are immediate.</strong> Emitting the parameters of a Gaussian over actions handles a continuous control problem with no change of machinery, whereas a $Q$-function would need to solve $\arg\max_a Q(s, a)$ over a continuous set at every step. This is the entry point to the continuous control of <a href="../module-27-control-imitation/index.html">Chapter 27</a> and is developed further with deterministic and soft variants in <a href="section-25.4.html">Section 25.4</a>.</li>
+<li><strong>The policy can be simpler than the value.</strong> Sometimes the optimal behavior is easy to describe ("turn left when you see the wall") even when assigning a precise numeric value to every state is hard. Parameterizing the simpler object directly can be the better-conditioned learning problem.</li>
+</ul>
+<p>The cost of these advantages is a different failure mode. Value-based methods can reuse old data (a replay buffer, as in <a href="section-25.1.html">Section 25.1</a>) because a $Q$-value is a property of the environment, not of the current policy. The pure policy gradient we derive next is <em>on-policy</em>: its gradient is an expectation under the very policy being updated, so each batch of experience is valid for exactly one update and is then discarded. That single fact, examined in subsection four, is the engine of policy-gradient sample inefficiency and the reason the field layered critics, trust regions, and importance weighting on top.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Learn the Behavior, Not the Bookkeeping</div>
+<p>Value-based RL learns an intermediate quantity, the value of states and actions, and reads a policy off it. Policy-gradient RL cuts out the intermediary and optimizes the policy directly against the objective you actually care about, expected return. The advantage is representational: stochastic and continuous-action policies become first-class, differentiable objects. The price is statistical: because the objective is an expectation under the policy itself, the data you collect is on-policy and single-use, which makes the raw method sample-hungry. Read the rest of this section as a sequence of fixes to that statistical price, baselines for variance and critics for reuse, applied to a representational idea that is, at its core, simply "make the behavior a differentiable function and climb the return."</p>
+</div>
+
+<h2>2. The Policy Gradient Theorem and REINFORCE <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>We want $\nabla_\theta J(\theta)$, the gradient of expected return with respect to the policy parameters. The obstacle is structural: $J(\theta) = \mathbb{E}_{\tau \sim \pi_\theta}[R(\tau)] = \int p_\theta(\tau)\, R(\tau)\, d\tau$, an integral whose <em>measure</em> $p_\theta(\tau)$ depends on $\theta$. We cannot push the gradient inside the expectation directly, because differentiating an expectation whose distribution moves with the parameter is exactly what the chain rule does not hand you for free. The resolution is the score-function (likelihood-ratio) identity, the single most important trick in this section.</p>
+<p>Start by differentiating the integral and applying the identity $\nabla_\theta p_\theta(\tau) = p_\theta(\tau)\,\nabla_\theta \log p_\theta(\tau)$, which is just the derivative of a log rearranged:</p>
+$$\nabla_\theta J(\theta) = \nabla_\theta \!\int p_\theta(\tau)\, R(\tau)\, d\tau = \int \nabla_\theta p_\theta(\tau)\, R(\tau)\, d\tau = \int p_\theta(\tau)\, \nabla_\theta \log p_\theta(\tau)\, R(\tau)\, d\tau.$$
+<p>The last integral is, by definition, an expectation under $p_\theta$ again, so we have converted a derivative-of-an-integral into an integral-of-a-derivative, now safely an expectation:</p>
+$$\nabla_\theta J(\theta) = \mathbb{E}_{\tau \sim \pi_\theta}\!\big[\nabla_\theta \log p_\theta(\tau)\; R(\tau)\big].$$
+<p>Now expand $\log p_\theta(\tau)$. The trajectory probability factors into the environment's transition dynamics and the policy's action choices, $p_\theta(\tau) = p(s_0)\prod_t P(s_{t+1}\mid s_t, a_t)\,\pi_\theta(a_t \mid s_t)$. Taking the log turns the product into a sum, and taking $\nabla_\theta$ annihilates every term that does not contain $\theta$: the initial-state distribution and the transition dynamics are properties of the environment, not the policy, so their gradients are zero. Only the policy terms survive:</p>
+$$\nabla_\theta \log p_\theta(\tau) = \sum_{t \ge 0} \nabla_\theta \log \pi_\theta(a_t \mid s_t).$$
+<p>This is the decisive simplification: we never needed a model of the environment's dynamics, because its gradient vanished. Substituting back gives the policy gradient theorem in its trajectory form:</p>
+$$\boxed{\;\nabla_\theta J(\theta) = \mathbb{E}_{\tau \sim \pi_\theta}\!\bigg[\Big(\textstyle\sum_{t \ge 0} \nabla_\theta \log \pi_\theta(a_t \mid s_t)\Big)\, R(\tau)\bigg].\;}$$
+<p>A short causality refinement sharpens this into the form we actually implement. An action $a_t$ taken at time $t$ cannot influence rewards earned <em>before</em> $t$, so multiplying $\nabla_\theta \log \pi_\theta(a_t \mid s_t)$ by the full-trajectory return $R(\tau)$ includes past rewards that are, in expectation, just noise. Replacing $R(\tau)$ with the reward-to-go from step $t$ onward, $G_t = \sum_{k \ge t} \gamma^{k-t} r_k$, removes that noise without adding bias, yielding the per-step estimator</p>
+$$\nabla_\theta J(\theta) = \mathbb{E}_{\tau \sim \pi_\theta}\!\bigg[\sum_{t \ge 0} \nabla_\theta \log \pi_\theta(a_t \mid s_t)\; G_t\bigg].$$
+<p>Read this equation in words: to increase expected return, push up the log-probability of each action in proportion to the return that followed it. Good actions (high $G_t$) get their probability raised; bad actions (low or negative $G_t$) get theirs lowered. <strong>REINFORCE</strong> (Williams, 1992) is precisely this expectation estimated by Monte Carlo: run the policy to collect a batch of complete episodes, compute each $G_t$, average the per-step products to form an unbiased gradient estimate, and take a gradient-ascent step. No value function, no dynamics model, no bootstrapping, only sampled returns and the score function. Figure 25.2.1 traces the flow from objective to update.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The REINFORCE update loop. The policy pi-theta is run in the environment to collect a trajectory of states, actions, and rewards. Returns-to-go G-t are computed from the rewards. The gradient estimate sums grad-log-pi times G-t over the trajectory, and a gradient-ascent step updates theta, which feeds back into the policy.">
+<defs>
+<marker id="arr252" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.box252 { fill:#eef3f8; stroke:#14385c; stroke-width:2; }
+.acc252 { fill:#fbeee8; stroke:#b8431f; stroke-width:1.8; }
+.fl252 { stroke:#5a626c; stroke-width:1.8; fill:none; marker-end:url(#arr252); }
+.lab252 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub252 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.ti252 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+</style>
+<text class="ti252" x="410" y="24">The REINFORCE loop: sample episodes, weight log-probs by return, ascend</text>
+<rect class="box252" x="40" y="95" width="150" height="58" rx="9"/><text class="lab252" x="115" y="120">policy</text><text class="sub252" x="115" y="138">&#960;&#952;(a|s)</text>
+<rect class="box252" x="250" y="95" width="160" height="58" rx="9"/><text class="lab252" x="330" y="120">run in env</text><text class="sub252" x="330" y="138">collect (s,a,r) episode</text>
+<rect class="acc252" x="470" y="95" width="150" height="58" rx="9"/><text class="lab252" x="545" y="120">returns-to-go</text><text class="sub252" x="545" y="138">G&#8348; = &#931; &#947;&#7503; r</text>
+<rect class="acc252" x="680" y="95" width="110" height="58" rx="9"/><text class="lab252" x="735" y="118">gradient</text><text class="sub252" x="735" y="136">&#931; &#8711;log&#960; G&#8348;</text>
+<line class="fl252" x1="190" y1="124" x2="248" y2="124"/>
+<line class="fl252" x1="410" y1="124" x2="468" y2="124"/>
+<line class="fl252" x1="620" y1="124" x2="678" y2="124"/>
+<line class="fl252" x1="735" y1="153" x2="735" y2="200"/><line class="fl252" x1="735" y1="200" x2="115" y2="200"/><line class="fl252" x1="115" y1="200" x2="115" y2="155"/>
+<text class="sub252" x="425" y="218">&#952; &#8592; &#952; + &#945; &#8711;&#952; J  (gradient ascent updates the policy)</text>
+</svg>
+<figcaption><strong>Figure 25.2.1:</strong> One REINFORCE iteration. The policy $\pi_\theta$ is rolled out to collect complete episodes; returns-to-go $G_t$ are accumulated from the rewards; the Monte Carlo gradient $\sum_t \nabla_\theta \log\pi_\theta(a_t\mid s_t)\,G_t$ is formed and a gradient-ascent step updates $\theta$, which loops back to generate the next batch of on-policy episodes.</figcaption>
+</figure>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: One grad-log-pi Update for a Single Action</div>
+<p>Take a two-action softmax policy in some state $s$ with logits $z = (z_0, z_1) = (0.0, 1.0)$, so the probabilities are $\pi(a_0) = e^{0}/(e^{0}+e^{1}) = 1/(1+e) \approx 0.269$ and $\pi(a_1) \approx 0.731$. Suppose we sampled action $a_0$ and its return-to-go came out positive, $G = +2.0$. For a softmax, the score function with respect to the logits is $\nabla_z \log \pi(a_0) = \mathbf{1}[a = a_0] - \pi = (1, 0) - (0.269, 0.731) = (0.731, -0.731)$. The REINFORCE gradient contribution is $G \cdot \nabla_z \log\pi(a_0) = 2.0 \cdot (0.731, -0.731) = (1.462, -1.462)$. Ascending it (add $\alpha$ times the gradient to $z$) <em>raises</em> $z_0$ and <em>lowers</em> $z_1$: because $a_0$ led to positive return, the policy is nudged to make $a_0$ more probable next time. Had $G$ been negative, the same arithmetic would push the other way, suppressing $a_0$. This one update, log-prob gradient scaled by realized return, is the entire learning signal of REINFORCE, summed over every action in every sampled episode.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Trick That Refused to Need a Model</div>
+<p>The quietly miraculous moment in the derivation is when the environment's transition dynamics $P(s_{t+1}\mid s_t, a_t)$ get hit by $\nabla_\theta$ and simply evaporate, because they do not depend on $\theta$. The agent is computing the gradient of "how the world rewards me" without ever writing down a single equation for how the world works. It is as if you optimized your commute by adjusting only your own choices and letting the traffic, which you never modeled, cancel itself out of the calculus. That cancellation is why REINFORCE is called <em>model-free</em>, and it is the same score-function identity that powers variational inference, black-box gradient estimation, and the policy-optimization step inside modern LLM fine-tuning.</p>
+</div>
+
+<h2>3. Variance Reduction: Baselines and the Advantage Function <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>REINFORCE is unbiased but its variance is brutal. The estimator multiplies each $\nabla_\theta \log\pi$ by a raw Monte Carlo return $G_t$, and returns swing wildly across episodes (one lucky rollout, one disaster), so the gradient direction is correct on average but jittery on any single batch, and learning is slow and unstable. The standard cure is to subtract a <em>baseline</em> $b(s_t)$, a quantity that depends on the state but not on the action taken, from the return before weighting the score:</p>
+$$\nabla_\theta J(\theta) = \mathbb{E}_{\tau \sim \pi_\theta}\!\bigg[\sum_{t \ge 0} \nabla_\theta \log\pi_\theta(a_t \mid s_t)\,\big(G_t - b(s_t)\big)\bigg].$$
+<p>The remarkable and load-bearing fact is that subtracting <em>any</em> action-independent baseline leaves the gradient exactly unbiased while typically slashing its variance. The unbiasedness follows from a one-line argument. The extra term the baseline introduces is, in expectation over the action drawn from $\pi_\theta$,</p>
+$$\mathbb{E}_{a \sim \pi_\theta}\!\big[\nabla_\theta \log\pi_\theta(a \mid s)\, b(s)\big] = b(s)\,\mathbb{E}_{a \sim \pi_\theta}\!\big[\nabla_\theta \log\pi_\theta(a \mid s)\big] = b(s)\sum_a \pi_\theta(a\mid s)\,\frac{\nabla_\theta \pi_\theta(a\mid s)}{\pi_\theta(a\mid s)} = b(s)\,\nabla_\theta \sum_a \pi_\theta(a\mid s) = b(s)\,\nabla_\theta 1 = 0.$$
+<p>The baseline can be pulled out of the action-expectation (it does not depend on $a$), the score-function expectation collapses to the gradient of the total probability mass, and that mass is identically one, whose gradient is zero. So the baseline contributes nothing to the mean and only reshapes the variance. The variance-optimal scalar baseline is a return-weighted average of squared scores, but in practice the near-optimal and standard choice is the state-value function $b(s) = V(s)$, the expected return from $s$ under the current policy. Subtracting it converts the raw return into the <strong>advantage</strong>,</p>
+$$A(s_t, a_t) \;=\; G_t - V(s_t) \;\approx\; Q(s_t, a_t) - V(s_t),$$
+<p>which measures how much better action $a_t$ was than the policy's average behavior in state $s_t$. The intuition is sharp: weighting the score by the advantage rather than the raw return means we raise the probability of an action only if it did <em>better than expected</em> for that state, and lower it if it did worse, rather than mechanically rewarding every action that happened to occur in a high-reward state. A move that returns $+100$ in a state where the average is $+105$ is, correctly, a <em>discouraged</em> move; the raw-return estimator would have rewarded it. Figure 25.2.2 contrasts the two weightings.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Property</th><th>Plain REINFORCE (weight $G_t$)</th><th>REINFORCE with baseline (weight $G_t - V(s_t)$)</th></tr></thead>
+<tbody>
+<tr><td>bias of the gradient</td><td>unbiased</td><td>unbiased (baseline is action-independent)</td></tr>
+<tr><td>variance</td><td>high: raw returns swing widely</td><td>much lower: centered on the state's average</td></tr>
+<tr><td>signal interpretation</td><td>"this action occurred in a good episode"</td><td>"this action beat the state's average"</td></tr>
+<tr><td>credit in a uniformly-good state</td><td>rewards every action seen</td><td>near-zero signal, correctly indifferent</td></tr>
+<tr><td>extra machinery</td><td>none</td><td>a learned value estimate $V_\phi(s)$</td></tr>
+<tr><td>typical effect on training</td><td>slow, noisy convergence</td><td>faster, markedly more stable</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 25.2.2:</strong> Plain REINFORCE versus REINFORCE with a value baseline. Both estimate the same (unbiased) gradient, but centering the return on a learned $V(s)$ removes the variance that comes from states being intrinsically high- or low-reward, leaving a signal that measures only how an action compares to the policy's own average in that state.</figcaption>
+</figure>
+<p>Implementing the baseline costs one extra learned object: a value network $V_\phi(s)$ trained by regression to fit the observed returns $G_t$ (minimizing $\sum_t (V_\phi(s_t) - G_t)^2$), running alongside the policy network. This is the first appearance of the two-network structure (a policy and a value estimate) that, when the value estimate is also used to <em>bootstrap</em> rather than only to center, becomes the actor-critic of <a href="section-25.3.html">Section 25.3</a>. The line between "REINFORCE with a value baseline" and "actor-critic" is exactly whether the value network only subtracts a baseline (this section) or also supplies bootstrapped targets that replace the Monte Carlo return (the next section).</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: How a Baseline Centers the Signal</div>
+<p>Suppose in a particular state $s$ the policy's value is $V(s) = 8.0$ (its average return from here), and across three sampled episodes the action taken from $s$ yielded returns-to-go $G = 10$, $G = 8$, and $G = 6$. Plain REINFORCE weights the three score vectors by $10, 8, 6$: all positive, so every one of these actions has its probability pushed <em>up</em>, even the below-average one, and the gradient magnitude is dominated by the shared offset of about $8$. With the baseline, the weights become advantages $A = G - V = +2, 0, -2$: the above-average action is encouraged, the average one gets no push, and the below-average one is actively discouraged. The mean weight dropped from $8$ to $0$ while the discriminating differences ($+2, 0, -2$) survived intact. That collapse of the common offset, with the informative spread preserved, is variance reduction made arithmetic: the same useful signal, far less noise.</p>
+</div>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Subtract the Expected, Keep the Surprising</div>
+<p>A baseline is a free lunch with a proof attached. Subtracting any function of the state alone changes nothing in expectation (the score function integrates to zero against a constant-in-action factor) but can dramatically cut variance. The natural baseline is the state value $V(s)$, and the return-minus-value remainder is the advantage $A(s, a) = G - V(s)$, the answer to "was this action better or worse than this state's average?" Weighting policy updates by advantage rather than raw return is the conceptual hinge of every modern policy-gradient method: REINFORCE-with-baseline here, A2C and PPO in <a href="section-25.3.html">Section 25.3</a> and <a href="../module-26-advanced-rl/index.html">Chapter 26</a>, all share the rule "push toward actions whose advantage is positive." The only thing they change is how the advantage is estimated.</p>
+</div>
+
+<h2>4. On-Policy Inefficiency and the Road to Actor-Critic <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The policy gradient is an expectation under $\pi_\theta$, the current policy. The instant we take a gradient step and change $\theta$, every episode we collected was generated by the old policy and is no longer a valid sample from the new one. So the data must be thrown away after a single update and fresh episodes collected. This <em>on-policy</em> constraint is the structural weakness of pure policy gradients, and it stands in sharp contrast to the value-based methods of <a href="section-25.1.html">Section 25.1</a>, whose replay buffer reused each transition hundreds of times because a $Q$-target is a property of the environment, not of the data-collecting policy.</p>
+<p>The consequence is sample inefficiency: REINFORCE needs a great many environment interactions to learn, because every interaction is spent once and discarded. Combined with the Monte Carlo variance of subsection three, even with a baseline, pure REINFORCE is rarely the algorithm one ships. Two complementary fixes define the rest of the chapter, and both are previewed here so the next section reads as their culmination.</p>
+<ul>
+<li><strong>Bootstrap the return with a critic.</strong> Instead of waiting for a full episode to compute the Monte Carlo return $G_t$, estimate it from a learned value function using a one-step (or $n$-step) bootstrap, $G_t \approx r_t + \gamma V_\phi(s_{t+1})$. The advantage becomes the temporal-difference error $\delta_t = r_t + \gamma V_\phi(s_{t+1}) - V_\phi(s_t)$, which has far lower variance than a full Monte Carlo return (at the cost of some bias from the imperfect $V_\phi$). A policy updated by this bootstrapped advantage is an <strong>actor-critic</strong>: the actor is $\pi_\theta$, the critic is $V_\phi$, and the critic's job has grown from "subtract a baseline" to "supply the target." This is the subject of <a href="section-25.3.html">Section 25.3</a> (A2C and A3C).</li>
+<li><strong>Reuse data with importance weighting and a trust region.</strong> If we correct for the mismatch between the old data-collecting policy and the current one with an importance ratio $\pi_\theta / \pi_{\theta_\text{old}}$, we can take several gradient steps on the same batch, recovering some of the sample efficiency that the on-policy constraint cost us. Doing this safely (the ratio must not move too far) is what proximal policy optimization (PPO) and trust-region methods provide, the subject of <a href="section-25.3.html">Section 25.3</a> and <a href="../module-26-advanced-rl/index.html">Chapter 26</a>.</li>
+</ul>
+<p>So the narrative arc of this chapter is set by the two weaknesses this section exposes. Variance, addressed by the baseline of subsection three and pushed further by the critic's low-variance bootstrap. Sample inefficiency, addressed by the critic's reuse of single transitions and by PPO's importance-weighted multi-step updates. Every advanced policy-gradient algorithm you will meet is REINFORCE plus a particular answer to "how do I estimate the advantage with less variance?" and "how do I reuse data without breaking the on-policy assumption?"</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Policy Gradients in the Age of Large Models (2024 to 2026)</div>
+<p>The score-function gradient derived in subsection two has become, somewhat unexpectedly, central to frontier large-model training. Reinforcement learning from human feedback (RLHF) fine-tunes language models with PPO, a direct descendant of the policy gradient theorem, treating token generation as a sequential decision problem of the kind <a href="../../toc.html">Chapter 28</a> formalizes. The 2024 surge in reasoning models pushed this further: Group Relative Policy Optimization (GRPO), introduced for DeepSeekMath and central to DeepSeek-R1 (2025), drops the learned value critic entirely and computes the advantage as a return centered on the <em>group</em> mean of several sampled completions, a baseline that is exactly the action-independent subtraction proved unbiased in subsection three, applied at the level of sampled answers. In parallel, REINFORCE-style estimators have made a comeback for LLM alignment (for example RLOO, REINFORCE leave-one-out, 2024) precisely because the critic is expensive at scale and a well-chosen Monte Carlo baseline recovers most of its benefit. The practitioner's 2026 takeaway: the two knobs this section isolates, the advantage estimator and the baseline, are still exactly where the action is, now at the scale of billion-parameter policies over token sequences.</p>
+</div>
+
+<h2>5. Worked Example: REINFORCE With a Baseline From Scratch, Then a Library <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make the whole pipeline executable on a real environment. The plan: implement REINFORCE with a value baseline entirely from scratch in PyTorch on the classic <code>CartPole-v1</code> Gymnasium task (balance a pole by pushing a cart left or right), train it until it solves the task, and plot the return curve climbing. Then we reproduce a comparable policy-gradient agent in a few library lines and state the line-count reduction. Code 25.2.1 is the from-scratch agent: a policy network, a value-baseline network, episode rollout, return computation, and the policy-plus-value update of subsections two and three.</p>
+<pre><code class="language-python">import gymnasium as gym
+import torch, torch.nn as nn
+import numpy as np
+
+torch.manual_seed(0); np.random.seed(0)
+env = gym.make("CartPole-v1")
+obs_dim = env.observation_space.shape[0]   # 4 state features
+n_act   = env.action_space.n               # 2 discrete actions (left, right)
+
+policy = nn.Sequential(nn.Linear(obs_dim, 128), nn.Tanh(), nn.Linear(128, n_act))
+value  = nn.Sequential(nn.Linear(obs_dim, 128), nn.Tanh(), nn.Linear(128, 1))
+opt_p = torch.optim.Adam(policy.parameters(), lr=3e-3)
+opt_v = torch.optim.Adam(value.parameters(),  lr=1e-2)
+gamma = 0.99
+
+def run_episode():
+    """Roll the current policy out for one full episode; cache log-probs, values, rewards."""
+    s, _ = env.reset()
+    log_probs, values, rewards = [], [], []
+    done = False
+    while not done:
+        st = torch.as_tensor(s, dtype=torch.float32)
+        logits = policy(st)
+        dist = torch.distributions.Categorical(logits=logits)  # softmax policy pi(a|s)
+        a = dist.sample()                                      # sample an action ON-policy
+        log_probs.append(dist.log_prob(a))                    # log pi(a_t | s_t)
+        values.append(value(st).squeeze())                    # baseline V(s_t)
+        s, r, term, trunc, _ = env.step(a.item())
+        rewards.append(r); done = term or trunc
+    return log_probs, values, rewards
+
+def returns_to_go(rewards):
+    """G_t = r_t + gamma G_{t+1}, computed backward over the episode."""
+    G, out = 0.0, []
+    for r in reversed(rewards):
+        G = r + gamma * G
+        out.append(G)
+    return torch.tensor(out[::-1], dtype=torch.float32)
+
+history = []
+for episode in range(600):
+    log_probs, values, rewards = run_episode()
+    G = returns_to_go(rewards)                      # Monte Carlo returns-to-go
+    V = torch.stack(values)
+    adv = G - V.detach()                            # advantage A_t = G_t - V(s_t); detach: critic is a baseline only
+    logp = torch.stack(log_probs)
+    policy_loss = -(logp * adv).sum()               # ascend grad-log-pi * advantage  => minimize its negative
+    value_loss  = ((V - G) ** 2).mean()             # regress the baseline V_phi(s) -> G_t
+    opt_p.zero_grad(); policy_loss.backward(); opt_p.step()
+    opt_v.zero_grad(); value_loss.backward();  opt_v.step()
+    history.append(sum(rewards))
+    if episode % 100 == 0:
+        print(f"ep {episode:3d}  return {np.mean(history[-20:]):6.1f}")
+</code></pre>
+<div class="code-caption"><strong>Code 25.2.1:</strong> REINFORCE with a value baseline from scratch on CartPole. The policy network defines $\pi_\theta(a\mid s)$ via a <code>Categorical</code> distribution; <code>run_episode</code> collects one on-policy trajectory; <code>returns_to_go</code> computes $G_t$; the advantage $G_t - V(s_t)$ weights the score $\log\pi_\theta(a_t\mid s_t)$ (the <code>.detach()</code> on $V$ enforces that the critic acts only as a baseline, not a differentiated target, exactly as subsection three requires), and the value network is regressed toward $G_t$.</div>
+<pre><code class="language-text">ep   0  return   21.0
+ep 100  return  102.4
+ep 200  return  187.6
+ep 300  return  421.8
+ep 400  return  498.5
+ep 500  return  500.0
+</code></pre>
+<div class="code-caption"><strong>Output 25.2.1:</strong> The mean episode return climbs from a random-policy baseline near 21 to the CartPole-v1 ceiling of 500, the agent has learned to balance the pole. The curve is the unbiased advantage-weighted policy gradient of subsections two and three doing its work over six hundred on-policy episodes.</div>
+<p>The numbers tell the story of subsection three made empirical: the return rises monotonically once the baseline starts centering the signal, and it reaches the environment's 500-step cap. Code 25.2.2 turns the recorded <code>history</code> into the learning curve, a return-versus-episode plot with a smoothed trend so the climb is legible through the Monte Carlo noise that subsection three warned about.</p>
+<pre><code class="language-python">import matplotlib.pyplot as plt
+
+h = np.array(history)
+smooth = np.convolve(h, np.ones(20) / 20, mode="valid")   # 20-episode moving average
+plt.figure(figsize=(7, 4))
+plt.plot(h, alpha=0.3, label="per-episode return")        # raw, noisy (high variance)
+plt.plot(range(19, len(h)), smooth, lw=2, label="20-ep moving average")
+plt.xlabel("episode"); plt.ylabel("return"); plt.title("REINFORCE + baseline on CartPole-v1")
+plt.legend(); plt.tight_layout(); plt.savefig("reinforce_curve.png", dpi=120)
+</code></pre>
+<div class="code-caption"><strong>Code 25.2.2:</strong> Plotting the learning curve. The faint per-episode line shows the raw Monte Carlo variance the baseline could not fully remove; the bold moving average shows the underlying climb toward the 500-step solved threshold, the visual signature of a working policy gradient.</div>
+<p>Now the library equivalent. The from-scratch agent above is roughly 45 lines of rollout, return, advantage, and dual-optimizer bookkeeping. A modern RL library collapses the same on-policy policy-gradient training, network construction, rollout collection, advantage estimation, and the update loop, into a handful of lines. Code 25.2.3 trains a comparable agent with Stable-Baselines3, whose A2C is a synchronous actor-critic built directly on the advantage-weighted policy gradient of this section.</p>
+<pre><code class="language-python">from stable_baselines3 import A2C
+
+# Construct, train, and evaluate an advantage-actor-critic policy-gradient agent.
+model = A2C("MlpPolicy", "CartPole-v1", gamma=0.99, seed=0, verbose=0)
+model.learn(total_timesteps=100_000)               # rollout + advantage + policy/value update, all internal
+
+# Roll out the trained policy and report mean return.
+env = gym.make("CartPole-v1")
+returns = []
+for _ in range(20):
+    s, _ = env.reset(); done = False; total = 0.0
+    while not done:
+        a, _ = model.predict(s, deterministic=True) # greedy action from the learned policy
+        s, r, term, trunc, _ = env.step(int(a)); total += r; done = term or trunc
+    returns.append(total)
+print(f"library A2C mean return over 20 eval episodes: {np.mean(returns):.1f}")
+</code></pre>
+<div class="code-caption"><strong>Code 25.2.3:</strong> The same task with Stable-Baselines3. The roughly 45 lines of from-scratch rollout, return-to-go, advantage centering, and dual-network update in Code 25.2.1 collapse to the three lines <code>A2C(...)</code>, <code>model.learn(...)</code>, and <code>model.predict(...)</code>: the library handles the policy and value networks, vectorized rollouts, advantage estimation, and the optimizer loop internally, applying the exact advantage-weighted policy gradient derived in subsections two and three.</div>
+<pre><code class="language-text">library A2C mean return over 20 eval episodes: 500.0</code></pre>
+<div class="code-caption"><strong>Output 25.2.3:</strong> The library agent also reaches the 500-step ceiling, confirming the from-scratch and packaged versions optimize the same objective by the same policy gradient. The line count fell from about 45 (hand-rolled training loop) to about 3 (construct, learn, predict).</div>
+<p>Read the three code blocks together. Code 25.2.1 implemented the policy gradient theorem and the value baseline by hand and trained CartPole to solved; Code 25.2.2 plotted the climb that subsection three's variance reduction made smooth enough to learn; Code 25.2.3 reproduced the result in three lines, with every piece, rollout, advantage, dual update, handled by the library. The pedagogical payoff is that the policy gradient is not a black box: you can derive it, code it on a real environment, watch it learn, and then recognize the identical algorithm inside the production tools of the temporal-AI toolbox.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Policy Gradient for Dynamic Inventory Pricing</div>
+<p><strong>Who:</strong> A pricing team at an online retailer optimizing a daily markdown policy for perishable stock, a sequential decision problem layered on the demand forecasts of <a href="../../part-2-classical-forecasting/module-05-univariate-forecasting/index.html">Chapter 5</a>.</p>
+<p><strong>Situation:</strong> Each day the agent observes inventory level, days-to-expiry, and recent demand, and chooses a discount tier; the reward is realized margin, with spoilage heavily penalized. The action effect is stochastic (demand is random) and the team wanted a policy that could express genuine randomness over tiers, not a brittle deterministic rule.</p>
+<p><strong>Problem:</strong> A value-based DQN (<a href="section-25.1.html">Section 25.1</a>) gave a deterministic argmax policy that oscillated between two tiers near decision boundaries and was hard to regularize toward smooth, slightly-randomized pricing. They wanted the stochastic-policy expressiveness of subsection one.</p>
+<p><strong>Dilemma:</strong> Plain REINFORCE was attractive for its direct stochastic policy but, on their noisy margin signal, its gradient variance (subsection three) made training erratic, and its on-policy data hunger (subsection four) made each simulator run expensive.</p>
+<p><strong>Decision:</strong> They used REINFORCE with a learned value baseline, exactly the structure of Code 25.2.1, so the advantage centered the noisy daily margin on each state's expected margin, and they trained against a calibrated demand simulator to amortize the on-policy sample cost.</p>
+<p><strong>How:</strong> A softmax policy over discount tiers and a value network regressed to realized returns; the advantage $G_t - V(s_t)$ weighted the log-probability updates, with the value <code>.detach()</code>ed so the critic served only as a baseline, as in subsection three.</p>
+<p><strong>Result:</strong> The baseline cut gradient variance enough to train stably; the learned policy was genuinely stochastic near boundaries (mixing tiers rather than flipping), reduced spoilage against the deterministic baseline, and exposed a clean knob (the advantage sign) for the analysts to audit which states drove markdowns.</p>
+<p><strong>Lesson:</strong> When the problem wants a stochastic policy and a noisy reward, the policy gradient with a value baseline is the natural first reach: the baseline buys the stability, the direct parameterization buys the stochasticity, and the on-policy cost is managed by training in simulation before deployment.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Advantage Actor-Critic in Three Lines</div>
+<p>The from-scratch agent of Code 25.2.1 ran roughly 45 lines: rollout loop, returns-to-go, advantage centering, two optimizers, and the training loop. Stable-Baselines3 (or CleanRL, RLlib, Tianshou) collapses the entire thing, networks, vectorized rollouts, advantage estimation, and the policy-plus-value update, to three lines, with the on-policy advantage-weighted gradient of this section computed internally.</p>
+<pre><code class="language-python">from stable_baselines3 import A2C
+model = A2C("MlpPolicy", "CartPole-v1", gamma=0.99)   # policy + value networks built for you
+model.learn(total_timesteps=100_000)                  # rollout, advantage, update: all internal
+</code></pre>
+<p>The line count drops from about 45 (hand-rolled REINFORCE-with-baseline) to about 3, with the rollout collection, advantage computation, and dual-network optimization that subsections two, three, and five spelled out by hand all handled by the library. Swap <code>A2C</code> for <code>PPO</code> and you get the trust-region, data-reusing successor of <a href="section-25.3.html">Section 25.3</a> with no other change.</p>
+</div>
+<div class="callout looking-back">
+<div class="callout-title">Looking Back: The MDP Objective, Now Differentiable</div>
+<p>The objective $J(\theta) = \mathbb{E}_{\tau \sim \pi_\theta}[\sum_t \gamma^t r_t]$ we just learned to ascend is the same expected discounted return that defined optimality in the Markov decision processes of <a href="../module-22-markov-decision-processes/index.html">Chapter 22</a> and the value functions of <a href="../module-24-bandits-rl-foundations/index.html">Chapter 24</a>. Those chapters told us <em>what</em> to optimize and solved it by dynamic programming over values; the policy gradient theorem tells us how to optimize it directly by differentiating through the policy with the score-function trick. The advantage $A(s, a) = Q(s, a) - V(s)$ that centered our gradient is built from the very $Q$ and $V$ of <a href="../module-24-bandits-rl-foundations/index.html">Chapter 24</a>. Part VI's earlier chapters fixed the objective; this section made it a target for gradient ascent on a neural policy.</p>
+</div>
+
+<div class="callout warning">
+<div class="callout-title">Common Pitfalls in Policy Gradients</div>
+<p>Four mistakes recur when readers first implement policy gradients, and naming them now saves hours of debugging:</p>
+<ul>
+<li><strong>Forgetting to detach the baseline.</strong> The advantage must use $V(s)$ as a <em>constant</em> in the policy loss (hence <code>adv = G - V.detach()</code> in Code 25.2.1). Letting gradients flow from the policy loss into the value network couples the two objectives and produces a biased, unstable update.</li>
+<li><strong>Reusing on-policy data.</strong> A REINFORCE batch is valid for exactly one update. Taking multiple gradient steps on the same episodes (without an importance correction) silently optimizes the wrong objective; this is precisely what PPO's ratio clipping of <a href="section-25.3.html">Section 25.3</a> exists to make safe.</li>
+<li><strong>Sign errors in the loss.</strong> Frameworks <em>minimize</em>, but the policy gradient <em>ascends</em> return, so the loss is the <em>negative</em> advantage-weighted log-prob, <code>-(logp * adv).sum()</code>. Drop the minus sign and the policy will reliably learn to do the worst possible thing.</li>
+<li><strong>Mistaking high return for a good baseline.</strong> A baseline that depends on the action taken is not action-independent and <em>does</em> bias the gradient; the unbiasedness proof of subsection three requires $b$ to be a function of the state alone.</li>
+</ul>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.2.1: Prove the Baseline Is Unbiased <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Starting from the score-function identity $\mathbb{E}_{a \sim \pi_\theta}[\nabla_\theta \log\pi_\theta(a\mid s)] = 0$, prove in full that subtracting any state-dependent baseline $b(s)$ from the return leaves the policy gradient unbiased, filling in every step of the chain $b(s)\sum_a \pi_\theta(a\mid s)\nabla_\theta\log\pi_\theta(a\mid s) = b(s)\nabla_\theta\sum_a \pi_\theta(a\mid s) = 0$. Then explain in one sentence why an <em>action</em>-dependent baseline (for example $b(s, a) = Q(s, a)$ used naively) would break the proof, and identify which step fails.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.2.2: Ablate the Baseline on CartPole <span class="exercise-type coding">Coding</span></div>
+<p>Modify Code 25.2.1 to run with the baseline disabled (set <code>adv = G</code>, i.e. weight the score by the raw return) and again with it enabled, using the same seed and hyperparameters. Plot both learning curves on one axis with the smoothing of Code 25.2.2, and report the variance of the per-episode return over the first 200 episodes for each. Confirm empirically that the baseline leaves the converged return unchanged (unbiased) while reducing the variance of the climb, the claim of subsection three.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.2.3: From Baseline to Bootstrapped Critic <span class="exercise-type analysis">Analysis</span></div>
+<p>The advantage in Code 25.2.1 uses the Monte Carlo return, $A_t = G_t - V(s_t)$. Replace it with the one-step temporal-difference advantage $\delta_t = r_t + \gamma V_\phi(s_{t+1}) - V_\phi(s_t)$ (the actor-critic advantage of <a href="section-25.3.html">Section 25.3</a>), keeping everything else fixed. Argue, in terms of bias and variance, why this change lowers variance but introduces bias, train both variants, and report which converges faster and which reaches a higher final return on CartPole. Connect your finding to the bias-variance trade that distinguishes REINFORCE from actor-critic.</p>
+</div>
+
+<p>We have parameterized a policy directly, derived the gradient of its expected return with the score-function trick, tamed that gradient's variance with a provably unbiased baseline, and trained a working agent on a real environment, by hand and then in three library lines. But two weaknesses remain visible in the return curve and the code: the gradient still carries Monte Carlo variance even with the baseline, and every episode is spent on a single update. The next section attacks both at once. <a href="section-25.3.html">Section 25.3</a> promotes the value baseline into a full <em>critic</em> that bootstraps the return, giving the low-variance temporal-difference advantage, and then builds A2C and A3C on it, before PPO and SAC layer on the trust-region and data-reuse machinery that make policy optimization the workhorse of modern deep reinforcement learning. The advantage you just learned to subtract becomes the quantity the critic learns to predict.</p>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-25.1.html"><span class="nav-label">Previous</span><span class="nav-num">Section 25.1</span><span class="nav-title">Deep Q-Networks and Value-Based Deep RL</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 25</span><span class="nav-num">Contents</span><span class="nav-title">Deep Reinforcement Learning</span></a>
+<a class="next" href="section-25.3.html"><span class="nav-label">Next</span><span class="nav-num">Section 25.3</span><span class="nav-title">Actor-Critic Methods (A2C/A3C, PPO, SAC)</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

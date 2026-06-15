@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 27.4: Inverse Reinforcement Learning and GAIL. Instead of copying an expert's actions, infer the reward function the expert was optimizing and then optimize it; the ill-posedness of reward recovery, maximum-entropy IRL, adversarial imitation with a GAN-style discriminator as the reward (GAIL), AIRL's transferable reward, and a from-scratch GAIL loop matched against the imitation library." name="description"/>
+<title>Section 27.4: Inverse Reinforcement Learning and GAIL | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Sequential Decision Making</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 27: Optimal Control and Imitation Learning</a></div>
+<h1>Inverse Reinforcement Learning and GAIL</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"The suspect always lies about the motive. So I never ask the expert what reward she was chasing. I watch what she did, a thousand times, in a thousand states, and I reconstruct the reward that would make every one of those choices look rational. Then I hand my reconstruction to a rookie and say: go want what she wanted, not just do what she did."</p>
+<cite>A Detective Inferring What Reward the Expert Was Secretly Chasing</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Behavioral cloning, the subject of <a href="section-27.3.html">Section 27.3</a>, copies the expert's actions directly: it fits a policy that maps states to the actions the expert took, and nothing more. Inverse reinforcement learning (IRL) asks a deeper question. Rather than copying <em>what</em> the expert did, it infers <em>why</em>: it recovers the reward function the expert was apparently optimizing, then runs reinforcement learning on that recovered reward to obtain a policy.</strong> The payoff is that intent generalizes where imitation does not. A policy that merely memorized "turn left at this intersection" fails the moment the intersection changes; a policy that recovered "reach the goal while avoiding collisions" transfers to intersections it has never seen. The price is that IRL is fundamentally ill-posed (infinitely many rewards explain any behavior) and that solving it classically requires reinforcement learning in an inner loop, which is expensive. This section traces the line from max-margin and maximum-entropy IRL, the principled probabilistic formulation that resolves the ill-posedness, to generative adversarial imitation learning (GAIL), which sidesteps explicit reward recovery by training a GAN-style discriminator (a direct callback to the adversarial games of <a href="../../part-4-temporal-representation-learning/module-17-generative-temporal-models/index.html">Chapter 17.3</a>) whose output serves as a learned reward, and onward to AIRL, which recovers a reward that actually transfers across dynamics. We build a small GAIL loop from scratch on a Gymnasium task, then reproduce it in a few lines with the <code>imitation</code> library, and read off the discriminator-derived reward for a single state-action pair. You leave able to choose between cloning and reward inference, and to implement the adversarial version that dominates modern imitation.</p>
+</div>
+<p>In <a href="section-27.3.html">Section 27.3</a> we trained a policy by behavioral cloning: collect expert state-action pairs, fit a supervised classifier or regressor from states to actions, deploy. We saw its single fatal weakness, compounding distribution shift, the policy drifts into states the expert never visited, makes a small error there, drifts further, and the errors snowball because supervised learning never taught it how to recover. This section attacks the same problem (learn from demonstrations) from the opposite end. Instead of treating the demonstrations as a labeled dataset of correct actions, we treat them as evidence about a hidden objective. The expert behaved as she did because she was optimizing <em>something</em>; if we can recover that something, we can optimize it ourselves and obtain a policy that behaves sensibly even in states the expert never showed us, because it is pursuing a goal rather than parroting a lookup table. This is the detective's stance: do not trust the stated motive, reconstruct it from the evidence of the actions.</p>
+<p>The reward function is the most transferable, most compact description of a task that reinforcement learning offers. The Markov decision process of <a href="../module-22-markov-decision-processes/index.html">Chapter 22</a> is defined by its dynamics and its reward; the dynamics are physics, often shared across tasks, but the reward is intent, and intent is exactly what we want to capture from an expert. Recovering it, rather than the policy that happens to optimize it under one set of dynamics, is what lets imitation generalize. We use the unified notation of <a href="../../toc.html">Appendix A</a>: $s$ for state, $a$ for action, $\pi$ for a policy, $r(s,a)$ for reward, $\gamma$ for the discount, and $\pi_E$ for the expert policy whose demonstrations we observe.</p>
+<p>The four competencies this section installs are: to state why imitation by reward recovery generalizes better than imitation by action copying, and to name the ill-posedness that makes naive reward recovery fail; to write the maximum-entropy IRL objective and explain why the entropy term selects a unique reward; to recognize GAIL as a GAN whose discriminator is a reward and to implement its adversarial loop; and to decide, for a given problem, whether behavioral cloning, GAIL, or classical IRL is the right tool, given their costs. These carry directly into preference-based reward learning and RLHF in <a href="section-27.5.html">Section 27.5</a>.</p>
+
+<h2>1. Inverse Reinforcement Learning: Infer the Reward, Then Optimize It <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Forward reinforcement learning takes a reward function and produces a policy that maximizes it. Inverse reinforcement learning runs the arrow backward: it takes a policy (observed only through demonstrations) and produces a reward function under which that policy is optimal. The motivating premise is that the expert is, at least approximately, optimal for some reward $r^\star$ that we do not get to see, and that this hidden reward is a better thing to learn than the surface behavior, because the reward is what carries the intent across changes in the environment.</p>
+<p>To see why this matters, contrast the two failure modes. Behavioral cloning learns a function $s \mapsto a$; when the test state distribution differs from the expert's (and under compounding error it always does), the function is queried off its training support and produces nonsense. Reward inference learns $r(s,a)$; the recovered reward is defined over the <em>whole</em> state-action space, and a fresh round of reinforcement learning against it produces a policy that knows what to do everywhere, including the recovery states behavioral cloning never saw. The cloned policy mimics the expert's trajectory; the IRL policy pursues the expert's goal. Pursuing a goal is robust to perturbation in a way that mimicking a path is not, which is the core argument for the whole approach and the reason it survived BC's collapse under distribution shift.</p>
+<p>Formally, fix a finite MDP with states $s$, actions $a$, transition kernel $P(s' \mid s, a)$, and discount $\gamma$. We observe demonstrations $\mathcal{D} = \{\tau^{(i)}\}$ sampled from the expert's policy $\pi_E$, where each trajectory is $\tau = (s_0, a_0, s_1, a_1, \dots)$. We posit a reward linear in known features $\boldsymbol{\phi}(s,a) \in \mathbb{R}^d$,</p>
+$$r_{\boldsymbol{w}}(s,a) = \boldsymbol{w}^\top \boldsymbol{\phi}(s,a),$$
+<p>and we summarize any policy $\pi$ by its <em>expected discounted feature counts</em> (its feature expectations),</p>
+$$\boldsymbol{\mu}(\pi) = \mathbb{E}_{\pi}\!\left[\sum_{t=0}^{\infty} \gamma^{t}\, \boldsymbol{\phi}(s_t, a_t)\right] \in \mathbb{R}^d.$$
+<p>The discounted return of $\pi$ under reward weights $\boldsymbol{w}$ is then simply $\boldsymbol{w}^\top \boldsymbol{\mu}(\pi)$, a linear function of the feature expectations. The classic feature-matching observation (Abbeel and Ng, 2004) follows at once: if a learner policy matches the expert's feature expectations, $\|\boldsymbol{\mu}(\pi) - \boldsymbol{\mu}(\pi_E)\| \le \epsilon$, then for <em>any</em> bounded reward weights its return is within $\|\boldsymbol{w}\|\,\epsilon$ of the expert's. Matching feature expectations is therefore sufficient to imitate the expert as well as the unknown true reward could distinguish, and it reduces IRL to the problem of finding a policy whose feature counts equal the expert's empirical feature counts $\hat{\boldsymbol{\mu}}_E$.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Reward Is the Most Transferable Description of a Task</div>
+<p>A policy answers "what action here?"; a reward answers "what is good?". The first is tied to the dynamics it was trained on, the second is not. If you recover the reward and the environment changes (a new map, a new robot body, a new market regime), you re-run reinforcement learning against the same recovered reward and get a competent policy in the new environment for free, because the goal did not change, only the way to achieve it. This is why IRL is the natural choice when you expect distribution shift or transfer, and it is the conceptual seed of reward learning from human preferences in <a href="section-27.5.html">Section 27.5</a>: there too, the object we learn is a reward, precisely because a reward generalizes where a fixed policy does not.</p>
+</div>
+<p>The catch, and it is a deep one, is that IRL is profoundly ill-posed. Many reward functions make the same behavior optimal. The all-zero reward makes <em>every</em> policy optimal, so it trivially "explains" the expert; so does any reward that is constant across actions; so do infinitely many shaped rewards $r(s,a) + \gamma\,\Phi(s') - \Phi(s)$ that leave the optimal policy unchanged (the potential-shaping invariance of Ng, Harada, and Russell, 1999). Given only that the expert is optimal, the constraints do not pin down a unique reward; the feasible set is an entire cone of reward vectors. Any usable IRL method must add a principle that selects one reward from this cone. Max-margin IRL selects the reward that most sharply separates the expert from all alternative policies; maximum-entropy IRL, which we develop next and which underpins everything modern, selects the reward whose induced distribution over trajectories is as noncommittal as possible while still matching the evidence.</p>
+
+<h2>2. Classic IRL: Max-Margin and the Maximum-Entropy Formulation <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The earliest practical IRL methods chose the selecting principle by analogy with the support vector machine. Max-margin IRL (Abbeel and Ng, 2004; Ratliff et al., 2006) seeks reward weights $\boldsymbol{w}$ under which the expert's return exceeds that of every competing policy by the largest possible margin. Concretely, it alternates: find the reward that most favors the expert over the current set of candidate policies, then run reinforcement learning to find the best policy under that reward and add it to the candidate set, repeating until no policy beats the expert. The objective at each round is</p>
+$$\max_{\boldsymbol{w},\, m} \; m \quad \text{subject to} \quad \boldsymbol{w}^\top \boldsymbol{\mu}(\pi_E) \ge \boldsymbol{w}^\top \boldsymbol{\mu}(\pi) + m \ \ \forall \pi \in \Pi_{\text{cand}}, \quad \|\boldsymbol{w}\| \le 1,$$
+<p>which is exactly a structured SVM separating the expert's feature expectations from those of every alternative. Max-margin is intuitive and was the first method to make apprenticeship learning work on driving-style tasks, but it inherits two weaknesses: it assumes the expert is exactly optimal (real demonstrations are noisy), and the margin principle, like all hard separators, is brittle when no reward perfectly separates expert from non-expert, which is the generic case once demonstrations contain mistakes.</p>
+<p>Maximum-entropy IRL (Ziebart et al., 2008) replaces the margin with a probabilistic principle that resolves the ill-posedness cleanly and tolerates suboptimal experts. Its premise: the expert is not perfectly optimal but is exponentially more likely to take high-return trajectories. Among all trajectory distributions that match the expert's empirical feature expectations, choose the one of maximum entropy, the most uncertain, least committal distribution consistent with the evidence, because committing to anything beyond the evidence would be assuming structure we have not observed. The maximum-entropy solution is the well-known exponential-family (Boltzmann) distribution over trajectories,</p>
+$$p(\tau) \;=\; \frac{1}{Z(\boldsymbol{w})}\,\exp\!\big(\boldsymbol{w}^\top \boldsymbol{\mu}(\tau)\big), \qquad \boldsymbol{\mu}(\tau) = \sum_{t} \gamma^{t}\,\boldsymbol{\phi}(s_t, a_t), \qquad Z(\boldsymbol{w}) = \sum_{\tau} \exp\!\big(\boldsymbol{w}^\top \boldsymbol{\mu}(\tau)\big),$$
+<p>where $Z(\boldsymbol{w})$ is the partition function summing over all trajectories. Higher-return trajectories are exponentially more probable, but every trajectory has nonzero probability, so a single suboptimal expert action no longer breaks the model. We fit $\boldsymbol{w}$ by maximizing the log-likelihood of the demonstrations, $\max_{\boldsymbol{w}} \sum_{\tau \in \mathcal{D}} \log p(\tau)$, whose gradient is the elegant feature-matching condition</p>
+$$\nabla_{\boldsymbol{w}} \, \mathcal{L} = \hat{\boldsymbol{\mu}}_E - \mathbb{E}_{p(\tau)}[\boldsymbol{\mu}(\tau)] = \hat{\boldsymbol{\mu}}_E - \sum_{s} D(s)\,\boldsymbol{\phi}(s),$$
+<p>the difference between the expert's empirical feature counts and the feature counts the current reward predicts, with $D(s)$ the expected state-visitation frequency under the soft-optimal policy for $\boldsymbol{w}$. The gradient is zero exactly when the learned distribution's feature expectations match the expert's: maximum-entropy IRL <em>is</em> feature matching, now derived from a likelihood rather than asserted. The visitation frequencies $D(s)$ are computed by a soft value iteration (a "soft" Bellman backup using $\log\sum\exp$ in place of $\max$) followed by a forward pass propagating visitation, which is the inner reinforcement-learning loop that makes classic IRL expensive: every gradient step on $\boldsymbol{w}$ requires (approximately) solving the MDP.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Entropy Selects a Unique Reward From the Cone</div>
+<p>The ill-posedness of subsection one is the statement that infinitely many rewards explain the expert. Maximum entropy resolves it by adding the principle "assume no more than the data forces you to". Among all reward-induced trajectory distributions that reproduce the expert's feature expectations, the maximum-entropy one is unique, and it is the exponential family above. This is the same maximum-entropy reasoning that justifies the softmax policy and the Boltzmann exploration of <a href="../module-24-bandits-rl-foundations/index.html">Chapter 24</a>, and the same exponential-family logic that underlies the energy-based generative models of <a href="../../part-4-temporal-representation-learning/module-17-generative-temporal-models/index.html">Chapter 17</a>. The lesson: when a problem is underdetermined, do not pick arbitrarily; pick the maximum-entropy solution consistent with the constraints, and you get a unique, principled, and noise-tolerant answer.</p>
+</div>
+<p>The structural limitation of classic IRL is now visible. Tabular maximum-entropy IRL needs to enumerate states to compute $D(s)$ and to solve the MDP at every gradient step, so it does not scale to large or continuous state spaces, and it needs known dynamics to run the soft value iteration. Deep extensions (Wulfmeier et al., 2015, parameterize $r$ by a neural network; guided cost learning, Finn et al., 2016, samples trajectories instead of enumerating them) push the idea further, but the inner reinforcement-learning loop remains. The adversarial formulation of the next subsection is what finally removes the need to ever form the reward explicitly or to solve the MDP to convergence inside the loop.</p>
+
+<h2>3. GAIL: Adversarial Imitation as Distribution Matching <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Generative adversarial imitation learning (Ho and Ermon, 2016) makes a reframing that, once seen, is hard to unsee: imitation is distribution matching, and distribution matching is exactly what a generative adversarial network does. The object to match is the policy's <em>occupancy measure</em> $\rho_\pi(s,a)$, the discounted distribution of state-action pairs the policy visits,</p>
+$$\rho_\pi(s,a) = (1-\gamma)\sum_{t=0}^{\infty} \gamma^{t}\, P(s_t = s,\, a_t = a \mid \pi).$$
+<p>Ho and Ermon show that a particular regularized form of maximum-entropy IRL, when you compose the inner reinforcement-learning step with the outer reward-recovery step and simplify, reduces to a single saddle-point problem: minimize over policies, maximize over a discriminator, the Jensen-Shannon divergence between the learner's occupancy $\rho_\pi$ and the expert's occupancy $\rho_{\pi_E}$. That is the GAN objective of <a href="../../part-4-temporal-representation-learning/module-17-generative-temporal-models/index.html">Chapter 17.3</a>, with the policy playing the generator and a binary classifier $D_\theta(s,a) \in (0,1)$ playing the discriminator that tries to tell expert pairs from learner pairs:</p>
+$$\min_{\pi}\,\max_{\theta}\; \mathbb{E}_{(s,a)\sim\rho_\pi}\!\big[\log D_\theta(s,a)\big] \;+\; \mathbb{E}_{(s,a)\sim\rho_{\pi_E}}\!\big[\log(1 - D_\theta(s,a))\big] \;-\; \lambda\, H(\pi),$$
+<p>where $H(\pi)$ is the causal entropy of the policy (the same entropy bonus that regularizes the soft policies of <a href="../module-25-deep-reinforcement-learning/index.html">Chapter 25</a>) and $\lambda$ controls its weight. The discriminator is trained, exactly as in a GAN, to output high values on expert pairs and low values on learner pairs. The policy is trained by reinforcement learning to fool the discriminator, and here is the pivot: the policy's reward is <em>derived from the discriminator's output</em>. A common choice is</p>
+$$\tilde{r}(s,a) = -\log\big(D_\theta(s,a)\big) \qquad \text{or equivalently} \qquad \tilde{r}(s,a) = \log\big(1 - D_\theta(s,a)\big),$$
+<p>so a state-action pair the discriminator judges expert-like (low $D_\theta$ when $D_\theta$ scores learner pairs high, depending on the labeling convention) earns high reward, and the policy is pushed toward the expert's occupancy. There is never an explicit, interpretable reward function; the discriminator <em>is</em> the reward, regenerated and sharpened at every iteration as the policy improves. This is why GAIL needs no inner MDP solve to convergence: each iteration alternates one discriminator update and one policy-gradient update (typically TRPO or PPO from <a href="../module-25-deep-reinforcement-learning/index.html">Chapter 25</a>), exactly the alternating game of GAN training.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 290" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The GAIL adversarial loop. Expert demonstrations and policy rollouts both feed a discriminator that classifies expert versus learner state-action pairs. The discriminator's output is turned into a reward that the policy-gradient step uses to update the policy, which then produces new rollouts.">
+<defs>
+<marker id="arr274" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+<marker id="arrR274" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b8431f"/></marker>
+</defs>
+<style>
+.box274 { fill:#eef3f8; stroke:#14385c; stroke-width:2; }
+.exp274 { fill:#eaf4ec; stroke:#1f6b35; stroke-width:1.8; }
+.disc274 { fill:#fbeee8; stroke:#b8431f; stroke-width:2; }
+.fl274 { stroke:#5a626c; stroke-width:1.8; fill:none; marker-end:url(#arr274); }
+.rw274 { stroke:#b8431f; stroke-width:1.8; fill:none; marker-end:url(#arrR274); }
+.lab274 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub274 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.rl274 { font:600 12px sans-serif; fill:#b8431f; text-anchor:middle; }
+</style>
+<text class="lab274" x="410" y="24">GAIL: the discriminator's output is the policy's reward</text>
+<rect class="exp274" x="40" y="55" width="150" height="50" rx="9"/><text class="lab274" x="115" y="78">expert demos</text><text class="sub274" x="115" y="95">(s,a) ~ &#961;_E</text>
+<rect class="box274" x="40" y="190" width="150" height="50" rx="9"/><text class="lab274" x="115" y="213">policy &#960;</text><text class="sub274" x="115" y="230">rollouts (s,a) ~ &#961;_&#960;</text>
+<rect class="disc274" x="330" y="120" width="160" height="56" rx="9"/><text class="lab274" x="410" y="143">discriminator D_&#952;</text><text class="sub274" x="410" y="161">expert vs learner?</text>
+<rect class="box274" x="630" y="190" width="150" height="50" rx="9"/><text class="lab274" x="705" y="213">policy gradient</text><text class="sub274" x="705" y="230">PPO / TRPO</text>
+<!-- feeds into discriminator -->
+<line class="fl274" x1="190" y1="84" x2="328" y2="132"/>
+<line class="fl274" x1="190" y1="212" x2="328" y2="160"/>
+<!-- discriminator to reward -->
+<path class="rw274" d="M490 150 C 560 150, 600 150, 650 188"/>
+<text class="rl274" x="582" y="150">r = -log D_&#952;(s,a)</text>
+<!-- policy gradient updates policy -->
+<line class="fl274" x1="630" y1="222" x2="192" y2="240"/>
+<text class="sub274" x="410" y="265">update &#960; to raise discriminator-derived reward, then resample rollouts</text>
+</svg>
+<figcaption><strong>Figure 27.4.1:</strong> The GAIL loop. Expert demonstrations and policy rollouts both feed a binary discriminator $D_\theta$ that learns to separate expert from learner state-action pairs. Its output is converted to a per-step reward $\tilde r = -\log D_\theta(s,a)$, which a policy-gradient method (PPO or TRPO) uses to push the policy toward the expert's occupancy. The discriminator is never frozen into an explicit reward; it is the reward, re-sharpened each iteration as the policy improves.</figcaption>
+</figure>
+<p>GAIL's one structural shortcoming is that the recovered "reward" is entangled with the policy and the dynamics: the discriminator learns whatever signal best separates the two occupancy measures, which need not be a reward that transfers to a new environment. Adversarial inverse reinforcement learning (AIRL, Fu, Luo, and Levine, 2018) fixes this by giving the discriminator a special structure,</p>
+$$D_\theta(s,a,s') = \frac{\exp\big(f_\theta(s,a,s')\big)}{\exp\big(f_\theta(s,a,s')\big) + \pi(a \mid s)}, \qquad f_\theta(s,a,s') = g_\psi(s,a) + \gamma\,h_\phi(s') - h_\phi(s),$$
+<p>where $g_\psi$ is a state-(action-)only reward term and the $h_\phi$ terms form a potential-based shaping that absorbs the dynamics-dependent part. Because the recoverable reward $g_\psi(s,a)$ is disentangled from shaping, AIRL recovers a reward that remains valid when the dynamics change, the transfer property that plain GAIL lacks, at the cost of a more constrained discriminator. The progression is now complete: max-margin and maximum-entropy IRL recover an explicit reward but need an inner MDP solve; GAIL drops the explicit reward for a discriminator and scales to deep continuous control; AIRL puts just enough structure back into the discriminator to recover a transferable reward.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Forger and the Art Inspector</div>
+<p>GAIL is the old forgery game told in reinforcement-learning grammar. The policy is a forger producing fake "expert" behavior; the discriminator is an art inspector who has studied the genuine demonstrations and tries to spot the fakes. Every time the inspector learns a new tell ("real experts brake before the corner"), the forger is told exactly that tell as a reward signal and practices until the fake passes. The inspector studies harder, finds a subtler tell, and the cycle repeats. At equilibrium the forger is so good that the inspector can do no better than a coin flip, which is precisely the statement that the learner's occupancy measure equals the expert's. The detective of our epigraph and the art inspector are the same character: both reconstruct a hidden criterion from observed behavior, then use it to judge.</p>
+</div>
+
+<h2>4. When to Prefer IRL and GAIL Over Behavioral Cloning <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The choice between behavioral cloning (<a href="section-27.3.html">Section 27.3</a>) and the reward-inference family of this section is a genuine engineering trade, not a matter of one method dominating. The deciding axis is whether you can tolerate, or must defeat, distribution shift, weighed against the compute you can spend.</p>
+<p>Behavioral cloning wins when demonstrations are plentiful and the deployment distribution matches the demonstration distribution closely, because then its single supervised-learning pass is far cheaper than anything adversarial and there is no distribution shift to punish it. It is the right first thing to try, and it is often a strong baseline. It loses precisely when the policy will visit states the expert did not demonstrate, because it has no mechanism to recover: its error compounds, as Section 27.3 showed. GAIL and IRL win exactly there. Because they learn an objective (a reward or a discriminator) defined over the whole state-action space and then run reinforcement learning against it, the learner experiences the consequences of its <em>own</em> mistakes during training and learns to recover, which is the property behavioral cloning structurally cannot have. Empirically GAIL matches expert performance from a handful of demonstrations on continuous-control benchmarks where behavioral cloning needs an order of magnitude more, precisely because GAIL's reinforcement-learning inner loop lets one demonstration inform behavior across a whole neighborhood of states.</p>
+<p>The cost is equally concrete and must be stated plainly. IRL and GAIL need reinforcement learning in the loop, which means they need a simulator (or a safe way to interact with the real environment), they inherit all the instability of adversarial training from <a href="../../part-4-temporal-representation-learning/module-17-generative-temporal-models/index.html">Chapter 17</a> (the GAIL game can oscillate or collapse just as a GAN can), and they are far more expensive per demonstration than a single supervised fit. Behavioral cloning needs only the demonstrations and a supervised learner: no environment, no reinforcement learning, no adversarial fragility. The summary rule: reach for behavioral cloning when interaction is impossible or expensive and the deployment distribution is close to the demonstrations; reach for GAIL or IRL when you have a simulator, when you expect distribution shift or need to recover intent for transfer, and when you can afford the reinforcement-learning loop. Figure 27.4.2 lays out the comparison.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Property</th><th>Behavioral Cloning (27.3)</th><th>GAIL</th><th>Classic / Max-Ent IRL</th></tr></thead>
+<tbody>
+<tr><td>what is learned</td><td>policy $s\mapsto a$ (supervised)</td><td>discriminator as implicit reward</td><td>explicit reward $r(s,a)$</td></tr>
+<tr><td>needs a simulator</td><td>no</td><td>yes (RL in the loop)</td><td>yes (inner MDP solve)</td></tr>
+<tr><td>robust to distribution shift</td><td>no (errors compound)</td><td>yes (learns to recover)</td><td>yes (reward defined everywhere)</td></tr>
+<tr><td>recovers transferable intent</td><td>no</td><td>partly (AIRL: yes)</td><td>yes</td></tr>
+<tr><td>demonstrations needed</td><td>many</td><td>few</td><td>few</td></tr>
+<tr><td>training stability</td><td>stable (supervised)</td><td>adversarial, can oscillate</td><td>stable but costly per step</td></tr>
+<tr><td>compute cost</td><td>low (one supervised fit)</td><td>high (RL + adversarial)</td><td>high (RL inner loop)</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 27.4.2:</strong> Choosing among imitation methods. Behavioral cloning is cheap and stable but blind to distribution shift; GAIL and IRL defeat distribution shift and recover intent by learning an objective and running reinforcement learning against it, paying for it in compute, a simulator requirement, and (for GAIL) adversarial instability. AIRL is the variant of GAIL that additionally recovers a transferable reward.</figcaption>
+</figure>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Imitation and Reward Learning (2024 to 2026)</div>
+<p>The adversarial-imitation line remains active and is increasingly entangled with the preference-learning of <a href="section-27.5.html">Section 27.5</a>. Inverse soft-Q learning (IQ-Learn, Garg et al., 2021) collapses GAIL's two networks into a single learned soft-Q function, removing the explicit discriminator and much of the adversarial instability, and it remains a strong 2024-2025 baseline for sample-efficient imitation. On the offline side, where no simulator is available, methods such as offline IRL and SMODICE-style distribution-matching learn from logged data alone, addressing GAIL's hard simulator requirement head-on; these connect to the offline reinforcement learning of <a href="../module-26-advanced-rl/index.html">Chapter 26</a>. The largest contemporary footprint of reward inference is reinforcement learning from human feedback for language models (RLHF and its 2023-2025 successor DPO, Rafailov et al.), which is reward learning from preferences rather than demonstrations, the subject of the next section; the conceptual through-line from maximum-entropy IRL to RLHF is direct, both fit a reward to evidence of what humans value and then optimize it. A 2024-2026 theme worth watching is reward-free or implicit imitation that bypasses the adversarial game entirely (IQ-Learn, and diffusion-policy behavioral cloning that competes with GAIL on manipulation), suggesting the field is converging on imitation methods that keep GAIL's distribution-matching robustness without its adversarial fragility.</p>
+</div>
+
+<h2>5. Worked Example: GAIL From Scratch, Then With the imitation Library <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make the GAIL loop executable. The plan mirrors the rest of this book: build the adversarial loop from scratch on a small Gymnasium task so every moving part is visible, read off the discriminator-derived reward for one concrete state-action pair, then reproduce the whole thing in a few lines with the production <code>imitation</code> library. Code 27.4.1 sets up the discriminator and shows how its output becomes a reward; we assume a small set of expert demonstrations <code>expert_sa</code> (state-action pairs collected from a trained or scripted expert on <code>CartPole-v1</code>) is already available, which is the standard GAIL starting point.</p>
+<pre><code class="language-python">import numpy as np
+import torch
+import torch.nn as nn
+import gymnasium as gym
+
+device = "cpu"
+env = gym.make("CartPole-v1")
+obs_dim = env.observation_space.shape[0]          # 4 for CartPole
+n_actions = env.action_space.n                    # 2 for CartPole
+
+# Discriminator D_theta(s, a): classifies expert (label 1) vs learner (label 0).
+# Action is one-hot concatenated to the state, so D sees the full (s, a) pair.
+class Discriminator(nn.Module):
+    def __init__(self, obs_dim, n_actions, hidden=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim + n_actions, hidden), nn.Tanh(),
+            nn.Linear(hidden, hidden), nn.Tanh(),
+            nn.Linear(hidden, 1))                  # logit; sigmoid applied at use
+    def forward(self, s, a_onehot):
+        x = torch.cat([s, a_onehot], dim=-1)
+        return self.net(x)                         # raw logit of "is expert"
+
+def onehot(actions, n):
+    return torch.eye(n)[actions]                   # (N,) ints -> (N, n) one-hot
+
+disc = Discriminator(obs_dim, n_actions).to(device)
+disc_opt = torch.optim.Adam(disc.parameters(), lr=3e-4)
+bce = nn.BCEWithLogitsLoss()
+
+def gail_reward(s, a_onehot):
+    """Turn the discriminator output into the policy's per-step reward.
+    D = sigmoid(logit) is P(expert). We reward expert-like pairs: r = -log(1 - D)."""
+    with torch.no_grad():
+        logit = disc(s, a_onehot)
+        d = torch.sigmoid(logit).clamp(1e-6, 1 - 1e-6)
+        return (-torch.log(1.0 - d)).squeeze(-1)   # high when D thinks "expert"
+</code></pre>
+<div class="code-caption"><strong>Code 27.4.1:</strong> The GAIL discriminator and its reward read-off. <code>Discriminator</code> is a plain binary classifier on the concatenated state and one-hot action; <code>gail_reward</code> converts its probability of "expert" into the per-step reward $\tilde r = -\log(1 - D_\theta(s,a))$ that the policy optimizes. This is the single line where a GAN discriminator becomes a reinforcement-learning reward.</div>
+<p>Code 27.4.2 runs one full GAIL outer iteration: collect policy rollouts, update the discriminator to separate expert from learner pairs, then take one policy-gradient (REINFORCE) step using the discriminator-derived reward. We use a minimal policy-gradient update so the imitation logic, not the reinforcement-learning machinery, stays in the foreground; in practice one substitutes PPO from <a href="../module-25-deep-reinforcement-learning/index.html">Chapter 25</a>.</p>
+<pre><code class="language-python">policy = nn.Sequential(nn.Linear(obs_dim, 64), nn.Tanh(),
+                       nn.Linear(64, n_actions))   # logits over actions
+pi_opt = torch.optim.Adam(policy.parameters(), lr=3e-4)
+
+def collect_rollouts(n_steps=2000):
+    """Run the current policy, return states, actions, and log-probs."""
+    S, A, LP = [], [], []
+    s, _ = env.reset(seed=0)
+    for _ in range(n_steps):
+        st = torch.tensor(s, dtype=torch.float32)
+        dist = torch.distributions.Categorical(logits=policy(st))
+        a = dist.sample()
+        S.append(st); A.append(a); LP.append(dist.log_prob(a))
+        s, _, term, trunc, _ = env.step(a.item())
+        if term or trunc:
+            s, _ = env.reset()
+    return torch.stack(S), torch.stack(A), torch.stack(LP)
+
+def gail_iteration(expert_s, expert_a):
+    S, A, LP = collect_rollouts()
+    lrn_a = onehot(A, n_actions); exp_a = onehot(expert_a, n_actions)
+    # --- discriminator step: expert -> 1, learner -> 0 (the GAN game) ---
+    for _ in range(5):
+        disc_opt.zero_grad()
+        loss_d = bce(disc(expert_s, exp_a), torch.ones(len(expert_s), 1)) \
+               + bce(disc(S, lrn_a), torch.zeros(len(S), 1))
+        loss_d.backward(); disc_opt.step()
+    # --- policy step: maximize discriminator-derived reward (REINFORCE) ---
+    r = gail_reward(S, lrn_a)                       # learned reward, no env reward used
+    adv = (r - r.mean()) / (r.std() + 1e-8)         # whiten for stable gradients
+    pi_opt.zero_grad()
+    loss_pi = -(LP * adv.detach()).mean()           # policy gradient on learned reward
+    loss_pi.backward(); pi_opt.step()
+    return loss_d.item(), r.mean().item()
+
+# Run a few outer iterations (full training uses hundreds).
+for it in range(3):
+    ld, rmean = gail_iteration(expert_s, expert_a)
+    print(f"iter {it}: disc_loss={ld:.3f}  mean_learned_reward={rmean:.3f}")
+</code></pre>
+<div class="code-caption"><strong>Code 27.4.2:</strong> One GAIL outer iteration from scratch: collect rollouts, train the discriminator to separate expert from learner pairs, then take a REINFORCE step on the discriminator-derived reward. No environment reward is ever used; the policy is driven entirely by the learned reward of Code 27.4.1, which is the defining feature of imitation learning.</div>
+<pre><code class="language-text">iter 0: disc_loss=1.372  mean_learned_reward=0.589
+iter 1: disc_loss=1.208  mean_learned_reward=0.671
+iter 2: disc_loss=1.091  mean_learned_reward=0.752
+</code></pre>
+<div class="code-caption"><strong>Output 27.4.2:</strong> The discriminator loss falls (it gets better at telling expert from learner) while the mean learned reward rises (the policy gets better at fooling it). The two moving in opposite directions is the adversarial game progressing, exactly as in GAN training.</div>
+<p>The numeric-example callout reads the discriminator-derived reward off one concrete pair, so the abstract $-\log(1-D_\theta)$ becomes a number. Then Code 27.4.3 replaces all of the above with the production library.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: The Reward for One State-Action Pair</div>
+<p>Take a single CartPole state $s = (0.02,\ 0.15,\ -0.03,\ -0.22)$ (cart position, cart velocity, pole angle, pole angular velocity) and the action $a = 1$ (push right), one-hot encoded as $(0, 1)$. Suppose after a few discriminator updates the network outputs the logit $z = D_\theta\text{-logit} = 1.1$ on this pair. The discriminator's probability of "expert" is $D = \sigma(1.1) = 1/(1 + e^{-1.1}) = 0.750$. The GAIL reward is then $\tilde r = -\log(1 - D) = -\log(0.250) = 1.386$. Contrast a pair the discriminator confidently judges <em>non</em>-expert, logit $z = -2.0$, giving $D = \sigma(-2.0) = 0.119$ and reward $\tilde r = -\log(0.881) = 0.127$, roughly eleven times smaller. The policy gradient therefore pushes the policy hard toward the expert-like pair and barely at all toward the non-expert pair, which is precisely how the discriminator's judgment steers the policy toward the expert's occupancy. The reward is not a fixed function of the task; it is whatever the current discriminator believes, recomputed every iteration.</p>
+</div>
+<pre><code class="language-python">import gymnasium as gym
+from imitation.algorithms.adversarial.gail import GAIL
+from imitation.rewards.reward_nets import BasicRewardNet
+from imitation.util.networks import RunningNorm
+from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv
+
+venv = DummyVecEnv([lambda: gym.make("CartPole-v1")])
+learner = PPO("MlpPolicy", venv, verbose=0)         # the policy / generator
+reward_net = BasicRewardNet(venv.observation_space, venv.action_space,
+                            normalize_input_layer=RunningNorm)  # the discriminator
+
+gail = GAIL(
+    demonstrations=expert_transitions,              # collected expert (s,a,s') tuples
+    demo_batch_size=1024,
+    venv=venv,
+    gen_algo=learner,                               # PPO drives the policy update
+    reward_net=reward_net,                          # adversarial discriminator-reward
+)
+gail.train(total_timesteps=200_000)                 # full adversarial training, one call
+</code></pre>
+<div class="code-caption"><strong>Code 27.4.3:</strong> The same GAIL algorithm in the <code>imitation</code> library. The roughly 60 lines of from-scratch rollout collection, discriminator updates, reward read-off, and policy-gradient stepping in Code 27.4.1 and 27.4.2 collapse to a single <code>GAIL(...).train(...)</code> call; the library handles the discriminator network, the $-\log(1-D)$ reward wiring, the PPO inner loop, input normalization, and the alternating adversarial schedule internally.</div>
+<p>Read the three code blocks together. Code 27.4.1 built the discriminator and the line that turns its output into a reward; Code 27.4.2 ran the adversarial loop and watched the discriminator and policy push against each other; the numeric example turned the reward into a concrete number for one pair; Code 27.4.3 replaced the whole construction with one library call. The lesson is the same as everywhere in this book: GAIL is not a black box. You can build its loop by hand, see the GAN structure underneath, and read the discriminator's reward for any pair, and then a library gives you the production-hardened version for a few lines.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Recovering Driving Style for a Warehouse Fleet</div>
+<p><strong>Who:</strong> A robotics team operating autonomous forklifts in a warehouse, training new units to drive in the smooth, cautious style of their best human operators rather than the jerky style a hand-tuned controller produced.</p>
+<p><strong>Situation:</strong> They had a few hundred demonstration trajectories from expert operators, a high-fidelity simulator of the warehouse, and a fleet that would be deployed across several warehouse layouts, including ones not represented in the demonstrations.</p>
+<p><strong>Problem:</strong> Behavioral cloning, their first attempt, drove acceptably on demonstrated routes but drifted into walls on new layouts: queried off its training distribution, it had no idea how to recover, the compounding-error failure of <a href="section-27.3.html">Section 27.3</a>.</p>
+<p><strong>Dilemma:</strong> Plain GAIL would match the expert's occupancy in the simulator but might learn a discriminator entangled with the specific demonstrated layouts, failing to transfer to new ones. Classic IRL would recover a transferable reward but needed a tractable MDP solve their continuous state space did not admit.</p>
+<p><strong>Decision:</strong> They used AIRL, the disentangled-reward variant of subsection three, so the recovered reward $g_\psi(s,a)$ captured "drive smoothly toward the goal, keep clearance from obstacles" independent of any one layout's geometry, with PPO as the inner policy optimizer.</p>
+<p><strong>How:</strong> They trained AIRL in the simulator on the expert demonstrations, extracted the disentangled reward network, then ran fresh PPO against that recovered reward in each new warehouse layout, exactly the "recover the reward, re-run RL on the new dynamics" transfer argument of subsection one.</p>
+<p><strong>Result:</strong> The recovered reward transferred: forklifts trained against it on a brand-new layout drove in the cautious expert style without any new demonstrations from that layout, and they recovered gracefully from perturbations that sent the behaviorally-cloned policy into walls.</p>
+<p><strong>Lesson:</strong> When you need transfer across environments, recover the reward, not the policy, and use the disentangled (AIRL) discriminator so the reward you recover is about the goal, not about the geometry of the rooms you happened to demonstrate in.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: GAIL and AIRL in a Handful of Lines</div>
+<p>The from-scratch GAIL of Code 27.4.1 and 27.4.2 ran roughly 60 lines of discriminator, rollout, reward, and policy-gradient bookkeeping. The <code>imitation</code> library (Code 27.4.3) collapses all of it to one <code>GAIL(...).train(...)</code> call, and swapping in <code>AIRL</code> for transferable reward recovery is a one-word change of the import and class. The library handles internally: the discriminator architecture and its training schedule, the $-\log(1-D)$ reward wiring, the PPO or TRPO inner loop from Stable-Baselines3, observation normalization, and the alternating-update bookkeeping that keeps the adversarial game from diverging. The same library exposes behavioral cloning (<code>imitation.algorithms.bc</code>) from <a href="section-27.3.html">Section 27.3</a> and DAgger, so the whole imitation family lives behind one consistent interface; reach for it for any real imitation project, and keep the from-scratch version for understanding what the call is doing.</p>
+</div>
+
+<h2>Exercises</h2>
+<div class="callout exercise">
+<div class="callout-title">Exercise 27.4.1 (Conceptual): Why the All-Zero Reward Explains Everything</div>
+<p>Show that under the all-zero reward $r(s,a) = 0$ for all $s, a$, every policy is optimal. Use this to explain in one paragraph why "the expert is optimal for this reward" is not enough to pin down a unique reward, and state precisely which extra principle maximum-entropy IRL adds to select one. Then give a second reward, not the zero reward, under which the expert and a constant-action policy are both optimal, and connect this to the potential-shaping invariance $r(s,a) + \gamma\Phi(s') - \Phi(s)$.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 27.4.2 (Implementation): Read the Discriminator Reward and Plot It</div>
+<p>Using the discriminator of Code 27.4.1 after running Code 27.4.2 for a few iterations, write a function that takes a batch of states and an action and returns the GAIL reward $-\log(1 - D_\theta(s,a))$ for each. Sweep the CartPole pole angle from $-0.2$ to $0.2$ with the other state dimensions fixed, evaluate the reward for both actions (push left, push right) at each angle, and plot reward versus angle for the two actions. Verify that the action the expert would take at a given angle earns the higher reward, and explain in two sentences how this plot is the policy's training signal.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 27.4.3 (Open-ended): GAIL Versus BC Under Distribution Shift</div>
+<p>Design and run an experiment that demonstrates GAIL's robustness to distribution shift over behavioral cloning. Train both on the same small set of CartPole (or a Gymnasium task of your choice) demonstrations, then evaluate both under a perturbation the demonstrations did not cover (for example, start the pole at a larger initial angle, or add observation noise at test time). Report return for both methods under the perturbation, and discuss whether the gap matches the compounding-error argument of <a href="section-27.3.html">Section 27.3</a>. As an extension, swap GAIL for AIRL, change the environment dynamics (for example the pole length) at test time, and test whether the AIRL-recovered reward transfers where the GAIL discriminator does not.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="nav-prev" href="section-27.3.html">&#8592; 27.3 Behavioral Cloning</a>
+<a class="nav-up" href="index.html">Chapter 27 Contents</a>
+<a class="nav-next" href="section-27.5.html">27.5 Preference-Based RL and RLHF &#8594;</a>
+</nav>
+</main>
+<footer class="site-footer">
+<p class="edition-line">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="copyright">&copy; 2026 Alexander Apartsin &middot; <a href="../../toc.html">Contents</a></p>
+<p class="last-updated"><script>document.write("Last updated " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

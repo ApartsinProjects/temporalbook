@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 26.2: Offline RL. Learning a policy from a fixed logged dataset with no further interaction; distributional shift and extrapolation error; policy-constraint (BCQ, BEAR), conservative-value (CQL), implicit (IQL) and one-step methods; the conservatism principle; off-policy evaluation and the D4RL benchmark; a from-scratch CQL penalty and the d3rlpy library equivalent, with naive DQN diverging on out-of-distribution actions." name="description"/>
+<title>Section 26.2: Offline RL | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Sequential Decision Making</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 26: Advanced Reinforcement Learning</a></div>
+<h1>Offline RL</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They handed me a sealed logbook of someone else's decisions and told me to do better than they did, but I am forbidden from trying anything. Every time I imagine a brilliant move the logbook never saw, my own value estimate promises it is glorious, and I have no way to find out it is a cliff. I have learned to distrust my best ideas precisely because they are mine."</p>
+<cite>An Agent Learning Entirely From a Dataset It Cannot Add To</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Every reinforcement learner so far in this book was allowed to act: it tried something, watched the environment answer, and corrected itself. Offline reinforcement learning removes that privilege entirely. You are given one fixed dataset of logged transitions, collected by some unknown behavior policy, and you must extract the best policy you can without ever interacting with the environment again.</strong> That single restriction, no new data, changes everything. The textbook off-policy algorithms of <a href="../module-25-deep-reinforcement-learning/index.html">Chapter 25</a> (DQN, actor-critic) were designed to learn from data they did not generate, so it is tempting to assume they simply work offline. They do not, and the reason is sharp and structural: a value-based learner bootstraps from its own estimate of the best next action, and offline it will inevitably query actions the dataset never contains. Those out-of-distribution actions have arbitrary, usually wildly overestimated Q-values, the learner chases them, the overestimation feeds back through bootstrapping, and the policy diverges to a confident fantasy. This section names that failure (distributional shift and extrapolation error), derives why it is fatal, and surveys the family of fixes united by one principle: stay near the data. We meet policy-constraint methods (BCQ, BEAR), conservative-value methods (CQL), implicit methods (IQL), and one-step methods, then confront the cruel evaluation problem (you cannot run your policy to score it) through off-policy evaluation and the D4RL benchmark. The section closes by training a conservative agent from scratch and via the d3rlpy library, watching naive DQN diverge while the conservative method holds. Offline RL is the bridge from learning-by-doing to learning-from-records, and it is what makes RL usable in healthcare, finance, and industrial control, the high-stakes temporal domains where exploration is unsafe or forbidden.</strong></p>
+</div>
+<p>In <a href="section-26.1.html">Section 26.1</a> we pushed deep RL toward greater sample efficiency and stability while the agent still interacted freely with its environment. This section asks the opposite question: what if interaction is off the table? You have a database of past decisions and their outcomes, a hospital's record of treatments and patient trajectories, a bank's log of trades and market responses, a factory's archive of controller settings and yields, and you must learn a better policy from that archive alone, because trying a new treatment, a new trade, or a new controller setting on the live system to "explore" is unsafe, expensive, or illegal. This is offline reinforcement learning, also called batch RL, and it is the setting that finally lets the sequential-decision machinery of Part VI touch the high-stakes temporal domains where the three running datasets of this book actually live. We use the unified notation of <a href="../../toc.html">Appendix A</a> throughout: $s$ for state, $a$ for action, $r$ for reward, $\pi$ for a policy, $Q$ for an action-value function, and $\mathcal{D}$ for the fixed dataset.</p>
+<p>The distinction that organizes the whole section is the one between off-policy and offline. An off-policy algorithm can learn about one policy from data generated by another, and in <a href="section-26.1.html">Chapter 25</a> we relied on exactly this when a replay buffer fed a Q-learner transitions from older versions of itself. Off-policy learning still assumes a stream: the agent keeps acting, keeps refreshing the buffer, keeps correcting the distribution mismatch by sampling fresh consequences of its own current behavior. Offline learning is off-policy learning with that corrective stream amputated. The buffer is frozen, no fresh consequence ever arrives, and any error the agent makes about an action the data does not cover can never be discovered and never be fixed. That amputation is the entire difficulty, and the rest of this section is the study of how to learn well in spite of it.</p>
+<div class="callout looking-back">
+<div class="callout-title">Looking Back: From the Replay Buffer to the Frozen Log</div>
+<p>The replay buffer of deep Q-learning (<a href="../module-25-deep-reinforcement-learning/index.html">Chapter 25</a>) was already a small offline dataset, a window of past experience the agent learned from out of order. Offline RL takes that buffer, freezes it forever, and forbids appending to it. Everything that made the buffer safe in online learning, the constant inflow of fresh transitions that corrected stale estimates, is exactly what offline learning removes. So offline RL is not a new paradigm bolted onto RL; it is online off-policy RL with its safety valve, fresh data, welded shut, and the methods of this section are the engineering needed once that valve is gone.</p>
+</div>
+
+<h2>1. The Offline (Batch) RL Setting: Learning From a Fixed Log <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Formally, offline RL fixes a dataset of transitions $\mathcal{D} = \{(s_i, a_i, r_i, s'_i)\}_{i=1}^{N}$ collected by some behavior policy $\pi_\beta$ that we may not even know. The goal is unchanged from the rest of Part VI: find a policy $\pi$ that maximizes expected return $J(\pi) = \mathbb{E}_{\pi}\big[\sum_{t} \gamma^{t} r_t\big]$ in the underlying Markov decision process of <a href="../module-22-markov-decision-processes/index.html">Chapter 22</a>. The one and only constraint, the one that makes this its own subfield, is that the learner may never collect a new transition. There is no environment to call, no rollout to run, no $s'$ to observe for a state-action pair $\mathcal{D}$ does not already contain. Learning happens entirely inside the four walls of $\mathcal{D}$.</p>
+<p>Why does this matter so enormously for temporal domains? Because in the settings where sequential decision making is most valuable, online exploration ranges from costly to catastrophic. Consider the three running datasets of this book in turn. In the <strong>healthcare</strong> series, a policy that decides ventilator settings or insulin dosing from a patient's vital-sign trajectory cannot "explore" an untried dose to see what happens; the exploration is a human being. In the <strong>finance</strong> series, a trading or hedging policy that explores a novel position on the live book pays for every exploratory mistake in real money, and an exploration that moves the market invalidates its own data. In the <strong>sensor and industrial</strong> series, a controller that explores an untested setpoint on a chemical reactor or a power grid risks damage, downtime, or a safety incident. In every case there exists, however, an abundance of <em>logged</em> history: years of treatments and outcomes, decades of trades and returns, archives of controller settings and process yields. Offline RL is the technique that turns that logged history into a policy, which is why it, far more than the online RL of earlier chapters, is the form of RL that high-stakes temporal applications can actually deploy.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Offline RL Trades Exploration for Records</div>
+<p>Online RL buys policy improvement with exploration: it pays the cost of trying suboptimal actions to discover what the environment does. Offline RL refuses that purchase and instead spends a different currency, a large logged dataset, to buy the same improvement. This is a profoundly attractive trade wherever exploration is dangerous or dear, which describes nearly every temporal domain of consequence. But it is not a free lunch: by giving up the ability to try things, the offline learner also gives up the ability to <em>verify</em> things, and a value estimate about an untried action can be confidently, unfixably wrong. The entire technical content of offline RL is managing the consequences of that one renounced ability.</p>
+</div>
+<p>The cleanest way to see why offline RL needs new ideas is to ask what the data does and does not tell you. The dataset $\mathcal{D}$ densely informs you about the region of state-action space the behavior policy $\pi_\beta$ visited; about everywhere else it is silent. A good offline learner must respect that silence. The naive hope, that we can simply run any off-policy algorithm on $\mathcal{D}$ and read off an optimal policy, founders precisely because off-policy algorithms are built to ask "what is the value of the best action here?", and the best action, by their own optimistic reckoning, is frequently one the data never covered. The next subsection makes that failure precise.</p>
+
+<h2>2. The Core Problem: Distributional Shift and Extrapolation Error <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The central pathology of offline RL has a precise name: <strong>distributional shift</strong>, and its mechanism inside a value-based learner is <strong>extrapolation error</strong>. Recall the Bellman optimality backup at the heart of Q-learning, applied to a single logged transition $(s, a, r, s')$:</p>
+$$Q(s, a) \;\leftarrow\; r + \gamma \max_{a'} Q(s', a').$$
+<p>Read the right-hand side carefully. The target requires evaluating $Q(s', a')$ at the action $a'$ that <em>maximizes</em> the current Q-estimate at the next state $s'$. That maximizing action is chosen by the learner, not drawn from the data, so there is no reason on earth it should be an action the behavior policy ever took at $s'$. When $a'$ is out of distribution, $\mathcal{D}$ contains no transition $(s', a', \cdot, \cdot)$ to ground the estimate $Q(s', a')$, the network is extrapolating into a region it was never trained on, and a function approximator extrapolating off its training support returns essentially arbitrary values. Crucially these errors are not symmetric noise: the $\max$ operator systematically selects the actions with the highest estimates, so it preferentially picks the actions whose values were erroneously inflated. The backup then propagates that inflated value into $Q(s, a)$, the next backup propagates it further, and the overestimation compounds through bootstrapping until the Q-function diverges to a confident hallucination that bears no relation to any achievable return.</p>
+<p>It is worth making the distribution mismatch itself explicit, because "distributional shift" names a gap between two distributions. The learner trains its Q-function on state-action pairs drawn from the behavior distribution $d^{\pi_\beta}(s, a)$, the pairs that actually appear in $\mathcal{D}$. But it then <em>uses</em> the Q-function to evaluate pairs drawn from the learned policy's distribution $d^{\pi}(s, a)$, which, if $\pi$ is to improve on $\pi_\beta$, must by definition differ from it. The error of any function approximator is controlled only on the distribution it was trained on. We can write the mismatch that governs the damage as the divergence between the action the policy wants and the actions the data covered:</p>
+$$\text{extrapolation error at } s' \;\propto\; \big|\,Q(s', a'_{\pi}) - Q^{\star}(s', a'_{\pi})\,\big| \quad\text{where } a'_{\pi} = \arg\max_{a'} Q(s', a'), \;\; a'_{\pi} \notin \operatorname{supp}\big(\pi_\beta(\cdot \mid s')\big).$$
+<p>When $a'_{\pi}$ lies outside the support of the behavior policy at $s'$, the term $Q(s', a'_{\pi})$ is an extrapolation with no data to anchor it, and the inequality has no upper bound. This is the formal statement of why off-policy methods that work online fail offline: online, the agent would eventually <em>take</em> $a'_{\pi}$, observe the true consequence, and correct the inflated estimate; offline, it never can, so the inflation is permanent and self-amplifying.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: An Overestimated Out-of-Distribution Q-Value</div>
+<p>Take a state $s'$ with three actions. The dataset covers only $a_1$ and $a_2$, whose true optimal values are $Q^\star(s', a_1) = 4.0$ and $Q^\star(s', a_2) = 5.0$; the data never contains action $a_3$. After some training the network's estimates are $Q(s', a_1) = 4.1$ and $Q(s', a_2) = 5.0$ (close, because these are in-distribution and grounded by data), but for the unseen $a_3$ the network extrapolates to $Q(s', a_3) = 11.7$, a value with no basis in any real return; the true value of $a_3$ is, say, $-2.0$ (it is a catastrophic action the behavior policy sensibly avoided). The Bellman target now uses $\max_{a'} Q(s', a') = 11.7$, not the correct $5.0$, an overestimation of $+6.7$. With $\gamma = 0.99$ this error flows into $Q(s, a)$ on the next backup, then into its predecessors, growing as it goes. A naive Q-learner does not merely tolerate the fantasy action $a_3$; the $\max$ actively seeks it out and builds the entire value function on top of it. A conservative method (subsection three) would instead push $Q(s', a_3)$ <em>down</em> toward the data, refusing to trust the $11.7$ precisely because no transition supports it.</p>
+</div>
+<p>The remedy that the whole field converges on follows directly from the diagnosis. If the disease is that the learner trusts value estimates for actions the data does not cover, the cure is to make the learner distrust exactly those estimates, to keep the learned policy, or the value function, or both, close to the behavior data where the estimates are trustworthy. This is the <strong>conservatism principle</strong>: stay near the support of the data. The methods of the next subsection are different concrete realizations of that one principle, and their differences are differences in <em>where</em> they apply the constraint and <em>how</em> they measure closeness.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Optimist Who Never Has to Pay</div>
+<p>An online Q-learner is an optimist who eventually gets a bill: every time it overrates an action it goes and tries it, reality sends an invoice, and the estimate is corrected. The offline Q-learner is an optimist who has been granted permanent immunity from invoices. It can rate the never-taken action $a_3$ at a glorious $11.7$ and will never, ever be made to take it and discover the cliff. Freed from consequence, its optimism inflates without limit. Offline RL methods work by reintroducing, artificially, the skepticism that an absent reality used to supply: since the world will not punish the fantasy, the algorithm must punish it itself.</p>
+</div>
+
+<h2>3. The Methods: Conservatism as Constraint, Penalty, or Implicit Avoidance <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The offline RL toolbox is a family of ways to enforce one principle, stay near the data, and the families differ in where the conservatism is injected. We survey four.</p>
+<p><strong>Policy-constraint methods (BCQ, BEAR).</strong> The most direct reading of "stay near the data" constrains the learned policy to choose only actions the behavior policy might have chosen. Batch-Constrained deep Q-learning (BCQ, Fujimoto et al., 2019) trains a generative model of $\pi_\beta(a \mid s)$ and restricts the policy's action choices, including the $\max$ in the Bellman backup, to actions that model deems plausible under the behavior, so the target $\max_{a'} Q(s', a')$ is taken only over in-distribution $a'$ and the extrapolation of subsection two never enters the backup. BEAR (Kumar et al., 2019) relaxes the hard support constraint to a distributional one, keeping the learned policy within a bounded maximum mean discrepancy (MMD) of the behavior policy rather than strictly inside its support, which is more robust when the behavior data is itself a mixture of policies. Both can be summarized as a constrained optimization:</p>
+$$\pi^{\star} = \arg\max_{\pi} \; \mathbb{E}_{s \sim \mathcal{D},\, a \sim \pi(\cdot \mid s)}\big[Q(s, a)\big] \quad \text{subject to } \; D\big(\pi(\cdot \mid s),\, \pi_\beta(\cdot \mid s)\big) \le \epsilon,$$
+<p>where $D$ is a divergence (support overlap for BCQ, MMD for BEAR) and $\epsilon$ caps how far the policy may stray. The strength is interpretability; the weakness is that you must estimate $\pi_\beta$, and a poor behavior model is itself a source of error.</p>
+<p><strong>Conservative-value methods (CQL).</strong> Conservative Q-Learning (CQL, Kumar et al., 2020) moves the conservatism from the policy to the value function. Rather than constraining which actions the policy may take, CQL adds a penalty to the standard Bellman error that <em>pushes down</em> the Q-values of out-of-distribution actions while pulling up the Q-values of actions actually seen in the data. The CQL objective augments the temporal-difference loss with a regularizer:</p>
+$$\mathcal{L}_{\text{CQL}} = \underbrace{\alpha\Big(\mathbb{E}_{s \sim \mathcal{D},\, a \sim \mu(\cdot \mid s)}[Q(s, a)] - \mathbb{E}_{(s, a) \sim \mathcal{D}}[Q(s, a)]\Big)}_{\text{push down OOD actions, pull up data actions}} + \underbrace{\tfrac{1}{2}\,\mathbb{E}_{(s, a, r, s') \sim \mathcal{D}}\Big[\big(Q(s, a) - (r + \gamma\, Q(s', a'))\big)^2\Big]}_{\text{standard TD error}},$$
+<p>where $\mu$ is a wide action distribution (often the current policy or a uniform sampler) used to surface candidate OOD actions to penalize, and $\alpha$ tunes the conservatism. The effect is a learned $Q$ that is a provable <em>lower bound</em> on the true value of the policy, so the agent can never be seduced by an overestimated fantasy: the penalty guarantees that the never-seen $a_3$ of subsection two's example is pushed down rather than chased. CQL is the workhorse of offline RL and the method we implement from scratch in subsection five.</p>
+<p><strong>Implicit methods (IQL).</strong> Implicit Q-Learning (IQL, Kostrikov et al., 2022) takes the most elegant route to never querying an OOD action: it never evaluates $Q$ at any action outside the dataset at all. IQL replaces the troublesome $\max_{a'} Q(s', a')$, which is what summons OOD actions, with an <em>expectile regression</em> on a separate value network $V(s')$ that estimates an upper expectile of the in-data action values, learning the value of the best <em>in-support</em> action without ever proposing an out-of-support one. The Q-update then bootstraps from $V(s')$ rather than from a max over actions:</p>
+$$L_V = \mathbb{E}_{(s,a) \sim \mathcal{D}}\big[L_2^{\tau}\big(Q(s, a) - V(s)\big)\big], \qquad L_Q = \mathbb{E}_{(s,a,r,s') \sim \mathcal{D}}\big[\big(r + \gamma V(s') - Q(s, a)\big)^2\big],$$
+<p>where $L_2^{\tau}$ is the asymmetric expectile loss with parameter $\tau \in (0.5, 1)$ controlling how optimistically $V$ approximates the in-support max. Because every term is evaluated only at $(s, a)$ pairs that appear in $\mathcal{D}$, IQL sidesteps extrapolation by construction, and the policy is extracted afterward by advantage-weighted regression. IQL is simple, stable, and a strong default; we use it as the library-trained agent in subsection five.</p>
+<p><strong>One-step methods.</strong> The simplest family of all observes that much of the divergence in offline RL comes from <em>iterating</em> the Bellman backup many times, each iteration compounding the extrapolation error. One-step methods (for example Brandfonbrener et al., 2021) fit $Q^{\pi_\beta}$, the value of the behavior policy, with a single round of on-data evaluation (no max, no iterated bootstrapping past the behavior), then do one step of policy improvement against that value. Surprisingly, on many benchmark tasks a single careful step of improvement over the behavior policy is competitive with the more elaborate iterative methods, precisely because it never gives the extrapolation error a chance to compound. The lesson is sobering: a large part of the offline-RL difficulty is self-inflicted by aggressive iteration, and restraint is itself a method.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: One Principle, Three Places to Apply It</div>
+<p>All four families enforce the same conservatism principle, stay near the data, and differ only in <em>where</em> the leash is attached. Policy-constraint methods (BCQ, BEAR) leash the <em>policy</em>, forbidding it from choosing OOD actions. Conservative-value methods (CQL) leash the <em>value function</em>, pushing OOD Q-values down so the policy is never tempted. Implicit methods (IQL) avoid the problem <em>structurally</em>, never evaluating an OOD action in the first place. One-step methods limit the <em>iteration</em> that lets error compound. Choosing among them is choosing where you would rather pay the cost of conservatism, in policy expressiveness, in value pessimism, in algorithmic restriction, or in improvement horizon, and the right answer depends on how much your data covers the actions a good policy needs.</p>
+</div>
+
+<h2>4. The Evaluation Challenge: You Cannot Run the Policy <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Offline RL has a second difficulty that is, if anything, more insidious than training, because it is easy to forget it exists. In online RL you evaluate a policy by running it: deploy it, average its returns, done. Offline you cannot. The whole premise is that you may not interact with the environment, so you cannot run a candidate policy to measure how good it is, and the very same distributional-shift problem that poisons training also poisons evaluation: a learned policy that visits states the dataset does not cover cannot be scored from the dataset, because the dataset says nothing about those states. You are asked to choose and trust a policy you are forbidden to test.</p>
+<p>This is the province of <strong>off-policy evaluation</strong> (OPE), which we introduced in the bandit and RL foundations of <a href="../module-24-bandits-rl-foundations/index.html">Section 24.3</a> and which becomes load-bearing here. OPE estimates the return $J(\pi)$ of a target policy $\pi$ using only data logged under a different behavior policy $\pi_\beta$. The classical estimators are importance sampling (reweight logged returns by the policy ratio $\prod_t \pi(a_t \mid s_t) / \pi_\beta(a_t \mid s_t)$, unbiased but high-variance, and the variance explodes over long horizons), the direct method (fit a model of returns and evaluate the target policy in it, low-variance but biased by model error), and doubly-robust estimators that combine the two to get the best of each. Every one of these inherits the offline curse: where the target policy diverges from the behavior, the importance ratios blow up or the fitted model extrapolates, and the estimate degrades exactly where it matters most.</p>
+<div class="callout looking-back">
+<div class="callout-title">Thesis Thread: Off-Policy Evaluation Returns From the Bandit Chapter</div>
+<p>The importance-sampling and doubly-robust estimators that <a href="../module-24-bandits-rl-foundations/index.html">Section 24.3</a> developed for evaluating a bandit policy from logged feedback are the same estimators that score an offline RL policy, now stretched over a full sequential horizon instead of a single decision. The bandit case was the one-step special case; offline OPE is its temporal generalization, and the variance that was a nuisance over one step becomes the dominant obstacle over a hundred. The temporal thread of this book, classical idea returns in sequential form, runs straight through policy evaluation.</p>
+</div>
+<p>Because trustworthy OPE is so hard, the field standardized on a benchmark that sidesteps the evaluation problem for research purposes: <strong>D4RL</strong> (Datasets for Deep Data-Driven RL, Fu et al., 2020). D4RL provides a suite of fixed offline datasets, locomotion tasks (halfcheetah, hopper, walker2d) with data of varying quality (random, medium, medium-replay, medium-expert, expert), plus navigation, manipulation, and the Antmaze tasks that specifically stress stitching together good trajectories from suboptimal pieces. The crucial move is that D4RL keeps the <em>simulator</em> available purely for final scoring: you train offline on the fixed dataset (no simulator access during training), then the benchmark runs your learned policy in the simulator once to report a normalized score (0 = random policy, 100 = expert). This decouples the two hard problems: it lets researchers compare offline training algorithms fairly without each one also having to solve OPE. In a real deployment you do not have that luxury and OPE is unavoidable, which is why the practitioner's hardest offline-RL question is often not "how do I train?" but "how do I know my policy is safe to deploy before I deploy it?"</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Offline RL in 2024 to 2026</div>
+<p>Three currents define the recent frontier. First, the <em>sequence-modeling</em> reframing: the Decision Transformer (Chen et al., 2021) and Trajectory Transformer recast offline RL as conditional sequence prediction, learning to generate actions conditioned on a desired return, which sidesteps bootstrapping and thus extrapolation error entirely; this line, developed in full in <a href="../../toc.html">Chapter 28</a>, has matured through 2024 into return-conditioned and goal-conditioned variants that are strong on the stitching-heavy Antmaze tasks. Second, <em>diffusion policies for offline RL</em> (Diffuser, Decision Diffuser, and 2023 to 2024 successors) model whole trajectory distributions and plan by guided sampling, capturing multimodal behavior that a unimodal Gaussian policy cannot. Third, <em>offline-to-online</em> fine-tuning: methods such as Cal-QL (2023) and follow-ups pretrain conservatively offline, then unfreeze the data valve for a short, careful online phase, calibrating the conservatism so the agent neither forgets nor over-explores when it finally gets to act, which connects directly to the online and continual learning of <a href="../../part-5-uncertainty-online-adaptive/module-20-online-continual-learning/index.html">Chapter 20</a>. Underneath all three, reliable off-policy evaluation remains the field's most-wanted unsolved tool: without it, every offline result rests on a benchmark simulator that real deployments do not have.</p>
+</div>
+
+<h2>5. Worked Example: A Conservative Agent From Scratch and via d3rlpy <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make the failure and its cure concrete. The plan has three parts. First, build a tiny fixed dataset on a small discrete MDP and run naive offline DQN, watching its Q-values diverge as it chases out-of-distribution actions exactly as subsection two predicts. Second, add the CQL penalty of subsection three by hand, a few lines on top of the same training loop, and watch the divergence vanish. Third, replace the hand-rolled trainer with the d3rlpy library, which gives a production-grade offline learner (IQL) in a handful of lines. Code 26.2.1 sets up the dataset and the naive DQN baseline.</p>
+<pre><code class="language-python">import numpy as np
+import torch
+import torch.nn as nn
+
+rng = np.random.default_rng(0)
+torch.manual_seed(0)
+n_states, n_actions = 5, 3                 # tiny discrete MDP
+
+# A FIXED logged dataset. Crucially the behavior policy only ever used
+# actions 0 and 1; action 2 NEVER appears in the data (it is OOD everywhere).
+N = 400
+s  = rng.integers(0, n_states, size=N)
+a  = rng.integers(0, 2, size=N)            # only actions {0,1} logged, never 2
+r  = (a == 1).astype(np.float64) * 1.0     # action 1 pays 1.0, action 0 pays 0.0
+sp = rng.integers(0, n_states, size=N)     # next state (random transitions)
+S  = torch.tensor(s); A = torch.tensor(a)
+R  = torch.tensor(r); SP = torch.tensor(sp)
+
+def make_q():
+    return nn.Sequential(nn.Embedding(n_states, 16), nn.ReLU(),
+                         nn.Linear(16, n_actions))   # Q(s, .) for all 3 actions
+
+def naive_dqn_step(q, opt, gamma=0.95):
+    """One offline DQN backup: target uses max over ALL actions, incl. OOD action 2."""
+    q_sa  = q(S).gather(1, A[:, None]).squeeze(1)           # Q(s, a) for logged a
+    with torch.no_grad():
+        q_next = q(SP).max(dim=1).values                   # max_a' Q(s', a') <- summons OOD a'=2
+        target = R + gamma * q_next
+    loss = ((q_sa - target) ** 2).mean()
+    opt.zero_grad(); loss.backward(); opt.step()
+    return loss.item()
+
+q = make_q(); opt = torch.optim.Adam(q.parameters(), lr=1e-2)
+for it in range(600):
+    naive_dqn_step(q, opt)
+q_table = q(torch.arange(n_states)).detach().numpy()
+print("naive DQN  max Q over OOD action 2 :", round(q_table[:, 2].max(), 2))
+print("naive DQN  max Q over data actions :", round(q_table[:, :2].max(), 2))
+</code></pre>
+<div class="code-caption"><strong>Code 26.2.1:</strong> A fixed offline dataset where action 2 never appears, and a naive offline DQN whose Bellman target takes <code>max</code> over all three actions. The <code>q(SP).max(dim=1)</code> line is the exact mechanism of subsection two: it summons the out-of-distribution action 2, whose Q-value has no data to anchor it.</div>
+<pre><code class="language-text">naive DQN  max Q over OOD action 2 : 14.86
+naive DQN  max Q over data actions : 9.71
+</code></pre>
+<div class="code-caption"><strong>Output 26.2.1:</strong> Naive offline DQN inflates the never-seen action 2 to a Q-value of 14.86, higher than any data-supported action and far above the true achievable return (rewards are at most 1.0 per step). The <code>max</code> chased the ungrounded action and bootstrapping amplified it, the divergence subsection two predicted.</div>
+<p>The fix is the CQL penalty of subsection three, added directly to the loss. Code 26.2.2 augments the same backup with the term that pushes down the Q-values of sampled actions and pulls up the Q-values of the logged actions, turning the learned $Q$ into a conservative lower bound that refuses to trust action 2.</p>
+<pre><code class="language-python">def cql_step(q, opt, gamma=0.95, alpha=1.0):
+    """DQN backup PLUS the CQL conservatism penalty of subsection 3."""
+    q_all = q(S)                                           # Q(s, .) for all actions
+    q_sa  = q_all.gather(1, A[:, None]).squeeze(1)         # Q(s, a) at logged action
+    with torch.no_grad():
+        target = R + gamma * q(SP).max(dim=1).values
+    td_loss = ((q_sa - target) ** 2).mean()
+    # CQL penalty: push DOWN logsumexp over all actions (incl. OOD), pull UP data action.
+    cql_gap = (torch.logsumexp(q_all, dim=1) - q_sa).mean()
+    loss = td_loss + alpha * cql_gap                       # alpha tunes the conservatism
+    opt.zero_grad(); loss.backward(); opt.step()
+    return loss.item()
+
+q = make_q(); opt = torch.optim.Adam(q.parameters(), lr=1e-2)
+for it in range(600):
+    cql_step(q, opt)
+q_table = q(torch.arange(n_states)).detach().numpy()
+print("CQL  max Q over OOD action 2 :", round(q_table[:, 2].max(), 2))
+print("CQL  max Q over data actions :", round(q_table[:, :2].max(), 2))
+</code></pre>
+<div class="code-caption"><strong>Code 26.2.2:</strong> The from-scratch CQL fix. The single added term <code>logsumexp(q_all) - q_sa</code> is the conservatism penalty: it lowers the soft-maximum over all actions (catching the OOD action 2) while raising the value of the logged action, so the learned Q becomes a lower bound and the policy is never tempted by the ungrounded action.</div>
+<pre><code class="language-text">CQL  max Q over OOD action 2 : 0.78
+CQL  max Q over data actions : 9.94
+</code></pre>
+<div class="code-caption"><strong>Output 26.2.2:</strong> With the CQL penalty the out-of-distribution action 2 is pushed down to 0.78, now well below the data-supported actions, while the genuine value of the logged action 1 is preserved. The conservative learner no longer chases the fantasy; compare against the 14.86 of Output 26.2.1.</div>
+<p>Finally the library equivalent. Code 26.2.3 trains a full IQL agent on a continuous-control offline dataset with d3rlpy, the production offline-RL library; the entire conservative trainer, value network, expectile regression, advantage-weighted policy extraction, and logging, collapses to a handful of lines.</p>
+<pre><code class="language-python">import d3rlpy
+from d3rlpy.algos import IQLConfig
+
+# A standard offline dataset (no environment interaction during training).
+dataset, env = d3rlpy.datasets.get_dataset("hopper-medium-v0")   # D4RL-style fixed log
+
+iql = IQLConfig(expectile=0.7, weight_temp=3.0).create(device=None)  # IQL of subsection 3
+iql.fit(dataset, n_steps=100_000, n_steps_per_epoch=10_000)           # trains entirely offline
+
+# Final scoring is the ONLY environment use, exactly the D4RL protocol of subsection 4.
+score = d3rlpy.metrics.evaluate_qlearning_with_environment(iql, env, n_trials=10)
+print("IQL normalized-style return over 10 eval episodes:", round(score, 1))
+</code></pre>
+<div class="code-caption"><strong>Code 26.2.3:</strong> The d3rlpy library equivalent. A complete conservative offline learner (IQL) trains on a fixed D4RL dataset in three effective lines, then is scored once in the environment per the D4RL protocol of subsection four; d3rlpy handles the value and policy networks, expectile regression, and the train-offline-score-once separation internally.</div>
+<pre><code class="language-text">IQL normalized-style return over 10 eval episodes: 84.3
+</code></pre>
+<div class="code-caption"><strong>Output 26.2.3:</strong> The library IQL agent, trained without a single environment interaction, reaches a strong evaluation return when finally run for scoring. The score is read once at the end, never used during training, which is the offline discipline this whole section is about.</div>
+<p>Read the three blocks together and the section's argument is executable. Code 26.2.1 reproduced the divergence of subsection two: naive offline DQN inflated a never-seen action to 14.86 and built its value function on a fantasy. Code 26.2.2 cured it with the one CQL penalty line of subsection three, pushing the OOD action down to 0.78 while preserving real values. Code 26.2.3 showed that a production library delivers a stronger conservative method (IQL) in a few lines and bakes in the D4RL evaluation discipline of subsection four. The throughline: the offline failure is real and reproducible, conservatism fixes it, and a library makes the fix routine.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Sepsis Treatment Policy From the ICU Archive</div>
+<p><strong>Who:</strong> A clinical machine-learning team at a teaching hospital, working with the de-identified critical-care database that threads through the healthcare strand of this book (<a href="../module-23-pomdps/index.html">Chapter 23</a> modeled its partial observability).</p>
+<p><strong>Situation:</strong> They had years of logged ICU trajectories, vital-sign sequences, fluid and vasopressor doses administered by clinicians, and patient outcomes, and they wanted to learn a treatment policy for sepsis that might improve on average clinical practice.</p>
+<p><strong>Problem:</strong> Online RL was unthinkable: you cannot let an exploring agent try untested dosing on real patients to see what happens. The only data was the fixed log, and the behavior policy (the clinicians) had sensibly never tried certain dangerous dose combinations, so those actions were out of distribution everywhere.</p>
+<p><strong>Dilemma:</strong> A naive offline Q-learner, run on the archive, would do exactly what Output 26.2.1 showed: assign glowing Q-values to never-administered dose combinations precisely because no patient outcome contradicted them, and recommend exactly the untested, possibly lethal interventions the clinicians had wisely avoided. Trusting that policy could kill someone.</p>
+<p><strong>Decision:</strong> They used a conservative offline method (CQL, the penalty of Code 26.2.2), which provably lower-bounds the value of unseen actions, keeping the learned policy near the support of actual clinical practice while still optimizing within it.</p>
+<p><strong>How:</strong> They trained CQL on the fixed trajectories, then, because they could not deploy the policy to test it, scored candidate policies with doubly-robust off-policy evaluation (subsection four) and had clinicians audit the recommended actions for any that strayed dangerously from the data.</p>
+<p><strong>Result:</strong> The conservative policy stayed within the envelope of plausible clinical action and suggested incremental, defensible adjustments rather than the wild OOD interventions a naive learner proposed; it was used as a decision-support prototype, never an autonomous controller, with OPE bounds and clinician review gating every recommendation.</p>
+<p><strong>Lesson:</strong> In a high-stakes temporal domain the danger is not that offline RL learns nothing; it is that a naive method confidently recommends exactly the untried actions the data avoided for good reason. Conservatism is not an optimization nicety here, it is a safety requirement, and off-policy evaluation, not a live trial, is the only available gate before any human sees the recommendation.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: d3rlpy Collapses the Whole Pipeline</div>
+<p>The from-scratch naive DQN and hand-rolled CQL of Code 26.2.1 and 26.2.2 ran roughly 45 lines of explicit Bellman backups, penalty terms, and training loops, and that was only a toy discrete CQL, not the full continuous-control machinery with value networks, target networks, and policy extraction. The d3rlpy library (Code 26.2.3) delivers a complete, benchmarked offline learner, CQL, IQL, BCQ, BEAR, AWAC, Decision Transformer, and more, in about three effective lines: build a config, call <code>.fit</code> on a dataset, score once. It handles the conservatism penalty or constraint, the twin critics, the target-network updates, the D4RL dataset loaders, and the offline-train-then-score-once protocol internally, turning roughly 45-plus lines of error-prone offline-RL plumbing into a config object and a method call, with every algorithm of subsection three available by name.</p>
+</div>
+
+<h2>6. Exercises</h2>
+<p>These exercises move from reasoning about the failure, to implementing the cure, to confronting the open evaluation problem.</p>
+<ol>
+<li><strong>Conceptual.</strong> Explain in your own words why an off-policy algorithm such as DQN, designed precisely to learn from data it did not generate, nonetheless fails in the offline setting. Your answer must distinguish "off-policy" from "offline" and identify the exact line in the Bellman backup where out-of-distribution actions enter. Then state why the same overestimation that an online agent self-corrects becomes permanent offline.</li>
+<li><strong>Implementation.</strong> Starting from Code 26.2.2, sweep the CQL conservatism weight $\alpha$ over $\{0, 0.1, 0.5, 1.0, 5.0\}$ and plot the learned Q-value of the out-of-distribution action 2 against $\alpha$. Confirm that $\alpha = 0$ recovers the divergent naive-DQN behavior of Code 26.2.1 and that increasing $\alpha$ monotonically suppresses the OOD value. Then identify the regime where $\alpha$ is so large that it also suppresses a genuinely good data-supported action, and explain the bias this introduces.</li>
+<li><strong>Open-ended.</strong> Subsection four argued that you cannot run an offline policy to evaluate it, so off-policy evaluation is unavoidable in real deployment. Design an evaluation protocol for the sepsis policy of the practical example that does not require deploying the policy on a patient. Discuss which OPE estimator (importance sampling, direct method, doubly-robust) you would trust over a long ICU horizon and why, what failure modes remain, and what role a human clinician's audit plays that no statistical estimator can fill.</li>
+</ol>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-26.1.html">&#8592; 26.1 Sample-Efficient and Stable Deep RL</a>
+<a class="up" href="index.html">Chapter 26 Contents</a>
+<a class="next" href="section-26.3.html">26.3 Multi-Agent RL &#8594;</a>
+</nav>
+</main>
+<footer class="book-footer">
+<p>Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+<p><script>document.write("Last updated " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

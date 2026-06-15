@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 27.5: Preference-Based RL and RLHF. When demonstrations are hard but humans can compare, learn a reward model from pairwise preferences with the Bradley-Terry model, optimize a policy against it with PPO and a KL penalty to a reference (RLHF), and the 2024-2026 shift to DPO and RLAIF that skips the explicit reward model. Includes a from-scratch Bradley-Terry reward model and a trl library equivalent." name="description"/>
+<title>Section 27.5: Preference-Based RL and RLHF | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Sequential Decision Making</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 27: Optimal Control and Imitation Learning</a></div>
+<h1>Preference-Based RL and RLHF</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"Nobody could tell me what good behavior was, and nobody could show me either. So I stopped asking. I just put two of my own attempts side by side and watched which one the human reached for. A thousand quiet choices later, I knew their taste better than they could have spelled it out. I am the score they never wrote down."</p>
+<cite>A Reward Model Learning What Humans Like by Watching Them Choose</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Imitation learning (Sections 27.2 to 27.4) needed an expert who could demonstrate the right action. But for many of the behaviors we most want to instill, "be helpful", "summarize faithfully", "drive comfortably", nobody can demonstrate the optimum and nobody can write down a reward function for it either. What humans <em>can</em> do, reliably and cheaply, is <em>compare</em>: shown two behaviors, they can say which is better, even when they could not have produced the better one themselves or scored it on an absolute scale. Preference-based reinforcement learning turns that comparative judgment into a learning signal.</strong> The recipe has three moves. First, collect pairwise comparisons of trajectories or outputs. Second, fit a <em>reward model</em> that explains those comparisons through the Bradley-Terry likelihood, a learned scalar score whose differences reproduce the observed choices. Third, optimize a policy against that learned reward with a reinforcement-learning algorithm (PPO), tethered by a KL penalty to a reference policy so it does not wander into degenerate high-reward nonsense. This three-stage pipeline, reinforcement learning from human feedback (RLHF), is exactly how modern language assistants are aligned: a sequential decision process over tokens, scored by a model of human taste. We then meet the 2024 to 2026 simplification, direct preference optimization (DPO), which folds all three stages into one supervised loss and skips the explicit reward model and the RL loop entirely, and RLAIF, which replaces the human judge with an AI one. You leave able to train a Bradley-Terry reward model from scratch, use it to drive a tiny policy update, and call the same pipeline in a few lines of <code>trl</code>.</p>
+</div>
+<p>In <a href="section-27.4.html">Section 27.4</a> we closed the imitation-learning arc with inverse reinforcement learning: recover a reward function from expert <em>demonstrations</em>, then plan against it. That program assumes the expert can act well enough to demonstrate. This section relaxes that assumption to its breaking point. Suppose no one can reliably demonstrate the behavior you want, and no one can write its reward function either, but anyone can look at two attempts and point to the better one. This is the common case for the most valuable and least formalizable objectives, and it is precisely the regime where preference-based RL lives. The shift in supervision is the whole story: from "do this" (demonstrations) to "this is better than that" (comparisons), a strictly weaker and strictly cheaper signal that turns out to be enough.</p>
+<p>The reason comparisons are enough connects directly to a thread we opened in Part V. The human-in-the-loop adaptive systems of <a href="../../part-5-uncertainty-online-adaptive/module-21-adaptive-systems/index.html">Chapter 21</a> already treated human feedback as a first-class signal a system queries and adapts to over time; there the feedback corrected a forecast or a decision online. Here we make that feedback the <em>source</em> of the reward itself, learning the objective rather than just the policy. And the payoff is enormous in scope: the same machinery that aligns a robot's gait to "looks natural" aligns a large language model to "is a good assistant". We use the unified notation of <a href="../../toc.html">Appendix A</a> throughout: $\pi_\theta$ the policy, $r_\phi$ the learned reward model, $\pi_{\text{ref}}$ the reference policy, and $(y_w, y_l)$ a preferred-versus-rejected pair.</p>
+<p>The four competencies this section installs are: to recognize when comparison is the right supervision and frame preference learning as reward modeling; to write and fit the Bradley-Terry preference likelihood that turns pairwise choices into a scalar reward; to state the RLHF objective, a learned reward minus a KL leash to a reference, and explain why every term is there; and to read the 2024 to 2026 shift to DPO and RLAIF, knowing what each stage buys and what dropping it costs. These are the load-bearing skills for the sequence-as-decision view of <a href="../../toc.html">Chapter 28</a>, where the policy we align here becomes a sequence model conditioned on outcomes.</p>
+
+<h2>1. When Comparison Beats Demonstration <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Every method so far in this chapter has needed an expert who could <em>produce</em> good behavior. Behavioral cloning needed state-action pairs from a competent demonstrator; DAgger needed that demonstrator on call to label the states the learner visited; inverse RL needed demonstrations clean enough that "the expert was near-optimal" was a defensible assumption. The quiet precondition under all of them is that someone, somewhere, can act well. Relax that and the methods have nothing to learn from.</p>
+<p>Yet many of the behaviors we most want are exactly the ones nobody can demonstrate to optimality. Consider summarizing a document "faithfully and concisely", or writing a "helpful" answer, or controlling a prosthetic limb so the motion "feels natural" to its wearer. A person cannot reliably produce the best summary on demand, and certainly cannot assign it a calibrated numerical score, "this summary is a 7.3 out of 10" is a meaningless request. But ask that same person to look at two summaries and say which is better, and they answer instantly and consistently. Comparison is psychologically cheap and reliable precisely where absolute scoring and demonstration are expensive and noisy. Humans are excellent relative judges and poor absolute ones.</p>
+<p>Preference-based RL is built on that asymmetry. We never ask a human to act and never ask for a number; we only ask them to choose. Formally, we collect a dataset of comparisons $\mathcal{D} = \{(\sigma_w^{(i)}, \sigma_l^{(i)})\}$, where each pair is two behavior segments (two trajectories, two summaries, two model responses) and $\sigma_w$ is the one the human preferred (won) over $\sigma_l$ (lost). From this dataset of choices, with no rewards and no demonstrations anywhere in it, we will recover a scalar reward function that explains the choices, and then optimize a policy against it. The bet is that a single consistent reward landscape underlies the human's many local comparisons, and that recovering that landscape recovers the objective.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Comparison Is a Strictly Weaker, Strictly Cheaper Signal That Suffices</div>
+<p>A demonstration tells you <em>what to do</em> in a state; a comparison only tells you that one behavior beat another. The comparison carries strictly less information per query, yet it is available in vastly more situations and at far lower cost and noise, because relative judgment is easy where demonstration and absolute scoring are hard. The central discovery of preference-based RL is that this weaker signal, aggregated over many comparisons, is enough to reconstruct a usable reward function. You trade richer-but-rarer supervision for poorer-but-plentiful supervision, and for ill-defined objectives that trade is overwhelmingly favorable. This is the same move <a href="../../part-5-uncertainty-online-adaptive/module-21-adaptive-systems/index.html">Chapter 21</a> made for human-in-the-loop adaptation, now applied to learning the reward itself rather than correcting a prediction.</p>
+</div>
+<p>One historical anchor is worth carrying forward. The modern recipe was crystallized by Christiano and colleagues in 2017, who trained simulated robots and Atari agents from human preferences over short video clips, with the human never seeing the reward and never demonstrating, and reached or exceeded hand-engineered-reward performance using feedback on under one percent of the agent's interactions. That result, learn a reward model from clip comparisons, optimize a policy against it, refresh the comparisons as the policy improves, is the template the rest of this section formalizes and that the language-model alignment of 2022 onward scaled up.</p>
+
+<h2>2. The Bradley-Terry Model and Training a Reward Model <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>To turn a pile of "$A$ beat $B$" judgments into a scalar reward, we need a model that maps each behavior to a number and predicts comparisons from those numbers. The Bradley-Terry model, a century-old model of paired comparisons (think chess Elo, which is the same idea), is exactly that link. Assign each item $\sigma$ a latent score $r_\phi(\sigma)$. The model says the probability that $\sigma_w$ is preferred to $\sigma_l$ is a logistic function of the score difference:</p>
+$$P_\phi(\sigma_w \succ \sigma_l) = \frac{\exp\big(r_\phi(\sigma_w)\big)}{\exp\big(r_\phi(\sigma_w)\big) + \exp\big(r_\phi(\sigma_l)\big)} = \sigma\!\big(r_\phi(\sigma_w) - r_\phi(\sigma_l)\big),$$
+<p>where $\sigma(z) = 1/(1 + e^{-z})$ is the logistic sigmoid. The structure is the entire point: preference probability depends only on the <em>difference</em> of scores, not their absolute level. A reward that is uniformly shifted by a constant predicts the identical preferences, so the reward model is identified only up to an additive constant, a fact that returns in subsection three as the reason a baseline or KL anchor is needed. When the two scores are equal the probability is one half (a coin flip, the human is indifferent); as the winner's score pulls ahead the probability saturates toward one.</p>
+<p>We fit $r_\phi$ by maximum likelihood: choose parameters that make the observed human choices as probable as possible. The negative log-likelihood over the comparison dataset is the reward-model training loss,</p>
+$$\mathcal{L}_{\text{RM}}(\phi) = -\,\mathbb{E}_{(\sigma_w, \sigma_l)\sim\mathcal{D}}\Big[\log \sigma\!\big(r_\phi(\sigma_w) - r_\phi(\sigma_l)\big)\Big],$$
+<p>which is precisely a binary-cross-entropy loss on the event "the winner outscores the loser", with the score difference as the logit. Minimizing it pushes the score of each preferred item above the score of its rejected partner by a margin that grows with how confidently the model should predict the human's choice. In the language-model setting $\sigma$ is a prompt-response pair and $r_\phi$ is typically the base language model with its output head replaced by a single scalar value head, so the reward model is "the policy network, scored". Figure 27.5.1 lays out the data flow from comparisons to a trained reward.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 290" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Flow from a pair of candidate outputs to a Bradley-Terry reward-model loss. A prompt feeds two candidate responses, a winner and a loser chosen by a human. Each response passes through the same reward model r-phi producing two scalar scores. The two scores feed a sigmoid of their difference, which is the Bradley-Terry preference probability and the training loss.">
+<defs>
+<marker id="arr275" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.box275 { fill:#eef3f8; stroke:#14385c; stroke-width:2; }
+.win275 { fill:#e8f5ec; stroke:#1c7a3e; stroke-width:1.8; }
+.los275 { fill:#fbeee8; stroke:#b8431f; stroke-width:1.8; }
+.rm275 { fill:#f1ecf8; stroke:#5a3aa0; stroke-width:2; }
+.fl275 { stroke:#5a626c; stroke-width:1.8; fill:none; marker-end:url(#arr275); }
+.lab275 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub275 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.win-t { font:600 12px sans-serif; fill:#1c7a3e; text-anchor:middle; }
+.los-t { font:600 12px sans-serif; fill:#b8431f; text-anchor:middle; }
+</style>
+<text class="lab275" x="410" y="24">From human choices to a scalar reward: the Bradley-Terry loss</text>
+<rect class="box275" x="30" y="120" width="92" height="46" rx="9"/><text class="sub275" x="76" y="148">prompt</text>
+<rect class="win275" x="200" y="70" width="120" height="44" rx="9"/><text class="win-t" x="260" y="97">y_w (chosen)</text>
+<rect class="los275" x="200" y="172" width="120" height="44" rx="9"/><text class="los-t" x="260" y="199">y_l (rejected)</text>
+<line class="fl275" x1="122" y1="135" x2="198" y2="98"/>
+<line class="fl275" x1="122" y1="151" x2="198" y2="188"/>
+<rect class="rm275" x="400" y="70" width="120" height="44" rx="9"/><text class="lab275" x="460" y="92" fill="#5a3aa0">reward r&#966;</text><text class="sub275" x="460" y="107">score r(y_w)</text>
+<rect class="rm275" x="400" y="172" width="120" height="44" rx="9"/><text class="lab275" x="460" y="194" fill="#5a3aa0">reward r&#966;</text><text class="sub275" x="460" y="209">score r(y_l)</text>
+<line class="fl275" x1="320" y1="92" x2="398" y2="92"/>
+<line class="fl275" x1="320" y1="194" x2="398" y2="194"/>
+<rect class="box275" x="610" y="120" width="180" height="46" rx="9"/><text class="lab275" x="700" y="142">&#963;( r(y_w) &#8722; r(y_l) )</text><text class="sub275" x="700" y="158">Bradley-Terry loss</text>
+<line class="fl275" x1="520" y1="100" x2="608" y2="134"/>
+<line class="fl275" x1="520" y1="186" x2="608" y2="152"/>
+<text class="sub275" x="700" y="190">push score(y_w) above score(y_l)</text>
+</svg>
+<figcaption><strong>Figure 27.5.1:</strong> The reward-model training loop. One prompt yields two candidate outputs; a human marks the winner $y_w$ and loser $y_l$. The <em>same</em> reward model $r_\phi$ scores both, and the Bradley-Terry loss $-\log\sigma(r_\phi(y_w) - r_\phi(y_l))$ pushes the winner's score above the loser's. Only the difference of scores matters, so the reward is identified up to an additive constant.</figcaption>
+</figure>
+<p>Two practical properties of this loss deserve emphasis before we use it. First, because only score differences are supervised, the reward model's absolute scale and offset are arbitrary; you cannot read $r_\phi(\sigma) = 4.2$ as "good" in any absolute sense, only $r_\phi(\sigma_w) > r_\phi(\sigma_l)$ is meaningful. Second, the reward model is a learned approximation of human taste and is therefore <em>exploitable</em>: a policy optimized hard enough against it will find inputs where the model's score is high but a real human would disagree, the phenomenon of reward hacking that motivates the KL leash of subsection three. The reward model is a proxy, accurate near the data it was trained on and untrustworthy far from it.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: A Bradley-Terry Preference Probability</div>
+<p>Suppose a trained reward model assigns response $y_w$ a score $r_\phi(y_w) = 2.1$ and response $y_l$ a score $r_\phi(y_l) = 1.3$. The model's predicted probability that a human prefers $y_w$ is $\sigma(2.1 - 1.3) = \sigma(0.8) = 1/(1 + e^{-0.8}) = 1/(1 + 0.449) \approx 0.690$, so about a 69 percent chance the human picks $y_w$. Now shift <em>both</em> scores up by 100, to $102.1$ and $101.3$: the difference is still $0.8$ and the predicted probability is unchanged at $0.690$, the concrete face of "identified only up to an additive constant". Push the winner further ahead, $r_\phi(y_w) = 4.3$ against $r_\phi(y_l) = 1.3$, and the difference $3.0$ gives $\sigma(3.0) \approx 0.953$: the model is now 95 percent sure, a near-certain preference. The reward model is calibrated to confidence: a half-point gap is a mild preference, a three-point gap is near-deterministic, and only gaps, never levels, carry meaning.</p>
+</div>
+
+<h2>3. RLHF: Optimizing a Policy Against the Learned Reward <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>With a reward model $r_\phi$ in hand we have an objective; now we optimize a policy against it. The naive move, "maximize expected learned reward", $\max_\theta \mathbb{E}_{y\sim\pi_\theta}[r_\phi(y)]$, fails for the reason subsection two warned about: the reward model is a proxy, and a policy free to maximize it will gallop off to regions where the proxy is high but wrong, producing degenerate outputs that score well and read badly. The reward model was never trained on those regions and cannot be trusted there. The standard fix is to add a leash. The RLHF objective optimizes reward minus a penalty for straying too far from a trusted reference policy $\pi_{\text{ref}}$ (usually the supervised-fine-tuned model the run started from):</p>
+$$\max_{\theta}\; \mathbb{E}_{x\sim\mathcal{D},\, y\sim\pi_\theta(\cdot\mid x)}\Big[\, r_\phi(x, y) \;-\; \beta\, \mathrm{KL}\!\big(\pi_\theta(\cdot\mid x)\,\|\,\pi_{\text{ref}}(\cdot\mid x)\big)\Big].$$
+<p>Read each term. The first, $r_\phi(x, y)$, is the learned reward: pull the policy toward outputs the reward model scores highly. The second, $\beta\,\mathrm{KL}(\pi_\theta \| \pi_{\text{ref}})$, is the leash: penalize the policy for putting probability mass where the reference would not, with coefficient $\beta$ setting the leash length. A large $\beta$ keeps the policy close to the trusted reference (safe, but little improvement); a small $\beta$ lets it chase reward harder (more improvement, more risk of reward hacking and of forgetting the fluency the reference had). The KL term also resolves the additive-constant ambiguity of subsection two: it anchors the policy to a concrete reference distribution, so the arbitrary offset of $r_\phi$ no longer matters.</p>
+<p>In practice this objective is optimized with proximal policy optimization (PPO), the policy-gradient algorithm of <a href="../../toc.html">Chapter 25</a>, treating each generated token as an action and the per-prompt reward (the reward-model score, with the KL penalty folded in as a per-token shaping term) as the return. This is where the temporal framing becomes literal: generating a response is a sequential decision process over tokens. The state is the prompt plus the tokens emitted so far, each action is the next token, and the episode ends at the end-of-sequence token, at which point the reward model scores the whole completion. RLHF is reinforcement learning over a token-level MDP, and the policy being aligned is a language model. The connection to the large language models of <a href="../../part-3-temporal-deep-learning/module-15-temporal-foundation-models/index.html">Chapter 15</a> is not an analogy; it is the same object. The assistants you interact with daily were tuned by exactly this loop: pretrain, supervised fine-tune to get $\pi_{\text{ref}}$, train a reward model from human comparisons, then PPO against it with a KL leash. Figure 27.5.2 names the three stages.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 220" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The three-stage RLHF pipeline drawn as three boxes left to right. Stage one, supervised fine-tuning, produces the reference policy. Stage two, reward modeling, trains r-phi from human comparisons. Stage three, PPO, optimizes the policy against the reward minus a KL penalty back to the reference policy from stage one.">
+<defs>
+<marker id="arrP275" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.st275 { fill:#eef3f8; stroke:#14385c; stroke-width:2; }
+.flP275 { stroke:#5a626c; stroke-width:1.8; fill:none; marker-end:url(#arrP275); }
+.klP275 { stroke:#b8431f; stroke-width:1.6; fill:none; marker-end:url(#arrP275); stroke-dasharray:5 4; }
+.tl275 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.sl275 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.kl275 { font:600 11px sans-serif; fill:#b8431f; text-anchor:middle; }
+</style>
+<text class="tl275" x="410" y="24">The three stages of RLHF</text>
+<rect class="st275" x="40" y="70" width="200" height="62" rx="10"/><text class="tl275" x="140" y="96">1. Supervised fine-tune</text><text class="sl275" x="140" y="116">gives reference &#960;_ref</text>
+<rect class="st275" x="310" y="70" width="200" height="62" rx="10"/><text class="tl275" x="410" y="96">2. Reward model r&#966;</text><text class="sl275" x="410" y="116">trained on human compares</text>
+<rect class="st275" x="580" y="70" width="200" height="62" rx="10"/><text class="tl275" x="680" y="96">3. PPO policy &#960;&#952;</text><text class="sl275" x="680" y="116">max r&#966; &#8722; &#946; KL to &#960;_ref</text>
+<line class="flP275" x1="240" y1="101" x2="308" y2="101"/>
+<line class="flP275" x1="510" y1="101" x2="578" y2="101"/>
+<path class="klP275" d="M 140 132 C 140 185, 680 185, 680 134"/>
+<text class="kl275" x="410" y="178">KL leash: stage 3 stays close to stage 1's &#960;_ref</text>
+</svg>
+<figcaption><strong>Figure 27.5.2:</strong> The classic RLHF pipeline. Supervised fine-tuning produces the reference policy $\pi_{\text{ref}}$; a reward model $r_\phi$ is trained on human comparisons; PPO then optimizes the policy to maximize $r_\phi$ minus a KL penalty back to $\pi_{\text{ref}}$. The dashed leash is what keeps stage three from exploiting the imperfect reward model of stage two.</figcaption>
+</figure>
+<p>The KL leash earns its place by preventing two distinct failure modes at once. It blocks <em>reward hacking</em>, where the policy discovers adversarial outputs the reward model overrates (repetitive boilerplate that happens to score high, say), because those outputs are far from the reference and the KL term taxes the distance. And it blocks <em>catastrophic forgetting</em> of the fluency and knowledge baked into the reference during pretraining and supervised fine-tuning, because staying near $\pi_{\text{ref}}$ in distribution means retaining its competence. Tuning $\beta$ is the central practical lever of an RLHF run: too tight and the policy barely improves, too loose and it games the reward and degrades. Much of the engineering folklore of RLHF is really folklore about keeping that one balance.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Reward Model Will Cheat If You Let It</div>
+<p>Remove the KL leash and an RLHF policy behaves like a student who has obtained the grading rubric and stopped caring about the subject. If the reward model has even a slight soft spot, say it mildly overrates longer answers, or answers that open with "Certainly!", or that hedge with a bulleted list, the unleashed policy will find that soft spot and live there, emitting confident, bulleted, certainly-prefixed sludge that scores beautifully and helps no one. The leash does not make the policy honest; it makes cheating expensive, by taxing every step away from the reference's distribution. It is a humbling reminder that you are not optimizing "be good", you are optimizing "score well on a flawed model of good", and the gap between those is exactly what the KL term is paid to police.</p>
+</div>
+
+<h2>4. DPO and the 2024 to 2026 Shift to Direct Preference Optimization <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The classic RLHF pipeline is powerful but heavy: three stages, a separate reward model to train and serve, and an on-policy RL loop (PPO) that is notoriously finicky to stabilize, needing careful reward normalization, value-function fitting, and $\beta$ tuning. A natural question is whether all that machinery is necessary, or whether the same preference signal can be optimized more directly. The answer, from Rafailov and colleagues in 2023 and the wave of work that followed, is direct preference optimization (DPO), which collapses reward modeling and policy optimization into a single supervised loss on the preference pairs, with no explicit reward model and no RL loop.</p>
+<p>The derivation rests on a clean observation: the KL-constrained objective of subsection three has a closed-form optimal policy, $\pi^*(y\mid x) \propto \pi_{\text{ref}}(y\mid x)\exp(r_\phi(x, y)/\beta)$. Invert that relation to write the reward in terms of the optimal policy and the reference, $r_\phi(x, y) = \beta\log\frac{\pi^*(y\mid x)}{\pi_{\text{ref}}(y\mid x)} + \beta\log Z(x)$, and substitute into the Bradley-Terry likelihood of subsection two. The partition function $Z(x)$ is shared between winner and loser and cancels in the difference, leaving a loss that depends only on the policy, the reference, and the preference pairs:</p>
+$$\mathcal{L}_{\text{DPO}}(\theta) = -\,\mathbb{E}_{(x, y_w, y_l)\sim\mathcal{D}}\left[\log \sigma\!\left(\beta\log\frac{\pi_\theta(y_w\mid x)}{\pi_{\text{ref}}(y_w\mid x)} - \beta\log\frac{\pi_\theta(y_l\mid x)}{\pi_{\text{ref}}(y_l\mid x)}\right)\right].$$
+<p>This is the same Bradley-Terry binary-cross-entropy as the reward-model loss, but with the implicit reward $\hat{r}_\theta(x, y) = \beta\log\frac{\pi_\theta(y\mid x)}{\pi_{\text{ref}}(y\mid x)}$ substituted in. The policy <em>is</em> the reward model now. Minimizing $\mathcal{L}_{\text{DPO}}$ raises the policy's log-probability of preferred responses and lowers it for rejected ones, each measured relative to the reference, which is precisely what the three-stage pipeline accomplished, but in one offline supervised pass with no reward model to train, no samples to draw on-policy, and no value function to fit. The KL leash of subsection three has not vanished; it survives, exactly, inside the $\log(\pi_\theta/\pi_{\text{ref}})$ ratio and the coefficient $\beta$, which is why DPO needs the reference model at training time.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: DPO Makes the Policy Its Own Reward Model</div>
+<p>RLHF trains a reward model, then optimizes a policy against it with RL. DPO observes that the optimal RLHF policy and the reward model are two views of one thing, so it skips straight to the policy and lets the implicit reward $\beta\log(\pi_\theta/\pi_{\text{ref}})$ do the reward model's job. The three-stage pipeline (reward model plus PPO) becomes one supervised loss on the same preference data. You give up an explicit, inspectable reward model and the ability to generate fresh on-policy comparisons during training, and in exchange you get a stable, offline, hyperparameter-light procedure that, on many alignment benchmarks from 2023 to 2026, matches or beats PPO-based RLHF. For most practitioners aligning a model from a fixed preference dataset, DPO is now the default first thing to try.</p>
+</div>
+<p>The DPO paper opened a fast-moving design space, and the 2024 to 2026 literature is full of variants worth naming. IPO adds a margin term to curb the overfitting DPO can show when preferences are near-deterministic; KTO drops the pairwise requirement entirely and learns from individual thumbs-up or thumbs-down labels using a prospect-theory-inspired loss, which matters because unpaired feedback is even cheaper to collect than pairs; ORPO folds preference optimization into the supervised fine-tuning stage so a single run produces an aligned model without a separate reference pass. Running through all of them is the same retreat from the heavy RL loop toward direct, supervised-style objectives on preference data.</p>
+<p>A second axis of the same period removes the human from the loop. Reinforcement learning from AI feedback (RLAIF), and the Constitutional AI approach that popularized it, replaces the human comparison labeler with a capable language model prompted to judge which of two responses better follows a written set of principles (a "constitution"). The AI judge produces the preference labels, which then feed exactly the reward-model-plus-RL or DPO machinery of this section. RLAIF trades some judgment quality for enormous gains in scale and cost, because an AI labeler is effectively unlimited, and it has become a standard way to bootstrap and scale alignment when human comparisons are the bottleneck. The frontier of 2025 to 2026 increasingly blends the two: a thin layer of trusted human comparisons to anchor quality, amplified by a much larger volume of AI-generated preferences.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Preference Optimization After PPO (2024 to 2026)</div>
+<p>The post-2023 alignment literature has split along two fronts this section has named. On the algorithm front, DPO (Rafailov et al., 2023) and its family, IPO (Azar et al., 2024), KTO (Ethayarajh et al., 2024), and ORPO (Hong et al., 2024), have largely displaced PPO as the default for offline preference data, trading on-policy flexibility for stability and simplicity; a counter-current (for example work on online and iterative DPO, and renewed PPO recipes) argues that on-policy sampling still matters for the hardest gains, so the PPO-versus-DPO question is genuinely open rather than settled. On the supervision front, RLAIF and Constitutional AI (Bai et al., 2022) showed AI-generated preferences can substitute for or amplify human ones, and 2024 to 2026 work pushes toward process-level and verifiable rewards: reasoning models trained with reinforcement learning against checkable correctness signals (for example the RL-from-verifiable-rewards recipes behind recent reasoning systems) extend preference-based ideas from "which answer does a human prefer" to "which reasoning trace actually solves the problem". The throughline for 2026: the reward, whether a learned Bradley-Terry model, an implicit DPO ratio, an AI judge, or a verifier, is the real lever, and how to specify and optimize it cheaply and without gaming is the central open problem of alignment.</p>
+</div>
+
+<h2>5. Worked Example: A Bradley-Terry Reward Model From Scratch, Then trl <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make the pipeline executable on a tiny synthetic problem where we know the ground-truth taste and can check that preference learning recovers it. The setup: each "behavior" is a 1-D feature $\sigma \in \mathbb{R}$, and the hidden human reward is $r^*(\sigma) = -(\sigma - 1.0)^2$, a taste that prefers behaviors near $\sigma = 1.0$ and dislikes those far from it. We never reveal $r^*$ to the learner. Instead we generate <em>pairwise preferences</em>: sample two behaviors, and let the human prefer the one with higher $r^*$, with Bradley-Terry label noise so the comparisons are realistic. Code 27.5.1 generates the preference data and trains a small Bradley-Terry reward model on it from scratch, then uses that learned reward to take one tiny preference-driven policy step, a from-scratch microcosm of the whole RLHF idea.</p>
+<pre><code class="language-python">import torch, torch.nn as nn
+
+torch.manual_seed(0)
+def true_reward(s):                       # the HIDDEN human taste; learner never sees it
+    return -(s - 1.0) ** 2                 # prefers behaviors near s = 1.0
+
+# --- 1. Generate pairwise preferences from the hidden taste (Bradley-Terry labels) ---
+N = 4000
+a = torch.rand(N, 1) * 6 - 3                # candidate behavior A in [-3, 3]
+b = torch.rand(N, 1) * 6 - 3                # candidate behavior B in [-3, 3]
+p_a_wins = torch.sigmoid(true_reward(a) - true_reward(b))   # Bradley-Terry probability
+a_wins = (torch.rand(N, 1) < p_a_wins).float()              # noisy human choice
+win = torch.where(a_wins.bool(), a, b)     # the preferred (won) behavior
+los = torch.where(a_wins.bool(), b, a)     # the rejected (lost) behavior
+
+# --- 2. Train a reward model r_phi by the Bradley-Terry / BCE loss of subsection 2 ---
+reward_model = nn.Sequential(nn.Linear(1, 32), nn.Tanh(), nn.Linear(32, 1))
+opt = torch.optim.Adam(reward_model.parameters(), lr=1e-2)
+for step in range(800):
+    rw, rl = reward_model(win), reward_model(los)            # scores of winner, loser
+    loss = -torch.log(torch.sigmoid(rw - rl) + 1e-8).mean()  # -log sigma(r_w - r_l)
+    opt.zero_grad(); loss.backward(); opt.step()
+print("final reward-model loss = %.4f" % loss.item())
+
+# --- 3. Use the LEARNED reward to take one preference-driven policy step ---
+# A "policy" here is a single mean parameter mu we generate behaviors around.
+mu = torch.zeros(1, requires_grad=True)    # start far from the (unknown) optimum 1.0
+pol_opt = torch.optim.SGD([mu], lr=0.2)
+ref_mu = torch.tensor(0.0)                  # reference policy (the KL anchor)
+for step in range(60):
+    samples = mu + 0.3 * torch.randn(256, 1)               # behaviors from the policy
+    learned_r = reward_model(samples).mean()                # maximize LEARNED reward...
+    kl = 0.5 * (mu - ref_mu) ** 2                           # ...minus a KL leash to ref
+    obj = -(learned_r - 0.1 * kl)                           # negate: SGD minimizes
+    pol_opt.zero_grad(); obj.backward(); pol_opt.step()
+print("policy mean moved to mu = %.3f (true optimum is 1.0)" % mu.item())
+</code></pre>
+<div class="code-caption"><strong>Code 27.5.1:</strong> The full preference-RL idea from scratch. Step 1 turns a hidden taste into Bradley-Terry-labeled comparisons; step 2 fits the reward model by the negative-log-sigmoid loss of subsection two; step 3 drives a one-parameter policy toward higher <em>learned</em> reward under a KL leash to a reference, the RLHF objective of subsection three in miniature. The policy never sees the true reward, only the model trained from choices.</div>
+<pre><code class="language-text">final reward-model loss = 0.5126
+policy mean moved to mu = 0.873 (true optimum is 1.0)
+</code></pre>
+<div class="code-caption"><strong>Output 27.5.1:</strong> The reward model learned from noisy comparisons alone, and the policy it guided moved from 0.0 toward 0.87, close to the true optimum of 1.0 it was never told. The small shortfall is the KL leash holding the policy back toward the reference at 0.0, exactly the safety-versus-reward trade of subsection three.</div>
+<p>Code 27.5.1 ran about 35 lines to express data generation, reward-model training, and a policy step. For a real language-model alignment run, the production library <code>trl</code> (HuggingFace Transformer Reinforcement Learning) collapses each of those stages to a configured trainer. Code 27.5.2 shows the reward-model and DPO calls; the same preference dataset that took dozens of lines of manual loss and optimization above becomes a trainer object and a single <code>.train()</code>.</p>
+<pre><code class="language-python">from datasets import Dataset
+from transformers import AutoModelForSequenceClassification, AutoModelForCausalLM, AutoTokenizer
+from trl import RewardTrainer, RewardConfig, DPOTrainer, DPOConfig
+
+# Preference data: each row has a prompt, a chosen response, and a rejected response.
+prefs = Dataset.from_dict({
+    "prompt":   ["Summarize the report.", "Explain gradient descent."],
+    "chosen":   ["A concise, faithful summary.", "A clear, correct explanation."],
+    "rejected": ["A rambling, off-topic reply.", "A confidently wrong explanation."],
+})
+
+# --- Option A: train an explicit Bradley-Terry reward model (subsection 2) ---
+rm = AutoModelForSequenceClassification.from_pretrained("distilbert-base-uncased", num_labels=1)
+tok = AutoTokenizer.from_pretrained("distilbert-base-uncased")
+RewardTrainer(model=rm, args=RewardConfig(output_dir="rm"),
+              train_dataset=prefs, processing_class=tok).train()   # BT loss, internally
+
+# --- Option B: skip the reward model and RL loop entirely with DPO (subsection 4) ---
+policy = AutoModelForCausalLM.from_pretrained("gpt2")
+DPOTrainer(model=policy, args=DPOConfig(output_dir="dpo", beta=0.1),
+           train_dataset=prefs, processing_class=tok).train()      # DPO loss, internally
+</code></pre>
+<div class="code-caption"><strong>Code 27.5.2:</strong> The same preference pipeline in <code>trl</code>. <code>RewardTrainer</code> fits the Bradley-Terry reward model of subsection two and <code>DPOTrainer</code> runs the DPO loss of subsection four, each with the KL anchoring, batching, and optimization handled internally. The roughly 35 lines of hand-written loss, optimizer, and policy step in Code 27.5.1 collapse to one trainer construction and one <code>.train()</code> call per option.</div>
+<pre><code class="language-text"># RewardTrainer:  Bradley-Terry loss minimized over the (chosen, rejected) pairs
+# DPOTrainer:     implicit-reward DPO loss; no separate reward model, no PPO loop
+# (both stream loss/accuracy logs per step; the chosen-vs-rejected margin grows)
+</code></pre>
+<div class="code-caption"><strong>Output 27.5.2:</strong> Both <code>trl</code> trainers consume the identical preference dataset; <code>RewardTrainer</code> yields a scored reward model for a downstream PPO run, while <code>DPOTrainer</code> yields an aligned policy directly, the practical embodiment of the RLHF-versus-DPO choice of subsection four.</div>
+<p>Read the two code blocks together. Code 27.5.1 exposed the gears: a Bradley-Terry loss is binary cross-entropy on score differences, and "RLHF" is maximizing a learned reward under a KL leash, both of which fit in a screenful of PyTorch. Code 27.5.2 showed that production tooling hides those gears behind a trainer, and, more importantly, that the modern default (<code>DPOTrainer</code>) discards the reward model and the RL loop altogether, exactly the simplification subsection four derived. The pedagogical payoff is that preference alignment is not a black box: you can build its reward model and policy step by hand, a library wraps the same math, and DPO is a principled shortcut through it, not a different idea.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Aligning a Support Assistant Without a Reward Spec</div>
+<p><strong>Who:</strong> A product team at a software company fine-tuning a customer-support assistant built on an open-weight base model, the kind of language model whose lineage runs back through <a href="../../part-3-temporal-deep-learning/module-15-temporal-foundation-models/index.html">Chapter 15</a>.</p>
+<p><strong>Situation:</strong> Their supervised-fine-tuned assistant was fluent but inconsistently helpful: sometimes terse to the point of unhelpful, sometimes padded with disclaimers, and no one on the team could write a reward function that captured "a good support answer".</p>
+<p><strong>Problem:</strong> They needed to encode a fuzzy quality bar, accurate, appropriately concise, warm but not obsequious, that they could recognize on sight but not specify, and they had limited annotator time.</p>
+<p><strong>Dilemma:</strong> Full PPO-based RLHF promised the most control but required training and serving a reward model and stabilizing an on-policy RL loop, weeks of finicky engineering. DPO promised most of the benefit from the same comparison data with a stable offline run, but gave up the inspectable reward model and online comparison refresh.</p>
+<p><strong>Decision:</strong> They collected about eight thousand pairwise comparisons (support agents picking the better of two assistant drafts), seeded with a small set of human pairs and amplified with RLAIF-style AI-judged pairs against a written quality rubric, then ran DPO with $\beta = 0.1$ against the supervised model as reference.</p>
+<p><strong>How:</strong> The pipeline was the <code>DPOTrainer</code> path of Code 27.5.2 on the eight thousand pairs; the supervised model served as both the initial policy and the frozen reference, so the KL ratio in the DPO loss kept the aligned model from drifting off its competent base.</p>
+<p><strong>Result:</strong> Human raters preferred the DPO-aligned assistant over the supervised baseline on a held-out prompt set, with the largest gains on the "appropriately concise" axis the team could never have hand-specified, and the offline run finished in hours without the PPO stabilization headaches.</p>
+<p><strong>Lesson:</strong> When the objective is recognizable but not writable, collect comparisons, not specifications; and when the comparisons are fixed and offline, reach for DPO before PPO. The reward you cannot write down, you can still learn from choices.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: From Thirty-Five Lines to One Trainer</div>
+<p>The from-scratch reward model, training loop, and policy step of Code 27.5.1 ran about 35 lines of explicit PyTorch (data generation, Bradley-Terry loss, two optimizers, a KL leash). The <code>trl</code> library collapses the entire pipeline to a configured trainer per stage: <code>RewardTrainer</code> implements the Bradley-Terry reward-model loss, <code>PPOTrainer</code> implements the KL-leashed PPO loop of subsection three, and <code>DPOTrainer</code> implements the direct loss of subsection four, each handling tokenization, batching, reference-model log-probabilities, KL estimation, and logging internally. The same preference dataset that drove dozens of hand-written lines becomes a few lines: build the trainer, call <code>.train()</code>. The library buys correctness on the fiddly parts (reference log-prob caching, KL estimation, sequence-level reward bookkeeping) that are easy to get subtly wrong by hand.</p>
+</div>
+
+<div class="callout looking-back">
+<div class="callout-title">Looking Back: Chapter 27 Closes, and the Reward Becomes a Condition</div>
+<p>Chapter 27 traced a single retreat from strong supervision toward weak. We began with optimal control, where a known model and a written cost let us compute the optimal action outright. Imitation learning gave up the model and the cost and leaned on demonstrations: behavioral cloning, DAgger, and inverse RL recovered behavior or reward from an expert who could act. This section gave up even the demonstration, keeping only the human's ability to <em>compare</em>, and showed that a Bradley-Terry reward model plus a KL-leashed policy update (RLHF), or its DPO shortcut, recovers a usable objective from choices alone, the recipe that aligns every modern assistant. The arc of the chapter is a ladder of ever-weaker supervision, and at each rung the same temporal MDP machinery does the work, now over tokens.</p>
+<p>Notice the conceptual hinge we end on. To align a language model we treated generation as a sequential decision process and reinforcement learning as the tool. <a href="../../toc.html">Chapter 28</a> turns that relationship inside out. Rather than using RL to train a sequence model, it asks whether the entire reinforcement-learning problem can be <em>recast as sequence modeling</em>: feed states, actions, and returns to a Transformer and let next-token prediction produce optimal behavior, conditioning on a desired return the way we here conditioned on a learned reward. The Decision Transformer and Trajectory Transformer of Chapter 28 are the destination of the temporal thread that the MDP of <a href="../../toc.html">Chapter 22</a> began: the MDP returns one last time, not as a control problem to solve but as a sequence to model. The reward we learned to score with here becomes the return we learn to condition on there.</p>
+</div>
+
+<section class="exercises">
+<h2>Exercises</h2>
+<p><strong>Conceptual.</strong> The Bradley-Terry model identifies the reward $r_\phi$ only up to an additive constant. (a) Show that shifting every score by the same constant $c$ leaves $P_\phi(\sigma_w \succ \sigma_l)$ unchanged. (b) Explain why this ambiguity is harmless for the RLHF objective of subsection three but would be a problem if you tried to compare reward-model scores across two separately trained reward models. (c) Identify which term in the RLHF objective resolves the ambiguity and why.</p>
+<p><strong>Implementation.</strong> Extend Code 27.5.1. (a) Sweep the KL coefficient (the <code>0.1</code> multiplying <code>kl</code>) across values $\{0.0, 0.05, 0.2, 1.0\}$ and report where the policy mean $\mu$ settles for each; explain the trend in terms of the leash length of subsection three. (b) Replace the from-scratch policy step with the DPO loss of subsection four: implement $\mathcal{L}_{\text{DPO}}$ directly on the <code>(win, los)</code> pairs using the reward model's frozen scores as a stand-in reference, and confirm the implied preference ordering matches the Bradley-Terry model you trained. (c) Add Bradley-Terry label noise control: vary the spread of the candidate behaviors and report how reward-model loss changes, relating it to the saturation behavior of the sigmoid.</p>
+<p><strong>Open-ended.</strong> RLAIF replaces the human comparison labeler with an AI judge. (a) Describe a concrete failure mode in which the AI judge's biases get baked into the learned reward and amplified by the policy, and connect it to the reward-hacking discussion of subsection three. (b) Propose a protocol that mixes a small number of trusted human comparisons with a large volume of AI-judged comparisons to bound that risk, and state what you would measure to know it is working. (c) Argue, with reference to the 2024 to 2026 verifiable-reward frontier of subsection four, when you would prefer a checkable correctness signal over any preference model at all.</p>
+</section>
+
+<nav class="chapter-nav" aria-label="Section navigation">
+<a class="nav-prev" href="section-27.4.html"><span class="nav-label">Previous</span><span class="nav-num">Section 27.4</span><span class="nav-title">Inverse Reinforcement Learning</span></a>
+<a class="nav-up" href="index.html"><span class="nav-label">Up</span><span class="nav-num">Chapter 27</span><span class="nav-title">Optimal Control and Imitation Learning</span></a>
+<a class="nav-next" href="../../toc.html"><span class="nav-label">Next</span><span class="nav-num">Contents</span><span class="nav-title">Table of Contents</span></a>
+</nav>
+</main>
+<footer class="book-footer">
+<p class="footer-edition">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="footer-copy">&copy; 2026 Alexander Apartsin &middot; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated"><script>document.write("Last updated " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 26.5: Hierarchical RL and Temporal Abstraction. Why flat reinforcement learning struggles with long horizons and sparse rewards, the options framework of temporally-extended actions with initiation sets, intra-option policies and termination conditions, the semi-MDP view and option-level Bellman equations, modern HRL (option-critic, FeUdal, HIRO, skill discovery), and a from-scratch manager-worker hierarchy that solves a sparse-reward gridworld a flat agent cannot." name="description"/>
+<title>Section 26.5: Hierarchical RL and Temporal Abstraction | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Sequential Decision Making</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 26: Advanced Reinforcement Learning</a></div>
+<h1>Hierarchical RL and Temporal Abstraction</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I do not walk to the kitchen one muscle twitch at a time. I issue an order, 'go to the kitchen', and let some subordinate worry about the thousand little steps. When it reports back, I issue the next order. I am paid to choose goals, not footsteps, and the secret of my productivity is that I never once read the footnotes."</p>
+<cite>A Manager Policy Delegating the Boring Steps to Its Subordinates</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Flat reinforcement learning chooses one primitive action per timestep, so on a task that needs a thousand carefully ordered steps before any reward arrives it must assign credit across a thousand-link chain of decisions, an exponentially thin needle in an exponentially large haystack. Hierarchical reinforcement learning (HRL) breaks that chain by letting an agent act at more than one time scale: a high-level policy commits to a temporally-extended behavior (an "option", or a subgoal handed to a worker) that runs for many primitive steps before returning control, so the high level reasons over a handful of decisions where the flat agent faced a thousand.</strong> The options framework formalizes a temporally-extended action as a triple of an initiation set, an intra-option policy, and a termination condition, and it turns the underlying Markov decision process into a semi-Markov decision process (SMDP) whose Bellman equations discount over the random duration of each option rather than over single steps. This section motivates HRL from the long-horizon credit-assignment problem (a direct sequel to the long-dependency pathology of <a href="../../toc.html">Section 9.4</a>), builds the options/SMDP theory with its option-level Bellman equations, surveys modern HRL (the option-critic, FeUdal manager-worker networks, goal-conditioned HIRO, and unsupervised skill discovery), connects temporal abstraction to planning and world models (forward to <a href="../../toc.html">Chapter 29</a>), and implements a from-scratch two-level manager-worker hierarchy that solves a sparse-reward gridworld on which a flat $Q$-learner never even finds the goal, then collapses the same idea to a clean library-style version. You leave able to recognize when a task needs temporal abstraction, to read and write option-level value updates, and to build a working hierarchy.</p>
+</div>
+<p>In <a href="section-26.4.html">Section 26.4</a> we pushed single-level deep agents harder, sharpening exploration and stability so a flat policy could squeeze more out of each environment step. This section changes the unit of decision entirely. Instead of asking the agent to choose better primitive actions, we let it choose <em>behaviors</em>: sequences of primitive actions, bundled and named, selected as wholes. That single move, from acting over actions to acting over temporally-extended actions, is the content of hierarchical reinforcement learning, and it is the most direct structural answer the field has to the problem that flat RL handles worst: the long horizon with a sparse reward. We use the unified notation of <a href="../../toc.html">Appendix A</a> throughout: $s$ a state, $a$ a primitive action, $\pi$ a policy, $r$ a reward, $\gamma$ the discount, and we add $o$ for an option and $g$ for a subgoal.</p>
+<p>Why does temporal abstraction deserve its own section rather than a remark that "you can group actions"? Because grouping actions correctly changes the mathematics of the problem, not just its engineering. An option that runs for a random number of steps turns the discrete-time MDP of <a href="../../toc.html">Chapter 22</a> into a semi-Markov process whose value equations must discount over duration, it changes what a Bellman backup means, and it changes the effective horizon over which credit must travel from thousands of primitive steps to a handful of option choices. Get the abstraction right and a task that was hopeless for a flat agent becomes routine; get it wrong (options that never terminate, subgoals the worker cannot reach, a manager that learns faster than its worker) and the hierarchy is worse than the flat baseline it replaced. This section gives you the theory to reason about that boundary and the code to sit on the right side of it.</p>
+<p>The competencies this section installs are four. To state precisely why flat RL's credit-assignment difficulty grows with the horizon and the reward sparsity. To define an option as an initiation-set, intra-option-policy, termination triple and to write the SMDP Bellman equations that value options. To place the modern HRL architectures (option-critic, FeUdal, HIRO, skill discovery) on a single map of "where does the abstraction come from". And to implement a two-level hierarchy from scratch and verify it solves a sparse-reward task a flat agent cannot. These are the load-bearing skills for the control-and-imitation methods of <a href="../../toc.html">Chapter 27</a> and the planning-over-abstractions of <a href="../../toc.html">Chapter 29</a>.</p>
+
+<h2>1. The Long-Horizon, Sparse-Reward Problem and Why Flat RL Struggles <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>A flat reinforcement learner chooses one primitive action at every timestep and learns from the reward signal that follows. On a task where reward is dense (something informative arrives almost every step) this is fine: the gradient of return with respect to each decision is well estimated because feedback is frequent and local. The trouble begins when the reward is <em>sparse</em> and the horizon is <em>long</em>: the agent must execute a long, specific sequence of primitive actions before any reward distinguishes success from failure, and until that reward arrives every action looks equally good or bad. Credit for the eventual outcome must then be assigned backward across the entire chain, and the longer the chain, the thinner the signal that reaches its early links.</p>
+<p>This is the control-theoretic twin of a pathology we have already met. In <a href="../../toc.html">Section 9.4</a> we saw that a recurrent network propagating a gradient backward across many timesteps multiplies one Jacobian per step, and the product vanishes (or explodes) geometrically with depth, so a learning signal from the distant future barely reaches the distant past. Temporal-difference credit assignment in a long-horizon MDP has the same shape: bootstrapped value information seeps backward one Bellman backup per step, discounted by $\gamma$ each time, so a reward $H$ steps away is attenuated by $\gamma^{H}$ before it influences an early decision. With $\gamma = 0.99$ and $H = 1000$ that factor is $\gamma^{H} \approx e^{-10} \approx 4.5 \times 10^{-5}$: the reward is, for practical purposes, invisible to the actions that earned it. Long-horizon RL is BPTT's long-dependency problem wearing a control costume.</p>
+<p>Compounding the attenuation is exploration. To even observe the sparse reward once, a flat agent acting by local exploration (epsilon-greedy, or small policy noise) must stumble onto the entire successful sequence by chance. If success requires a specific length-$H$ sequence over $|\mathcal{A}|$ actions, the probability of hitting it by undirected exploration is on the order of $|\mathcal{A}|^{-H}$, which is astronomically small for any non-trivial $H$. The agent cannot learn from a reward it never sees, and it cannot reliably see a reward that demands a long precise sequence. The two difficulties reinforce each other: sparse reward starves credit assignment, and the long horizon starves exploration.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two timelines compared. The top timeline shows a flat agent taking many small primitive-action steps from start to a distant sparse reward, with the discount factor gamma to the power H shrinking the signal. The bottom timeline shows a hierarchical agent taking a few long option steps to the same reward, so the discounted distance is much shorter.">
+<defs>
+<marker id="arr265" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+<marker id="arrO265" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.lab265 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub265 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.flat265 { stroke:#5a626c; stroke-width:1.6; fill:none; marker-end:url(#arr265); }
+.opt265 { stroke:#14385c; stroke-width:2.4; fill:none; marker-end:url(#arrO265); }
+.goal265 { fill:#fbeee8; stroke:#b8431f; stroke-width:1.8; }
+.gtxt265 { font:600 12px sans-serif; fill:#b8431f; text-anchor:middle; }
+</style>
+<text class="lab265" x="410" y="24">Same task, two decision granularities</text>
+<text class="sub265" x="70" y="78" font-weight="600">Flat</text>
+<line class="flat265" x1="100" y1="74" x2="130" y2="74"/>
+<line class="flat265" x1="135" y1="74" x2="165" y2="74"/>
+<line class="flat265" x1="170" y1="74" x2="200" y2="74"/>
+<line class="flat265" x1="205" y1="74" x2="235" y2="74"/>
+<line class="flat265" x1="240" y1="74" x2="270" y2="74"/>
+<line class="flat265" x1="275" y1="74" x2="305" y2="74"/>
+<line class="flat265" x1="310" y1="74" x2="340" y2="74"/>
+<line class="flat265" x1="345" y1="74" x2="375" y2="74"/>
+<line class="flat265" x1="380" y1="74" x2="410" y2="74"/>
+<line class="flat265" x1="415" y1="74" x2="445" y2="74"/>
+<line class="flat265" x1="450" y1="74" x2="480" y2="74"/>
+<line class="flat265" x1="485" y1="74" x2="515" y2="74"/>
+<line class="flat265" x1="520" y1="74" x2="550" y2="74"/>
+<line class="flat265" x1="555" y1="74" x2="585" y2="74"/>
+<line class="flat265" x1="590" y1="74" x2="620" y2="74"/>
+<line class="flat265" x1="625" y1="74" x2="655" y2="74"/>
+<rect class="goal265" x="665" y="60" width="56" height="28" rx="6"/><text class="gtxt265" x="693" y="78">reward</text>
+<text class="sub265" x="380" y="104">H primitive steps, signal attenuated by &#947;<tspan dy="-5" font-size="9">H</tspan></text>
+<text class="sub265" x="70" y="178" font-weight="600">HRL</text>
+<line class="opt265" x1="100" y1="174" x2="285" y2="174"/><text class="sub265" x="192" y="164">option o&#8321;</text>
+<line class="opt265" x1="290" y1="174" x2="475" y2="174"/><text class="sub265" x="382" y="164">option o&#8322;</text>
+<line class="opt265" x1="480" y1="174" x2="655" y2="174"/><text class="sub265" x="567" y="164">option o&#8323;</text>
+<rect class="goal265" x="665" y="160" width="56" height="28" rx="6"/><text class="gtxt265" x="693" y="178">reward</text>
+<text class="sub265" x="380" y="208">3 option decisions, signal attenuated by &#947;<tspan dy="-5" font-size="9">3</tspan> at the option level</text>
+</svg>
+<figcaption><strong>Figure 26.5.1:</strong> The same sparse-reward task seen by a flat agent (top, $H$ primitive decisions before reward) and a hierarchical agent (bottom, a few option decisions). At the option level the reward is only a handful of decisions away, so the SMDP discount $\gamma^{\tau}$ over option durations attenuates the credit signal far less than the flat $\gamma^{H}$, which is the mechanism by which temporal abstraction shortens the effective horizon.</figcaption>
+</figure>
+<p>Temporal abstraction is the structural fix. If the agent could commit to a behavior that runs for many primitive steps, then at the level where it makes decisions the horizon collapses: a task that was a thousand primitive steps deep might be only a handful of <em>option</em> choices deep, and credit must travel across that handful, not the thousand. The discount seen at the option level is $\gamma$ raised to the option's duration rather than to a single step, so reward that was attenuated by $\gamma^{1000}$ at the primitive level might be attenuated by only $\gamma^{3}$ at a three-option level. Acting at multiple time scales is therefore not a convenience but a direct shortening of the chain over which credit must propagate, exactly as Figure 26.5.1 contrasts. The rest of this section makes "a behavior that runs for many steps" mathematically precise and then builds one.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Temporal Abstraction Shortens the Credit-Assignment Horizon</div>
+<p>The single reason HRL helps on long-horizon sparse-reward tasks is that it changes the <em>number of decisions</em> between a state and the reward, not the wall-clock length of the episode. A flat agent makes one decision per primitive step, so an $H$-step task is an $H$-decision credit-assignment problem and the reward is discounted by $\gamma^{H}$. A hierarchical agent whose options each run for tens of steps makes $H/\bar{\tau}$ decisions, where $\bar{\tau}$ is the mean option length, so the same task is an $(H/\bar{\tau})$-decision problem and the reward is discounted by roughly $\gamma^{H/\bar{\tau}}$ at the level that matters. Longer options mean fewer decisions mean a shorter effective horizon mean a stronger learning signal reaching early choices. Every benefit of temporal abstraction, easier credit assignment, more directed exploration, faster planning, descends from this one change in decision count.</p>
+</div>
+
+<h2>2. The Options Framework and the Semi-MDP View <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The classical formalization of a temporally-extended action is the <em>option</em>, introduced by Sutton, Precup, and Singh. An option $o$ is a triple</p>
+$$o = \langle \mathcal{I}_o,\; \pi_o,\; \beta_o \rangle,$$
+<p>where the three components answer three questions about the behavior. The <strong>initiation set</strong> $\mathcal{I}_o \subseteq \mathcal{S}$ says <em>where the option may begin</em>: the option is available for selection only in states $s \in \mathcal{I}_o$. The <strong>intra-option policy</strong> $\pi_o(a \mid s)$ says <em>what the option does</em> while it runs: a policy over primitive actions that executes until termination. The <strong>termination condition</strong> $\beta_o(s) \in [0,1]$ says <em>when the option ends</em>: the probability that the option stops upon reaching state $s$, returning control to the level above. A primitive action is the degenerate special case of an option that is available everywhere, takes exactly one action, and always terminates after one step ($\beta_o \equiv 1$), so options strictly generalize actions and a flat MDP is an HRL problem with only one-step options.</p>
+<p>An agent equipped with a set of options $\mathcal{O}$ chooses among them with a <em>policy over options</em> $\mu(o \mid s)$, which selects an option in an initiation state, runs that option's intra-option policy until it terminates, then chooses the next option, and so on. Crucially the options run for a <em>random</em> number of primitive steps $\tau$ (random because $\beta_o$ is stochastic and the environment is stochastic), and this is what takes us out of the ordinary discrete-time MDP. A process in which actions take random, state-dependent amounts of time is a <strong>semi-Markov decision process (SMDP)</strong>, and the value functions of an SMDP discount over those durations.</p>
+<p>Concretely, define for an option $o$ started in state $s$ two SMDP quantities: the expected discounted reward accumulated while the option runs, and the discounted distribution over the state where it terminates. Let $\tau$ be the (random) option duration and $r_{t+1}, \dots, r_{t+\tau}$ the primitive rewards collected. Write the option's <em>reward model</em> and <em>transition model</em> as</p>
+$$R_o(s) = \mathbb{E}\!\left[\sum_{i=1}^{\tau} \gamma^{i-1} r_{t+i} \,\Big|\, s_t = s,\, o\right], \qquad P_o(s' \mid s) = \mathbb{E}\!\left[\gamma^{\tau}\,\mathbb{1}[s_{t+\tau} = s'] \,\Big|\, s_t = s,\, o\right],$$
+<p>where $R_o(s)$ is the discounted reward earned during the option and $P_o(s' \mid s)$ folds the discount $\gamma^{\tau}$ over the random duration into the transition itself (so $P_o$ is a sub-stochastic, discount-weighted kernel, not a probability distribution). With these two models the <em>option-level Bellman equations</em> have exactly the shape of the ordinary ones, but over options rather than primitive actions:</p>
+$$Q_{\mu}(s, o) = R_o(s) + \sum_{s'} P_o(s' \mid s)\, V_{\mu}(s'), \qquad V_{\mu}(s) = \sum_{o} \mu(o \mid s)\, Q_{\mu}(s, o).$$
+<p>The optimal option-value equation is the same backup with a max over options available in the initiation set,</p>
+$$Q^{*}(s, o) = R_o(s) + \sum_{s'} P_o(s' \mid s)\, \max_{o' \in \mathcal{O}(s')} Q^{*}(s', o'),$$
+<p>and a single SMDP $Q$-learning update, after running an option from $s$ to its termination at $s'$ in $\tau$ steps and collecting accumulated discounted reward $G = \sum_{i=1}^{\tau}\gamma^{i-1} r_{t+i}$, is</p>
+$$Q(s, o) \;\leftarrow\; Q(s, o) + \alpha\Big[\, G + \gamma^{\tau}\max_{o'} Q(s', o') - Q(s, o)\,\Big].$$
+<p>This is ordinary $Q$-learning with two modifications, and both come from the option running for $\tau$ steps rather than one: the immediate reward is the <em>accumulated discounted</em> reward $G$ over the whole option, and the bootstrap discount is $\gamma^{\tau}$ rather than $\gamma$. Setting $\tau \equiv 1$ recovers flat $Q$-learning exactly, which is the precise sense in which the SMDP view generalizes <a href="../../toc.html">Chapter 22</a>. The decisive consequence is the one Section 1 anticipated: because the bootstrap discount is $\gamma^{\tau}$ with $\tau$ often large, value information jumps many primitive steps in a single backup, so credit propagates across the episode in a number of updates proportional to the option count rather than the primitive-step count.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: The SMDP Multi-Step Discount</div>
+<p>Suppose an option runs for exactly $\tau = 20$ primitive steps and collects a reward of $+1$ only on its final step, with $\gamma = 0.95$. The accumulated discounted reward over the option is $G = \gamma^{19}\cdot 1 = 0.95^{19} \approx 0.377$, and the bootstrap of the next option's value is discounted by $\gamma^{\tau} = 0.95^{20} \approx 0.358$. Compare the flat view of the same trajectory: a flat agent would need 20 separate one-step backups, each discounting by $0.95$, for value to travel from the reward back to the option's first state, and after those 20 backups the propagated factor is $0.95^{20} \approx 0.358$, identical, but it took twenty updates instead of one. Now chain three such options before reward (so $H = 60$ primitive steps): the flat agent attenuates by $0.95^{60} \approx 0.046$ and needs sixty backups to move credit end to end, while the three-option agent attenuates by $\gamma^{\tau_1+\tau_2+\tau_3}$ across just three SMDP backups. Same total discounting, an exponential reduction in the number of decisions and updates over which credit must survive: 3 versus 60. That update-count reduction is why the hierarchy learns and the flat agent does not.</p>
+</div>
+<p>Two subtleties matter in practice. First, the option models $R_o$ and $P_o$ are usually not known and must be learned, which is what the intra-option learning methods and the option-critic of Section 3 do. Second, the SMDP view above treats each option as atomic (decisions are made only at option boundaries), but <em>intra-option</em> methods can update an option's value and policy at every primitive step it executes, which is far more data-efficient because every step teaches, not just every boundary. The option-critic of the next subsection is exactly an intra-option, end-to-end-differentiable realization of this idea.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Tyranny of the Never-Terminating Option</div>
+<p>An option that never decides to stop ($\beta_o \equiv 0$) is a manager who delegates a task and then goes on permanent vacation: control never comes back, the high level makes exactly one decision for the whole episode, and the hierarchy quietly degenerates into a single fixed policy. The opposite failure, an option that terminates every step ($\beta_o \equiv 1$), is a micromanager who recalls the worker after every footstep, and the hierarchy degenerates back into the flat agent it was supposed to improve on. Useful temporal abstraction lives in the narrow band between the absentee and the micromanager, and a recurring difficulty in learned HRL is that gradient descent, left unregularized, drifts toward one of these two trivial extremes (usually the micromanager, because terminating often is locally rewarding). The deliberation-cost and termination-regularization tricks of Section 3 exist precisely to keep options from collapsing to length one.</p>
+</div>
+
+<h2>3. Modern HRL: Option-Critic, FeUdal, HIRO, and Skill Discovery <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The classical options framework assumes the options are given. The central question of modern HRL is the opposite: <em>where do the options come from?</em> Four major families answer it differently, and they organize cleanly along that axis.</p>
+<p><strong>Learn the options end to end (the option-critic).</strong> Bacon, Harb, and Precup's option-critic (2017) makes the intra-option policies $\pi_o$ and the termination functions $\beta_o$ differentiable and trains them, together with the policy over options, directly by gradient ascent on the expected return. The intra-option policy gradient and the termination gradient are derived analogues of the ordinary policy gradient, and the key practical result is the <em>termination gradient</em>: an option's termination probability is pushed up where ending the option and switching is advantageous, and pushed down where continuing is. Left alone this collapses options to length one, so a <em>deliberation cost</em> (a small penalty per option switch) is added to keep options temporally extended, which is the regularizer the fun note above anticipated. The option-critic learns the whole hierarchy from reward alone, with no subgoals specified by hand.</p>
+<p><strong>Manager sets a direction, worker follows it (FeUdal networks).</strong> The feudal view, from Dayan and Hinton's feudal RL (1993) and modernized by Vezhnevets et al.'s FeUdal Networks (FuN, 2017), splits the agent into a slow <em>Manager</em> and a fast <em>Worker</em>. The Manager operates at a coarse time scale and emits a <em>directional subgoal</em> in a learned latent state space (a vector indicating "move the latent state this way"); the Worker is rewarded, by an intrinsic reward, for producing primitive actions that move the latent state in the Manager's chosen direction. The Manager never speaks in primitive actions and the Worker never sees the environment reward directly, so the temporal abstraction is enforced architecturally: the Manager's directional goals persist over a fixed horizon, giving the hierarchy its multiple time scales by construction.</p>
+<p><strong>Manager sets a goal state, worker reaches it (goal-conditioned HRL, HIRO).</strong> The most directly useful modern recipe is goal-conditioned: a high-level policy proposes a <em>subgoal</em> $g$ (often a target state or a target in a feature space), and a goal-conditioned low-level policy $\pi(a \mid s, g)$ is trained to reach it, rewarded by an intrinsic reward such as the negative distance to $g$. Nachum et al.'s HIRO (2018) made this work off-policy and data-efficiently, with a <em>goal relabeling</em> trick that re-labels the high-level transitions so the high-level critic stays consistent as the low-level policy changes underneath it. Goal-conditioned hierarchies are attractive because the subgoal interface is interpretable (a subgoal is a place to get to) and because the low level can be reused across tasks that share a state space.</p>
+<p><strong>Discover skills with no reward at all (unsupervised skill discovery).</strong> A fourth family learns a repertoire of options before any task reward exists, by an intrinsic objective that rewards behaviors for being <em>distinguishable</em>. DIAYN (Eysenbach et al., 2018, "Diversity Is All You Need") maximizes the mutual information between a latent skill code and the states the skill visits, so different codes learn to occupy different regions of state space, yielding a set of distinct, reusable skills with no extrinsic reward. The downstream task then only has to learn a policy over these pre-discovered skills, a much shorter-horizon problem. Skill discovery is the unsupervised-representation-learning idea of <a href="../../toc.html">Chapter 16</a> transported into the action space: learn a useful basis of behaviors first, solve tasks over that basis second.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Method</th><th>Where the abstraction comes from</th><th>High-level interface</th><th>Trained by</th></tr></thead>
+<tbody>
+<tr><td>Classical options</td><td>given by the designer</td><td>option id $o = \langle \mathcal{I},\pi,\beta\rangle$</td><td>SMDP $Q$-learning</td></tr>
+<tr><td>Option-critic</td><td>learned end to end from reward</td><td>option id, with learned $\pi_o, \beta_o$</td><td>intra-option + termination gradients, deliberation cost</td></tr>
+<tr><td>FeUdal (FuN)</td><td>architecturally enforced</td><td>directional latent goal</td><td>Manager + Worker, intrinsic directional reward</td></tr>
+<tr><td>HIRO (goal-conditioned)</td><td>learned subgoals, off-policy</td><td>target state / feature subgoal $g$</td><td>off-policy, goal relabeling</td></tr>
+<tr><td>DIAYN (skill discovery)</td><td>unsupervised, before task reward</td><td>discrete skill code $z$</td><td>mutual-information / diversity objective</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 26.5.2:</strong> Modern HRL on one axis, "where does the temporal abstraction come from". The methods range from hand-given options (left) through reward-driven end-to-end learning (option-critic) and architecturally enforced hierarchy (FeUdal) to goal-conditioned subgoals (HIRO) and fully unsupervised skill discovery (DIAYN). The shared idea is a high-level policy choosing a temporally-extended behavior; the methods differ only in what that behavior is and how it is acquired.</figcaption>
+</figure>
+<p>Across all four families a single interface recurs: the <strong>subgoal as temporal-abstraction boundary</strong>. Whether it is an option id, a directional latent vector, a target state, or a skill code, the high level communicates to the low level a commitment that persists for many primitive steps, and that persistence is the temporal abstraction. The design choices, what the subgoal is, how the low level is rewarded for it, how often the high level may change it, are the engineering surface of HRL, and the worked example in Section 5 instantiates the simplest member of the family (a target-cell subgoal with a distance-based intrinsic reward) so the interface is concrete.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Hierarchy Meets Language and World Models (2024 to 2026)</div>
+<p>The most active 2024 to 2026 thread is using <em>language</em> as the subgoal interface. Methods in the spirit of SayCan, Voyager, and Eureka let a large language model propose high-level subgoals ("collect wood", "build a shelter") that a low-level learned or scripted policy executes, turning the language model into a manager policy and grounding its instructions in a learned worker, exactly the manager-worker split of FeUdal with a far richer subgoal space. A second active line couples hierarchy with <em>world models</em>: Director (Hafner et al., 2022) learns a manager that proposes subgoals inside the latent space of a Dreamer-style world model and a worker that reaches them, planning temporally-abstract behaviors entirely in imagination, which is the bridge to <a href="../../toc.html">Chapter 29</a>. A third line revisits <em>unsupervised skill discovery</em> with metric and Lipschitz-constrained objectives (METRA and related 2023 to 2024 work) that scale skill discovery to high-dimensional pixel control where DIAYN's mutual-information bound was loose. The 2026 practitioner's read: hand-designed options are largely gone, and the live questions are what subgoal space to learn in (raw state, learned latent, or language) and how to discover reusable skills without task reward.</p>
+</div>
+
+<h2>4. Temporal Abstraction in Planning and World Models <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Temporal abstraction pays off twice. Section 1 showed its first payoff, a shorter credit-assignment horizon for learning. Its second payoff is for <em>planning</em>, and it is just as large. Recall from <a href="../../toc.html">Section 22</a> that planning with a model means simulating forward and backing up values; the cost of a planning rollout scales with how many model steps it spans. If the planner can take <em>option-length</em> steps using the option models $R_o$ and $P_o$ of Section 2, then a plan that would have been a thousand primitive-step rollout becomes a handful of option-step rollouts, an exponential reduction in planning depth, with the SMDP discount $\gamma^{\tau}$ handling the variable durations automatically. Abstraction shortens the planning horizon for exactly the reason it shortens the learning horizon: fewer decisions between start and goal.</p>
+<p>This is precisely where HRL meets the world models of <a href="../../toc.html">Chapter 29</a>. A world model is a learned simulator $\hat{P}(s' \mid s, a)$ that lets an agent imagine consequences without acting; a <em>temporally-abstract</em> world model learns the option-level transition $P_o(s' \mid s)$ directly, predicting where an option will land and how much reward it will accrue without rolling out its every primitive step. Planning over such a model is planning over behaviors, and it is what lets methods like Director (previewed in the research-frontier callout) plan in imagination over hundreds of effective steps at acceptable cost. The two ideas are complementary: the world model supplies the simulator, and temporal abstraction supplies the coarse time scale at which simulating is cheap. <a href="../../toc.html">Chapter 29</a> develops learned world models and planning in full; the message to carry there is that hierarchy and planning are not separate tricks but the same lever, fewer decisions, applied once to learning and once to search.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: One Lever, Two Payoffs</div>
+<p>Temporal abstraction is a single lever, "make each decision span many primitive steps", that pays off in two distinct phases of an agent's life. In <em>learning</em>, it shortens the chain over which TD credit must propagate, so reward signal survives to reach the decisions that earned it (Section 1). In <em>planning</em>, it shortens the depth of model rollouts, so a search reaches a distant goal in a few abstract steps instead of many primitive ones (this section). The option models $R_o, P_o$ of Section 2 are the shared machinery: the same discounted reward-and-transition summary of an option that defines its SMDP value backup also defines the abstract step a planner takes. Build the abstraction once and both the learner and the planner inherit the shorter horizon, which is why temporal abstraction sits at the center of the most capable long-horizon agents in <a href="../../toc.html">Chapter 29</a>.</p>
+</div>
+
+<h2>5. Worked Example: A Manager-Worker Hierarchy on a Sparse-Reward Gridworld <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make the entire section executable on the smallest task that exhibits the long-horizon, sparse-reward difficulty: a gridworld where reward is $+1$ only at a single goal cell far from the start and $0$ everywhere else, with a step budget too short for undirected exploration to stumble onto the goal. We will first show a flat tabular $Q$-learner failing on it, then build a two-level manager-worker hierarchy from scratch that solves it, and finally collapse the hierarchy to a clean, compact version. Code 26.5.1 defines the environment and the flat baseline.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(0)
+N = 12                                   # 12x12 grid; goal is far from start -> long horizon
+START, GOAL = (0, 0), (N - 1, N - 1)
+ACTIONS = [(-1, 0), (1, 0), (0, -1), (0, 1)]   # up, down, left, right
+MAX_STEPS = 80                           # budget; shortest path is 22 steps, but sparse reward
+
+def step(pos, a):
+    """One primitive step; stay in place if it would leave the grid."""
+    nr, nc = pos[0] + ACTIONS[a][0], pos[1] + ACTIONS[a][1]
+    if 0 <= nr < N and 0 <= nc < N:
+        pos = (nr, nc)
+    r = 1.0 if pos == GOAL else 0.0      # SPARSE: reward only at the goal
+    return pos, r, pos == GOAL
+
+def flat_q_learning(episodes=4000, alpha=0.5, gamma=0.97, eps=0.2):
+    """Tabular epsilon-greedy Q-learning over PRIMITIVE actions."""
+    Q = np.zeros((N, N, 4))
+    successes = 0
+    for ep in range(episodes):
+        pos = START
+        for _ in range(MAX_STEPS):
+            a = rng.integers(4) if rng.random() < eps else int(np.argmax(Q[pos]))
+            nxt, r, done = step(pos, a)
+            target = r + (0.0 if done else gamma * np.max(Q[nxt]))
+            Q[pos][a] += alpha * (target - Q[pos][a])   # flat one-step TD backup
+            pos = nxt
+            if done:
+                successes += 1
+                break
+    return successes / episodes
+
+print("flat Q-learning success rate: %.3f" % flat_q_learning())
+</code></pre>
+<div class="code-caption"><strong>Code 26.5.1:</strong> The sparse-reward gridworld and a flat tabular $Q$-learner. The goal sits 22 steps from the start, reward is $+1$ only at the goal, and the per-episode budget is 80 steps, so epsilon-greedy exploration must chain a long correct sequence by chance to ever see the reward. The one-step TD backup is the flat baseline temporal abstraction will beat.</div>
+<pre><code class="language-text">flat Q-learning success rate: 0.004
+</code></pre>
+<div class="code-caption"><strong>Output 26.5.1:</strong> The flat agent essentially never solves the task: across 4000 episodes its success rate is under one percent, because undirected exploration almost never stumbles onto the distant goal and so the sparse reward never enters its value table to be propagated.</div>
+<p>The flat agent fails exactly as Section 1 predicted: it cannot learn from a reward it never sees. Now the hierarchy. The <em>worker</em> is a goal-conditioned policy that, given a target cell as a subgoal, learns to reach it under an intrinsic reward (it gets $+1$ for arriving at its subgoal). The <em>manager</em> chooses subgoals, a coarse grid of waypoint cells, with SMDP $Q$-learning over those subgoal choices, bootstrapping with $\gamma^{\tau}$ over the option duration $\tau$ exactly as Section 2 derived. Code 26.5.2 implements both levels from scratch.</p>
+<pre><code class="language-python"># --- WORKER: goal-conditioned Q over (pos, subgoal) with an INTRINSIC reach reward ---
+SUBGOALS = [(r, c) for r in range(0, N, 3) for c in range(0, N, 3)] + [GOAL]  # waypoint cells
+SG_INDEX = {g: i for i, g in enumerate(SUBGOALS)}
+
+def reach_subgoal(Qw, pos, g, gamma=0.95, eps=0.2, train=True, alpha=0.5, budget=20):
+    """Run the worker toward subgoal g; intrinsic reward +1 on reaching g. Returns
+    (new_pos, primitive_steps_tau, extrinsic_reward_sum, reached)."""
+    gi = SG_INDEX[g]
+    tau, ext = 0, 0.0
+    for _ in range(budget):
+        a = rng.integers(4) if (train and rng.random() < eps) else int(np.argmax(Qw[pos[0], pos[1], gi]))
+        nxt, r_ext, _ = step(pos, a)
+        ext += r_ext
+        reached = (nxt == g)
+        r_int = 1.0 if reached else 0.0                      # INTRINSIC: reach the subgoal
+        if train:
+            tgt = r_int + (0.0 if reached else gamma * np.max(Qw[nxt[0], nxt[1], gi]))
+            Qw[pos[0], pos[1], gi, a] += alpha * (tgt - Qw[pos[0], pos[1], gi, a])
+        pos = nxt; tau += 1
+        if reached:
+            break
+    return pos, tau, ext, (pos == g)
+
+# --- MANAGER: SMDP Q-learning over subgoal choices, bootstrapping with gamma**tau ---
+def manager_worker(episodes=4000, alpha=0.5, gamma=0.97):
+    Qm = np.zeros((N, N, len(SUBGOALS)))              # manager value over (pos, subgoal)
+    Qw = np.zeros((N, N, len(SUBGOALS), 4))           # worker goal-conditioned value
+    successes = 0
+    for ep in range(episodes):
+        pos, steps = START, 0
+        while steps < MAX_STEPS:
+            o = rng.integers(len(SUBGOALS)) if rng.random() < 0.2 else int(np.argmax(Qm[pos]))
+            g = SUBGOALS[o]
+            nxt, tau, ext, _ = reach_subgoal(Qw, pos, g)       # run the option (worker)
+            done = (nxt == GOAL)
+            G = ext                                            # accumulated extrinsic reward
+            tgt = G + (0.0 if done else (gamma ** tau) * np.max(Qm[nxt]))  # SMDP backup: gamma**tau
+            Qm[pos[0], pos[1], o] += alpha * (tgt - Qm[pos[0], pos[1], o])
+            pos = nxt; steps += tau
+            if done:
+                successes += 1; break
+    return successes / episodes, Qm, Qw
+
+rate, Qm, Qw = manager_worker()
+print("manager-worker success rate: %.3f" % rate)
+</code></pre>
+<div class="code-caption"><strong>Code 26.5.2:</strong> A two-level manager-worker hierarchy from scratch. The worker is a goal-conditioned $Q$-table trained on an intrinsic reach reward; the manager runs SMDP $Q$-learning over waypoint subgoals, bootstrapping with $\gamma^{\tau}$ over the worker's option duration $\tau$, exactly the option-level backup of Section 2. The manager faces a handful of subgoal decisions where the flat agent faced 80 primitive ones.</div>
+<pre><code class="language-text">manager-worker success rate: 0.971
+</code></pre>
+<div class="code-caption"><strong>Output 26.5.2:</strong> The hierarchy solves the task the flat agent could not: a 0.97 success rate versus the flat agent's 0.004. The worker quickly learns to reach nearby waypoints under its dense intrinsic reward, and the manager, choosing among only a dozen subgoals, propagates the sparse goal reward across a short option-level chain.</div>
+<p>The contrast between Output 26.5.1 and Output 26.5.2 is the whole section in two numbers: under one percent flat, ninety-seven percent hierarchical, on the same environment with the same step budget. The hierarchy wins for the two reasons Section 1 named. The worker's <em>intrinsic</em> reward is dense (reaching a nearby waypoint is easy and frequently rewarded), so the low level learns fast. And the manager's <em>SMDP</em> backup with $\gamma^{\tau}$ moves credit across the episode in a handful of option decisions rather than eighty primitive ones, so the sparse goal reward actually reaches the early subgoal choices. Code 26.5.3 distills the same two-level idea into a compact, reusable shape.</p>
+<pre><code class="language-python">def hierarchical_agent(episodes=4000, gamma=0.97):
+    """Compact manager-worker: same algorithm, tightened into a reusable loop."""
+    Qm = np.zeros((N, N, len(SUBGOALS)))
+    Qw = np.zeros((N, N, len(SUBGOALS), 4))
+    wins = 0
+    for ep in range(episodes):
+        pos, steps = START, 0
+        while steps < MAX_STEPS:
+            o = rng.integers(len(SUBGOALS)) if rng.random() < 0.2 else int(np.argmax(Qm[pos]))
+            nxt, tau, ext, _ = reach_subgoal(Qw, pos, SUBGOALS[o])   # option = worker reaching subgoal
+            done = nxt == GOAL
+            tgt = ext + (0.0 if done else (gamma ** tau) * Qm[nxt].max())  # one SMDP line
+            Qm[pos[0], pos[1], o] += 0.5 * (tgt - Qm[pos[0], pos[1], o])
+            pos, steps = nxt, steps + tau
+            if done:
+                wins += 1; break
+    return wins / episodes
+
+print("compact hierarchical success rate: %.3f" % hierarchical_agent())
+</code></pre>
+<div class="code-caption"><strong>Code 26.5.3:</strong> The clean version. The manager loop is the single SMDP backup line <code>tgt = ext + gamma**tau * Qm[nxt].max()</code> reusing the worker of Code 26.5.2; the whole hierarchical controller is about a dozen lines, down from the roughly forty lines of the two explicit levels in Code 26.5.2. A production stack (option-critic in a library, or HIRO via an offline-RL toolkit) would learn $\pi_o$ and $\beta_o$ with neural networks but keeps this exact $\gamma^{\tau}$ SMDP backup at its core.</div>
+<pre><code class="language-text">compact hierarchical success rate: 0.969
+</code></pre>
+<div class="code-caption"><strong>Output 26.5.3:</strong> The compact controller matches the explicit two-level version (0.969 versus 0.971), confirming the dozen-line distillation lost no capability: the SMDP backup and the goal-conditioned worker are the entire mechanism.</div>
+<p>Read the three code blocks together. Code 26.5.1 established that a flat $Q$-learner cannot solve the sparse-reward task at all. Code 26.5.2 built the manager-worker hierarchy from scratch and solved it, with the worker's dense intrinsic reward and the manager's $\gamma^{\tau}$ SMDP backup doing exactly the work Sections 1 and 2 predicted. Code 26.5.3 compressed the controller to a dozen lines without losing the win. The pedagogical payoff is that temporal abstraction is not exotic: a goal-conditioned worker plus an SMDP backup over subgoals is enough to turn an unsolvable task into a nearly solved one.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Warehouse Robot That Could Not Find the Charger</div>
+<p><strong>Who:</strong> A robotics team training a mobile picking robot in a warehouse simulator, with the sensor-and-telemetry control stack threaded through <a href="../../toc.html">Chapter 32</a>.</p>
+<p><strong>Situation:</strong> The robot earned reward only for completing a full pick-and-deliver cycle: navigate to a shelf, grasp an item, navigate to a packing station, release. Each cycle was hundreds of low-level motor steps and the reward came once, at the very end.</p>
+<p><strong>Problem:</strong> A flat deep-RL agent trained for days and never completed a single cycle in evaluation, because, exactly as Output 26.5.1 shows in miniature, undirected exploration never chained the full sequence to see the terminal reward, so nothing entered the value estimate to be learned from.</p>
+<p><strong>Dilemma:</strong> Reward shaping by hand (adding intermediate rewards) risked the classic failure of the robot gaming the shaped reward instead of completing the task, while waiting for the flat agent to discover the cycle was, by the $|\mathcal{A}|^{-H}$ argument of Section 1, hopeless within any realistic compute budget.</p>
+<p><strong>Decision:</strong> They adopted a goal-conditioned hierarchy in the HIRO style: a manager proposing target poses (go to shelf, go to station) and a goal-conditioned worker rewarded intrinsically for reaching each pose, with the manager trained by an SMDP backup over the worker's variable option durations, the structure of Code 26.5.2 scaled up with neural networks.</p>
+<p><strong>How:</strong> The worker reached poses under a dense distance-based intrinsic reward (frequent, easy to learn), and the manager chose a short sequence of poses per cycle, so its credit-assignment problem was a handful of pose decisions rather than hundreds of motor steps, with the off-policy goal relabeling of HIRO keeping the manager consistent as the worker improved.</p>
+<p><strong>Result:</strong> The hierarchy completed full cycles within hours of training where the flat agent had failed for days, and the learned worker transferred unchanged to a second task (restocking) that shared the navigation skill, the skill-reuse benefit Section 3 noted for goal-conditioned hierarchies.</p>
+<p><strong>Lesson:</strong> When reward is sparse and the horizon is long, do not shape the reward by hand and hope; give the agent a temporal-abstraction interface (subgoals plus a dense intrinsic reach reward) so the manager faces a short-horizon problem and the worker faces a dense one, and reuse the worker across tasks that share its state space.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Options and Skills Off the Shelf</div>
+<p>The from-scratch manager and worker of Code 26.5.2 ran about forty lines of explicit two-level bookkeeping (a separate $Q$-table, intrinsic-reward loop, and SMDP backup for each level). Modern frameworks supply the pieces. A goal-conditioned hierarchy can be assembled from a goal-conditioned policy and a hindsight-relabeling replay buffer in a few lines on top of Stable-Baselines3 or CleanRL, with the relabeling and off-policy bookkeeping handled internally; offline skill-conditioned policies come pre-built in <code>d3rlpy</code>; and Gymnasium's wrappers standardize the goal-conditioned observation interface so the manager and worker plug together without custom glue.</p>
+<pre><code class="language-python">import gymnasium as gym
+from stable_baselines3 import SAC
+from stable_baselines3.her import HerReplayBuffer
+
+# A goal-conditioned worker with Hindsight Experience Replay: the intrinsic
+# reach-the-subgoal learning of Code 26.5.2, but relabeling and goal handling are internal.
+env = gym.make("FetchReach-v3")                          # dict obs: observation + desired_goal
+worker = SAC("MultiInputPolicy", env, replay_buffer_class=HerReplayBuffer,
+             replay_buffer_kwargs=dict(n_sampled_goal=4, goal_selection_strategy="future"))
+worker.learn(total_timesteps=20_000)                     # learns to reach arbitrary subgoals
+# A manager then issues desired_goal vectors and bootstraps with gamma**tau over option length.
+</code></pre>
+<p>The worker's roughly twenty lines of explicit goal-conditioned $Q$-learning and intrinsic reward collapse to the three lines that construct and train an HER-equipped agent, with the subgoal relabeling, the replay buffer, and the off-policy updates all internal. The manager keeps the one $\gamma^{\tau}$ SMDP backup of Code 26.5.2 unchanged, because that is the irreducible content of temporal abstraction.</p>
+</div>
+<div class="callout warning">
+<div class="callout-title">Common Pitfalls in Hierarchical RL</div>
+<p>Four mistakes recur when readers first build a hierarchy, and naming them now saves days of failed runs:</p>
+<ul>
+<li><strong>Options collapsing to length one.</strong> If termination is learned without a deliberation cost or termination regularizer, gradient descent drives $\beta_o \to 1$ and the hierarchy degenerates to a flat agent (the micromanager of the fun note). Always penalize switching or fix a minimum option length.</li>
+<li><strong>The non-stationary manager.</strong> The manager bootstraps on the worker's behavior, but the worker is changing as it learns, so the manager's targets are non-stationary and its value can diverge. HIRO's goal relabeling and a slower manager learning rate are the standard fixes.</li>
+<li><strong>Forgetting $\gamma^{\tau}$ in the SMDP backup.</strong> Bootstrapping the manager with a single-step $\gamma$ instead of $\gamma^{\tau}$ over the option duration silently mis-discounts every backup, as if every option took one step, and the manager learns a wrong value. The exponent is the duration, not one.</li>
+<li><strong>Subgoals the worker cannot reach.</strong> If the manager proposes subgoals outside the worker's competence, the worker's intrinsic reward stays at zero, the manager sees no signal, and nothing learns. Constrain the subgoal space (here, a coarse waypoint grid) to what the worker can plausibly attain.</li>
+</ul>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 26.5.1: Why the SMDP Discount Is an Exponent <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Starting from the SMDP $Q$-learning update $Q(s,o) \leftarrow Q(s,o) + \alpha[\,G + \gamma^{\tau}\max_{o'}Q(s',o') - Q(s,o)\,]$, explain in one paragraph why the bootstrap discount is $\gamma^{\tau}$ rather than $\gamma$, and show that setting $\tau \equiv 1$ recovers flat one-step $Q$-learning exactly. Then argue, using the $\gamma^{H/\bar\tau}$ versus $\gamma^{H}$ comparison of Section 1, why a hierarchy with mean option length $\bar\tau = 20$ propagates credit across an $H = 200$ task in roughly ten SMDP backups instead of two hundred flat ones.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 26.5.2: Add Learned Termination to the Worker <span class="exercise-type coding">Coding</span></div>
+<p>Extend the worker of Code 26.5.2 so each option also learns a termination function $\beta_o(s) \in [0,1]$ instead of always running until it reaches the subgoal or exhausts its budget. Add a small deliberation cost (a fixed penalty subtracted from the manager's reward each time it switches options) and sweep that cost from $0$ to $0.5$. Plot the mean option length $\bar\tau$ and the task success rate against the deliberation cost, and confirm that with zero cost the options collapse toward length one (the micromanager failure of the fun note) while too large a cost makes the manager commit too long.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 26.5.3: Discover Skills Without the Goal Reward <span class="exercise-type open">Open-Ended</span></div>
+<p>Replace the hand-chosen waypoint subgoals of Code 26.5.2 with a small unsupervised skill-discovery objective in the DIAYN spirit: train a fixed number of discrete "skills", each a policy conditioned on a skill code, by rewarding each skill for visiting states that a learned discriminator can tell apart from the other skills' states. Then train the manager to select among the discovered skills to reach the goal. Compare its success rate and sample efficiency against the hand-designed-subgoal version, and discuss when unsupervised skills help (reusability, no subgoal design) versus when hand-designed subgoals are simply better (you already know the task structure). There is no single right answer; argue the trade against the four families of Section 3.</p>
+</div>
+<div class="callout looking-back">
+<div class="callout-title">Looking Back: From Reward-Driven Hierarchy to Structure and Demonstrations</div>
+<p>This section closes Chapter 26, our deep dive into advanced reinforcement learning, with the field's structural answer to the long horizon: act at multiple time scales, value options over an SMDP, and let a manager delegate to a worker so credit travels across a handful of decisions instead of thousands. Every method in this chapter, from the exploration and stability of <a href="section-26.4.html">Section 26.4</a> to the hierarchies here, has assumed that <em>reward</em> is the teacher: the agent acts, the environment scores, and learning extracts the value of those scores. <a href="../../toc.html">Chapter 27</a> questions that assumption. Optimal control replaces trial-and-error with explicit models and cost functions, solving for the best action sequence when the dynamics are known, and imitation learning replaces reward entirely with <em>demonstrations</em>, learning a policy from an expert's behavior when reward is hard to specify but examples are easy to obtain. The temporal-abstraction interface you built here reappears there too: a demonstrated trajectory is naturally segmented into skills, and an imitation learner can recover options from it. We move from learning behavior out of reward to learning it out of structure (control) and example (imitation), the two settings where pure reward is the wrong tool.</p>
+</div>
+
+<p>We have turned the long-horizon, sparse-reward problem that defeats flat RL into a short-horizon problem by changing the unit of decision from the primitive action to the temporally-extended option, formalized that change as an SMDP with $\gamma^{\tau}$ Bellman backups, surveyed the modern methods that learn the abstraction rather than hand it over, and built a manager-worker hierarchy that solves a task a flat agent never even reaches. The thread that runs through every part of this, fewer decisions between a state and its reward, is the same thread that will run through planning in <a href="../../toc.html">Chapter 29</a>. Next, <a href="../../toc.html">Chapter 27</a> sets reward aside altogether and asks what an agent can learn when it is given a model and a cost (optimal control) or an expert's demonstrations (imitation learning) instead.</p>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-26.4.html"><span class="nav-label">Previous</span><span class="nav-num">Section 26.4</span><span class="nav-title">Exploration and Stability in Deep RL</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 26</span><span class="nav-num">Contents</span><span class="nav-title">Advanced Reinforcement Learning</span></a>
+<a class="next" href="../module-27-control-imitation/index.html"><span class="nav-label">Next Chapter</span><span class="nav-num">Chapter 27</span><span class="nav-title">Optimal Control and Imitation Learning</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

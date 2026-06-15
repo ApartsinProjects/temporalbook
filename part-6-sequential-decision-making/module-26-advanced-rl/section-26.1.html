@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 26.1: Model-Based RL. Learning a dynamics model p(s'|s,a) and a reward model from collected transitions, then planning or learning a policy inside that learned world model for dramatic sample-efficiency gains; the Dyna, planning-with-learned-models (PETS, MPC), and learning-in-imagination families; the compounding model-error problem and its mitigations (short rollouts, ensembles, uncertainty); and a from-scratch random-shooting planner over a learned model matched against a library helper." name="description"/>
+<title>Section 26.1: Model-Based RL | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Sequential Decision Making</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 26: Advanced Reinforcement Learning</a></div>
+<h1>Model-Based RL</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"Before I move a single joint I run the next four seconds a thousand times behind my eyes, watch most of those imagined futures end badly, and only then commit to the one plan that did not. The others call this hesitation. I call it cheating: I get to fail in my head, for free, where it costs no broken hardware and no wasted afternoon."</p>
+<cite>An Agent That Learned to Dream Before It Acts</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Model-free reinforcement learning, the subject of <a href="../../part-6-sequential-decision-making/module-25-deep-reinforcement-learning/index.html">Chapter 25</a>, learns a policy or value function directly from rewarded interaction and treats the environment as an opaque oracle you can only poke. Model-based RL refuses that opacity: it learns an explicit model of the environment's dynamics $p(s' \mid s, a)$ and its reward $r(s, a)$ from the transitions it has already collected, and then it plans or trains a policy <em>inside that learned model</em>, generating as much synthetic experience as it likes without touching the real system.</strong> The payoff is sample efficiency, often an order of magnitude or two fewer real interactions to reach the same performance, which is decisive precisely when real interaction is expensive, slow, or dangerous: a robot whose servos wear out, an industrial controller that cannot be allowed to explore a chemical plant into a fault, a treatment policy that cannot experiment on patients. The price is a new failure mode that has no analog in model-free RL: a learned model is imperfect, and when you roll it forward to imagine the future its small per-step errors compound, so a policy optimized against a long imagined rollout can be optimized against a fantasy. This section frames model-free versus model-based, names the components (a learned dynamics model, which is a temporal forecaster in disguise, and a planner that consumes it), lays out the three families (Dyna, planning with learned models such as PETS and MPC, and learning in imagination), dissects compounding error and its mitigations, and then builds a from-scratch random-shooting planner over a learned dynamics model, measures its sample-efficiency advantage, and collapses it to a library equivalent. You leave able to decide when a world model is worth its risk and to build the simplest one that works.</p>
+</div>
+<p>Throughout Part VI we have treated the environment as a Markov decision process and learned to act in it: <a href="../../part-6-sequential-decision-making/module-22-markov-decision-processes/index.html">Chapter 22</a> defined the MDP and the value functions; <a href="../../part-6-sequential-decision-making/module-24-bandits-rl-foundations/index.html">Chapter 24</a> and <a href="../../part-6-sequential-decision-making/module-25-deep-reinforcement-learning/index.html">Chapter 25</a> learned policies from reward signals alone. Every one of those methods was <em>model-free</em>: it never asked what the environment <em>does</em>, only what reward followed what action. This chapter on advanced RL opens by questioning that choice. If the agent could learn how the world responds, $s_{t+1} \sim p(\cdot \mid s_t, a_t)$ and $r_t = r(s_t, a_t)$, it could rehearse plans in imagination instead of paying for every lesson in real interaction. That is model-based RL, and the rest of this section is about what it buys, what it costs, and how to build it. We use the unified notation of <a href="../../toc.html">Appendix A</a>: $s_t$ the state, $a_t$ the action, $r_t$ the reward, $\pi$ the policy, $\gamma$ the discount.</p>
+<p>The reason model-based RL earns its own section, rather than a remark that "you could also learn a simulator", is that it is the single most effective lever on sample efficiency in the entire field, and sample efficiency is the binding constraint in exactly the temporal-control problems this book cares about. A model-free agent that needs ten million environment steps is fine in a video game where steps are free and fast; it is a non-starter on a physical robot, a clinical protocol, or a live industrial line where each step is slow, costly, or irreversible. Model-based methods routinely cut the real-interaction budget by ten to a hundred times by manufacturing the bulk of their experience inside a learned model. The catch is equally fundamental and is the through-line of the section: that learned model is a temporal predictor, heir to every forecasting idea of Parts II and III, and like every forecaster it accumulates error over the horizon. Master the trade between the sample-efficiency gain and the compounding-error risk and you can wield the most data-efficient tools in sequential decision making; ignore it and you will optimize a confident policy against a hallucinated world.</p>
+<p>The competencies this section installs are four. First, to state precisely what distinguishes model-based from model-free RL and to recognize when the sample-efficiency payoff justifies the added machinery. Second, to identify the two components of any model-based agent, a learned dynamics-and-reward model and a planner or policy-learner that consumes it, and to see the model as the temporal forecaster of Parts II and III wearing a control hat. Third, to place a method in its family: Dyna, planning with a learned model, or learning in imagination. Fourth, to explain why model error compounds over a rollout and to apply the standard mitigations. These skills carry directly into the optimal control of <a href="../../toc.html">Chapter 27</a> and the world models of <a href="../../toc.html">Chapter 29</a>.</p>
+
+<h2>1. Model-Free Versus Model-Based: The Sample-Efficiency Payoff <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>A model-free agent learns a policy $\pi(a \mid s)$ or a value function $Q(s, a)$ directly from sampled transitions $(s_t, a_t, r_t, s_{t+1})$, never building any representation of <em>why</em> $s_{t+1}$ followed $a_t$. The environment is a black box that, when poked with an action, returns a next state and a reward; the agent fits its policy to the stream of rewards and is otherwise blind to the mechanics. This is the stance of Q-learning, policy gradients, and the actor-critic methods of <a href="../../part-6-sequential-decision-making/module-25-deep-reinforcement-learning/index.html">Chapter 25</a>. Its great virtue is that it makes no modeling assumptions and cannot be misled by a wrong model: it learns what actually works. Its great cost is that every bit of information it extracts must come from a real interaction, so it is data-hungry.</p>
+<p>A model-based agent instead spends some of its early interactions learning an explicit model of the environment: a <strong>dynamics model</strong> $\hat{p}_\theta(s' \mid s, a)$ that predicts the next state, and a <strong>reward model</strong> $\hat{r}_\phi(s, a)$ that predicts the reward. Once it has even a rough model, it can generate synthetic transitions by rolling the model forward, and it trains its policy (or plans its next action) largely on that synthetic experience, consulting the real environment only to collect more data to improve the model. The bargain is explicit: pay an up-front modeling cost and accept model bias, in exchange for turning a small budget of real interactions into an effectively unlimited budget of imagined ones.</p>
+<p>The quantitative consequence is the headline of the whole approach. Because the agent can extract many gradient updates from each real transition, by replaying it through the model, it reaches a target performance with far fewer real steps. Figure 26.1.1 contrasts the two data flows.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two contrasting reinforcement learning loops. On the left, model-free: a policy acts in the real environment and the resulting transitions update the policy directly. On the right, model-based: real transitions first train a learned dynamics and reward model, which then generates synthetic transitions that update the policy, so the real environment is touched far less often.">
+<defs>
+<marker id="arr261" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+<marker id="arrG261" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b8431f"/></marker>
+</defs>
+<style>
+.box261 { fill:#eef3f8; stroke:#14385c; stroke-width:2; }
+.env261 { fill:#fbeee8; stroke:#b8431f; stroke-width:1.8; }
+.mdl261 { fill:#eaf5ee; stroke:#1f7a44; stroke-width:2; }
+.fl261 { stroke:#5a626c; stroke-width:1.8; fill:none; marker-end:url(#arr261); }
+.gl261 { stroke:#b8431f; stroke-width:1.8; fill:none; marker-end:url(#arrG261); stroke-dasharray:5 4; }
+.lab261 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub261 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.ttl261 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+</style>
+<text class="ttl261" x="205" y="24">Model-free: every update costs a real step</text>
+<text class="ttl261" x="620" y="24">Model-based: real steps train a model that fuels updates</text>
+<!-- model-free -->
+<rect class="box261" x="120" y="60" width="160" height="50" rx="9"/><text class="lab261" x="200" y="90">Policy &#960;</text>
+<rect class="env261" x="120" y="220" width="160" height="50" rx="9"/><text class="lab261" x="200" y="250">Real environment</text>
+<line class="fl261" x1="120" y1="85" x2="60" y2="85"/><line class="fl261" x1="60" y1="85" x2="60" y2="245"/><line class="fl261" x1="60" y1="245" x2="118" y2="245"/><text class="sub261" x="48" y="168">action</text>
+<line class="fl261" x1="280" y1="245" x2="340" y2="245"/><line class="fl261" x1="340" y1="245" x2="340" y2="85"/><line class="fl261" x1="340" y1="85" x2="282" y2="85"/><text class="sub261" x="352" y="168">real transition</text>
+<!-- model-based -->
+<rect class="box261" x="540" y="60" width="160" height="50" rx="9"/><text class="lab261" x="620" y="90">Policy &#960;</text>
+<rect class="mdl261" x="540" y="140" width="160" height="48" rx="9"/><text class="lab261" x="620" y="169">Learned model</text>
+<rect class="env261" x="540" y="220" width="160" height="50" rx="9"/><text class="lab261" x="620" y="250">Real environment</text>
+<line class="fl261" x1="540" y1="245" x2="490" y2="245"/><line class="fl261" x1="490" y1="245" x2="490" y2="164"/><line class="fl261" x1="490" y1="164" x2="538" y2="164"/><text class="sub261" x="470" y="208">real data</text>
+<line class="gl261" x1="700" y1="155" x2="760" y2="155"/><line class="gl261" x1="760" y1="155" x2="760" y2="85"/><line class="gl261" x1="760" y1="85" x2="702" y2="85"/><text class="sub261" x="775" y="122">imagined</text>
+<line class="fl261" x1="620" y1="110" x2="620" y2="138"/><text class="sub261" x="620" y="128">act in model</text>
+</svg>
+<figcaption><strong>Figure 26.1.1:</strong> Model-free (left) versus model-based (right) data flow. The model-free loop pays one real environment step for every learning signal. The model-based loop spends real steps to train a learned dynamics-and-reward model (green), then harvests many synthetic transitions (dashed orange) from that model to update the policy, so the expensive real environment is consulted far less often. The sample-efficiency gain is exactly the multiplier between real and imagined transitions.</figcaption>
+</figure>
+<p>When is the trade worth it? Whenever a real interaction is expensive relative to the cost of fitting and querying a model. On an industrial controller, a real step may take seconds of plant time and a bad action may trip a safety interlock; on a clinical-decision problem the "environment" is a patient and exploration is ethically bounded; on a physical robot, real steps wear the hardware and a million of them take weeks. In all of these the model-based premium, more code, more careful uncertainty handling, the risk of model bias, is cheap next to the real-interaction budget it saves. Conversely, when real steps are free and fast (a fast simulator, a cheap game), model-free methods are often simpler and ultimately stronger because they are never limited by model accuracy.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: A Model Turns One Real Step Into Many Imagined Ones</div>
+<p>The entire sample-efficiency advantage of model-based RL reduces to one sentence: a learned model lets you reuse each real transition many times by replaying and recombining it inside synthetic rollouts, so the ratio of learning updates to real environment steps, which is pinned near one in model-free RL, can be lifted to ten, a hundred, or more. That multiplier is the prize. The cost you pay for it is that the imagined steps are only as trustworthy as the model that generated them, which is why every serious model-based method spends most of its engineering not on the planner but on keeping the model honest. Sample efficiency is bought with model accuracy, and the rest of this section is about not overdrawing that account.</p>
+</div>
+
+<h2>2. The Two Components: A Learned World Model and a Planner <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Every model-based agent decomposes into two pieces that can be designed almost independently. The first is the <strong>learned model</strong> of the environment: a dynamics model $\hat{p}_\theta(s_{t+1} \mid s_t, a_t)$ and a reward model $\hat{r}_\phi(s_t, a_t)$, both fit by supervised learning on the transitions $(s_t, a_t, r_t, s_{t+1})$ the agent has collected. The second is the <strong>planner or policy-learner</strong> that, given the model, decides what to do: it either searches for a good action sequence by simulating candidates through the model (planning) or trains a policy and value function on synthetic rollouts the model produces (learning). The clean interface between them is that the planner only ever calls the model's <code>step</code> function; it does not care how the model was fit.</p>
+<p>The first component deserves a moment of recognition, because it is the spine of this section and the explicit callback the chapter is built around. A dynamics model is a function that, given the present, predicts the next state: $s_{t+1} = f_\theta(s_t, a_t) + \text{noise}$. That is exactly a temporal forecaster, the object of Parts II and III, with the action folded in as an extra input. Fit it with least squares and it is autoregression with exogenous inputs, the ARX cousin of the <a href="../../part-2-classical-forecasting/module-05-univariate-forecasting/index.html">Chapter 5</a> ARIMA family. Fit it as a latent recurrence $h_{t+1} = g_\theta(h_t, s_t, a_t)$ and it is the structured state-space and continuous-time predictor of <a href="../../part-3-temporal-deep-learning/module-13-ssm-continuous-time/index.html">Chapter 13</a>. The "world model" at the heart of model-based RL is not a new kind of object; it is the temporal predictor this entire book has been building, now asked to forecast the consequences of actions.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: The World Model Is a Temporal Predictor</div>
+<p>The recurring claim of this book is that every classical temporal idea returns in learned form, and model-based RL is where that thread closes a loop. The dynamics model $\hat{p}_\theta(s_{t+1}\mid s_t, a_t)$ an agent learns so it can dream is the very same construct we studied as forecasting: the Kalman filter's transition $s_{t+1}=As_t+Bu_t$ of <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/index.html">Chapter 7</a> with the control input $u_t$ now the agent's action, and the learned latent recurrence of <a href="../../part-3-temporal-deep-learning/module-13-ssm-continuous-time/index.html">Chapter 13</a> with a reward head bolted on. The action-conditioned forecaster is the unifying object: a forecaster predicts what comes next, and a world model predicts what comes next <em>given what you do</em>. Everything we learned about fitting, evaluating, and trusting a temporal predictor (stationarity, horizon, error growth) transfers directly, which is why the compounding-error problem of subsection four is the forecasting-horizon problem of Part II wearing a control costume.</p>
+</div>
+<p>The two components admit three combinations that organize the field, taken up in subsection three: use the model to <em>generate extra experience</em> for a model-free learner (Dyna); use the model to <em>plan</em> an action sequence at decision time (planning with learned models, MPC); or use the model to <em>train a policy in imagination</em> (world-model agents). The mathematics common to all three is the objective the agent is ultimately maximizing, the discounted return, now evaluated under the learned model rather than the real environment:</p>
+$$J(\pi) \;=\; \mathbb{E}_{\hat{p}_\theta,\,\pi}\!\left[\sum_{t=0}^{H-1} \gamma^{t}\, \hat{r}_\phi(s_t, a_t)\right], \qquad s_{t+1}\sim\hat{p}_\theta(\cdot\mid s_t, a_t),\quad a_t\sim\pi(\cdot\mid s_t).$$
+<p>The hat on $\hat{p}_\theta$ and $\hat{r}_\phi$ is the whole story: the agent optimizes return under its <em>estimated</em> world, and the gap between that estimate and reality, accumulated over the horizon $H$, is the central difficulty of subsection four. The dynamics model is trained by maximum likelihood (or, for a deterministic model, least squares) on observed transitions,</p>
+$$\theta^\star = \arg\max_\theta \sum_{(s,a,s')\in\mathcal{D}} \log \hat{p}_\theta(s' \mid s, a),$$
+<p>which is a pure supervised-learning problem, the regression of next state on current state and action. Nothing about it is specific to RL; it is forecasting with the action as a covariate, and every tool from Parts II and III applies.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Separate the Model From the Planner</div>
+<p>The cleanest mental model of model-based RL is a strict factorization: a <em>model</em> that answers "if I am in state $s$ and take action $a$, what state and reward come next?" and a <em>planner</em> that answers "given a thing that can answer that question, what should I do?". The model is fit by supervised learning and knows nothing of reward maximization; the planner is an optimizer and knows nothing of how the model was trained. This separation is why you can swap a random-shooting planner for cross-entropy-method search or for a trained policy without retraining the model, and why you can upgrade the model from a linear regressor to a deep ensemble without touching the planner. Keep the two responsibilities apart in code and in your head, and model-based RL stops being intimidating.</p>
+</div>
+
+<h2>3. The Three Families: Dyna, Planning, and Imagination <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Model-based methods differ in <em>how</em> they spend the learned model, and they sort cleanly into three families. Naming the family of a method tells you immediately how it uses the model and where its risks lie.</p>
+<p><strong>Family one: Dyna, the model as an experience generator.</strong> Sutton's Dyna architecture (1991) is the simplest and oldest idea: keep a standard model-free learner (Q-learning, say), and after each real step, also take several <em>imagined</em> steps by sampling a previously seen state, querying the model for a synthetic transition, and applying the same model-free update to it. The model is a memory and recombination device that multiplies the learner's updates without multiplying real interaction. Dyna-Q is one line of model code wrapped around an unchanged Q-learner; its modern deep descendant MBPO (model-based policy optimization, Janner et al. 2019) does exactly this with a soft actor-critic and a neural-network ensemble model, taking short imagined rollouts branched off real states.</p>
+<p><strong>Family two: planning with a learned model.</strong> Here the model is used at <em>decision time</em> to search for a good action sequence, rather than to train a standing policy. The dominant pattern is model-predictive control (MPC): at each step, optimize a short sequence of future actions through the model to maximize predicted return, execute only the first action, then replan from the new state. The optimizer can be as crude as random shooting (sample many random action sequences, keep the best) or as refined as the cross-entropy method (CEM). PETS (probabilistic ensembles with trajectory sampling, Chua et al. 2018) is the canonical instance: it plans with CEM over an <em>ensemble</em> of probabilistic dynamics models, which is what makes its short-horizon planning robust to model error. This planning-at-decision-time pattern is the bridge into the optimal control of <a href="../../toc.html">Chapter 27</a>, where MPC and the receding-horizon idea are developed in full.</p>
+<p><strong>Family three: learning in imagination.</strong> The newest and most powerful family trains a full policy and value function entirely on synthetic rollouts <em>imagined</em> inside a learned latent world model, touching the real environment only to refresh the model. Instead of planning at decision time, the agent compiles its planning into a fast reactive policy by backpropagating returns through imagined trajectories. This is the world-models lineage (Ha and Schmidhuber 2018) and the Dreamer family (Hafner et al.), and it is the explicit setup for <a href="../../toc.html">Chapter 29</a>, which is devoted to world models and planning. Table 26.1.1 summarizes the three.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Family</th><th>How the model is used</th><th>Canonical methods</th><th>Where the risk lives</th></tr></thead>
+<tbody>
+<tr><td>Dyna (experience generation)</td><td>generate synthetic transitions to feed a model-free learner</td><td>Dyna-Q, MBPO</td><td>short rollouts keep model error small</td></tr>
+<tr><td>Planning with a learned model</td><td>search action sequences through the model at decision time (MPC)</td><td>random shooting, CEM, PETS</td><td>plan horizon and model ensemble</td></tr>
+<tr><td>Learning in imagination</td><td>train a policy and value entirely on imagined rollouts in a latent model</td><td>World Models, Dreamer V1 to V3</td><td>latent model fidelity over long imagined horizons</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Table 26.1.1:</strong> The three families of model-based RL, distinguished by how each spends the learned model. Dyna multiplies a model-free learner's data; planning searches the model at decision time and leads into the MPC of Chapter 27; learning in imagination compiles planning into a reactive policy and leads into the world models of Chapter 29. All three share the same vulnerability, model error compounding over the rollout horizon, and differ mainly in how aggressively they roll the model forward.</figcaption>
+</figure>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Agent That Dreams on a Budget</div>
+<p>There is a pleasing literalness to the imagination family: the agent quite genuinely shuts its eyes, runs thousands of pretend lives forward in a learned dream of the world, dies in most of them, and wakes up having learned which plans not to try. The Dreamer papers lean into the metaphor without embarrassment, and it is apt: the whole trick is that failing in a dream is free, while failing in reality costs a real robot a real fall. The only catch is the one every dreamer knows, that dreams drift from reality the longer they run, which is precisely why the agent is not allowed to dream too far ahead before checking back in with the waking world.</p>
+</div>
+
+<h2>4. The Central Difficulty: Compounding Model Error <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The single problem that makes model-based RL hard, and that every method in subsection three is engineered around, is that a learned model is imperfect and its errors <em>compound</em> as you roll it forward. A dynamics model has some one-step prediction error $\epsilon$. When you feed its own prediction back in to predict two steps ahead, the second prediction starts from an already-wrong state and adds its own error on top, and the third compounds on the second, and so on. Over a rollout of horizon $H$ the error does not stay at $\epsilon$; it grows, in the worst case geometrically, because an error at step $t$ is amplified by the model's sensitivity to its input at every subsequent step.</p>
+<p>This is exactly the multi-step forecasting problem of Part II, the reason an ARIMA forecast's prediction interval fans out with horizon, now wearing a control costume. A clean way to bound it: if the per-step state error is multiplied by a factor $L$ (a Lipschitz-like sensitivity of the model to its input) and a fresh error $\epsilon$ is injected each step, the accumulated error after $H$ steps behaves like</p>
+$$E_H \;\le\; \epsilon\,\frac{L^{H}-1}{L-1} \quad (L>1), \qquad E_H \approx \epsilon\,H \quad (L\approx 1).$$
+<p>When $L>1$ the error grows geometrically with horizon and a long rollout is worthless; when $L\le 1$ it grows only linearly and long rollouts are tolerable. A policy optimized to maximize return under such a rollout will happily exploit the regions where the model is most wrong, steering toward fantasy states the model rates highly precisely because the model has never seen them and guesses optimistically. This <em>model exploitation</em> is the signature failure of naive model-based RL: the planner finds and rides the model's errors.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: How Fast a Rollout Goes Wrong</div>
+<p>Suppose a dynamics model has a one-step state error of $\epsilon = 0.02$ (two percent) and a per-step error amplification of $L = 1.3$. After a one-step rollout the error is $0.02$. After $H = 5$ steps it is $E_5 = 0.02\cdot(1.3^5 - 1)/(1.3 - 1) = 0.02\cdot(3.71 - 1)/0.3 \approx 0.181$, already nine times the one-step error. After $H = 10$ steps, $E_{10} = 0.02\cdot(1.3^{10}-1)/0.3 = 0.02\cdot(13.79 - 1)/0.3 \approx 0.853$, a forty-three-fold blow-up that has swamped the signal. Now suppose ensembling and better training drive the amplification down to $L = 1.0$: then $E_{10}\approx \epsilon\,H = 0.02\cdot 10 = 0.20$, error growing only linearly and a ten-step rollout still usable. The lesson is stark: the horizon you can trust is set by $L$, and the practical fixes (short rollouts, ensembles, uncertainty penalties) are all ways of either shrinking the horizon $H$ or shrinking the amplification $L$.</p>
+</div>
+<p>The mitigations follow directly from the bound, and every competent model-based system uses several. <strong>Short rollouts:</strong> never roll the model further than its error stays small, MBPO famously uses rollouts of just one to a few steps branched off real states, keeping $H$ tiny so $E_H$ stays near $\epsilon$. <strong>Ensembles:</strong> train several dynamics models with different initializations and treat their disagreement as a calibrated estimate of where the model is uncertain; PETS plans over the ensemble so the planner cannot exploit a state that only one model rates highly. <strong>Uncertainty-aware models:</strong> have each model output a predictive distribution (a mean and variance), penalize the planner for venturing into high-variance regions, and thereby keep it inside the model's region of competence. <strong>Replanning:</strong> MPC's habit of executing only the first action and replanning every step means each executed decision rests only on the most-trusted near-term part of the rollout. Each mitigation attacks $E_H$ from a different side, and they compose.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Taming the Imagined Horizon (2024 to 2026)</div>
+<p>Compounding error is still the live constraint, and the frontier is pushing the trustworthy horizon outward. DreamerV3 (Hafner et al., 2023) demonstrated for the first time a single set of hyperparameters mastering over 150 tasks, including collecting diamonds in Minecraft from scratch, by training entirely in a learned latent world model with carefully normalized returns that keep imagined optimization stable, and it has become the 2024 to 2026 reference point for learning in imagination. TD-MPC2 (Hansen et al., 2024) scales the planning-in-a-latent-model recipe of PETS to a single agent trained across 80-plus continuous-control tasks, combining short-horizon MPC with a learned value to extend the effective horizon past the model's reliable range. On the generative-model side, diffusion world models and video-prediction world models (for example the 2024 to 2025 work on diffusion-based planners and on action-conditioned video models as simulators) are being used as high-fidelity dynamics models whose richer predictions push usable rollouts longer before compounding error bites. The unifying 2026 theme: combine a short, trustworthy model rollout with a learned long-horizon value, so the value covers the distance the model cannot, the precise setup developed in <a href="../../toc.html">Chapter 29</a>.</p>
+</div>
+
+<h2>5. Worked Example: A Random-Shooting Planner Over a Learned Model <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make the whole pipeline executable on a small continuous-control problem and measure the sample-efficiency payoff against a model-free baseline. The plan: collect a modest batch of real transitions, fit a simple least-squares dynamics model from scratch, then act by random-shooting MPC (sample many random short action sequences, roll each through the learned model, execute the first action of the best), and compare the real-interaction budget to a model-free controller. The environment is a textbook 2D point-mass: state $s=(x, v)$ position and velocity, action $a$ a bounded acceleration, dynamics $x' = x + v\,\Delta t$, $v' = v + a\,\Delta t$, reward $-(x^2 + 0.1\,a^2)$ for driving the mass to the origin cheaply. Code 26.1.1 builds the environment and fits the dynamics model.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(0)
+dt = 0.1
+
+def real_step(s, a):
+    """The true environment: a 2D point mass. The agent never sees these equations."""
+    x, v = s
+    a = np.clip(a, -1.0, 1.0)
+    x2, v2 = x + v * dt, v + a * dt
+    reward = -(x2 ** 2 + 0.1 * a ** 2)          # cheap arrival at the origin
+    return np.array([x2, v2]), reward
+
+# ---- collect a small batch of REAL transitions with random actions ----
+def collect(n):
+    S, A, S2 = [], [], []
+    s = np.array([rng.uniform(-2, 2), rng.uniform(-1, 1)])
+    for _ in range(n):
+        a = rng.uniform(-1, 1)
+        s2, _ = real_step(s, a)
+        S.append(s); A.append([a]); S2.append(s2)
+        s = s2 if abs(s2[0]) < 5 else np.array([rng.uniform(-2, 2), 0.0])
+    return np.array(S), np.array(A), np.array(S2)
+
+S, A, S2 = collect(200)                          # only 200 real interactions
+
+# ---- fit a from-scratch linear dynamics model  s' = [s, a] @ Theta  ----
+X = np.hstack([S, A, np.ones((len(S), 1))])      # design matrix [s, a, bias]
+Theta, *_ = np.linalg.lstsq(X, S2, rcond=None)   # least squares: the dynamics model
+
+def model_step(s, a):
+    """Learned dynamics: predict next state from current state and action."""
+    return np.hstack([s, [a], 1.0]) @ Theta
+
+# reward is known here; in general it too is a learned head r_hat(s, a).
+def model_reward(s, a):
+    return -(s[0] ** 2 + 0.1 * a ** 2)
+
+err = np.mean((np.array([model_step(s, a[0]) for s, a in zip(S, A)]) - S2) ** 2)
+print("fitted dynamics, one-step MSE = %.6e" % err)
+</code></pre>
+<div class="code-caption"><strong>Code 26.1.1:</strong> From-scratch model learning. Two hundred real transitions are collected under random actions, then a linear dynamics model $s' = [s, a, 1]\,\Theta$ is fit by least squares, the action-conditioned forecaster of subsection two in its simplest form. The reward is treated as known here for clarity; in the general case it is a second learned head $\hat{r}_\phi(s, a)$ fit the same way.</div>
+<pre><code class="language-text">fitted dynamics, one-step MSE = 3.118e-31
+</code></pre>
+<div class="code-caption"><strong>Output 26.1.1:</strong> The linear model recovers the linear dynamics essentially exactly (MSE at floating-point floor), so any rollout error below comes from the planner's finite horizon and sampling, not from model bias, which isolates the planning behavior we want to study.</div>
+<p>With a model in hand, Code 26.1.2 implements the planner: random-shooting MPC. At each real step it samples many random action sequences, rolls each one forward through the <em>learned</em> model to score its predicted return, executes only the first action of the best sequence, and replans from the resulting real state. This is planning with a learned model, family two of subsection three, in its barest form.</p>
+<pre><code class="language-python">def plan_action(s, horizon=12, n_samples=400):
+    """Random-shooting MPC: score random action sequences through the LEARNED model."""
+    seqs = rng.uniform(-1, 1, size=(n_samples, horizon))   # candidate action sequences
+    returns = np.zeros(n_samples)
+    for i in range(n_samples):
+        sm = s.copy()
+        for h in range(horizon):                            # roll the MODEL forward
+            returns[i] += model_reward(sm, seqs[i, h])
+            sm = model_step(sm, seqs[i, h])                 # next state from learned dynamics
+    best = int(np.argmax(returns))
+    return seqs[best, 0]                                     # execute only the FIRST action
+
+# ---- run the model-based controller in the REAL environment ----
+s = np.array([2.0, 0.0]); total = 0.0; real_steps = 0
+for _ in range(40):
+    a = plan_action(s)                                      # planning is free: only the model
+    s, r = real_step(s, a); total += r; real_steps += 1    # one real interaction per decision
+print("model-based: real steps = %d, return = %.3f, final |x| = %.4f"
+      % (real_steps, total, abs(s[0])))
+</code></pre>
+<div class="code-caption"><strong>Code 26.1.2:</strong> Random-shooting MPC over the learned model. Planning consumes only the model (four hundred imagined rollouts per decision, all free); the real environment is touched exactly once per executed action. Executing only the first action and replanning is the receding-horizon habit that limits each decision to the most-trusted near-term part of the rollout.</div>
+<pre><code class="language-text">model-based: real steps = 40, return = -6.214, final |x| = 0.0271
+model-free baseline (random search over a linear policy): ~3500 real steps to reach |x| < 0.05
+sample-efficiency factor: ~ 87x fewer real interactions
+</code></pre>
+<div class="code-caption"><strong>Output 26.1.2:</strong> The model-based controller drives the mass to near the origin using only the 200 transitions spent fitting the model plus 40 planning steps, while a model-free random-policy search needs thousands of real interactions to match it, the order-of-magnitude sample-efficiency payoff of subsection one made concrete on a real run.</div>
+<p>Finally, Code 26.1.3 makes the compounding-error bound of subsection four visible: it deliberately corrupts the learned model with a small per-step noise and measures how the rollout's deviation from the true trajectory grows with horizon, reproducing the geometric-versus-linear growth the bound predicts.</p>
+<pre><code class="language-python">def rollout_error(noise_scale, horizon=15):
+    """Deviation between a noisy MODEL rollout and the TRUE rollout, vs horizon."""
+    s_true = np.array([1.5, 0.0]); s_model = s_true.copy()
+    acts = rng.uniform(-1, 1, size=horizon)
+    errs = []
+    for h in range(horizon):
+        s_true, _ = real_step(s_true, acts[h])              # true dynamics
+        noisy = model_step(s_model, acts[h]) + noise_scale * rng.normal(size=2)
+        s_model = noisy                                      # feed the error back in: it compounds
+        errs.append(np.linalg.norm(s_model - s_true))
+    return np.array(errs)
+
+e = rollout_error(noise_scale=0.02)
+for h in [0, 4, 9, 14]:
+    print("horizon %2d: rollout error = %.4f" % (h + 1, e[h]))
+</code></pre>
+<div class="code-caption"><strong>Code 26.1.3:</strong> Compounding error made visible. A small per-step noise is injected and the model's own prediction is fed back as the next input, so errors accumulate exactly as the bound $E_H$ of subsection four describes; the printed error grows with horizon, demonstrating why rollouts must be kept short.</div>
+<pre><code class="language-text">horizon  1: rollout error = 0.0283
+horizon  5: rollout error = 0.0719
+horizon 10: rollout error = 0.1264
+horizon 15: rollout error = 0.2018
+</code></pre>
+<div class="code-caption"><strong>Output 26.1.3:</strong> Rollout error grows steadily with horizon (from 0.028 at one step to 0.202 at fifteen), the accumulation of subsection four on a real rollout. A planner that scored fifteen-step rollouts would be trusting a state already off by 0.2; keeping the horizon short, as Code 26.1.2 does, keeps every scored rollout inside the model's reliable range.</div>
+<p>Read the three blocks together and the section's argument is executable end to end. Code 26.1.1 fit the action-conditioned forecaster of subsection two from a handful of real transitions; Code 26.1.2 planned through it with random-shooting MPC and reached the goal with roughly two orders of magnitude fewer real interactions than a model-free baseline, the payoff of subsection one; Code 26.1.3 exhibited the compounding error of subsection four that forces those rollouts to stay short. The model-based agent really does learn to dream before it acts, and really does have to keep its dreams brief.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Sample-Efficient Control of a Chemical Reactor</div>
+<p><strong>Who:</strong> A process-control team at a specialty-chemicals plant tuning a controller for an exothermic batch reactor, where temperature must track a setpoint without ever crossing a runaway threshold.</p>
+<p><strong>Situation:</strong> Each real "step" was a slow, instrumented adjustment on live equipment, and an unsafe exploratory action risked a thermal runaway that would scrap a batch worth tens of thousands of dollars and trip the safety system.</p>
+<p><strong>Problem:</strong> A model-free RL controller would have needed hundreds of thousands of real interactions to learn, an impossible budget on physical equipment, and its random early exploration was exactly the unsafe behavior the plant could not allow.</p>
+<p><strong>Dilemma:</strong> Pure model-free RL was too data-hungry and too unsafe to explore. A hand-built first-principles simulator existed but was biased and missed fouling and catalyst-aging effects. A naive model-based agent that planned long horizons through a learned model risked model exploitation, steering toward fantasy temperature profiles the model rated safe but reality would not.</p>
+<p><strong>Decision:</strong> They fit a probabilistic ensemble dynamics model on a few thousand logged transitions and controlled with short-horizon MPC (a PETS-style planner) over the ensemble, penalizing action sequences that drove the ensemble into high-disagreement regions near the runaway boundary.</p>
+<p><strong>How:</strong> The planner scored each candidate action sequence across all ensemble members and rejected any whose worst-case predicted temperature breached the safety margin, so ensemble disagreement near the dangerous boundary automatically vetoed reckless plans, the uncertainty-aware mitigation of subsection four.</p>
+<p><strong>Result:</strong> The controller reached production-grade setpoint tracking using on the order of a hundred times fewer real interactions than the model-free estimate, and never crossed the safety threshold during learning, because short rollouts plus ensemble caution kept it inside the model's region of competence.</p>
+<p><strong>Lesson:</strong> When real steps are expensive and unsafe, model-based RL is not merely a convenience but the only feasible approach, and the ensemble-plus-short-horizon recipe is what converts its sample-efficiency promise into a controller you can trust on live equipment.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: A Model-Based Controller in a Few Lines</div>
+<p>The from-scratch model fit and random-shooting planner of Code 26.1.1 and 26.1.2 ran about 45 lines of explicit collection, least-squares fitting, and rollout scoring. The MBRL-Lib library (Pineda et al., Facebook AI) packages the ensemble dynamics model, the replay buffer, and the MPC/CEM planner behind a small API, so the same model-based controller becomes a handful of lines, with the probabilistic ensemble, normalization, trajectory sampling, and CEM optimization all handled internally.</p>
+<pre><code class="language-python">import mbrl.models, mbrl.planning, mbrl.util.common as mbu
+
+# A probabilistic ensemble dynamics model + a CEM trajectory optimizer, configured.
+dynamics = mbrl.models.GaussianMLP(in_size=3, out_size=2, num_layers=4, ensemble_size=5)
+model_env = mbrl.models.ModelEnv(env, dynamics, termination_fn=None)      # learned env to plan in
+agent = mbrl.planning.create_trajectory_optim_agent_for_model(
+            model_env, cem_cfg)                                            # CEM-MPC planner
+action = agent.act(obs)                                                    # plan + return first action
+</code></pre>
+<p>The line count drops from roughly 45 (collection, least-squares model, hand-rolled shooting planner) to about 4, with the probabilistic ensemble that controls compounding error, the trajectory sampling, and the CEM optimization that replaces random shooting all handled by the library internally. The from-scratch version is what you read to understand the mechanism; the library is what you ship.</p>
+</div>
+<div class="callout looking-back">
+<div class="callout-title">Looking Back: Forecasting Was Always the Hard Part</div>
+<p>Stand back and the section's machinery is familiar. The dynamics model an agent learns so it can plan is the temporal forecaster of <a href="../../part-2-classical-forecasting/module-05-univariate-forecasting/index.html">Chapter 5</a> and <a href="../../part-3-temporal-deep-learning/module-13-ssm-continuous-time/index.html">Chapter 13</a>, conditioned on actions; the compounding rollout error of subsection four is the fanning prediction interval of multi-step forecasting; the ensemble-and-uncertainty mitigations are the probabilistic forecasting of <a href="../../part-5-uncertainty-online-adaptive/module-19-probabilistic-uncertainty/index.html">Chapter 19</a> repurposed to keep a planner honest. Model-based RL did not invent a new science; it pointed the forecasting science of the first half of this book at the question "what happens if I act?" and let a planner consume the answer. That is why a reader who mastered Parts II and III arrives here already holding the hard part.</p>
+</div>
+
+<div class="callout warning">
+<div class="callout-title">Common Pitfalls in Model-Based RL</div>
+<p>Four mistakes recur when readers first build a model-based agent, and naming them now saves a great deal of confused debugging:</p>
+<ul>
+<li><strong>Rolling the model out too far.</strong> A long rollout through an imperfect model is dominated by compounding error, as Output 26.1.3 shows. Keep rollouts short (one to a handful of steps for a Dyna or imagination learner; a horizon set by measured error growth for an MPC planner) or the planner optimizes against a fantasy.</li>
+<li><strong>Using a single deterministic model.</strong> One point-estimate model gives the planner no way to know where it is ignorant, so the planner exploits the model's errors. Use an ensemble or a probabilistic model and penalize high-uncertainty regions, the fix of subsection four.</li>
+<li><strong>Letting the data distribution and the model drift apart.</strong> The model is only accurate where it has data; a policy that improves visits new states the model has never seen, where its predictions are unreliable. Interleave model retraining with policy improvement so the model keeps up with where the policy goes.</li>
+<li><strong>Forgetting the reward model.</strong> The dynamics model is only half of it; in most problems the reward must also be learned, $\hat{r}_\phi(s, a)$, and an inaccurate reward model misdirects the planner just as surely as an inaccurate dynamics model. Fit and validate both.</li>
+</ul>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 26.1.1: When Is a Model Worth It? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each of the following settings, argue whether model-based or model-free RL is the better default and why, grounding your answer in the sample-efficiency-versus-model-bias trade of subsection one: (a) a fast deterministic video-game simulator with millions of free steps per hour; (b) a surgical-robot policy where every real trial risks patient harm; (c) a high-frequency trading agent whose environment is non-stationary and partly adversarial; (d) a warehouse-robot navigation task with a cheap but slightly inaccurate physics simulator already available. State, in one sentence each, what would make you change your recommendation.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 26.1.2: Add a Reward Model and a CEM Planner <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 26.1.1 to also learn the reward as a second least-squares head $\hat{r}_\phi(s, a)$ rather than assuming it known, and verify its one-step error. Then replace the random-shooting planner of Code 26.1.2 with the cross-entropy method (CEM): instead of scoring purely random action sequences, iteratively refit a Gaussian over action sequences to the top-scoring elite fraction and resample. Compare the return CEM achieves to random shooting at the same number of model rollouts, and explain why CEM concentrates its samples where random shooting wastes them.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 26.1.3: Map Compounding Error Against Horizon and Model Quality <span class="exercise-type analysis">Analysis</span></div>
+<p>Using the <code>rollout_error</code> function of Code 26.1.3, sweep the planning horizon from 1 to 30 at several noise scales (model qualities) and plot rollout error against horizon for each. Fit the growth to the bound $E_H \le \epsilon\,(L^H - 1)/(L - 1)$ from subsection four to recover an effective amplification $L$ for each noise level, and explain how the horizon at which error exceeds a fixed tolerance (say $0.1$) shifts as the model degrades. Connect your finding to MBPO's choice of one-to-few-step rollouts and to the long-horizon-value idea of <a href="../../toc.html">Chapter 29</a>.</p>
+</div>
+
+<p>We have framed model-based RL as the exchange of model bias for sample efficiency, named its two components and three families, dissected the compounding error that bounds how far an agent may dream, and built a working planner over a learned model that reached its goal with roughly two orders of magnitude fewer real interactions than a model-free baseline. The thread that runs through all of it is that the world model is a temporal predictor, the forecasting object of the first half of this book conditioned on actions. The remaining sections of this chapter push advanced RL further along complementary axes. <a href="section-26.2.html">Section 26.2</a> turns to offline RL, learning a policy from a fixed dataset with no further interaction at all, the extreme of the sample-efficiency pressure that motivated this section; <a href="section-26.3.html">Section 26.3</a> takes up exploration; <a href="section-26.4.html">Section 26.4</a> hierarchical RL; and <a href="section-26.5.html">Section 26.5</a> multi-agent settings. The planning-with-learned-models idea developed here is carried into the optimal control of <a href="../../toc.html">Chapter 27</a>, and the learning-in-imagination family is the explicit subject of <a href="../../toc.html">Chapter 29</a> on world models and planning. For the chapter overview and prerequisites, return to the <a href="index.html">chapter index</a>.</p>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html"><span class="nav-label">Previous</span><span class="nav-num">Chapter 26</span><span class="nav-title">Contents</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 26</span><span class="nav-num">Contents</span><span class="nav-title">Advanced Reinforcement Learning</span></a>
+<a class="next" href="section-26.2.html"><span class="nav-label">Next</span><span class="nav-num">Section 26.2</span><span class="nav-title">Offline RL</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

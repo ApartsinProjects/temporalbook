@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 25.4: Continuous Control. Why discrete-action DQN does not apply when an actuator demands a real-valued torque, price, dose, or flow; Gaussian and deterministic policies; the DDPG, TD3, and SAC algorithm family; action squashing with tanh, reward scaling and observation normalization; MuJoCo and Gymnasium benchmarks and sim-to-real; and a from-scratch Gaussian actor-critic on Pendulum matched against a library agent." name="description"/>
+<title>Section 25.4: Continuous Control | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Sequential Decision Making</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 25: Deep Reinforcement Learning</a></div>
+<h1>Continuous Control</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"Do not hand me a menu of three buttons labeled left, right, and brake. I am a valve. I open by a real number between zero and one, and if you make me round that number to the nearest button you will overshoot the setpoint, oscillate, and blame the controller. Give me the torque. Give me the actual torque."</p>
+<cite>An Actuator Demanding a Real Number, Not a Discrete Choice</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The deep Q-network of <a href="section-25.2.html">Section 25.2</a> learns by computing a value for every action and picking the best, which works beautifully when there are four actions and is impossible when there are infinitely many. A robot joint accepts any torque in a continuous interval; a market-making policy quotes any price; an insulin pump delivers any dose; a chemical plant sets any flow rate. For these actuators the $\max_a Q(s,a)$ at the heart of DQN is an intractable optimization over a continuous set at every single timestep, so the entire value-iteration recipe stalls.</strong> Continuous control replaces "score every action and take the argmax" with "learn a policy that directly outputs an action", either a deterministic map $\mathbf{a} = \mu(\mathbf{s})$ or a stochastic Gaussian $\mathbf{a} \sim \mathcal{N}(\boldsymbol{\mu}(\mathbf{s}), \boldsymbol{\Sigma}(\mathbf{s}))$, and trains it with an actor-critic loop. This section explains why discrete methods break, derives the Gaussian policy and its log-probability, walks the canonical algorithm family DDPG, TD3, and SAC (with TD3's twin critics, delayed updates, and target smoothing fixing the overestimation that sinks DDPG), confronts the practical realities that make continuous control finicky (action bounds and tanh squashing, reward scaling, observation normalization), surveys the MuJoCo and Gymnasium benchmarks and the sim-to-real gap that <a href="../../toc.html">Chapter 35</a> must cross, and finally trains a Gaussian actor-critic from scratch on Pendulum and then in a few lines with a library. You leave able to choose, implement, and debug a continuous-control agent.</p>
+</div>
+<p>In <a href="section-25.3.html">Section 25.3</a> we built policy-gradient and actor-critic methods that learn a parameterized policy directly, and we noted in passing that this is what makes continuous actions tractable. This section cashes that promise. Where <a href="section-25.2.html">Section 25.2</a> learned a value function and read a discrete policy off its argmax, here the policy is the primary object and the value function (the critic) exists only to teach it. The shift is forced by the actuators of the running industrial and finance domains of Part VI: torques, prices, doses, and flows are real numbers, not menu items, and an agent that can only choose from a fixed discrete list either cannot represent the right action at all or must discretize so finely that the action set explodes. We use the unified notation of <a href="../../toc.html">Appendix A</a> throughout: $\mathbf{s}$ the state, $\mathbf{a}$ the action, $r$ the reward, $\pi$ the policy, $Q$ the action-value, $\gamma$ the discount.</p>
+<p>The four competencies this section installs are these: to recognize why the discrete-action machinery of DQN cannot be applied to a continuous actuator and to write down a Gaussian policy that can; to place DDPG, TD3, and SAC in one family and explain what each fixes about the previous one, especially the overestimation bias that TD3's twin critics and SAC's entropy regularization address; to apply the practical stabilizers (tanh action squashing with its log-probability correction, reward scaling, observation normalization) that turn a finicky algorithm into one that actually converges; and to implement a continuous-control agent from scratch and then reproduce it with a production library. These are the load-bearing skills for the advanced RL of <a href="section-25.5.html">Section 25.5</a>, the imitation and control of <a href="../../toc.html">Chapter 27</a>, and the robotics applications of <a href="../../toc.html">Chapter 35</a>.</p>
+
+<h2>1. Continuous Action Spaces: Why DQN Does Not Apply <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>A discrete-action agent enumerates. Deep Q-learning, the workhorse of <a href="section-25.2.html">Section 25.2</a>, learns a function $Q(\mathbf{s}, a)$ that scores each of a finite set of actions, and it acts by taking the highest-scoring one, $a^\star = \arg\max_a Q(\mathbf{s}, a)$. The greedy step and the Bellman target $r + \gamma \max_{a'} Q(\mathbf{s}', a')$ both rest on the same operation: a maximization over the action set, computed by simply trying every action. That is cheap when the set has four members and a single forward pass of the network produces all four values at once. It is the entire reason DQN is practical.</p>
+<p>Now replace the four buttons with a valve. The action is a torque $\mathbf{a} \in [\mathbf{a}_{\min}, \mathbf{a}_{\max}] \subset \mathbb{R}^k$, a real vector with infinitely many values. The operation $\max_a Q(\mathbf{s}, a)$ is now a continuous optimization over a $k$-dimensional box, and it must be solved afresh at every timestep of acting and at every entry of every minibatch during training. There is no enumeration; for a general neural-network $Q$ there is no closed form for the maximizer; and running an inner optimizer (gradient ascent on $a$) inside every Bellman backup is both expensive and unstable. The argmax that made DQN work is exactly what makes it inapplicable here. This is not a tuning difficulty, it is a structural wall: the discrete-action algorithm has no tractable continuous counterpart by direct extension.</p>
+<p>The naive escape, discretize the interval into bins and run DQN on the bins, fails on dimension. One joint split into 10 bins is fine; a humanoid with 17 joints split into 10 bins each has $10^{17}$ joint actions, a set no network can score and no buffer can cover. Discretization also throws away the metric structure of the action space (that a torque of 0.49 is nearly identical to 0.50), forcing the agent to relearn from scratch what a single continuous output would express for free. The lesson is that for actuators we should not score actions at all; we should <em>emit</em> them.</p>
+<p>The fix is to make the policy a function that outputs an action directly. Two flavors recur throughout this section. A <strong>deterministic policy</strong> is a map $\mathbf{a} = \boldsymbol{\mu}_{\boldsymbol{\theta}}(\mathbf{s})$ that returns one action per state; DDPG and TD3 use this form. A <strong>stochastic Gaussian policy</strong> outputs the parameters of a distribution and samples from it,</p>
+$$\mathbf{a} \sim \pi_{\boldsymbol{\theta}}(\cdot \mid \mathbf{s}) = \mathcal{N}\!\big(\boldsymbol{\mu}_{\boldsymbol{\theta}}(\mathbf{s}),\, \boldsymbol{\sigma}_{\boldsymbol{\theta}}(\mathbf{s})^2\big),$$
+<p>where the network emits a mean $\boldsymbol{\mu}_{\boldsymbol{\theta}}(\mathbf{s})$ and a (state-dependent or state-independent) standard deviation $\boldsymbol{\sigma}_{\boldsymbol{\theta}}(\mathbf{s})$, and the action is drawn from the resulting normal; SAC and the policy-gradient methods of <a href="section-25.3.html">Section 25.3</a> use this form. For a diagonal Gaussian over a $k$-dimensional action the log-probability of a sampled action, the quantity the policy gradient needs, is the closed form</p>
+$$\log \pi_{\boldsymbol{\theta}}(\mathbf{a} \mid \mathbf{s}) = -\frac{1}{2}\sum_{i=1}^{k}\left[\frac{(a_i - \mu_i)^2}{\sigma_i^2} + 2\log \sigma_i + \log 2\pi\right].$$
+<p>The Gaussian buys two things at once. It produces continuous actions by construction (a sample from a normal is a real number, no argmax required), and its built-in randomness <em>is</em> the exploration, replacing the $\epsilon$-greedy coin flip of DQN with a principled spread $\boldsymbol{\sigma}$ that the agent can widen when uncertain and shrink as it commits. The deterministic policy gives up that built-in exploration and must inject noise by hand, a difference we return to in subsection two.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Emit the Action, Do Not Score It</div>
+<p>The single conceptual move that separates continuous control from discrete RL is this: stop asking "which action has the highest value?" and start asking "what action should I take?". DQN answers the first question, which requires an argmax over the action set and breaks when the set is continuous. Continuous-control methods answer the second directly with a policy network whose output <em>is</em> the action (deterministic) or a distribution over actions (stochastic). The critic still learns a value, but only to provide a gradient that improves the actor, never to be argmaxed over. Whenever you see an actuator that takes a real number, your first instinct should be "actor-critic with a policy that outputs that number", not "discretize and run DQN".</p>
+</div>
+
+<h2>2. The Continuous-Control Algorithms: DDPG, TD3, and SAC <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The modern continuous-control toolbox is a short lineage of three off-policy actor-critic algorithms, each fixing a concrete defect of the previous one. Reading them as a family, rather than as three unrelated names, is the fastest way to understand the design space and to choose among them.</p>
+<p><strong>DDPG (Deep Deterministic Policy Gradient).</strong> DDPG is the continuous analogue of DQN: it keeps a replay buffer and target networks (the off-policy stability tricks of <a href="section-25.2.html">Section 25.2</a>) but replaces the intractable $\max_a Q$ with a learned deterministic actor $\boldsymbol{\mu}_{\boldsymbol{\theta}}(\mathbf{s})$ that approximates the maximizer. The critic learns $Q_{\boldsymbol{\phi}}(\mathbf{s},\mathbf{a})$ by minimizing the Bellman error toward the target $y = r + \gamma\, Q_{\boldsymbol{\phi}'}\big(\mathbf{s}', \boldsymbol{\mu}_{\boldsymbol{\theta}'}(\mathbf{s}')\big)$, and the actor is trained to output actions the critic scores highly, by ascending the deterministic policy gradient</p>
+$$\nabla_{\boldsymbol{\theta}} J \approx \mathbb{E}_{\mathbf{s}}\big[\nabla_{\mathbf{a}} Q_{\boldsymbol{\phi}}(\mathbf{s},\mathbf{a})\big|_{\mathbf{a}=\boldsymbol{\mu}_{\boldsymbol{\theta}}(\mathbf{s})}\,\nabla_{\boldsymbol{\theta}}\boldsymbol{\mu}_{\boldsymbol{\theta}}(\mathbf{s})\big],$$
+<p>which is the chain rule pushing the critic's "which way is better" signal back through the actor's parameters. Because the actor is deterministic, exploration is added by hand: a noise process (Gaussian, or the temporally correlated Ornstein-Uhlenbeck noise of the original paper) is added to the action during data collection. DDPG works, but it is notoriously brittle: it inherits and amplifies the <em>overestimation bias</em> of Q-learning, because the critic's approximation errors are positively biased by the very maximization the actor performs, and the actor then chases those phantom high values into collapse.</p>
+<p><strong>TD3 (Twin Delayed DDPG).</strong> TD3 is DDPG plus three targeted fixes for that overestimation, and it is the reliable workhorse of deterministic continuous control. (1) <em>Twin critics</em>: learn two independent critics $Q_{\boldsymbol{\phi}_1}, Q_{\boldsymbol{\phi}_2}$ and use the <em>minimum</em> of the two in the Bellman target, $y = r + \gamma \min_{i=1,2} Q_{\boldsymbol{\phi}'_i}(\mathbf{s}', \tilde{\mathbf{a}})$; taking the smaller estimate deliberately counteracts the upward bias, the same clipped-double-Q idea that double DQN applied to discrete actions. (2) <em>Delayed policy updates</em>: update the actor (and the target networks) less often than the critics, typically once every two critic steps, so the actor chases a value estimate that has had time to settle rather than a noisy moving target. (3) <em>Target policy smoothing</em>: add a small clipped Gaussian noise to the target action $\tilde{\mathbf{a}} = \boldsymbol{\mu}_{\boldsymbol{\theta}'}(\mathbf{s}') + \operatorname{clip}(\boldsymbol{\epsilon}, -c, c)$ when computing the target, which regularizes the critic so it cannot exploit sharp spurious peaks in its own value surface. These three changes turn DDPG's brittleness into TD3's reliability at almost no extra conceptual cost.</p>
+<p><strong>SAC (Soft Actor-Critic).</strong> SAC takes the stochastic route. It is an off-policy actor-critic over a Gaussian policy that maximizes a <em>maximum-entropy</em> objective, reward plus a bonus for keeping the policy uncertain,</p>
+$$J(\pi) = \sum_t \mathbb{E}_{(\mathbf{s}_t,\mathbf{a}_t)\sim\pi}\big[r(\mathbf{s}_t,\mathbf{a}_t) + \alpha\, \mathcal{H}\big(\pi(\cdot\mid\mathbf{s}_t)\big)\big],$$
+<p>where $\mathcal{H}$ is the policy entropy and the temperature $\alpha$ trades reward against exploration. The entropy term is not a heuristic add-on; it makes the policy explore broadly and robustly, prevents premature collapse onto a narrow deterministic action, and (with the automatic-temperature variant that tunes $\alpha$ to hit a target entropy) makes SAC remarkably insensitive to hyperparameters. SAC also borrows TD3's twin critics for the same overestimation fix. The full SAC algorithm is the subject of the dedicated <a href="section-25.3.html">Section 25.3</a> treatment referenced in Callback 25.3 below; here we place it in the family.</p>
+<div class="callout looking-back">
+<div class="callout-title">Callback 25.3: Soft Actor-Critic and the Entropy View</div>
+<p>SAC was introduced in <a href="section-25.3.html">Section 25.3</a> as a maximum-entropy actor-critic, where we derived its soft Bellman backup and the automatic temperature tuning that keeps the policy entropy at a target level. This section adds the continuous-control framing: SAC is the stochastic member of the DDPG/TD3/SAC family, the one whose Gaussian policy outputs continuous actions natively and whose entropy bonus supplies exploration without the hand-tuned noise process that DDPG and TD3 require. When you reach the worked example in subsection five, the from-scratch Gaussian actor-critic is a stripped-down cousin of SAC: same Gaussian policy and log-probability, minus the entropy temperature and twin critics that make full SAC robust.</p>
+</div>
+<p>The deterministic-versus-stochastic choice is the axis that organizes the family. A deterministic policy (DDPG, TD3) outputs exactly one action per state and explores only through externally injected noise; it tends to be sample-efficient and is natural when the optimal policy really is a single best action. A stochastic policy (SAC) outputs a distribution and explores through its own variance; it is more robust to hyperparameters, handles multimodal or genuinely stochastic-optimal tasks better, and degrades gracefully because it never bets everything on one action. The practical default in 2026 is SAC for most continuous benchmarks (robust, strong, little tuning) and TD3 when sample efficiency or a clean deterministic policy matters; plain DDPG is mostly of historical and pedagogical interest now, the ancestor you understand in order to understand its successors. Figure 25.4.1 lays the family out side by side.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Property</th><th>DDPG</th><th>TD3</th><th>SAC</th></tr></thead>
+<tbody>
+<tr><td>policy type</td><td>deterministic $\boldsymbol{\mu}(\mathbf{s})$</td><td>deterministic $\boldsymbol{\mu}(\mathbf{s})$</td><td>stochastic Gaussian</td></tr>
+<tr><td>exploration</td><td>added action noise</td><td>added action noise</td><td>policy entropy (built in)</td></tr>
+<tr><td>critics</td><td>one</td><td>two, take the min</td><td>two, take the min</td></tr>
+<tr><td>overestimation fix</td><td>none (brittle)</td><td>twin + delay + smoothing</td><td>twin critics + entropy</td></tr>
+<tr><td>actor update</td><td>every step</td><td>delayed (every 2 steps)</td><td>every step</td></tr>
+<tr><td>key knob</td><td>noise scale</td><td>noise/delay/smoothing</td><td>temperature $\alpha$ (auto-tunable)</td></tr>
+<tr><td>2026 role</td><td>ancestor, pedagogical</td><td>sample-efficient default</td><td>robust default</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 25.4.1:</strong> The continuous-control family at a glance. DDPG is the deterministic actor-critic ancestor; TD3 hardens it against overestimation with twin critics, delayed actor updates, and target smoothing; SAC takes the stochastic, maximum-entropy route and folds exploration into the policy itself. All three are off-policy and share a replay buffer and target networks.</figcaption>
+</figure>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Overestimation Is the Enemy, and the Minimum Is the Cure</div>
+<p>The thread connecting TD3 and SAC is a single failure mode: a learned critic, maximized over actions, systematically overestimates value, because any positive noise in the value estimate is selected for by the maximization, and the actor then climbs toward states the critic has merely overrated. DDPG has no defense and frequently diverges. Both successors defend with the same trick: learn two critics and use the smaller of the two in the target, so an overestimate in one critic is censored by the other. TD3 adds delayed updates and target smoothing on top; SAC adds an entropy bonus that keeps the policy from collapsing onto the overrated action in the first place. When a continuous-control agent's return curve climbs and then collapses, suspect overestimation first, and reach for the twin-critic minimum.</p>
+</div>
+
+<h2>3. Practical Realities: Squashing, Scaling, and Why It Is Finicky <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Continuous control has a reputation for being finicky, and the reputation is earned. The algorithms of subsection two are correct, but a faithful implementation that ignores three mundane practicalities, action bounds, reward magnitude, and observation scale, will often fail to learn while emitting no error at all. These are not optional polish; they are part of the algorithm.</p>
+<p><strong>Action bounds and tanh squashing.</strong> A Gaussian policy outputs an unbounded sample in $\mathbb{R}^k$, but every real actuator has limits: a torque saturates, a valve cannot open past fully open, a dose has a ceiling. The standard fix is to pass the raw Gaussian sample through a $\tanh$ and rescale to the action range, $\mathbf{a} = \tanh(\mathbf{u})$ for $\mathbf{u} \sim \mathcal{N}(\boldsymbol{\mu}, \boldsymbol{\sigma}^2)$, which maps any real vector into $(-1, 1)^k$ smoothly. The catch is that squashing changes the distribution, so the log-probability used by the policy gradient must be corrected by the change-of-variables Jacobian of the $\tanh$:</p>
+$$\log \pi(\mathbf{a}\mid\mathbf{s}) = \log \mathcal{N}(\mathbf{u}\mid\boldsymbol{\mu},\boldsymbol{\sigma}^2) - \sum_{i=1}^{k}\log\!\big(1 - \tanh^2(u_i)\big),$$
+<p>where the subtracted term accounts for how the $\tanh$ compresses probability mass near the bounds. Omitting this correction is one of the most common silent bugs in a hand-rolled SAC: the agent trains, the loss looks plausible, and the policy quietly learns the wrong thing because its log-probabilities are inconsistent with the actions it actually took. We implement the correction explicitly in subsection five.</p>
+<p><strong>Reward scaling.</strong> The critic regresses onto returns, and a neural network regressor is sensitive to the magnitude of its targets. A task whose per-step rewards are in the thousands produces value targets in the tens of thousands, which blow up the critic's gradients; a task with rewards near $10^{-3}$ produces a signal the optimizer can barely see. Scaling rewards (or normalizing returns) to a sane range, often $O(1)$, is frequently the difference between learning and not, and it is why benchmark wrappers ship reward-scaling options. The temperature $\alpha$ in SAC interacts with reward scale directly, which is one more reason the automatic-temperature variant, which adapts to the scale, is so much easier to use.</p>
+<p><strong>Observation normalization.</strong> Symmetrically, the policy and critic ingest observations whose components may live on wildly different scales (a joint angle in radians near 1, a cart position in meters near 0.01, a velocity in the hundreds). Feeding raw heterogeneous features to a network slows or prevents learning. The standard remedy is a running normalizer that maintains an online mean and variance of each observation component and standardizes inputs to zero mean and unit variance, exactly the streaming standardization an online learner uses in <a href="../../toc.html">Chapter 20</a>. Together these three stabilizers explain most of the gap between "I implemented the equations" and "it actually learns".</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Sampling and Squashing One Continuous Action</div>
+<p>Take a one-dimensional actuator whose policy, in some state, outputs mean $\mu = 0.4$ and standard deviation $\sigma = 0.5$. We sample the raw action by the reparameterization trick: draw $\xi = 1.2$ from a standard normal and form $u = \mu + \sigma\,\xi = 0.4 + 0.5\cdot 1.2 = 1.0$. The raw action $u = 1.0$ is unbounded and could not be sent to a valve limited to $[-1, 1]$. Squash it: $a = \tanh(1.0) = 0.7616$, now safely inside the bound. The raw Gaussian log-density at $u=1.0$ is $\log\mathcal{N}(1.0\mid 0.4, 0.25) = -\tfrac12\big[(1.0-0.4)^2/0.25 + \log(2\pi\cdot 0.25)\big] = -\tfrac12[1.44 + 0.4516] = -0.9458$. The tanh correction subtracts $\log(1 - \tanh^2(1.0)) = \log(1 - 0.7616^2) = \log(0.4200) = -0.8675$, giving the squashed log-probability $\log\pi(a) = -0.9458 - (-0.8675) = -0.0783$. Notice the correction is large here (about $0.87$ in log units) because $u=1.0$ sits where the tanh is compressing hard; near the bounds the correction dominates, which is exactly why omitting it corrupts the gradient.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Tyranny of the Forgotten Jacobian</div>
+<p>There is a special circle of debugging purgatory reserved for the engineer who squashed the action but forgot to correct the log-probability. The agent does not crash. The reward does not flatline at zero. Instead it climbs, plateaus a bit low, and sits there, smug and broken, while you stare at a learning curve that looks <em>almost</em> right and audit your reward function, your network sizes, your learning rate, and your sanity in that order. The bug is one missing line: <code>- log(1 - a.pow(2))</code>. Continuous control is the domain where the difference between "works" and "subtly wrong forever" is a single term in a density, which is the entire reason this section insists you write that term out by hand at least once.</p>
+</div>
+
+<h2>4. Benchmarks and Sim-to-Real <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Continuous-control research is organized around a small set of standard benchmarks, and knowing them is how you read the literature and calibrate your own results. The dominant suite is the MuJoCo continuous-control tasks (HalfCheetah, Hopper, Walker2d, Ant, Humanoid, and friends), a collection of simulated articulated bodies whose goal is locomotion: emit joint torques each step to make the body run forward as fast as possible without falling. They are exposed through the Gymnasium API (the maintained successor to OpenAI Gym), which since 2022 ships MuJoCo as a permissively licensed, pip-installable backend, alongside the simpler classic-control tasks like Pendulum and the continuous version of MountainCar that we use for the worked example because they train in seconds on a laptop. A second important suite is DeepMind Control (dm_control), with finer-grained tasks and a standardized reward structure. Reporting on these benchmarks follows the reproducibility discipline of <a href="section-25.5.html">Section 25.5</a>: report the mean and standard deviation of final return over many seeds, never a single lucky run, because continuous-control variance across seeds is large.</p>
+<p>The benchmarks are simulators, and that is both their strength and their central limitation. A simulator gives unlimited, cheap, perfectly labeled, safely resettable experience, which is why almost all continuous-control progress is measured in simulation. But the policies must eventually drive real actuators, and the <strong>sim-to-real gap</strong>, the mismatch between simulated and real dynamics, friction, latency, sensor noise, and unmodeled effects, routinely turns a policy that is superb in simulation into one that flails on hardware. The gap is the defining obstacle of applied continuous control and the subject of <a href="../../toc.html">Chapter 35</a>'s robotics treatment. The standard mitigations are domain randomization (train across a distribution of simulator parameters so the policy is robust to the real value it will meet), system identification (fit the simulator to the real robot), and conservative sim-to-real fine-tuning with a small amount of real, often expensive, on-hardware data. The temporal thread is direct: a sim-trained policy faces a distribution shift the moment it is deployed, the same non-stationarity and drift problem of <a href="../../toc.html">Chapter 20</a>, now with a physical robot on the other end.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Continuous Control in 2024 to 2026</div>
+<p>Three currents define the recent frontier. First, <em>sample efficiency</em>: model-based continuous control, led by the Dreamer line culminating in DreamerV3 (Hafner et al., 2023) and the TD-MPC2 world-model planner (Hansen et al., 2024), learns a latent dynamics model and plans or imagines inside it, reaching strong continuous-control performance with far fewer real interactions than model-free SAC or TD3, and connecting forward to the world models of <a href="../../toc.html">Chapter 29</a>. Second, <em>offline and real-robot learning</em>: offline RL methods (CQL, IQL, and the diffusion-policy actors of 2023 to 2024) learn continuous controllers from fixed logged datasets without any environment interaction, the safety-critical regime for medical and industrial actuators, supported by the d3rlpy library. Third, <em>scaling and generalist control</em>: large transformer and diffusion policies trained across many continuous-control tasks and real robots (RT-2, Octo, and the open X-embodiment effort, 2023 to 2024) point toward a single policy that controls many actuators, the continuous-control analogue of a foundation model and a bridge to <a href="../../toc.html">Chapter 35</a>. The practitioner's read for 2026: SAC and TD3 remain the reliable model-free baselines, but the sample-efficiency frontier has moved decisively toward learned world models and offline data.</p>
+</div>
+
+<h2>5. Worked Example: A Gaussian Actor-Critic, From Scratch and by Library <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make the section executable on Pendulum-v1, the canonical small continuous-control task: swing a frictionless pendulum upright by applying a continuous torque in $[-2, 2]$. The plan mirrors the rest of the book: build the policy and a one-step actor-critic update from scratch in PyTorch, exposing the Gaussian sampling, the tanh squash, and the log-probability correction explicitly; then collect a short trajectory and verify the update runs and the squashing keeps every action in bounds; then replace the whole thing with a few lines of Stable-Baselines3 and state the line-count reduction. Code 25.4.1 is the from-scratch Gaussian policy with squashing.</p>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+import gymnasium as gym
+
+ACT_LOW, ACT_HIGH = -2.0, 2.0          # Pendulum torque bounds
+LOG_STD_MIN, LOG_STD_MAX = -5.0, 2.0   # clamp the learned log-std for stability
+
+class GaussianActor(nn.Module):
+    """A squashed-Gaussian policy: outputs mean and log-std, samples, tanh-squashes."""
+    def __init__(self, obs_dim, act_dim, hidden=64):
+        super().__init__()
+        self.body = nn.Sequential(nn.Linear(obs_dim, hidden), nn.Tanh(),
+                                  nn.Linear(hidden, hidden), nn.Tanh())
+        self.mu_head = nn.Linear(hidden, act_dim)        # mean of the raw Gaussian
+        self.log_std_head = nn.Linear(hidden, act_dim)   # log-std of the raw Gaussian
+
+    def forward(self, obs):
+        h = self.body(obs)
+        mu = self.mu_head(h)
+        log_std = self.log_std_head(h).clamp(LOG_STD_MIN, LOG_STD_MAX)
+        return mu, log_std
+
+    def sample(self, obs):
+        mu, log_std = self.forward(obs)
+        std = log_std.exp()
+        normal = torch.distributions.Normal(mu, std)
+        u = normal.rsample()                 # reparameterized raw sample (mu + std * xi)
+        a_tanh = torch.tanh(u)               # SQUASH into (-1, 1)
+        # log-prob of the SQUASHED action: subtract the tanh change-of-variables Jacobian
+        logp = normal.log_prob(u).sum(-1)
+        logp = logp - torch.log(1 - a_tanh.pow(2) + 1e-6).sum(-1)
+        # rescale (-1,1) -> actuator range [ACT_LOW, ACT_HIGH]
+        action = ACT_LOW + 0.5 * (a_tanh + 1.0) * (ACT_HIGH - ACT_LOW)
+        return action, logp
+
+class Critic(nn.Module):
+    """A state-value baseline V(s) for the actor-critic advantage."""
+    def __init__(self, obs_dim, hidden=64):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(obs_dim, hidden), nn.Tanh(),
+                                 nn.Linear(hidden, hidden), nn.Tanh(),
+                                 nn.Linear(hidden, 1))
+    def forward(self, obs):
+        return self.net(obs).squeeze(-1)
+</code></pre>
+<div class="code-caption"><strong>Code 25.4.1:</strong> The from-scratch squashed-Gaussian actor and a value critic. The <code>sample</code> method is the heart of continuous control: it draws a reparameterized raw action, squashes it with <code>tanh</code>, applies the change-of-variables log-probability correction (<code>- log(1 - a^2)</code>), and rescales into the actuator's torque range. Omitting the correction line is the silent bug of subsection three.</div>
+<p>Code 25.4.2 wires these into one actor-critic update step: roll out the policy, bootstrap a one-step return, compute the advantage from the critic, and take a gradient step on both the policy loss (negative advantage-weighted log-probability) and the critic loss (return regression). This is the smallest complete continuous-control learner, the stripped-down cousin of SAC promised in Callback 25.3.</p>
+<pre><code class="language-python">def ac_update(actor, critic, opt_a, opt_c, obs, action_logp, reward, next_obs, done, gamma=0.99):
+    """One on-policy actor-critic update on a single transition (Pendulum)."""
+    logp = action_logp                                   # log pi(a|s) from sample()
+    with torch.no_grad():
+        target = reward + gamma * (1 - done) * critic(next_obs)   # one-step bootstrap
+    value = critic(obs)
+    advantage = (target - value).detach()                # critic says how good the action was
+    actor_loss = -(advantage * logp).mean()              # policy gradient: push up good actions
+    critic_loss = (value - target).pow(2).mean()         # regress V toward the return
+    opt_a.zero_grad(); actor_loss.backward(); opt_a.step()
+    opt_c.zero_grad(); critic_loss.backward(); opt_c.step()
+    return actor_loss.item(), critic_loss.item()
+
+env = gym.make("Pendulum-v1")
+obs_dim = env.observation_space.shape[0]    # 3 for Pendulum
+act_dim = env.action_space.shape[0]         # 1 for Pendulum
+actor, critic = GaussianActor(obs_dim, act_dim), Critic(obs_dim)
+opt_a = torch.optim.Adam(actor.parameters(), lr=3e-4)
+opt_c = torch.optim.Adam(critic.parameters(), lr=3e-4)
+
+obs, _ = env.reset(seed=0)
+obs_t = torch.tensor(obs, dtype=torch.float32)
+action, logp = actor.sample(obs_t.unsqueeze(0))
+a_np = action.squeeze(0).detach().numpy()
+next_obs, reward, term, trunc, _ = env.step(a_np)
+next_t = torch.tensor(next_obs, dtype=torch.float32)
+al, cl = ac_update(actor, critic, opt_a, opt_c,
+                   obs_t.unsqueeze(0), logp,
+                   torch.tensor([reward], dtype=torch.float32),
+                   next_t.unsqueeze(0), torch.tensor([float(term)]))
+print("sampled torque   = %.4f  (in bounds: %s)" % (a_np[0], ACT_LOW <= a_np[0] <= ACT_HIGH))
+print("actor loss = %.4f   critic loss = %.4f" % (al, cl))
+</code></pre>
+<div class="code-caption"><strong>Code 25.4.2:</strong> One from-scratch actor-critic update on a Pendulum transition. The advantage from the critic tells the Gaussian policy which way to move its mean; the squashing of Code 25.4.1 guarantees the emitted torque respects the $[-2, 2]$ bound before it ever reaches the simulator. A full training run wraps this step in a rollout loop over many episodes.</div>
+<pre><code class="language-text">sampled torque   = 0.8137  (in bounds: True)
+actor loss = -0.0042   critic loss = 18.7351
+</code></pre>
+<div class="code-caption"><strong>Output 25.4.1:</strong> One update step. The sampled torque lands inside the actuator bound because the tanh squash of Code 25.4.1 enforces it by construction; the large initial critic loss reflects the untrained value function regressing onto Pendulum's strongly negative rewards, the reward-scale issue of subsection three.</div>
+<p>Now the library pair. Code 25.4.3 trains a full, robust SAC agent on the same task with Stable-Baselines3, which internally implements the squashed-Gaussian policy, the twin critics, the automatic temperature, the replay buffer, and the target networks of subsection two. The squashing, log-probability correction, and reward handling we wrote by hand are all inside the library.</p>
+<pre><code class="language-python">import gymnasium as gym
+from stable_baselines3 import SAC
+
+env = gym.make("Pendulum-v1")
+model = SAC("MlpPolicy", env, verbose=0, seed=0)   # squashed-Gaussian SAC, all defaults
+model.learn(total_timesteps=20_000)                # off-policy training with replay + twin critics
+
+obs, _ = env.reset(seed=0)
+action, _ = model.predict(obs, deterministic=True) # greedy action for evaluation
+print("SB3 SAC action =", action)
+</code></pre>
+<div class="code-caption"><strong>Code 25.4.3:</strong> The library equivalent. The roughly 70 lines of from-scratch policy, squashing, log-probability correction, and update loop in Code 25.4.1 and 25.4.2 collapse to three meaningful lines: construct, <code>learn</code>, <code>predict</code>. Stable-Baselines3 supplies the twin critics, automatic temperature, replay buffer, target networks, and the tanh-squash correction internally, none of which you write or maintain.</div>
+<pre><code class="language-text">SB3 SAC action = [-0.7421]
+</code></pre>
+<div class="code-caption"><strong>Output 25.4.2:</strong> The trained SB3 SAC agent emits a single continuous torque to swing the pendulum upright. The same continuous action our from-scratch policy produced, now from a fully trained, robust agent built in three lines instead of seventy.</div>
+<p>Read the three blocks together. Code 25.4.1 exposed the squashed-Gaussian policy and the one log-probability correction that is the section's most error-prone line. Code 25.4.2 drove it with a complete actor-critic update, showing the critic's advantage steering the policy mean and the squash keeping every torque in bounds. Code 25.4.3 replaced all of it with a production SAC that adds the twin critics, automatic temperature, and replay machinery of subsection two for free. The payoff is the same as everywhere in this book: you understand the algorithm because you built its core by hand, and you ship the robust version because a library implemented the parts that are tedious to get exactly right.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Continuous Controller for a Chemical Reactor</div>
+<p><strong>Who:</strong> A process-control team at a specialty-chemicals plant replacing a hand-tuned PID loop that sets the coolant flow rate of an exothermic batch reactor, the industrial actuator thread of Part VI.</p>
+<p><strong>Situation:</strong> The reactor temperature must track a setpoint despite a nonlinear, time-varying reaction; the actuator is a coolant valve that accepts any flow in a continuous range, and the existing PID overshot during the exothermic peak, risking a runaway.</p>
+<p><strong>Problem:</strong> They wanted a learned controller that emits a continuous flow rate each control interval and anticipates the exotherm, but it had to respect the valve's hard physical bounds and be trained safely, since a bad action on the real reactor is dangerous and expensive.</p>
+<p><strong>Dilemma:</strong> Discretizing the flow into bins and running DQN was tempting for its simplicity but coarse and unstable near the setpoint, exactly the discretization failure of subsection one. Online model-free RL on the real reactor was unsafe. A continuous policy trained in a simulator risked the sim-to-real gap of subsection four.</p>
+<p><strong>Decision:</strong> They trained a SAC agent in a calibrated reactor simulator with the flow action tanh-squashed to the valve's physical range, used domain randomization over the reaction-rate and heat-transfer parameters to harden against sim-to-real mismatch, and validated offline against logged historical batches before any live deployment.</p>
+<p><strong>How:</strong> The action was squashed and rescaled to the valve range exactly as in Code 25.4.1; rewards combined setpoint-tracking error with a penalty for overshoot and were scaled to $O(1)$ per the reward-scaling discipline of subsection three; observations (temperature, its rate of change, batch age) were running-normalized.</p>
+<p><strong>Result:</strong> The SAC controller tracked the setpoint with markedly less overshoot than the PID baseline across the exothermic peak, respected the valve bounds by construction, and transferred to the real reactor after a short conservative fine-tuning phase on a handful of supervised batches.</p>
+<p><strong>Lesson:</strong> Continuous control is the right framing the moment the actuator takes a real number, but the win comes from the practicalities as much as the algorithm: squash to the physical bound, scale the reward, normalize the observation, and close the sim-to-real gap deliberately, or a correct policy will still fail on the real valve.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: SAC and TD3 in Three Lines</div>
+<p>The from-scratch actor, critic, squashing, log-probability correction, and update loop of Code 25.4.1 and 25.4.2 run about 70 lines and still lack the twin critics, temperature tuning, and replay buffer that make a real agent robust. Stable-Baselines3 supplies a tuned, tested continuous-control agent in three lines, and switching algorithms is a one-word change.</p>
+<pre><code class="language-python">from stable_baselines3 import SAC, TD3
+import gymnasium as gym
+
+env = gym.make("HalfCheetah-v4")              # a MuJoCo continuous-control benchmark
+model = TD3("MlpPolicy", env, verbose=0)      # swap TD3 -> SAC for the stochastic agent
+model.learn(total_timesteps=1_000_000)        # full off-policy training, all machinery internal
+</code></pre>
+<p>The library handles the twin critics, target policy smoothing, delayed updates (TD3), automatic temperature (SAC), replay buffer, target networks, action squashing, and the log-probability Jacobian correction internally, every practicality of subsections two and three, none of which you write. The line-count reduction is roughly seventy hand-written lines to three, and the result is a far more robust agent. The CleanRL single-file implementations are the recommended companion when you want to read every line of a correct TD3 or SAC without the library abstraction.</p>
+</div>
+
+<h2>Exercises</h2>
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.4.1 (Conceptual): Why the Argmax Breaks</div>
+<p>Explain precisely why the deep Q-network update of <a href="section-25.2.html">Section 25.2</a> cannot be applied directly to a continuous action space. Identify the two specific operations in the DQN algorithm that require a maximization over actions, and explain why discretizing the action interval into bins is not a satisfactory fix for a high-dimensional actuator (give the scaling argument explicitly for a 12-joint robot with 10 bins per joint). Then state, in one sentence each, how a deterministic policy and a Gaussian policy each sidestep the problem.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.4.2 (Implementation): The Squash Correction Matters</div>
+<p>Extend Code 25.4.1 and 25.4.2 into a full training loop on Pendulum-v1 and run it twice: once with the tanh log-probability correction line included, and once with that single line deleted. Plot the episodic return of both runs over training. Confirm that the version without the correction learns a measurably worse or unstable policy, and explain, referring to the change-of-variables formula of subsection three, why the missing Jacobian term corrupts the policy gradient. Report the final mean return over five seeds for each variant.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.4.3 (Open-ended): TD3 Versus SAC on Your Actuator</div>
+<p>Pick a continuous-control task with a real actuator interpretation (a MuJoCo locomotion task, the continuous LunarLander, or a simulated valve or pricing problem of your own). Train both TD3 and SAC from Stable-Baselines3 with default hyperparameters over at least five seeds each, and compare them on three axes: final return, sample efficiency (return at a fixed early budget), and seed-to-seed variance. Then deliberately degrade the setup, scale the reward by 1000 without re-tuning, and report which algorithm is more robust to the reward-scale change. Connect your finding to the automatic-temperature argument of subsection two and the reproducibility discipline of <a href="section-25.5.html">Section 25.5</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-25.3.html">&#8592; Previous: 25.3 Soft Actor-Critic and Maximum-Entropy RL</a>
+<a class="up" href="index.html">Chapter 25 Contents</a>
+<a class="next" href="section-25.5.html">Next: 25.5 Practical Deep RL &#8594;</a>
+</nav>
+</main>
+<footer class="book-footer">
+<p>Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&copy; 2026 Alexander Apartsin &middot; <a href="../../toc.html">Contents</a></p>
+<p class="last-updated"></p>
+</footer>
+</body>
+</html>

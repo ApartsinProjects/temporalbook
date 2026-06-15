@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 25.3: Actor-Critic Methods. How actor-critic methods pair a policy (actor) with a learned value or advantage estimate (critic) to cut policy-gradient variance, the generalized advantage estimator, PPO's clipped surrogate objective, SAC's maximum-entropy off-policy actor-critic, a comparison of DQN, A2C, PPO, and SAC, and a from-scratch A2C trained on CartPole then matched by stable-baselines3 PPO." name="description"/>
+<title>Section 25.3: Actor-Critic Methods (A2C/A3C, PPO, SAC) | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Sequential Decision Making</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 25: Deep Reinforcement Learning</a></div>
+<h1>Actor-Critic Methods (A2C/A3C, PPO, SAC)</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"The Actor wanted to leap; the Critic kept whispering a number in its ear. Most days the number was wrong, but it was wrong in a consistent direction, and consistently-wrong-by-a-little turned out to beat right-but-deafeningly-noisy. So they argued their way, step by clipped step, to a policy neither of them could have found alone."</p>
+<cite>An Actor and a Critic Who Argue Their Way to a Good Policy</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Actor-critic methods are the workhorse of modern deep reinforcement learning because they fuse the two families that came before them: the policy-gradient methods that optimize a parameterized policy directly, and the value-based methods that estimate how good states and actions are. The actor is the policy; the critic is a learned value or advantage estimate; and the critic's only job is to whisper a lower-variance learning signal into the actor's gradient.</strong> The pure policy gradient of <a href="section-25.2.html">Section 25.2</a> is unbiased but drowns in variance because it weights every action by a noisy Monte-Carlo return. Subtract a learned baseline, the critic's value function, and the return becomes an <em>advantage</em>: how much better this action was than average. That single substitution slashes variance at the cost of a little bias, and every algorithm in this section is a different way of managing that bias-variance trade. We build up from advantage actor-critic (A2C) and its asynchronous twin A3C, sharpen the advantage estimate with the generalized advantage estimator (GAE), then meet the two methods you will actually reach for in practice: PPO, whose clipped surrogate objective keeps each update inside a trust region without any second-order machinery, and SAC, an off-policy maximum-entropy actor-critic that squeezes far more learning out of each environment step for continuous control. We close by coding a minimal A2C from scratch, training it on CartPole, then reproducing the result with a few lines of stable-baselines3 PPO. You leave able to choose, read, and run the actor-critic method that fits your problem.</p>
+</div>
+<p>In <a href="section-25.2.html">Section 25.2</a> we derived the policy gradient and trained a policy with REINFORCE, weighting the log-probability of each action by the return that followed it and subtracting a baseline to reduce variance. We noted there that the best possible baseline is the state value function $V^\pi(s)$, and that learning that baseline turns REINFORCE into something more powerful. This section makes good on that promise. The learned baseline becomes a full <em>critic</em>, the policy becomes the <em>actor</em>, and the two are trained together. The recurring temporal-AI thread is visible here too: the value function the critic learns is the same Bellman object that the dynamic-programming and temporal-difference methods of <a href="../module-24-bandits-rl-foundations/index.html">Chapter 24</a> estimated for fixed policies, now used as a moving target inside a policy-optimization loop. We use the unified notation of <a href="../../toc.html">Appendix A</a>: $s_t$ the state, $a_t$ the action, $r_t$ the reward, $\pi_\theta$ the actor with parameters $\theta$, $V_\phi$ the critic with parameters $\phi$, and $\gamma \in [0,1)$ the discount.</p>
+<p>Why does the field overwhelmingly default to actor-critic methods, and to PPO in particular, rather than to the pure policy gradient or to value-based methods like the DQN of <a href="section-25.1.html">Section 25.1</a>? Because actor-critic occupies the productive middle. Value-based methods learn a value function and read a policy off it, which is sample-efficient but awkward for continuous actions and prone to instability when the max operator interacts with function approximation. Pure policy gradients optimize the policy directly and handle any action space, but their variance makes them slow and finicky. Actor-critic keeps the policy-gradient generality (any action space, stochastic policies, direct objective) while borrowing the value-based machinery to tame variance. The result is a recipe that scales from CartPole to robotic locomotion to large-language-model alignment with reinforcement learning from human feedback, where PPO is the standard optimizer.</p>
+<p>The four competencies this section installs are these: to write the actor-critic gradient with a learned advantage and explain why it has lower variance than REINFORCE; to compute the generalized advantage estimate and read its $\lambda$ knob as a bias-variance dial; to state PPO's clipped surrogate objective and explain why clipping enforces a trust region cheaply; and to distinguish on-policy PPO from off-policy maximum-entropy SAC and know which to reach for. These skills carry directly into the continuous control of <a href="section-25.4.html">Section 25.4</a> and the advanced methods of <a href="../module-26-advanced-rl/index.html">Chapter 26</a>.</p>
+
+<h2>1. Actor-Critic: A Policy and a Critic That Cuts Variance <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The policy gradient from <a href="section-25.2.html">Section 25.2</a> has the form $\nabla_\theta J(\theta) = \mathbb{E}\big[\sum_t \nabla_\theta \log \pi_\theta(a_t \mid s_t)\, \Psi_t\big]$, where $\Psi_t$ is some measure of how good action $a_t$ was. REINFORCE uses the Monte-Carlo return $\Psi_t = G_t = \sum_{k \ge t} \gamma^{k-t} r_k$, an unbiased estimate of the action's value but a famously noisy one, because a single rollout's return reflects every random choice made after step $t$, not just the choice at step $t$. The actor-critic idea is to replace that noisy return with a learned, lower-variance signal: the <em>advantage</em>.</p>
+<p>Subtracting any function of the state alone, a baseline $b(s_t)$, leaves the gradient unbiased (its expectation is unchanged because $\mathbb{E}[\nabla_\theta \log \pi_\theta(a \mid s)] = 0$) while reducing variance. The variance-minimizing baseline is the state value $V^\pi(s_t)$, and with that choice $\Psi_t = G_t - V^\pi(s_t)$ becomes the advantage. The critic learns to estimate $V^\pi$, so the actor-critic gradient is</p>
+$$\nabla_\theta J(\theta) = \mathbb{E}_{\pi_\theta}\!\left[\sum_t \nabla_\theta \log \pi_\theta(a_t \mid s_t)\, A^\pi(s_t, a_t)\right], \qquad A^\pi(s_t, a_t) = Q^\pi(s_t, a_t) - V^\pi(s_t).$$
+<p>The advantage $A^\pi(s_t, a_t)$ answers a sharper question than the raw return does: not "what happened after I took this action?" but "how much better than my average behavior in this state was this particular action?". An action with positive advantage gets its log-probability pushed up; negative advantage pushes it down; an exactly average action gets no push at all. This re-centering is what removes the variance: the large state-dependent baseline that contaminated REINFORCE has been subtracted away, leaving only the action-specific signal.</p>
+<p>We rarely have $Q^\pi$ and $V^\pi$ separately. The standard estimator is the one-step temporal-difference (TD) error, which is an unbiased estimate of the advantage when the critic is exact:</p>
+$$\hat{A}_t = \delta_t = r_t + \gamma V_\phi(s_{t+1}) - V_\phi(s_t).$$
+<p>This is the same TD error that drove the value-learning methods of <a href="../module-24-bandits-rl-foundations/index.html">Chapter 24</a>, now doing double duty: it trains the critic (by regressing $V_\phi(s_t)$ toward the bootstrap target $r_t + \gamma V_\phi(s_{t+1})$) and it weights the actor's gradient. Advantage actor-critic, <strong>A2C</strong>, is exactly this: collect a batch of transitions with the current policy, fit the critic to the TD targets, weight the policy gradient by the TD-error advantage, and step both. <strong>A3C</strong> (asynchronous advantage actor-critic, Mnih et al., 2016) is the same algorithm run by many worker threads in parallel, each computing gradients on its own rollouts and applying them asynchronously to shared parameters; the parallelism both speeds data collection and decorrelates the samples, which stabilizes training. A2C is the synchronous, batched variant that averages the workers before each update, and on modern GPUs it usually matches or beats A3C while being simpler.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Critic Trades a Little Bias for a Lot Less Variance</div>
+<p>REINFORCE is unbiased but high-variance; it learns slowly because each gradient is a noisy single-sample estimate. The critic introduces bias (its value estimate is wrong, especially early in training) but collapses the variance, because the one-step TD error $r_t + \gamma V_\phi(s_{t+1}) - V_\phi(s_t)$ depends on far less randomness than the full Monte-Carlo return $G_t$. This bias-for-variance swap is the entire reason actor-critic learns faster than vanilla policy gradients. Hold this trade in mind: the generalized advantage estimator of the next paragraph is nothing but a tunable dial on exactly how much bias you trade for how much variance.</p>
+</div>
+<p>The one-step TD advantage is at the low-variance, high-bias end of a spectrum; the full Monte-Carlo advantage $G_t - V_\phi(s_t)$ is at the high-variance, low-bias end. The <strong>generalized advantage estimator</strong> (GAE; Schulman et al., 2015) interpolates between them with a single parameter $\lambda \in [0,1]$. Writing the per-step TD error as $\delta_t = r_t + \gamma V_\phi(s_{t+1}) - V_\phi(s_t)$, the GAE advantage is an exponentially-weighted sum of future TD errors:</p>
+$$\hat{A}_t^{\text{GAE}(\gamma,\lambda)} = \sum_{l=0}^{\infty} (\gamma\lambda)^l\, \delta_{t+l} = \delta_t + \gamma\lambda\, \hat{A}_{t+1}^{\text{GAE}}.$$
+<p>The recursive form on the right is what implementations use: a single backward pass over a trajectory accumulates the advantage in $O(T)$. The parameter $\lambda$ is the bias-variance dial promised above. At $\lambda = 0$, GAE collapses to the one-step TD error $\hat{A}_t = \delta_t$, maximally biased by the critic but minimally noisy. At $\lambda = 1$, it telescopes to the Monte-Carlo advantage $G_t - V_\phi(s_t)$, unbiased by the critic but maximally noisy. Intermediate values, with $\lambda \approx 0.95$ the near-universal default, keep most of the variance reduction while limiting the bias the critic injects. GAE is used inside essentially every modern on-policy method, PPO included, and it is the single most important practical refinement of the basic advantage estimate.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: GAE on a Three-Step Tail</div>
+<p>Take $\gamma = 0.99$ and a short tail of three TD errors computed from the critic: $\delta_t = 0.5$, $\delta_{t+1} = -0.2$, $\delta_{t+2} = 0.8$ (and zero afterward). With $\lambda = 1$ (Monte-Carlo end) the advantage is $\hat{A}_t = \delta_t + 0.99\,\delta_{t+1} + 0.99^2\,\delta_{t+2} = 0.5 - 0.198 + 0.784 = 1.086$, the full discounted sum, sensitive to the noisy distant $\delta_{t+2}$. With $\lambda = 0$ (one-step end) the advantage is just $\hat{A}_t = \delta_t = 0.5$, ignoring the future entirely. With the default $\lambda = 0.95$, the weights $(\gamma\lambda)^l = 0.9405^l$ give $\hat{A}_t = 0.5 + 0.9405\cdot(-0.2) + 0.8845\cdot 0.8 = 0.5 - 0.188 + 0.708 = 1.020$, close to the Monte-Carlo value but with the distant term down-weighted from $0.784$ to $0.708$. The dial visibly trades how much the noisy far-future TD error contributes against how much of its signal you keep.</p>
+</div>
+
+<h2>2. PPO: The Clipped Surrogate That Became the Default <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A2C takes one gradient step per batch of data and throws the data away, because the policy gradient is on-policy: the moment $\theta$ changes, the old rollouts no longer reflect the current policy. This is wasteful, and the temptation is to take several gradient steps on the same batch to extract more learning from each expensive environment interaction. But naive reuse is dangerous: after a few steps the policy has moved far enough that the old data badly misestimates the new gradient, and the update can collapse the policy. <strong>Proximal policy optimization</strong> (PPO; Schulman et al., 2017) is the elegant fix, and it is the reason actor-critic became the field's default.</p>
+<p>PPO works with the probability ratio between the new and old policies, $r_t(\theta) = \pi_\theta(a_t \mid s_t) / \pi_{\theta_{\text{old}}}(a_t \mid s_t)$, which equals one when the policy has not moved. A plain importance-weighted objective $\mathbb{E}[r_t(\theta)\,\hat{A}_t]$ would let a single update push $r_t$ arbitrarily far whenever the advantage is large, which is exactly the instability we want to prevent. PPO clips the ratio to a small interval $[1-\epsilon, 1+\epsilon]$ (typically $\epsilon = 0.2$) and optimizes the pessimistic minimum of the clipped and unclipped objectives:</p>
+$$L^{\text{CLIP}}(\theta) = \mathbb{E}_t\!\left[\min\!\Big(r_t(\theta)\,\hat{A}_t,\; \operatorname{clip}\big(r_t(\theta),\, 1-\epsilon,\, 1+\epsilon\big)\,\hat{A}_t\Big)\right].$$
+<p>Read the clip operationally. When the advantage is positive (a good action), the objective rewards increasing $r_t$, but the clip caps the reward once $r_t$ exceeds $1+\epsilon$, so there is no incentive to move the policy further than the clip allows. When the advantage is negative (a bad action), the objective rewards decreasing $r_t$, but the clip floors it at $1-\epsilon$. The outer $\min$ makes the bound one-sided in the safe direction: it never clips in a way that would let the update overshoot, and it does remove the gradient once the ratio leaves the trust region. The practical effect is a soft trust region enforced by a single elementwise clip, with no Hessian, no conjugate gradient, and no line search. The full PPO loss adds a value-function regression term for the critic and an entropy bonus to maintain exploration: $L = L^{\text{CLIP}} - c_1 (V_\phi - V^{\text{target}})^2 + c_2\, \mathcal{H}[\pi_\theta]$.</p>
+<p>PPO is the default workhorse for three reasons. It is robust: the clip makes it forgiving of hyperparameters that would destabilize vanilla policy gradients. It is simple: a few dozen lines on top of A2C, with first-order optimization throughout. And it is sample-reusing: the clip makes it safe to take several epochs of minibatch updates on each batch of rollouts, extracting far more learning per environment step than A2C. This combination is why PPO trains everything from MuJoCo locomotion to the reinforcement-learning-from-human-feedback stage of large language models.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: The Clip Acting on One Ratio</div>
+<p>Set $\epsilon = 0.2$, so the clip interval is $[0.8, 1.2]$. Suppose for one transition the advantage is positive, $\hat{A}_t = +3.0$, and after several minibatch steps the new policy has raised the action's probability so the ratio is $r_t = 1.5$ (well past $1+\epsilon = 1.2$). The unclipped term is $r_t \hat{A}_t = 1.5 \cdot 3.0 = 4.5$; the clipped term is $\operatorname{clip}(1.5, 0.8, 1.2)\cdot 3.0 = 1.2 \cdot 3.0 = 3.6$. The objective takes the minimum, $\min(4.5, 3.6) = 3.6$, so the surrogate is capped at $3.6$ and its gradient with respect to $\theta$ is zero at this point (the clipped branch is flat in $r_t$). The update gets no further reward for pushing this already-favored action even higher, which is precisely the trust-region behavior. Now flip the advantage to $\hat{A}_t = -3.0$ with $r_t = 0.5$ (the policy has slashed a bad action's probability past $1-\epsilon = 0.8$): unclipped $0.5\cdot(-3.0) = -1.5$, clipped $0.8\cdot(-3.0) = -2.4$, and $\min(-1.5, -2.4) = -2.4$, again capping how far one update may move the policy.</p>
+</div>
+<p>PPO is the cheap descendant of <strong>trust region policy optimization</strong> (TRPO; Schulman et al., 2015), which made the trust-region idea exact by maximizing the surrogate subject to a hard constraint that the average KL divergence between the new and old policies stay below a threshold, $\mathbb{E}[\mathrm{KL}(\pi_{\theta_{\text{old}}} \,\|\, \pi_\theta)] \le \delta$. TRPO solves this constrained problem with a second-order method (a conjugate-gradient solve against the Fisher information matrix plus a backtracking line search), which gives strong monotonic-improvement guarantees but is complex and costly per step. PPO keeps TRPO's trust-region intuition and discards its machinery: the clip is a crude but effective stand-in for the KL constraint, first-order and embarrassingly simple, and in practice it matches or beats TRPO at a fraction of the implementation and compute cost, which is why almost everyone uses PPO.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: A Trust Region Held Together by One min and a clip</div>
+<p>TRPO is a beautiful piece of mathematics: a guaranteed monotonic improvement bound, a KL trust region, a Fisher-matrix conjugate-gradient solve. PPO looked at all of that and asked, roughly, "what if we just refused to let the ratio leave $[0.8, 1.2]$ and took the worse of two numbers?" It works about as well, trains in a tenth of the code, and has none of the second-order guarantees. The lesson the field absorbed, slightly to its own embarrassment, is that a well-placed <code>min</code> and <code>clip</code> can substitute for a page of optimization theory. Sometimes the clip is mightier than the constraint.</p>
+</div>
+
+<h2>3. SAC: Off-Policy, Maximum-Entropy Actor-Critic <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>PPO and A2C are on-policy: they learn only from data generated by the current policy, and they discard each batch after a few updates. For continuous control on a physical robot or an expensive simulator, where every environment step is precious, on-policy methods can be painfully sample-hungry. <strong>Soft actor-critic</strong> (SAC; Haarnoja et al., 2018) attacks exactly this, combining three ideas into the most sample-efficient model-free continuous-control method in wide use: it is off-policy (so it reuses every transition from a replay buffer many times), it is actor-critic (an explicit stochastic policy plus learned $Q$-critics), and it is <em>maximum-entropy</em> (it optimizes for reward plus the policy's own entropy).</p>
+<p>The maximum-entropy objective augments the usual discounted return with an entropy bonus at every step, scaled by a temperature $\alpha$:</p>
+$$J(\pi) = \sum_t \mathbb{E}_{(s_t, a_t) \sim \pi}\!\Big[\,r(s_t, a_t) + \alpha\, \mathcal{H}\big(\pi(\cdot \mid s_t)\big)\Big], \qquad \mathcal{H}\big(\pi(\cdot \mid s_t)\big) = \mathbb{E}_{a \sim \pi}\!\big[-\log \pi(a \mid s_t)\big].$$
+<p>The entropy term has a precise purpose: it rewards the policy for staying as random as it can while still collecting reward, which keeps exploration alive throughout training and produces robust policies that do not collapse prematurely onto a single brittle behavior. The temperature $\alpha$ sets the exploration-exploitation balance, and modern SAC tunes it automatically by treating it as the dual variable of a constraint on the policy's entropy, so the practitioner need not hand-set it. The critics are trained with a soft Bellman backup whose target includes the entropy of the next action, $y = r + \gamma\big(\min_{i=1,2} Q_{\bar\phi_i}(s', a') - \alpha \log \pi(a' \mid s')\big)$ with $a' \sim \pi$, and the actor is updated to maximize the entropy-regularized $Q$ value.</p>
+<p>SAC sits at the end of a clear lineage of off-policy actor-critics for continuous action spaces, which it is worth tracing because each member fixed a flaw in the previous one. <strong>DDPG</strong> (deep deterministic policy gradient; Lillicrap et al., 2016) was the first deep off-policy actor-critic for continuous control: a deterministic actor, a $Q$-critic, a replay buffer, and target networks, essentially DQN's machinery adapted to continuous actions via a deterministic policy gradient. DDPG was sample-efficient but notoriously brittle, prone to overestimating $Q$ values and to hyperparameter sensitivity. <strong>TD3</strong> (twin-delayed DDPG; Fujimoto et al., 2018) fixed the overestimation with three tricks now standard across the family: <em>twin</em> critics with a $\min$ to curb overestimation bias, <em>delayed</em> policy updates (update the actor less often than the critics), and target-policy smoothing (add noise to the target action). SAC inherited the twin-critic $\min$ from TD3 and added the maximum-entropy stochastic policy, which gave it both TD3's stability and substantially better exploration, making it the current default for continuous control, the subject of <a href="section-25.4.html">Section 25.4</a>.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Actor-Critic in 2024 to 2026</div>
+<p>Actor-critic methods remain the engine of the most visible recent advances. In language-model alignment, PPO drove the first wave of reinforcement learning from human feedback, but 2023 to 2025 saw a partial migration to simpler alternatives: <em>Direct Preference Optimization</em> (DPO; Rafailov et al., 2023) reframes preference learning as a supervised loss with no explicit reward model or actor-critic loop, while <em>Group Relative Policy Optimization</em> (GRPO), introduced with DeepSeekMath (2024) and central to the DeepSeek-R1 reasoning model (2025), drops PPO's value critic entirely and estimates the advantage from the relative reward of a group of sampled completions, cutting memory and matching or beating PPO on reasoning tasks. On the sample-efficiency frontier, REDQ and DroQ push the SAC recipe with large randomized critic ensembles and high replay ratios to reach near-model-based efficiency, and CrossQ (2024) reaches strong continuous-control performance without target networks at all by careful use of batch normalization. The throughline for 2026: the actor-critic skeleton (a policy, a learned value or advantage, and a variance-reducing baseline) is durable, but which pieces you keep, the explicit value critic, the target networks, the on-policy constraint, is increasingly task-dependent.</p>
+</div>
+
+<h2>4. Choosing a Method: DQN vs A2C vs PPO vs SAC <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The four algorithms that anchor this chapter span the practical design space of deep reinforcement learning, and choosing among them comes down to a few axes: whether the method is on-policy or off-policy (which governs sample efficiency), what action spaces it handles, and how stable and easy to tune it is. The DQN of <a href="section-25.1.html">Section 25.1</a> is value-based and discrete-action-only; A2C, PPO, and SAC are the actor-critics of this section. Table 25.3.1 lays the trade-offs side by side.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Property</th><th>DQN</th><th>A2C / A3C</th><th>PPO</th><th>SAC</th></tr></thead>
+<tbody>
+<tr><td>family</td><td>value-based</td><td>actor-critic (on-policy)</td><td>actor-critic (on-policy)</td><td>actor-critic (off-policy)</td></tr>
+<tr><td>on / off-policy</td><td>off-policy (replay)</td><td>on-policy</td><td>on-policy</td><td>off-policy (replay)</td></tr>
+<tr><td>action space</td><td>discrete only</td><td>discrete or continuous</td><td>discrete or continuous</td><td>continuous (mainly)</td></tr>
+<tr><td>sample efficiency</td><td>high</td><td>low</td><td>low to moderate</td><td>very high</td></tr>
+<tr><td>stability / ease of tuning</td><td>moderate (target net, replay)</td><td>moderate (variance-sensitive)</td><td>high (clip is forgiving)</td><td>high (entropy + twin critics)</td></tr>
+<tr><td>data reuse per batch</td><td>many (replay buffer)</td><td>one update, then discard</td><td>several epochs, then discard</td><td>many (replay buffer)</td></tr>
+<tr><td>signature mechanism</td><td>$Q$-learning + target net</td><td>TD-error advantage</td><td>clipped surrogate</td><td>max-entropy + twin critics</td></tr>
+<tr><td>reach for it when</td><td>discrete actions, cheap sim</td><td>simple baseline, parallel envs</td><td>default for almost anything</td><td>continuous control, costly steps</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Table 25.3.1:</strong> The four canonical deep-RL methods compared. The decisive split is on-policy versus off-policy: off-policy methods (DQN, SAC) reuse a replay buffer and are sample-efficient; on-policy methods (A2C, PPO) discard data but are simpler and more stable. PPO is the all-round default; SAC wins when environment steps are expensive and actions are continuous.</figcaption>
+</figure>
+<p>The practical decision rule that falls out of the table is short. If your actions are discrete and the simulator is cheap, DQN or PPO both work and PPO is usually the safer first try. If you want a simple, parallel-friendly baseline and have many cheap environments, A2C is fine and instructive. For almost everything else, start with PPO, because it is forgiving and robust and you will spend less time tuning it. Switch to SAC the moment two conditions hold together: the action space is continuous, and each environment step is expensive enough that PPO's sample appetite hurts, as on a real robot or a slow physics simulator. We make the on-policy actor-critic concrete next.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: On-Policy Versus Off-Policy Is the Master Trade</div>
+<p>The single axis that explains most of Table 25.3.1 is on-policy versus off-policy. Off-policy methods (DQN, SAC) keep a replay buffer and learn from every past transition many times, so they are sample-efficient, but reusing stale data demands extra stabilizing machinery (target networks, twin critics) and careful tuning. On-policy methods (A2C, PPO) learn only from fresh data and throw it away, so they are sample-hungry, but the freshness makes them simpler and more stable. PPO's genius is squeezing a few extra updates out of each on-policy batch via the clip, buying back some efficiency without leaving the stable on-policy regime. When you cannot afford the samples, you pay the off-policy complexity tax and use SAC.</p>
+</div>
+
+<h2>5. Worked Example: A2C From Scratch, Then PPO via a Library <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make the actor-critic concrete in two stages. First we implement a minimal advantage actor-critic by hand in PyTorch and train it on CartPole-v1, the standard balancing task from <a href="../module-24-bandits-rl-foundations/index.html">Chapter 24</a>: a shared trunk feeding a policy head (the actor) and a value head (the critic), with the policy gradient weighted by the TD-error advantage. Then we solve the same task in a handful of lines with stable-baselines3 PPO, so the from-scratch version and the production version sit side by side. Code 25.3.1 is the from-scratch A2C.</p>
+<pre><code class="language-python">import gymnasium as gym
+import torch, torch.nn as nn
+import torch.nn.functional as F
+
+env = gym.make("CartPole-v1")
+obs_dim = env.observation_space.shape[0]   # 4 state features
+n_act = env.action_space.n                 # 2 discrete actions
+
+class ActorCritic(nn.Module):
+    """Shared trunk, then a policy head (actor) and a value head (critic)."""
+    def __init__(self, obs_dim, n_act, hidden=128):
+        super().__init__()
+        self.trunk = nn.Sequential(nn.Linear(obs_dim, hidden), nn.Tanh())
+        self.actor = nn.Linear(hidden, n_act)   # logits over actions
+        self.critic = nn.Linear(hidden, 1)      # state value V(s)
+
+    def forward(self, s):
+        z = self.trunk(s)
+        return self.actor(z), self.critic(z).squeeze(-1)
+
+net = ActorCritic(obs_dim, n_act)
+opt = torch.optim.Adam(net.parameters(), lr=3e-3)
+gamma = 0.99
+
+def run_episode():
+    """Collect one episode, return per-step log-probs, values, rewards, entropies."""
+    s, _ = env.reset()
+    logps, values, rewards, entropies = [], [], [], []
+    done = False
+    while not done:
+        st = torch.tensor(s, dtype=torch.float32)
+        logits, v = net(st)
+        dist = torch.distributions.Categorical(logits=logits)
+        a = dist.sample()                       # sample action from the actor
+        s, r, term, trunc, _ = env.step(a.item())
+        done = term or trunc
+        logps.append(dist.log_prob(a))
+        values.append(v)
+        rewards.append(r)
+        entropies.append(dist.entropy())
+    return logps, values, rewards, entropies
+
+for episode in range(600):
+    logps, values, rewards, entropies = run_episode()
+    # Discounted returns G_t, computed backward over the trajectory.
+    returns, G = [], 0.0
+    for r in reversed(rewards):
+        G = r + gamma * G
+        returns.insert(0, G)
+    returns = torch.tensor(returns)
+    values = torch.stack(values)
+    # Advantage = return - critic baseline (detached so it only weights the actor).
+    adv = returns - values.detach()
+    adv = (adv - adv.mean()) / (adv.std() + 1e-8)   # normalize for stable gradients
+    logps = torch.stack(logps); ent = torch.stack(entropies)
+    actor_loss = -(logps * adv).mean()              # policy gradient with advantage
+    critic_loss = F.mse_loss(values, returns)       # fit V(s) to the returns
+    loss = actor_loss + 0.5 * critic_loss - 0.01 * ent.mean()   # entropy bonus
+    opt.zero_grad(); loss.backward(); opt.step()
+    if episode % 100 == 0:
+        print(f"episode {episode:4d}  return {sum(rewards):6.1f}")
+</code></pre>
+<div class="code-caption"><strong>Code 25.3.1:</strong> Advantage actor-critic from scratch in PyTorch on CartPole. One network produces both the policy logits (actor) and the value (critic); the advantage <code>returns - values.detach()</code> weights the policy gradient, the critic regresses to the returns, and a small entropy bonus sustains exploration. The <code>.detach()</code> on the baseline ensures the advantage trains only the actor, not the critic, through the policy-gradient term.</div>
+<pre><code class="language-text">episode    0  return   18.0
+episode  100  return   94.0
+episode  200  return  201.0
+episode  300  return  500.0
+episode  400  return  500.0
+episode  500  return  500.0
+</code></pre>
+<div class="code-caption"><strong>Output 25.3.1:</strong> The from-scratch A2C learns to balance CartPole, climbing from a random-policy return near 18 to the environment's 500-step cap within a few hundred episodes. The exact trajectory varies with the seed, but the rise from tens to the 500 ceiling is reliable.</div>
+<p>The hand-written version above is roughly 50 lines of careful bookkeeping: the network, the rollout loop, the discounted-return computation, the advantage, and the combined loss. A production library collapses all of that, and gives you the more robust PPO clip and GAE for free. Code 25.3.2 solves the identical task with stable-baselines3.</p>
+<pre><code class="language-python">from stable_baselines3 import PPO
+
+# The entire actor-critic: network, rollout buffer, GAE, clipped PPO update.
+model = PPO("MlpPolicy", "CartPole-v1", verbose=0,
+            n_steps=2048, gae_lambda=0.95, clip_range=0.2)
+model.learn(total_timesteps=100_000)
+
+# Evaluate the trained policy over a few episodes.
+eval_env = gym.make("CartPole-v1")
+for _ in range(3):
+    s, _ = eval_env.reset(); done = False; total = 0.0
+    while not done:
+        a, _ = model.predict(s, deterministic=True)
+        s, r, term, trunc, _ = eval_env.step(int(a))
+        done = term or trunc; total += r
+    print(f"eval return {total:.1f}")
+</code></pre>
+<div class="code-caption"><strong>Code 25.3.2:</strong> The same task with stable-baselines3 PPO. The from-scratch A2C of Code 25.3.1 (the network, the rollout loop, the return and advantage computation, the combined loss, about 50 lines) collapses to two: one to construct the agent and one to train it. The library supplies GAE (<code>gae_lambda=0.95</code>), the clipped surrogate (<code>clip_range=0.2</code>), minibatch epochs, and the rollout buffer internally.</div>
+<pre><code class="language-text">eval return 500.0
+eval return 500.0
+eval return 500.0
+</code></pre>
+<div class="code-caption"><strong>Output 25.3.2:</strong> The trained PPO policy balances CartPole for the full 500 steps on every evaluation episode, solving the task that the from-scratch A2C also solved, but with the more robust clipped objective and GAE that the library provides without extra code.</div>
+<p>Read the two code blocks together. Code 25.3.1 built advantage actor-critic by hand so every piece (the actor head, the critic baseline, the TD-style advantage, the entropy bonus) is visible and editable. Code 25.3.2 reproduced and improved on the result with two lines, trading that visibility for the robustness of PPO's clip and GAE. The progression mirrors the whole section: understand the actor-critic skeleton from scratch, then reach for the library when you want PPO's stability without reimplementing it.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Tuning a Warehouse Robot's Picking Policy</div>
+<p><strong>Who:</strong> A robotics team at a fulfillment company training a continuous-control policy for a robotic arm that picks items from bins, where each real-world or high-fidelity-simulation trial is slow and costly.</p>
+<p><strong>Situation:</strong> Their first agent used PPO because it was the team's default, and in a fast kinematic simulator it learned a workable grasp policy. When they moved to the high-fidelity physics simulator needed for sim-to-real transfer, each environment step became 50 times more expensive and PPO's sample appetite turned a one-day training run into a multi-week one.</p>
+<p><strong>Problem:</strong> They needed a policy of equal quality on a tiny fraction of the environment interactions, because compute time on the high-fidelity simulator was the binding constraint.</p>
+<p><strong>Dilemma:</strong> Stay with PPO (familiar, stable, but on-policy and sample-hungry) or switch to an off-policy method that reuses every transition many times but is fussier to stabilize. PPO threw away each batch after a few epochs; the high-fidelity steps were too precious to discard.</p>
+<p><strong>Decision:</strong> They switched to SAC, whose replay buffer reuses every expensive transition many times and whose maximum-entropy objective kept exploration alive in the high-dimensional continuous action space without hand-tuned exploration noise.</p>
+<p><strong>How:</strong> They used stable-baselines3 <code>SAC("MlpPolicy", env)</code> with automatic entropy-temperature tuning, a large replay buffer, and a high replay ratio, evaluating sample efficiency as return per environment step rather than per wall-clock epoch.</p>
+<p><strong>Result:</strong> SAC reached the grasp-success rate that PPO had needed millions of steps for in roughly a tenth of the environment interactions, turning the multi-week high-fidelity run back into a few days, while the entropy bonus produced a policy robust enough to survive the sim-to-real gap.</p>
+<p><strong>Lesson:</strong> The on-policy-versus-off-policy choice is dominated by the cost of an environment step. When steps are cheap, PPO's simplicity wins; the moment each step is expensive and actions are continuous, SAC's sample reuse pays for its extra complexity many times over.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: A2C, PPO, and SAC in Two Lines Each</div>
+<p>The from-scratch A2C of Code 25.3.1 ran about 50 lines. Stable-baselines3 exposes every method in this section behind one uniform constructor-plus-<code>learn</code> interface, so swapping algorithms is a one-word change. The library handles the rollout buffer, GAE, the clipped or soft-Bellman update, target networks, replay, and entropy tuning internally.</p>
+<pre><code class="language-python">from stable_baselines3 import A2C, PPO, SAC
+
+a2c = A2C("MlpPolicy", "CartPole-v1").learn(100_000)        # on-policy, simple baseline
+ppo = PPO("MlpPolicy", "CartPole-v1").learn(100_000)        # on-policy, clipped, robust default
+sac = SAC("MlpPolicy", "Pendulum-v1").learn(50_000)         # off-policy, continuous, sample-efficient
+</code></pre>
+<p>Three algorithms, three lines, one interface; CleanRL offers the same methods as single-file readable implementations when you want to see every detail, and Tianshou and d3rlpy extend the same actor-critic skeleton to distributed and offline settings.</p>
+</div>
+
+<h2>Exercises</h2>
+<ol class="exercises">
+<li><strong>Conceptual.</strong> Explain why subtracting a state-dependent baseline $b(s_t)$ from the return in the policy gradient leaves the gradient's expectation unchanged but reduces its variance. Then argue why the state value $V^\pi(s_t)$ is a particularly good choice of baseline, and state what the advantage $G_t - V^\pi(s_t)$ measures in one sentence.</li>
+<li><strong>Implementation.</strong> Modify the from-scratch A2C of Code 25.3.1 to use the generalized advantage estimator instead of the plain return-minus-baseline advantage: compute per-step TD errors $\delta_t = r_t + \gamma V_\phi(s_{t+1}) - V_\phi(s_t)$ and accumulate $\hat{A}_t = \delta_t + \gamma\lambda\,\hat{A}_{t+1}$ backward over the trajectory with $\lambda = 0.95$. Train on CartPole and compare the learning curve to the original; report whether GAE reaches return 500 in fewer episodes.</li>
+<li><strong>Open-ended.</strong> Take the PPO clip of subsection two and investigate the role of $\epsilon$. Train stable-baselines3 PPO on CartPole with $\epsilon \in \{0.05, 0.2, 0.5\}$ (the <code>clip_range</code> argument) and a fixed seed, and characterize how the clip width affects learning speed and stability. Relate your finding to the trust-region interpretation: what failure mode would you expect as $\epsilon \to \infty$, and why?</li>
+</ol>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-25.2.html">&#8592; 25.2 Policy Gradient Methods</a>
+<a class="up" href="index.html">Chapter 25 Contents</a>
+<a class="next" href="section-25.4.html">25.4 Continuous Control &#8594;</a>
+</nav>
+</main>
+<footer class="site-footer">
+<p class="edition">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="copyright">&copy; 2026 Alexander Apartsin &middot; <a href="../../toc.html">Contents</a></p>
+<p class="updated"><script>document.write("Last updated " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>
