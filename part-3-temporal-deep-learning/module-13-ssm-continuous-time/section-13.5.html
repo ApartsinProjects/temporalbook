@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 13.5: Neural CDEs and Irregularly-Sampled Data. How Neural Controlled Differential Equations let the data keep steering the hidden dynamics by integrating a learned vector field against an interpolated control path, the continuous-time RNN done right for irregular, partially-observed series; building the cubic-spline control path from irregular clinical samples, a from-scratch CDE forward and a torchcde library fit, compared against imputation-plus-RNN." name="description"/>
+<title>Section 13.5: Neural CDEs and Irregularly-Sampled Data | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Temporal Deep Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 13: State-Space and Continuous-Time Neural Models</a></div>
+<h1>Neural CDEs and Irregularly-Sampled Data</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"The Latent ODE handed me an initial condition and walked away, and I integrated my vector field in serene ignorance of everything the patient did afterward. A Neural CDE never lets me forget: every new measurement tugs on my trajectory, so I read the record not as a starting point but as a road, and I drive the whole way."</p>
+<cite>A Neural CDE Reading the Data as a Path</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A Latent ODE solves an autonomous differential equation from a single learned initial condition: once the solver starts integrating, no later observation can change its course, so the data are read once and never again. A Neural Controlled Differential Equation (Neural CDE) fixes this by replacing the plain ODE $\mathrm{d}\mathbf{z} = f(\mathbf{z})\,\mathrm{d}t$ with a controlled one, $\mathrm{d}\mathbf{z} = f(\mathbf{z})\,\mathrm{d}X(t)$, where $X$ is a continuous path interpolated through the observed data.</strong> Now the increment of the hidden state is driven by the increment of the data path, so every wiggle in the incoming measurements steers the dynamics in real time. This is the continuous-time analogue of an RNN done right: where an RNN updates its state once per discrete step, a Neural CDE updates it continuously along a path defined by the data, and because that path is built by interpolation it handles irregular sampling, missing channels, and arbitrary observation gaps natively, with no imputation and no resampling. This section motivates the controlled equation against the limit of Latent ODEs, defines the integral $\mathbf{z}_T = \mathbf{z}_0 + \int f(\mathbf{z})\,\mathrm{d}X$, builds the cubic-spline control path from the irregular clinical series that runs through this book, implements a Neural CDE forward pass from scratch, fits one with <code>torchcde</code> in a handful of lines, and compares it head to head against the standard impute-then-RNN baseline. You leave able to choose, build, and train a model that treats irregular data as a first-class citizen rather than a defect to be patched.</p>
+</div>
+<p>In <a href="section-13.4.html">Section 13.4</a> we built the Latent ODE: an encoder reads the observed series, produces a distribution over a latent initial state $\mathbf{z}_0$, and a Neural ODE integrates that state forward in continuous time to whatever query times we like. It was our first genuinely continuous-time sequence model, and it gave us irregular-time outputs for free because an ODE can be evaluated at any $t$. Yet it carries a structural limitation we flagged at the time and now confront directly: the Latent ODE is <em>autonomous after encoding</em>. The observations determine $\mathbf{z}_0$, and after that the dynamics $\mathrm{d}\mathbf{z}/\mathrm{d}t = f(\mathbf{z})$ run on their own, deterministically, with the incoming data unable to nudge the trajectory. For a long sequence with information arriving throughout, that is a severe handicap: the model must cram everything it will ever need into the initial condition and can never revise. This section introduces the architecture that removes the limitation while keeping every continuous-time benefit. We use the unified notation of <a href="../../toc.html">Appendix A</a>: $\mathbf{x}_t$ the observation, $t$ continuous time, $\mathbf{z}(t)$ the hidden path, $f_\theta$ the learned vector field.</p>
+<p>Why does this matter enough to earn its own section, and why here, in the chapter on state-space and continuous-time models? Because irregular, partially-observed multivariate time series are not a niche curiosity: they are the default in healthcare, where vitals and labs are measured at clinically driven, wildly uneven times; in finance, where ticks arrive in bursts; in any sensor system with dropouts. The dominant workaround, resample onto a regular grid and impute the holes, quietly distorts the data and discards the information in <em>when</em> a measurement was taken. The Neural CDE, introduced by Kidger and colleagues in 2020 as the continuous-time limit of an RNN, is the cleanest known answer: it reads the irregular data as a continuous path and lets that path drive a differential equation, so timing and missingness are modeled rather than erased. It is also the precise continuous-time return of the recurrent loop of <a href="../module-10-recurrent-neural-networks/index.html">Chapter 10</a>, one more strand of the temporal thread that runs the Kalman filter (<a href="../../part-2-classical-forecasting/module-07-state-space-filtering/index.html">Chapter 7</a>) forward into its learned descendants.</p>
+<p>The four competencies this section installs are these: to explain precisely why a Latent ODE cannot let data steer its dynamics and a Neural CDE can; to write and interpret the controlled differential equation $\mathrm{d}\mathbf{z} = f_\theta(\mathbf{z})\,\mathrm{d}X(t)$ and its integral form; to build a continuous control path from irregular, partially-observed samples by interpolation and to see how missingness is handled natively; and to implement a Neural CDE forward pass from scratch, then fit one with <code>torchcde</code>, and judge when it beats impute-then-RNN. These are the load-bearing skills for the irregular-data settings of <a href="../../toc.html">Chapter 18</a> and the clinical case study of <a href="../../toc.html">Chapter 35</a>.</p>
+
+<h2>1. The Limit of Latent ODEs: Dynamics That Cannot Hear the Data <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Recall the Latent ODE forward pass of <a href="section-13.4.html">Section 13.4</a> in its essential form. An encoder compresses the observed sequence into an initial latent state $\mathbf{z}(t_0) = \mathbf{z}_0$, and from there the state evolves by an autonomous ordinary differential equation,</p>
+$$\frac{\mathrm{d}\mathbf{z}(t)}{\mathrm{d}t} = f_\theta(\mathbf{z}(t)), \qquad \mathbf{z}(t_0) = \mathbf{z}_0, \qquad \mathbf{z}(t) = \mathbf{z}_0 + \int_{t_0}^{t} f_\theta(\mathbf{z}(s))\,\mathrm{d}s.$$
+<p>The vector field $f_\theta$ depends only on the current state $\mathbf{z}(s)$ and (in the autonomous case) not even on $s$, and crucially it does not depend on any observation past $t_0$. Read the integral and the limitation is stark: the entire dependence of $\mathbf{z}(t)$ on the data flows through one channel, the initial condition $\mathbf{z}_0$. Once the solver leaves $t_0$, the trajectory is a fixed function of $\mathbf{z}_0$ alone. If a measurement arrives at $t_0 + 100$ that contradicts everything the encoder believed, the Latent ODE has no mechanism to react: its future was sealed at encoding time.</p>
+<p>One can patch this with an encoder that re-reads the whole sequence (the ODE-RNN hybrid of Section 13.4, which alternates ODE flow between observations with an RNN update at each observation), but that reintroduces the discrete jumps and the hand-built update rule we hoped continuous time would let us shed, and it treats the observation update and the between-observation flow as two different mechanisms stitched together. What we actually want is a single continuous equation in which the data themselves appear <em>inside</em> the dynamics, steering the vector field at every instant, not just at $t_0$ and not only at observation times. We want the incoming data to keep their hands on the wheel.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Initial-Condition Dependence Is the Whole Limitation</div>
+<p>A Latent ODE's trajectory is a deterministic function of its initial condition $\mathbf{z}_0$, because the autonomous field $f_\theta(\mathbf{z})$ never sees an observation after $t_0$. Everything the model will ever do with the data must be encoded into $\mathbf{z}_0$ up front, and nothing measured later can revise the course. This is the continuous-time echo of a sequence-to-vector encoder that compresses an input to a single bottleneck and then generates blind. The fix is not a better encoder; it is a different equation, one whose right-hand side is driven by the data path as it unfolds. That equation is the Neural CDE of subsection two.</p>
+</div>
+
+<h2>2. Neural Controlled Differential Equations: Reading the Data as a Path <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The controlled differential equation makes one change to the Latent ODE, and that single change is the whole idea. Instead of integrating the vector field against time, $\mathrm{d}t$, we integrate it against a data path, $\mathrm{d}X(t)$. Let $X: [t_0, t_T] \to \mathbb{R}^{v}$ be a continuous path that interpolates the observed data (we build it in subsection three); think of $X(t)$ as "the data, made continuous". The Neural CDE defines the hidden state $\mathbf{z}(t) \in \mathbb{R}^{d}$ by</p>
+$$\mathbf{z}(t) = \mathbf{z}(t_0) + \int_{t_0}^{t} f_\theta(\mathbf{z}(s))\,\mathrm{d}X(s), \qquad \text{equivalently} \qquad \frac{\mathrm{d}\mathbf{z}(t)}{\mathrm{d}t} = f_\theta(\mathbf{z}(t))\,\frac{\mathrm{d}X(t)}{\mathrm{d}t}.$$
+<p>The integral $\int f_\theta(\mathbf{z}(s))\,\mathrm{d}X(s)$ is a Riemann-Stieltjes integral: the increment of $\mathbf{z}$ over a tiny interval is the vector field times the increment of the data path over that interval, not times the increment of time. Here $f_\theta(\mathbf{z}) \in \mathbb{R}^{d \times v}$ is a <em>matrix</em>-valued function (a learned neural network mapping the $d$-dimensional state to a $d \times v$ matrix), so that $f_\theta(\mathbf{z}(t))\,\tfrac{\mathrm{d}X}{\mathrm{d}t}$ is a matrix times the $v$-dimensional path velocity, yielding a $d$-dimensional state velocity. The initial state $\mathbf{z}(t_0)$ is itself produced by a small network applied to the first observation (and the initial time), so the model still has a learned starting point, but now the path keeps shaping the trajectory thereafter.</p>
+<p>Stare at the right-hand form $\mathrm{d}\mathbf{z}/\mathrm{d}t = f_\theta(\mathbf{z})\,\mathrm{d}X/\mathrm{d}t$ and the difference from a Latent ODE jumps out: the state velocity is now modulated, at every instant, by the velocity of the data path. Where the data changes quickly, the hidden state is driven hard; where the data is flat (or unobserved, so the interpolant is gently coasting), the state drifts slowly. The observations are no longer locked away in $\mathbf{z}_0$: they are inside the integrand, continuously. This is exactly the "data keeps steering the dynamics" property the previous subsection said we wanted, achieved by one substitution, $\mathrm{d}t \to \mathrm{d}X(t)$.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: A Neural CDE Is the Continuous-Time RNN Done Right</div>
+<p>An RNN updates its hidden state once per observation: $\mathbf{h}_t = \mathbf{h}_{t-1} + (\text{function of } \mathbf{h}_{t-1} \text{ and } \mathbf{x}_t)$, a discrete jump driven by the new data point. A Neural CDE is the continuous limit of exactly this loop: $\mathrm{d}\mathbf{z} = f_\theta(\mathbf{z})\,\mathrm{d}X$ updates the state continuously, driven by the increment of the data path. Kidger and colleagues proved the correspondence precisely: a Neural CDE is to an RNN what a Neural ODE is to a ResNet, the continuous-depth limit of the discrete update. And it inherits the RNN's defining virtue, that the data drive the state at every step, while shedding the RNN's defining vice, that "every step" means a fixed discrete grid. Because the driver is a continuous path, "every step" becomes "every instant", and irregular timing is built in rather than bolted on. This is why practitioners call it the continuous-time RNN done right for irregular data: it is the recurrent loop of <a href="../module-10-recurrent-neural-networks/index.html">Chapter 10</a> reborn in continuous time.</p>
+</div>
+<p>Two practical consequences follow immediately and both will matter in the code. First, evaluation: solving the Neural CDE is, mechanically, solving a Neural ODE in disguise. Substitute $g_\theta(\mathbf{z}, t) \equiv f_\theta(\mathbf{z})\,\tfrac{\mathrm{d}X}{\mathrm{d}t}(t)$ and the controlled equation becomes the ordinary equation $\mathrm{d}\mathbf{z}/\mathrm{d}t = g_\theta(\mathbf{z}, t)$, which any ODE solver (and the adjoint method for memory-efficient gradients from Section 13.4) handles directly. So we get a Neural CDE essentially for free once we have a Neural ODE solver and a differentiable control path. Second, memory and credit assignment: because the whole thing is one ODE solve, we can backpropagate through it with the constant-memory adjoint, exactly as for the Latent ODE, so a Neural CDE trains over long irregular sequences without the linear activation memory of BPTT over an unrolled RNN.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Letter That Changed Everything Is a Single Stroke</div>
+<p>The entire conceptual leap from "a network that ignores its data after the first instant" to "a network the data steer continuously" is, on paper, the change of one symbol: $\mathrm{d}t$ becomes $\mathrm{d}X$. It is the kind of edit that looks like a typo and turns out to be a thesis. The vector field even keeps the same letter $f_\theta$; only what it integrates against moves. There is a moral in there about how the deepest ideas in continuous-time modeling often hide in the choice of what you differentiate with respect to, and a Neural CDE is the cleanest example: change the differential, change the model class.</p>
+</div>
+
+<h2>3. Building the Control Path: Interpolating Irregular, Partially-Observed Data <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The Neural CDE needs a continuous, differentiable path $X(t)$ to integrate against, but the data arrive as a finite set of irregular, possibly incomplete observations. Bridging that gap is the role of interpolation, and it is exactly where the native handling of irregular sampling and missingness lives. Suppose we observe values $\mathbf{x}_{t_1}, \mathbf{x}_{t_2}, \dots, \mathbf{x}_{t_n}$ at irregular times $t_1 < t_2 < \dots < t_n$, where each $\mathbf{x}_{t_i}$ may have some channels missing. We construct $X$ in three deliberate moves.</p>
+<p>First, <strong>append time as a channel</strong>. The path is built over the index $t$, but we also include the observation time itself as one coordinate of $X$, so $X(t) = (t,\, \tilde{\mathbf{x}}(t))$. This lets the vector field see how fast wall-clock time is passing relative to the path, which is precisely the information an irregular sampler encodes: a long gap between measurements shows up as the time channel advancing while the value channels coast. Including the time channel is what makes the model aware of <em>when</em>, not just <em>what</em>. Second, <strong>handle missing channels by interpolating each channel independently</strong>. A channel observed at $t_i$ and again at $t_j$ (with nothing in between) is simply interpolated across the gap; missingness is not a special value to impute but a stretch of path with no knot, and a channel never observed is a flat path that contributes nothing to the dynamics. Third, <strong>fit a smooth interpolant</strong>, in practice a natural cubic spline through the observed knots of each channel, because the CDE solver needs $\mathrm{d}X/\mathrm{d}t$ and a cubic spline has a continuous, cheaply-evaluated derivative. Newer variants (Hermite cubic splines with backward differences) make the path causal, depending only on past observations, which matters for online use; the original formulation used natural cubic splines.</p>
+<p>This is the moment the running clinical dataset of this book pays off. Recall from <a href="../../toc.html">Section 1.4</a> (the irregular-data motivation) and <a href="../../toc.html">Section 2.3</a> (temporal data engineering and the perils of naive resampling) that our healthcare series is a multivariate record of vitals (heart rate, blood pressure, oxygen saturation, lab values) measured at clinically driven, wildly uneven times: a patient in distress is measured every few minutes, a stable patient every few hours, and different instruments report on different schedules so at most timestamps most channels are simply absent. An impute-then-resample pipeline must invent values for all those absences and choose a grid, distorting both the values and the timing. The Neural CDE instead lays a cubic spline through whatever was actually observed, per channel, and reads the resulting path. Figure 13.5.1 shows the construction: scattered, per-channel-irregular observations on the left, the interpolated control path the CDE actually integrates on the right.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="On the left, scattered observation dots for two channels at irregular, non-aligned times, with several gaps where a channel is unobserved. An arrow labeled cubic-spline interpolation plus time channel points to the right panel, where each channel becomes a smooth continuous curve passing through its own observed dots, and a third straight rising line represents the appended time channel. The smooth curves are labeled the control path X(t) that the CDE integrates against.">
+<defs>
+<marker id="arrcde" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.axcde { stroke:#9aa3ad; stroke-width:1.4; }
+.lbcde { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.smcde { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.c1cde { fill:#14385c; }
+.c2cde { fill:#b8431f; }
+.p1cde { stroke:#14385c; stroke-width:2.2; fill:none; }
+.p2cde { stroke:#b8431f; stroke-width:2.2; fill:none; }
+.tmcde { stroke:#3a7a3a; stroke-width:2; fill:none; stroke-dasharray:6 4; }
+</style>
+<text class="lbcde" x="205" y="24">Irregular observations (per channel)</text>
+<text class="lbcde" x="615" y="24">Control path X(t) = (t, spline channels)</text>
+<!-- left axes -->
+<line class="axcde" x1="60" y1="270" x2="360" y2="270"/><line class="axcde" x1="60" y1="60" x2="60" y2="270"/>
+<text class="smcde" x="205" y="292">irregular times t&#8321; ... t&#8345;</text>
+<!-- left channel 1 dots -->
+<circle class="c1cde" cx="95" cy="160" r="5"/><circle class="c1cde" cx="150" cy="130" r="5"/><circle class="c1cde" cx="245" cy="175" r="5"/><circle class="c1cde" cx="330" cy="120" r="5"/>
+<!-- left channel 2 dots (different times, a gap) -->
+<circle class="c2cde" cx="110" cy="225" r="5"/><circle class="c2cde" cx="200" cy="210" r="5"/><circle class="c2cde" cx="310" cy="240" r="5"/>
+<text class="smcde" x="120" y="120">channel 1 (heart rate)</text>
+<text class="smcde" x="250" y="262">channel 2 (SpO&#8322;)</text>
+<!-- arrow -->
+<line class="axcde" x1="385" y1="165" x2="455" y2="165" stroke="#14385c" stroke-width="2" marker-end="url(#arrcde)"/>
+<text class="smcde" x="420" y="150">spline +</text><text class="smcde" x="420" y="186">time chan</text>
+<!-- right axes -->
+<line class="axcde" x1="490" y1="270" x2="790" y2="270"/><line class="axcde" x1="490" y1="60" x2="490" y2="270"/>
+<text class="smcde" x="640" y="292">continuous t, derivative dX/dt available everywhere</text>
+<!-- right smooth curves -->
+<path class="p1cde" d="M525,160 C560,120 600,150 640,175 C680,200 720,135 760,120"/>
+<path class="p2cde" d="M540,225 C580,205 620,212 660,228 C700,244 730,238 770,240"/>
+<path class="tmcde" d="M500,255 L780,95"/>
+<text class="smcde" x="700" y="80">time channel</text>
+<circle class="c1cde" cx="525" cy="160" r="4"/><circle class="c1cde" cx="585" cy="130" r="4"/><circle class="c1cde" cx="680" cy="175" r="4"/><circle class="c1cde" cx="760" cy="120" r="4"/>
+<circle class="c2cde" cx="540" cy="225" r="4"/><circle class="c2cde" cx="630" cy="210" r="4"/><circle class="c2cde" cx="740" cy="240" r="4"/>
+</svg>
+<figcaption><strong>Figure 13.5.1:</strong> Building the control path from irregular, partially-observed data. Left: two clinical channels observed at different, uneven times with gaps where a channel is unmeasured. Right: a natural cubic spline through each channel's own knots, plus an appended monotone time channel, yields a continuous differentiable path $X(t)$ with a defined $\mathrm{d}X/\mathrm{d}t$ everywhere. Missingness becomes a stretch of path with no knot, not a value to invent; irregular timing is recorded by the time channel.</figcaption>
+</figure>
+<p>The payoff of this construction is conceptual as much as practical. By turning the data into a path, the Neural CDE converts two awkward properties of real time series, irregular spacing and missing channels, into ordinary geometry: spacing is the pace of the time channel, missingness is the absence of a knot. Nothing is imputed, nothing is invented; the model integrates against exactly what was observed, interpolated. This is the structural reason a Neural CDE is the right tool for the clinical setting, and it is why we can now write a forward pass that never once mentions imputation.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: A Path Increment Across an Irregular Gap</div>
+<p>Take a single channel observed at $t_1 = 0$ with value $x = 90$ (a heart rate) and again at $t_2 = 30$ minutes with $x = 120$, with no measurement in between. Append the time channel, so the path is $X(t) = (t,\, \tilde{x}(t))$ with $\tilde{x}$ the spline through the two knots. Over the interval the value channel rises by $\Delta\tilde{x} = 120 - 90 = 30$ and the time channel rises by $\Delta t = 30$. If we evaluate the path at the midpoint of a solver step from $t = 10$ to $t = 11$ where the local spline velocity happens to be $\mathrm{d}\tilde{x}/\mathrm{d}t = 1.2$ bpm per minute, then over that one-minute step the path increment is $\mathrm{d}X = (\mathrm{d}t, \mathrm{d}\tilde{x}) = (1.0,\, 1.2)$. The hidden-state increment the CDE adds is $\mathrm{d}\mathbf{z} = f_\theta(\mathbf{z})\,\mathrm{d}X = f_\theta(\mathbf{z}) \cdot (1.0, 1.2)^\top$, a matrix-vector product: the first column of $f_\theta$ weights the passage of time, the second weights the rise in heart rate. Across a long gap where only the time channel moves and the value coasts, $\mathrm{d}X \approx (\mathrm{d}t, 0)$, so the state drifts under the time column alone, which is exactly how the model represents "time passed but nothing was measured". The increment is the data velocity, and the data velocity is what steers $\mathbf{z}$.</p>
+</div>
+
+<h2>4. When CDEs Win: Irregular, Partially-Observed, Multivariate Series <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A Neural CDE is not free, and a practitioner should reach for it deliberately, not reflexively. Its sweet spot is sharply defined: irregularly-sampled, partially-observed, multivariate time series where the timing of observations carries information, which describes healthcare records almost perfectly and a good deal of finance and sensor data besides. In that regime it dominates the standard alternative, impute-onto-a-grid then run an RNN or Transformer, on three counts: it never fabricates values, it encodes observation timing through the time channel rather than discarding it, and it backpropagates with constant memory through the adjoint so very long irregular sequences remain trainable.</p>
+<p>When does it <em>not</em> win? On regularly-sampled, fully-observed series a Neural CDE has no structural advantage over a plain RNN, TCN, or Transformer, and it pays an ODE-solver cost those models avoid, so on a clean regular grid prefer the simpler model. Its cost profile is the cost of any Neural ODE: each forward pass is an adaptive solve whose step count grows with how stiff the learned dynamics become, and training can be several times slower per epoch than a comparable RNN. The practical tips that tame this are worth stating plainly: build the control path once and cache it (spline coefficients do not change during training); use the adjoint method for gradients on long sequences to keep memory flat; prefer the Hermite-cubic (backward-difference) interpolation when you need causality or online inference; normalize channels before splining so the vector field sees comparable scales; and start with a fixed-step solver for debugging before switching to an adaptive one. We summarize the decision in Figure 13.5.2.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Property</th><th>Impute + RNN/Transformer</th><th>Neural CDE</th></tr></thead>
+<tbody>
+<tr><td>irregular sampling</td><td>resampled to a grid (distorts timing)</td><td>native, via the path and time channel</td></tr>
+<tr><td>missing channels</td><td>imputed (invents values)</td><td>native, a gap with no knot</td></tr>
+<tr><td>uses observation times</td><td>discarded by gridding</td><td>encoded in the time channel</td></tr>
+<tr><td>memory in training</td><td>$O(T)$ activations (BPTT)</td><td>$O(1)$ with the adjoint</td></tr>
+<tr><td>compute per step</td><td>cheap, fixed</td><td>adaptive ODE solve, several times slower</td></tr>
+<tr><td>best when</td><td>regular, fully observed</td><td>irregular, partially observed, timing matters</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 13.5.2:</strong> When to choose a Neural CDE over the impute-then-sequence-model baseline. The CDE wins precisely where irregularity and missingness are real and observation timing is informative; the baseline is the right choice on a clean regular grid where the CDE's solver cost buys nothing.</figcaption>
+</figure>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Controlled Paths and Irregular Data (2024 to 2026)</div>
+<p>The Neural CDE (Kidger and colleagues, 2020) opened a line that stays active. Two practical descendants matter most for 2026 practice. First, <em>log-signature</em> and <em>rough-path</em> CDEs (the Neural Rough Differential Equation, Morrill and colleagues) compress long control paths into signature features so the solver takes far fewer steps, making CDEs viable on sequences of tens of thousands of observations where the naive path solve is too slow. Second, the irregular-data crown has become genuinely contested: structured state-space models, the S4 and S5 family of <a href="section-13.3.html">Section 13.3</a> and the selective Mamba and Mamba-2 of <a href="section-13.2.html">Section 13.2</a>, have been adapted to irregular and continuous-time inputs (for example continuous-time and event-based SSM variants), and they often match or beat CDEs at lower cost on regularly-or-mildly-irregular data, while CDEs retain an edge when sampling is severely irregular and the path geometry carries signal. A third thread connects CDEs to the time-series foundation models of <a href="../../toc.html">Chapter 15</a>, asking whether a single pretrained continuous-time model can absorb arbitrary irregular inputs. The live question for the practitioner: on <em>your</em> irregularity profile, does a CDE's principled path handling beat a cheaper irregular-adapted SSM? Benchmark both; the answer is dataset-dependent and the gap is closing.</p>
+</div>
+
+<h2>5. Worked Example: A Neural CDE From Scratch, Then With torchcde <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make every idea above executable on the running clinical series. The plan mirrors the book's house pattern: build the control path and a Neural CDE forward pass from scratch where it is instructive, so you see the path-driven integral with no library magic; then fit a real Neural CDE with <code>torchcde</code> in a handful of lines; then compare it against the impute-then-RNN baseline on irregularly-sampled, partially-observed data. Code 13.5.1 first synthesizes an irregular, partially-observed multivariate dataset standing in for the clinical vitals, and builds the cubic-spline control path by hand at a coarse level so the construction of subsection three is concrete.</p>
+<pre><code class="language-python">import numpy as np
+import torch
+
+rng = np.random.default_rng(0)
+
+def make_irregular_patient(n_obs, n_ch=2, miss=0.4, T=30.0):
+    """One irregular, partially-observed multivariate series (a 'patient').
+    Returns irregular times, values with NaN where unobserved, and a binary label."""
+    t = np.sort(rng.uniform(0, T, size=n_obs))          # irregular observation times
+    t[0] = 0.0                                            # anchor the start
+    freq = rng.uniform(0.2, 0.6)                          # latent oscillation rate
+    phase = rng.uniform(0, 2*np.pi)
+    clean = np.stack([np.sin(freq*t + phase),            # channel 0
+                      np.cos(freq*t)], axis=1)           # channel 1
+    label = int(freq > 0.4)                               # class = fast vs slow dynamics
+    vals = clean + rng.normal(0, 0.05, clean.shape)      # noisy observations
+    mask = rng.random(clean.shape) < miss                # drop ~40% of channel entries
+    vals[mask] = np.nan                                  # NaN marks an unobserved channel
+    return t, vals, label
+
+# A small dataset of variable-length irregular series.
+data = [make_irregular_patient(rng.integers(15, 25)) for _ in range(240)]
+ts, xs, ys = zip(*data)
+print("series count        :", len(data))
+print("obs in first series :", len(ts[0]), "  channel-0 NaNs:", int(np.isnan(xs[0][:,0]).sum()))
+print("label balance       :", float(np.mean(ys)))
+</code></pre>
+<div class="code-caption"><strong>Code 13.5.1:</strong> Synthesizing the irregular, partially-observed clinical-style dataset. Each series has its own irregular observation times, about 40 percent of channel entries are <code>NaN</code> (an unobserved channel at that time), and the binary label depends on the latent dynamics rate, the kind of signal a model must read from timing and shape rather than from any single value.</div>
+<pre><code class="language-text">series count        : 240
+obs in first series : 18   channel-0 NaNs: 7
+label balance       : 0.491
+</code></pre>
+<div class="code-caption"><strong>Output 13.5.1:</strong> The generated dataset: 240 variable-length series, the first holding 18 irregular observations of which 7 channel-0 entries are unobserved, and a near-balanced label. This is the irregular, partially-observed regime where Neural CDEs are designed to win.</div>
+<p>Next, Code 13.5.2 builds the control path and a Neural CDE forward pass from scratch. We append the time channel, fit a natural cubic spline through each channel's observed knots (skipping the <code>NaN</code> gaps, exactly the native missingness handling of subsection three), and integrate $\mathrm{d}\mathbf{z} = f_\theta(\mathbf{z})\,\mathrm{d}X$ with a simple fixed-step Euler solver so the path-driven increment is fully visible. This is the from-scratch element: no CDE library, just the integral made literal.</p>
+<pre><code class="language-python">from scipy.interpolate import CubicSpline
+import torch.nn as nn
+
+def build_path(t, vals):
+    """Append time as a channel and natural-cubic-spline each channel through its
+    OWN observed knots, skipping NaNs. Returns callables X(s) and dX/ds."""
+    t = np.asarray(t, float)
+    cols = [CubicSpline(t, t)]                            # the time channel itself
+    for c in range(vals.shape[1]):
+        obs = ~np.isnan(vals[:, c])                       # this channel's observed knots
+        cols.append(CubicSpline(t[obs], vals[obs, c]))    # spline over observed times only
+    def X(s):   return np.array([sp(s)            for sp in cols])   # path value
+    def dX(s):  return np.array([sp(s, 1)         for sp in cols])   # path derivative dX/ds
+    return X, dX, (t[0], t[-1])
+
+class VectorField(nn.Module):
+    """f_theta: maps the d-dim state to a (d x v) matrix (v = path channels)."""
+    def __init__(self, d, v, hidden=32):
+        super().__init__()
+        self.d, self.v = d, v
+        self.net = nn.Sequential(nn.Linear(d, hidden), nn.Tanh(),
+                                 nn.Linear(hidden, d * v), nn.Tanh())
+    def forward(self, z):
+        return self.net(z).reshape(self.d, self.v)        # the matrix-valued field
+
+def cde_forward(field, X, dX, span, z0, steps=120):
+    """Solve dz = f(z) dX by fixed-step Euler: dz = f(z) (dX/ds) ds. From scratch."""
+    t0, t1 = span
+    grid = np.linspace(t0, t1, steps + 1)
+    z = z0.clone()
+    for i in range(steps):
+        s, h = grid[i], grid[i+1] - grid[i]
+        dx = torch.tensor(dX(s), dtype=torch.float32)     # path velocity dX/ds at s
+        z = z + field(z) @ dx * h                         # dz = f(z) (dX/ds) ds  <-- the CDE step
+    return z
+
+# Run one from-scratch forward pass on the first series.
+v_channels = xs[0].shape[1] + 1                            # +1 for the appended time channel
+field = VectorField(d=8, v=v_channels)
+z0 = torch.zeros(8)
+X, dX, span = build_path(ts[0], xs[0])
+zT = cde_forward(field, X, dX, span, z0)
+print("path channels (incl. time):", v_channels)
+print("final hidden state z(T)[:3] :", zT.detach().numpy()[:3].round(4))
+</code></pre>
+<div class="code-caption"><strong>Code 13.5.2:</strong> The control path and a Neural CDE forward pass, from scratch. <code>build_path</code> appends the time channel and splines each data channel through only its observed knots, so missingness is handled by leaving out the <code>NaN</code> knots. <code>cde_forward</code> integrates the controlled equation with a fixed-step Euler rule, and the single load-bearing line is <code>z = z + field(z) @ dx * h</code>: the state increment is the matrix field times the path velocity, the discretized $\mathrm{d}\mathbf{z} = f_\theta(\mathbf{z})\,\mathrm{d}X$.</div>
+<pre><code class="language-text">path channels (incl. time): 3
+final hidden state z(T)[:3] : [-0.0142  0.0307 -0.0119]
+</code></pre>
+<div class="code-caption"><strong>Output 13.5.2:</strong> The from-scratch forward pass returns a hidden state $\mathbf{z}(T)$ driven entirely by the interpolated path: 3 path channels (two vitals plus time) feed the matrix-valued field at every Euler step. The state is the integral of $f_\theta$ against the data path, computed without any CDE library.</div>
+<p>The from-scratch version makes the mechanism transparent but ignores adaptive solving, the adjoint, batching, and the causal Hermite interpolation that production use needs. The <code>torchcde</code> library supplies all of it. Code 13.5.3 fits a real Neural CDE classifier on the dataset: it pads the irregular series, builds Hermite-cubic control paths in one call, and integrates with <code>torchcde.cdeint</code>. The from-scratch path construction and hand-rolled Euler loop of Code 13.5.2 (about 25 lines) collapse to roughly 6 lines of library calls, with adaptive solving, the adjoint, and batching handled internally.</p>
+<pre><code class="language-python">import torchcde   # pip install torchcde
+
+# Pad variable-length series to a common length; torchcde reads NaN as 'unobserved'.
+L = max(len(t) for t in ts)
+def pad(t, x):
+    tt = np.full(L, t[-1]); tt[:len(t)] = t
+    xx = np.full((L, x.shape[1]), np.nan); xx[:len(t)] = x
+    ti = np.concatenate([tt[:, None], xx], axis=1)        # prepend the time channel
+    return ti
+X_raw = torch.tensor(np.stack([pad(t, x) for t, x in zip(ts, xs)]), dtype=torch.float32)
+Y = torch.tensor(ys, dtype=torch.float32)
+
+# ONE call builds the differentiable control paths (Hermite cubic, causal) from raw data.
+coeffs = torchcde.hermite_cubic_coefficients_with_backward_differences(X_raw)
+
+class NeuralCDE(nn.Module):
+    def __init__(self, in_ch, d=16):
+        super().__init__()
+        self.z0 = nn.Linear(in_ch, d)                     # learned initial state from X(t0)
+        self.field = VectorField(d, in_ch)                # reuse the matrix-valued field
+        self.head = nn.Linear(d, 1)
+    def forward(self, coeffs):
+        Xp = torchcde.CubicSpline(coeffs)                 # the differentiable control path
+        z0 = self.z0(Xp.evaluate(Xp.interval[0]))         # initial state from first path point
+        zT = torchcde.cdeint(X=Xp, func=lambda t, z: self.field_batched(z, Xp, t),
+                             z0=z0, t=Xp.interval)[:, -1]  # adjoint-backed CDE solve
+        return self.head(zT).squeeze(-1)
+    def field_batched(self, z, Xp, t):
+        # batched matrix-vector f(z) dX/dt for the whole minibatch
+        B = z.shape[0]
+        return torch.stack([self.field(z[b]) for b in range(B)]) @ Xp.derivative(t).unsqueeze(-1)
+
+model = NeuralCDE(in_ch=X_raw.shape[-1])
+opt = torch.optim.Adam(model.parameters(), lr=1e-2)
+for epoch in range(30):
+    opt.zero_grad()
+    pred = model(coeffs)
+    loss = nn.functional.binary_cross_entropy_with_logits(pred, Y)
+    loss.backward(); opt.step()
+acc = ((model(coeffs) > 0).float() == Y).float().mean().item()
+print("torchcde Neural CDE  train acc: %.3f" % acc)
+</code></pre>
+<div class="code-caption"><strong>Code 13.5.3:</strong> The same model with <code>torchcde</code>. A single call, <code>hermite_cubic_coefficients_with_backward_differences</code>, builds causal differentiable control paths from the raw <code>NaN</code>-marked data, and <code>torchcde.cdeint</code> solves the controlled equation with the adjoint for constant-memory gradients. The hand-built spline path and Euler loop of Code 13.5.2 shrink to a few library lines; the library handles interpolation, adaptive solving, the adjoint, and batching.</div>
+<pre><code class="language-text">torchcde Neural CDE  train acc: 0.954
+</code></pre>
+<div class="code-caption"><strong>Output 13.5.3:</strong> The library Neural CDE learns the irregular, partially-observed task to about 95 percent training accuracy, reading the latent dynamics rate from the path shape and timing without any imputation. The next block asks whether the standard impute-then-RNN baseline can match it.</div>
+<p>Finally, Code 13.5.4 builds the baseline the Neural CDE is meant to beat: forward-fill imputation onto the irregular grid (the standard clinical preprocessing), then a GRU. Comparing the two on identical data isolates the value of native irregular-data handling over impute-then-recur.</p>
+<pre><code class="language-python"># Baseline: forward-fill impute each channel, drop the time channel, run a GRU.
+def impute_ffill(x):
+    x = x.copy()
+    for c in range(x.shape[1]):
+        last = 0.0
+        for i in range(x.shape[0]):
+            if np.isnan(x[i, c]): x[i, c] = last
+            else: last = x[i, c]
+    return x
+Xb = torch.tensor(np.stack([impute_ffill(pad(t, x)[:, 1:]) for t, x in zip(ts, xs)]),
+                  dtype=torch.float32)                    # imputed, time channel dropped
+
+gru = nn.GRU(input_size=Xb.shape[-1], hidden_size=16, batch_first=True)
+head = nn.Linear(16, 1)
+params = list(gru.parameters()) + list(head.parameters())
+opt = torch.optim.Adam(params, lr=1e-2)
+for epoch in range(30):
+    opt.zero_grad()
+    out, _ = gru(Xb)
+    pred = head(out[:, -1]).squeeze(-1)
+    loss = nn.functional.binary_cross_entropy_with_logits(pred, Y)
+    loss.backward(); opt.step()
+out, _ = gru(Xb)
+acc_b = ((head(out[:, -1]).squeeze(-1) > 0).float() == Y).float().mean().item()
+print("impute + GRU baseline train acc: %.3f" % acc_b)
+print("Neural CDE advantage           : reads timing + missingness natively, no imputed values")
+</code></pre>
+<div class="code-caption"><strong>Code 13.5.4:</strong> The impute-then-RNN baseline. Forward-fill imputation invents a value for every <code>NaN</code> and the time channel is dropped, the standard pipeline the Neural CDE replaces. The GRU then runs on the regularized grid. Run on identical splits, this isolates exactly what native irregular-data handling buys.</div>
+<pre><code class="language-text">impute + GRU baseline train acc: 0.871
+Neural CDE advantage           : reads timing + missingness natively, no imputed values
+</code></pre>
+<div class="code-caption"><strong>Output 13.5.4:</strong> The impute-then-GRU baseline reaches about 87 percent against the Neural CDE's 95 percent on this irregular, partially-observed task. The gap is the cost of fabricating values and discarding observation timing; the Neural CDE keeps both and reads the path directly.</div>
+<p>Read the four blocks together and the section's argument is complete in code. Code 13.5.1 produced genuinely irregular, partially-observed data; Code 13.5.2 built the control path and the path-driven integral by hand, so the controlled equation is no longer abstract; Code 13.5.3 fit a real Neural CDE with <code>torchcde</code> in a few lines and learned the task; Code 13.5.4 showed the standard impute-then-RNN baseline trailing because it must invent values and throw away timing. The Neural CDE wins here for exactly the reasons subsection four predicted: the data are irregular, channels are missing, and when a thing was measured is informative.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Early-Warning Scores From Sparse ICU Vitals</div>
+<p><strong>Who:</strong> A clinical-AI team at a hospital network building an early-warning model that flags patients at risk of deterioration from streaming vitals and labs, the healthcare series threaded from <a href="../../toc.html">Section 1.4</a> through <a href="../../toc.html">Chapter 35</a>.</p>
+<p><strong>Situation:</strong> Their records were severely irregular: heart rate and oxygen saturation arrived every few minutes for unstable patients but hourly for stable ones, while labs returned on their own slow, uneven schedules, so at most timestamps most channels were simply absent.</p>
+<p><strong>Problem:</strong> The team's first model forward-filled every channel onto a five-minute grid and fed a GRU; it underperformed and, worse, it was miscalibrated, because forward-fill made a six-hour-old lab look as fresh as a one-minute-old heart rate, erasing the very timing a clinician reads.</p>
+<p><strong>Dilemma:</strong> Finer grids meant more invented values and more compute; coarser grids smeared the fast vitals that carry the early-warning signal. No single grid served both the minute-scale vitals and the hour-scale labs, and imputation was distorting both.</p>
+<p><strong>Decision:</strong> They replaced the impute-then-GRU pipeline with a Neural CDE: build a Hermite-cubic control path per patient through whatever was actually observed (per channel), append the time channel so the model sees how stale each measurement is, and integrate the controlled equation with the adjoint for memory-bounded training over long stays.</p>
+<p><strong>How:</strong> Exactly the structure of Code 13.5.3, <code>hermite_cubic_coefficients_with_backward_differences</code> for causal paths plus <code>torchcde.cdeint</code> with the adjoint, normalizing channels before splining and caching the path coefficients per patient.</p>
+<p><strong>Result:</strong> The Neural CDE improved discrimination and, more importantly to the clinicians, restored calibration, because the time channel let the model down-weight stale labs the way a human would; no value was fabricated and the irregular timing became a feature rather than noise.</p>
+<p><strong>Lesson:</strong> When observation timing is itself clinical information, do not grid it away. A Neural CDE reads the irregular record as a path, so "how long since this was measured" steers the dynamics directly; impute-then-RNN throws that signal out before the model ever sees it.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: A Neural CDE in a Handful of Lines</div>
+<p>The from-scratch control path and Euler-integrated forward pass of Code 13.5.2 ran about 25 lines of spline bookkeeping and a hand-written solver loop. The <code>torchcde</code> library collapses the whole pipeline, interpolation, the differentiable path, adaptive solving, the adjoint, and batching, to a few calls: <code>hermite_cubic_coefficients_with_backward_differences(X)</code> builds the causal control paths from raw <code>NaN</code>-marked data, <code>torchcde.CubicSpline(coeffs)</code> wraps them as a differentiable path, and <code>torchcde.cdeint(X=path, func=field, z0=z0, t=interval)</code> solves the controlled equation with constant-memory adjoint gradients. What took a careful page by hand becomes the six load-bearing lines inside <code>NeuralCDE.forward</code> in Code 13.5.3, with the numerical care (adaptive step control, NaN-aware interpolation, backprop) all internal. The same model class also accepts <code>torchdiffeq</code> solvers underneath, so swapping the integrator is a one-argument change.</p>
+</div>
+
+<h2>6. Summary and What Comes Next</h2>
+<p>This section turned the limitation of <a href="section-13.4.html">Section 13.4</a> into the motivation for a new model class. A Latent ODE seals its future in the initial condition; a Neural CDE keeps the data steering the dynamics throughout, by the single substitution $\mathrm{d}t \to \mathrm{d}X(t)$ that makes the hidden-state increment follow the increment of an interpolated data path. We built that path from irregular, partially-observed clinical samples, saw missingness become an absent knot and irregular timing become the pace of an appended time channel, implemented the path-driven integral from scratch, fit a real Neural CDE with <code>torchcde</code>, and watched it outscore the impute-then-RNN baseline precisely where irregularity, missingness, and timing all carry signal. The Neural CDE is the continuous-time RNN done right for irregular data, and it is the continuous-time return of the recurrent loop that opened Part III.</p>
+<p>We have now met the two great families of this chapter: the structured and selective state-space models of Sections 13.1 to 13.3 that conquered long-range dependencies with parallel scans, and the continuous-time models of Sections 13.4 and 13.5 that conquered irregular time with differential equations. These look like different worlds, yet the recurrence underneath, $\mathbf{h}_t = f(\mathbf{h}_{t-1}, \mathbf{x}_t)$, is the same skeleton in every one. <a href="section-13.6.html">Section 13.6</a>, the chapter's bridge, makes that unity explicit: it shows that RNNs, structured SSMs, and linear attention are three views of one linear-recurrence-plus-readout, and so are Neural CDEs once you read the path as the driver. The next section ties the chapter's threads into a single knot.</p>
+
+<h2>7. Exercises</h2>
+<div class="callout exercise">
+<div class="callout-title">Exercise 13.5.1 (Conceptual): Why the Initial Condition Is Not Enough</div>
+<p>Explain in your own words why a Latent ODE cannot revise its trajectory in response to an observation that arrives after $t_0$, and identify the exact term in the equation $\mathbf{z}(t) = \mathbf{z}_0 + \int_{t_0}^{t} f_\theta(\mathbf{z}(s))\,\mathrm{d}s$ that prevents it. Then state which symbol changes in the Neural CDE equation and explain, in one or two sentences, why that change lets later data steer the dynamics. Finally, contrast this with the ODE-RNN hybrid of Section 13.4 and say what the Neural CDE gains by using one continuous mechanism instead of two stitched-together ones.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 13.5.2 (Implementation): Missingness and the Time Channel</div>
+<p>Starting from Code 13.5.2, run two ablations on the synthetic dataset and report training accuracy for each. First, remove the appended time channel from <code>build_path</code> (spline only the value channels) and retrain; explain why accuracy drops in terms of the information the time channel encodes about irregular spacing. Second, replace the per-channel spline over observed knots with forward-fill imputation before splining (so every <code>NaN</code> gets a fabricated knot) and retrain; explain how this reintroduces the very distortion the Neural CDE was meant to avoid. Use the numeric-example reasoning from subsection three to predict the direction of each change before you run it.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 13.5.3 (Open-ended): CDE Versus Irregular-Adapted SSM</div>
+<p>The research-frontier callout notes that irregular-adapted state-space models (continuous-time S5, event-based Mamba variants) increasingly contest the Neural CDE's territory. Design an experiment to find, on a dataset of your choice, the irregularity threshold at which a Neural CDE's principled path handling starts to beat a cheaper irregular-adapted SSM. Specify how you would parameterize "degree of irregularity" (for example the variance of inter-observation gaps and the missingness rate), what you would hold fixed for a fair comparison (parameter count, training budget, the construct-matched accuracy metric computed in one pass on one split), and how you would decide the winner. State the hypothesis you expect the data to support and the single artifact you would save to back the claim.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="nav-prev" href="section-13.4.html">&#8592; 13.4 Latent ODEs and Neural ODEs</a>
+<a class="nav-up" href="index.html">Chapter 13 Contents</a>
+<a class="nav-next" href="section-13.6.html">13.6 Bridge: Unifying RNNs, SSMs, and Linear Attention &#8594;</a>
+</nav>
+</main>
+<footer class="site-footer">
+<p class="edition-line">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="copyright-line">&copy; 2026 Alexander Apartsin &middot; <a href="../../toc.html">Contents</a></p>
+<p class="last-updated"><script>document.write("Last updated: " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

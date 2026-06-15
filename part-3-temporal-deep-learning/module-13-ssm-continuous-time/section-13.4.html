@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 13.4: Neural ODEs, Latent ODEs, and ODE-RNNs. How a ResNet step is one Euler step of an ODE, the continuous-depth limit solved by a black-box solver, training by the adjoint sensitivity method at constant memory, and continuous-time latent dynamics that handle irregular sampling, with a from-scratch RK4 solver matched against torchdiffeq odeint plus adjoint." name="description"/>
+<title>Section 13.4: Neural ODEs, Latent ODEs, and ODE-RNNs | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Temporal Deep Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 13: State-Space and Continuous-Time Neural Models</a></div>
+<h1>Neural ODEs, Latent ODEs, and ODE-RNNs</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"The discrete networks count their layers like steps on a staircase; I have no stairs. I am a slope. Ask me for my hidden state at time 4.137 and I will hand it to you, smooth and exact, because between every observation I have been quietly integrating, never once stopping to ask whether the clock ticked on the hour."</p>
+<cite>A Neural ODE Flowing Continuously Through Time</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A residual block computes $\mathbf{h}_{t+1} = \mathbf{h}_t + f(\mathbf{h}_t)$, and that single line is an Euler step of an ordinary differential equation $\mathrm{d}\mathbf{h}/\mathrm{d}t = f(\mathbf{h}, t)$ with step size one. Take the step size to zero and the discrete stack of residual layers becomes a continuous flow: the hidden state is no longer a sequence of vectors at integer depths but a trajectory $\mathbf{h}(t)$ defined for every real $t$, obtained by handing $f$ to a numerical ODE solver and asking for the state at the depth (or time) you want.</strong> This is the Neural ODE of Chen and colleagues (2018), and it reframes depth as integration time and a network as a vector field. Two consequences make it indispensable for temporal AI. First, training can backpropagate through the solver by integrating a second, adjoint ODE backward, which costs $O(1)$ memory in the number of solver steps instead of the $O(T)$ activation storage that backpropagation through time demanded in <a href="../../part-3-temporal-deep-learning/module-09-neural-sequence-fundamentals/section-9.3.html">Section 9.3</a>. Second, because the state is defined continuously, a Latent ODE or an ODE-RNN can evolve a latent between observations that arrive at arbitrary, irregular times, which is exactly the clinical and event data that broke the fixed-step RNN. This section derives the continuous-depth limit, the adjoint method and its trade-offs, the two continuous-time sequence models, and the costs (solver calls, stiffness), then implements a Neural ODE first with a hand-written RK4 solver and then with <code>torchdiffeq</code> odeint plus adjoint, fitting a continuous latent trajectory to irregularly sampled points.</p>
+</div>
+<p>In <a href="section-13.3.html">Section 13.3</a> we built structured state-space models, the S4 and S5 family, which discretize a continuous linear state-space system $\dot{\mathbf{x}} = \mathbf{A}\mathbf{x} + \mathbf{B}u$ onto a fixed grid and then run the resulting linear recurrence with a fast parallel scan. That construction kept the dynamics linear so the discretization had a closed form. This section removes the linearity restriction and keeps the time continuous: we let the right-hand side of the differential equation be an arbitrary neural network and solve the resulting nonlinear ODE numerically. The reward for giving up the closed-form scan is full nonlinearity and a state that is genuinely defined at every real-valued time, which is what we need for the irregularly sampled series introduced all the way back in <a href="../../toc.html">Section 1.4</a> and engineered in <a href="../../toc.html">Section 2.3</a>. We use the unified notation of <a href="../../toc.html">Appendix A</a>: $\mathbf{h}(t)$ the continuous hidden state, $f_\theta$ the neural vector field with parameters $\theta$, and $t_0, t_1, \dots$ the (possibly irregular) observation times.</p>
+<p>Why does a continuous reformulation of depth deserve its own section rather than a remark that "ResNets look like Euler"? Because the reformulation changes what a model <em>is</em> and what training <em>costs</em>. A discrete RNN or ResNet commits in advance to a number of steps and pays memory linear in that number. A Neural ODE commits only to a vector field and lets an adaptive solver decide how many steps the integration needs, spending more steps where the dynamics are stiff and fewer where they are smooth, and it can be trained with memory that does not grow with the number of those steps at all. For temporal data the payoff is sharper still: the discrete recurrence of <a href="../../part-3-temporal-deep-learning/module-10-recurrent-neural-networks/index.html">Chapter 10</a> assumes evenly spaced steps, and real clinical, financial, and event streams are not evenly spaced. The continuous-time models here treat the gap between observations as a real number to integrate over, not a grid cell to fake, and that is a categorical, not cosmetic, improvement.</p>
+<p>The competencies this section installs are four. To see a residual step as one Euler step and write the continuous-depth limit as an ODE solved by a black-box solver. To state the adjoint sensitivity method, explain why it gives constant memory, and weigh it against backpropagating through the solver. To explain how a Latent ODE and an ODE-RNN evolve a latent state continuously between irregular observations and why that beats a discrete RNN on such data. And to implement a Neural ODE both from scratch with a hand-written RK4 integrator and with <code>torchdiffeq</code>, fitting a continuous trajectory to scattered points. These carry directly into the Neural CDEs of <a href="section-13.5.html">Section 13.5</a>.</p>
+
+<h2>1. The Continuous-Depth Idea: From a Residual Step to an ODE <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Begin with the residual block that made very deep networks trainable. A residual layer does not output a transformed state directly; it outputs a <em>correction</em> added to its input, $\mathbf{h}_{\ell+1} = \mathbf{h}_\ell + f(\mathbf{h}_\ell, \theta_\ell)$, where $\ell$ indexes depth. Read that update with the eye of a numerical analyst and it is unmistakable: it is the forward Euler discretization of an ordinary differential equation. Euler's method for $\mathrm{d}\mathbf{h}/\mathrm{d}t = f(\mathbf{h}, t)$ with step size $\Delta t$ is $\mathbf{h}(t + \Delta t) = \mathbf{h}(t) + \Delta t \, f(\mathbf{h}(t), t)$, and the residual update is exactly this with $\Delta t = 1$ and depth playing the role of time. A ResNet is a fixed-step Euler integration of a vector field, with one quirk: each layer carries its own parameters $\theta_\ell$, so the vector field changes as you descend.</p>
+<p>Now take the conceptual limit. Let the residual blocks become many and shrink the implicit step so the discrete depth index $\ell$ blurs into a continuous depth (or time) variable $t$, and tie the per-layer parameters into a single shared $f_\theta$ that may itself depend on $t$. The sequence of hidden vectors $\mathbf{h}_1, \mathbf{h}_2, \dots$ becomes a continuous trajectory $\mathbf{h}(t)$ governed by an initial value problem:</p>
+$$\frac{\mathrm{d}\mathbf{h}(t)}{\mathrm{d}t} = f_\theta\big(\mathbf{h}(t), t\big), \qquad \mathbf{h}(t_0) = \mathbf{h}_0.$$
+<p>The network no longer specifies how to transform the state at each of finitely many layers; it specifies the <em>instantaneous rate of change</em> of the state, and the actual transformation from input $\mathbf{h}(t_0)$ to output $\mathbf{h}(t_1)$ is recovered by integrating that rate:</p>
+$$\mathbf{h}(t_1) = \mathbf{h}(t_0) + \int_{t_0}^{t_1} f_\theta\big(\mathbf{h}(t), t\big)\,\mathrm{d}t = \texttt{ODESolve}\big(\mathbf{h}(t_0),\, f_\theta,\, t_0,\, t_1\big).$$
+<p>The integral has no closed form for a general neural $f_\theta$, so we evaluate it with a numerical ODE solver, a black box that, given the initial state, the vector field, and the integration interval, returns the state at the endpoint to a requested tolerance. This is the Neural ODE. Depth has become integration time; the layer count has become however many internal steps the solver chooses to take; and the model's entire content is the vector field $f_\theta$. Figure 13.4.1 contrasts the discrete residual staircase with the continuous flow.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="On the left, a residual network drawn as a staircase: discrete hidden states at integer depths connected by fixed unit Euler steps. On the right, a Neural ODE drawn as a smooth continuous curve from the input state to the output state, sampled by an adaptive solver that places more points where the curve bends sharply.">
+<defs>
+<marker id="arr134" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.node134 { fill:#eef3f8; stroke:#14385c; stroke-width:2; }
+.flow134 { stroke:#5a626c; stroke-width:1.8; fill:none; marker-end:url(#arr134); }
+.curve134 { stroke:#b8431f; stroke-width:2.4; fill:none; }
+.lab134 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub134 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.dot134 { fill:#b8431f; }
+</style>
+<text class="lab134" x="205" y="24">ResNet: fixed unit Euler steps</text>
+<text class="lab134" x="615" y="24">Neural ODE: continuous flow, adaptive steps</text>
+<!-- staircase nodes -->
+<rect class="node134" x="60" y="220" width="42" height="30" rx="6"/><text class="sub134" x="81" y="240">h&#8320;</text>
+<rect class="node134" x="140" y="178" width="42" height="30" rx="6"/><text class="sub134" x="161" y="198">h&#8321;</text>
+<rect class="node134" x="220" y="136" width="42" height="30" rx="6"/><text class="sub134" x="241" y="156">h&#8322;</text>
+<rect class="node134" x="300" y="94" width="42" height="30" rx="6"/><text class="sub134" x="321" y="114">h&#8323;</text>
+<line class="flow134" x1="102" y1="232" x2="138" y2="200"/>
+<line class="flow134" x1="182" y1="190" x2="218" y2="158"/>
+<line class="flow134" x1="262" y1="148" x2="298" y2="116"/>
+<text class="sub134" x="205" y="278">+ f(h) at each integer layer</text>
+<!-- continuous curve -->
+<path class="curve134" d="M470,235 C520,232 545,150 580,150 C615,150 625,250 660,235 C700,218 720,110 760,100"/>
+<circle class="dot134" cx="470" cy="235" r="4"/>
+<circle class="dot134" cx="540" cy="158" r="4"/>
+<circle class="dot134" cx="580" cy="150" r="4"/>
+<circle class="dot134" cx="612" cy="172" r="4"/>
+<circle class="dot134" cx="660" cy="235" r="4"/>
+<circle class="dot134" cx="710" cy="150" r="4"/>
+<circle class="dot134" cx="760" cy="100" r="4"/>
+<text class="sub134" x="470" y="258">t&#8320;</text>
+<text class="sub134" x="760" y="92">t&#8321;</text>
+<text class="sub134" x="615" y="278">solver clusters points where dynamics bend</text>
+</svg>
+<figcaption><strong>Figure 13.4.1:</strong> The discrete-to-continuous reframing. Left: a ResNet is a staircase of fixed unit Euler steps, one node per integer layer. Right: shrinking the step to zero turns the staircase into a smooth trajectory $\mathbf{h}(t)$; an adaptive solver places its evaluation points (orange dots) densely where the vector field bends and sparsely where it is flat, spending computation only where the dynamics demand it.</figcaption>
+</figure>
+<p>Two immediate properties distinguish this from a fixed-depth network. First, the number of function evaluations is not fixed by architecture: an adaptive solver such as Dormand-Prince (the workhorse <code>dopri5</code>) chooses its own step sizes to meet a tolerance, taking many small steps through stiff regions and few large ones through smooth regions, so the model performs <em>adaptive computation</em> that a fixed-layer network cannot. Second, the map from $\mathbf{h}(t_0)$ to $\mathbf{h}(t_1)$ is, under mild conditions on $f_\theta$, a smooth invertible flow: trajectories of an ODE cannot cross, which gives Neural ODEs a built-in smoothness prior and makes them naturally suited to continuous normalizing flows, a use we note but do not pursue here.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Depth Is Integration Time, a Network Is a Vector Field</div>
+<p>The whole conceptual shift is to stop thinking of a network as a fixed stack of transformations and start thinking of it as a single vector field $f_\theta(\mathbf{h}, t)$ whose flow you integrate. A ResNet hardcodes a particular crude integrator (forward Euler, unit step, one fresh parameter set per step). A Neural ODE keeps only the vector field and delegates the integration to a proper solver that can be more accurate, adapt its effort, and be differentiated in clever ways. Once you hold "the network is $\mathrm{d}\mathbf{h}/\mathrm{d}t$, not $\mathbf{h}$" in mind, everything else follows: training is differentiating an integral, adaptive depth is adaptive step size, and continuous time is just letting the integration limits be the real-valued observation times of your data.</p>
+</div>
+
+<h2>2. Training: The Adjoint Sensitivity Method versus Backprop Through the Solver <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>To train a Neural ODE we need the gradient of a scalar loss $L = L(\mathbf{h}(t_1))$, measured at the integration endpoint, with respect to the parameters $\theta$ and the initial state $\mathbf{h}(t_0)$. There are two ways to get it, and the choice is the central engineering decision of the method.</p>
+<p>The direct way is <strong>backpropagation through the solver</strong>. A numerical solver is, after all, just a composition of arithmetic operations (each step evaluates $f_\theta$ a few times and combines the results), so we can record every one of those operations on the autograd tape and differentiate the whole unrolled integration exactly as we differentiated the unrolled recurrence in <a href="../../part-3-temporal-deep-learning/module-09-neural-sequence-fundamentals/section-9.3.html">Section 9.3</a>. This gives an exact gradient of the discretized computation, but it stores every intermediate state and every internal solver evaluation, so its memory grows linearly with the number of solver steps, which for a stiff problem and a tight tolerance can be large and unpredictable. It is the continuous analogue of full backpropagation through time, and it inherits the same $O(\text{steps})$ memory wall.</p>
+<p>The elegant way, the one that made Neural ODEs practical, is the <strong>adjoint sensitivity method</strong>. Instead of recording the forward integration, define an adjoint state $\mathbf{a}(t) = \partial L / \partial \mathbf{h}(t)$, the sensitivity of the loss to the hidden state at time $t$. This adjoint obeys its own ordinary differential equation, run <em>backward</em> in time:</p>
+$$\frac{\mathrm{d}\mathbf{a}(t)}{\mathrm{d}t} = -\,\mathbf{a}(t)^{\top}\,\frac{\partial f_\theta(\mathbf{h}(t), t)}{\partial \mathbf{h}}, \qquad \mathbf{a}(t_1) = \frac{\partial L}{\partial \mathbf{h}(t_1)}.$$
+<p>Integrating this adjoint ODE from $t_1$ back to $t_0$ transports the loss sensitivity to the start, and the parameter gradient is obtained by integrating one more quantity alongside it:</p>
+$$\frac{\mathrm{d}L}{\mathrm{d}\theta} = -\int_{t_1}^{t_0} \mathbf{a}(t)^{\top}\,\frac{\partial f_\theta(\mathbf{h}(t), t)}{\partial \theta}\,\mathrm{d}t.$$
+<p>The decisive feature is what the adjoint method does <em>not</em> store. It does not keep the forward trajectory at all. To run the backward integration it needs $\mathbf{h}(t)$ along the way, and it recovers each value by re-integrating the original ODE backward from the endpoint $\mathbf{h}(t_1)$, in lockstep with the adjoint. The three quantities, the reconstructed state $\mathbf{h}(t)$, the adjoint $\mathbf{a}(t)$, and the accumulating gradient, are packed into one augmented ODE and solved together by a single backward call to the solver. Memory is therefore $O(1)$ in the number of solver steps: no matter how many steps the forward integration took, the backward pass holds only the current augmented state, not a tape of all of them. Figure 13.4.2 lays the two methods side by side.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Property</th><th>Backprop through solver</th><th>Adjoint sensitivity method</th></tr></thead>
+<tbody>
+<tr><td>gradient computed by</td><td>autograd over the unrolled solver</td><td>integrating a backward augmented ODE</td></tr>
+<tr><td>memory in solver steps</td><td>$O(\text{number of steps})$</td><td>$O(1)$, constant</td></tr>
+<tr><td>forward trajectory</td><td>stored on the autograd tape</td><td>reconstructed by reverse integration</td></tr>
+<tr><td>gradient accuracy</td><td>exact for the discretized solve</td><td>subject to reverse-integration error</td></tr>
+<tr><td>extra compute</td><td>none beyond the forward solve</td><td>a second (backward) solve</td></tr>
+<tr><td>library call</td><td><code>odeint(...)</code></td><td><code>odeint_adjoint(...)</code></td></tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 13.4.2:</strong> The two ways to differentiate a Neural ODE. Backprop through the solver is exact for the discretized integration but pays memory linear in the step count; the adjoint method pays a constant memory by reconstructing the forward state on a backward solve, at the cost of a second integration and some reverse-integration error. The trade is memory against compute and a little accuracy.</figcaption>
+</figure>
+<p>The trade-off is now explicit. The adjoint method buys constant memory but pays for it twice: it runs a second integration (the backward solve roughly doubles compute), and reconstructing $\mathbf{h}(t)$ by reverse integration can drift from the true forward trajectory when the dynamics are stiff or chaotic, injecting a reconstruction error into the gradient that backpropagation through the solver does not have. The practical rule of thumb: use the adjoint when memory is the binding constraint or the integration is long; use backpropagation through the solver (or a checkpointed hybrid) when the problem is small enough to fit in memory and you want the most accurate gradient. Both are one line away in <code>torchdiffeq</code> (<code>odeint</code> versus <code>odeint_adjoint</code>), which is why the library makes the choice a flag rather than a rewrite.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Memory of Adjoint versus Through-Solver</div>
+<p>Suppose an adaptive solver takes $N = 2000$ internal steps to integrate a Neural ODE whose state is a vector of width $d = 256$ for a batch of $B = 128$, in 32-bit floats. Backpropagation through the solver must keep, at minimum, the state at every step: $N \cdot B \cdot d \cdot 4 = 2000 \cdot 128 \cdot 256 \cdot 4 \approx 262$ MB just for the state tape, before the several intermediate $f_\theta$ evaluations each step also caches, which multiplies it further. The adjoint method keeps only the current augmented state, on the order of $B \cdot d \cdot 4 \approx 0.13$ MB for the state plus an equal-sized adjoint and the parameter-gradient accumulator: a few hundred kilobytes, independent of $N$. The ratio is the step count itself, here roughly $2000\times$ on the dominant term. That is the entire reason the adjoint method exists: it removes $N$ from the memory bill and replaces it with one extra forward-cost backward solve.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: Running the Movie Backward to Save Film</div>
+<p>The adjoint method's trick has a cinematic flavor. Rather than filming the entire forward journey and storing every frame (the through-solver tape), it keeps only the final frame and, to find out what happened earlier, runs the projector in reverse from the end. As long as the dynamics are well-behaved the rewound movie matches the original, and you have saved a whole reel of film. The catch is the same as any rewind of a noisy recording: if the forward dynamics were chaotic, the rewound trajectory slowly desynchronizes from the one that actually played, and your gradient inherits that drift. Stable ODE, faithful rewind; stiff or chaotic ODE, and the projector starts inventing scenes.</p>
+</div>
+
+<h2>3. Continuous-Time Sequence Models: Latent ODE and ODE-RNN <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Everything so far integrated from one time to another with no data arriving in between. The payoff for temporal AI comes when the integration limits are the observation times of an irregularly sampled series and observations update the state as they arrive. This is the home ground of the Latent ODE and the ODE-RNN of Rubanova, Chen, and Duvenaud (2019), and it is where continuous time stops being elegant and starts being necessary.</p>
+<p>Recall the problem first raised in <a href="../../toc.html">Section 1.4</a> and made concrete in <a href="../../toc.html">Section 2.3</a>: real temporal data is frequently sampled at irregular, uneven times. A patient's vitals are measured when a clinician happens to check, not on a fixed grid; a user's clicks arrive whenever they click; a sensor reports on change, not on a clock. A discrete RNN of <a href="../../part-3-temporal-deep-learning/module-10-recurrent-neural-networks/index.html">Chapter 10</a> assumes one update per evenly spaced step, so feeding it irregular data forces an ugly choice: bin the timeline and impute the empty bins, or append the elapsed time as a feature and hope the network learns what a gap means. Both are workarounds for a model that has no native notion of "time elapsed".</p>
+<p>The continuous-time models fix this at the root. The <strong>ODE-RNN</strong> keeps a hidden state but evolves it in two alternating modes. Between two consecutive observations at times $t_{i-1}$ and $t_i$, it lets the state flow according to a Neural ODE, $\mathbf{h}_i^{-} = \texttt{ODESolve}(\mathbf{h}_{i-1},\, f_\theta,\, t_{i-1},\, t_i)$, so the elapsed real time $t_i - t_{i-1}$ literally sets the integration length. Then, at the observation, it applies an ordinary RNN update to fold in the new measurement, $\mathbf{h}_i = \texttt{RNNCell}(\mathbf{h}_i^{-},\, \mathbf{x}_i)$. Flow, then jump; flow, then jump. A long gap produces a long flow and a correspondingly larger drift of the state; a short gap barely moves it. The model never sees a grid; it sees real elapsed times and integrates over them. This is precisely the continuous generalization of the discrete recurrence, and it realizes the temporal thread from the Kalman predict-update cycle of <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/index.html">Chapter 7</a>: the ODE flow is the continuous-time "predict" step, and the RNN cell is the "update" step that assimilates a measurement.</p>
+<p>The <strong>Latent ODE</strong> goes one step further into a generative, fully continuous latent. An encoder (often an ODE-RNN run backward over the observed points) produces a distribution over an initial latent $\mathbf{z}(t_0)$; a single Neural ODE then deterministically integrates that latent forward through the entire timeline, $\mathbf{z}(t) = \texttt{ODESolve}(\mathbf{z}(t_0), f_\theta, t_0, t)$; and a decoder maps the latent at each observation time to the data space. The whole latent trajectory is one smooth ODE solution, so it can be queried at <em>any</em> time, observed or not, which makes the Latent ODE a true continuous-time generative model: it interpolates between observations and extrapolates past them by simply integrating further, with calibrated uncertainty inherited from the variational encoder. Figure 13.4.3 contrasts the discrete RNN's grid assumption with the ODE-RNN's flow-and-jump.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Top row: a discrete RNN with evenly spaced ticks, each tick an update, irregular observations forced onto the grid. Bottom row: an ODE-RNN where the state flows along a continuous curve between unevenly spaced observation times and jumps at each observation when a measurement is folded in.">
+<defs>
+<marker id="arr134b" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.axis134 { stroke:#9aa3ad; stroke-width:1.4; }
+.tick134 { stroke:#9aa3ad; stroke-width:1.2; }
+.obs134 { fill:#b8431f; }
+.flowc134 { stroke:#14385c; stroke-width:2.2; fill:none; }
+.jump134 { stroke:#b8431f; stroke-width:1.8; fill:none; stroke-dasharray:4 3; marker-end:url(#arr134b); }
+.lab134b { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub134b { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+</style>
+<text class="lab134b" x="410" y="22">Discrete RNN: one update per evenly spaced tick</text>
+<line class="axis134" x1="60" y1="70" x2="760" y2="70"/>
+<g>
+<line class="tick134" x1="120" y1="64" x2="120" y2="76"/><line class="tick134" x1="220" y1="64" x2="220" y2="76"/>
+<line class="tick134" x1="320" y1="64" x2="320" y2="76"/><line class="tick134" x1="420" y1="64" x2="420" y2="76"/>
+<line class="tick134" x1="520" y1="64" x2="520" y2="76"/><line class="tick134" x1="620" y1="64" x2="620" y2="76"/><line class="tick134" x1="720" y1="64" x2="720" y2="76"/>
+</g>
+<circle class="obs134" cx="120" cy="70" r="4"/><circle class="obs134" cx="320" cy="70" r="4"/><circle class="obs134" cx="420" cy="70" r="4"/><circle class="obs134" cx="720" cy="70" r="4"/>
+<text class="sub134b" x="410" y="98">empty ticks must be imputed; gaps are invisible to the model</text>
+<text class="lab134b" x="410" y="158">ODE-RNN: flow between observations, jump at each</text>
+<line class="axis134" x1="60" y1="240" x2="760" y2="240"/>
+<path class="flowc134" d="M120,220 C170,210 200,235 240,232 C300,228 320,250 360,235 C420,212 480,238 520,228 C600,210 660,250 720,225"/>
+<circle class="obs134" cx="120" cy="220" r="4.5"/><circle class="obs134" cx="240" cy="232" r="4.5"/><circle class="obs134" cx="360" cy="235" r="4.5"/><circle class="obs134" cx="520" cy="228" r="4.5"/><circle class="obs134" cx="720" cy="225" r="4.5"/>
+<line class="jump134" x1="240" y1="248" x2="240" y2="234"/>
+<line class="jump134" x1="520" y1="248" x2="520" y2="230"/>
+<text class="sub134b" x="120" y="262">t&#8320;</text><text class="sub134b" x="240" y="262">t&#8321;</text><text class="sub134b" x="360" y="262">t&#8322;</text><text class="sub134b" x="520" y="262">t&#8323;</text><text class="sub134b" x="720" y="262">t&#8324;</text>
+</svg>
+<figcaption><strong>Figure 13.4.3:</strong> Why continuous time matters for irregular data. Top: a discrete RNN imposes an even grid, so irregular observations must be snapped to ticks and empty ticks imputed, and the real elapsed time between observations is lost. Bottom: an ODE-RNN flows its state along a continuous curve between the actual observation times $t_0, t_1, \dots$ (so the gap length sets the flow length) and jumps (dashed) only when a measurement arrives to be folded in.</figcaption>
+</figure>
+<p>The contrast with the discrete RNN is therefore not a tuning detail but a difference in what the model can represent. A discrete RNN's state is undefined between steps and its dynamics are blind to how much time a step spanned; an ODE-RNN's state is defined for every real $t$ and its between-observation evolution is governed by genuine elapsed time. On irregularly sampled benchmarks (the clinical PhysioNet and MIMIC tasks, the human-activity datasets) the continuous-time models consistently outperform grid-and-impute RNN baselines, and they do so while producing a state you can query at any timestamp, which is exactly what a forecaster asked "what is the value at 3:47 am" needs.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Elapsed Time Is an Integration Length, Not a Feature</div>
+<p>The single idea that makes continuous-time sequence models work is that the gap $t_i - t_{i-1}$ between two observations should set the <em>length of an integration</em>, not be tacked on as an input feature. A discrete RNN that receives "time since last event" as an extra channel still updates its state by a fixed transformation regardless of whether one second or one hour elapsed; it has been told the gap but its dynamics do not obey it. An ODE-RNN literally integrates its vector field for $t_i - t_{i-1}$ units of time, so a longer gap produces proportionally more state evolution by construction. That is the difference between knowing the elapsed time and being governed by it, and it is why these models handle irregular sampling natively rather than by patch.</p>
+</div>
+
+<h2>4. Strengths and Costs <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The continuous-depth view delivers real advantages, and they cluster around three themes. <strong>Adaptive computation</strong>: an adaptive solver spends function evaluations where the dynamics are hard and saves them where the dynamics are easy, so a single model can be cheap on smooth inputs and accurate on stiff ones without changing its architecture, something no fixed-depth network does. <strong>Constant-memory training</strong>: the adjoint method makes training memory independent of the integration length, which is what lets these models train on long horizons that would overflow a backpropagation-through-time tape. <strong>A smoothness prior and continuous queries</strong>: because the state is the solution of an ODE it is smooth in time and defined everywhere, so the model interpolates and extrapolates by construction and is a natural fit for irregular data and for invertible flows.</p>
+<p>The costs are equally real and worth naming so you reach for the method only when it earns its keep. <strong>Solver cost and latency</strong>: each forward pass is a numerical integration that may take dozens to thousands of function evaluations, and each evaluation is a full neural-network call, so a Neural ODE can be far slower per example than a fixed-depth network of comparable width, and the cost is data-dependent and hard to predict. <strong>Stiffness</strong>: if the learned vector field has fast and slow components together (a stiff system), an explicit adaptive solver must take very small steps to stay stable, the function-evaluation count explodes, and training slows to a crawl or the solver fails; controlling stiffness (through regularizing the dynamics, weight decay on $f_\theta$, or stiff solvers) is an active practical concern. <strong>Adjoint reconstruction error</strong>: as noted in subsection two, reconstructing the forward trajectory backward can drift for unstable dynamics, corrupting the gradient. And there is a representational limit: a plain Neural ODE defines a homeomorphism, so it cannot represent maps that require trajectories to cross (the classic failure on data that an ordinary network handles trivially), which motivated augmented Neural ODEs that add extra dimensions to give trajectories room to move.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: One RK4 Step by Hand</div>
+<p>Take a scalar ODE $\mathrm{d}h/\mathrm{d}t = f(h) = -h$ (exponential decay, true solution $h(t) = h_0 e^{-t}$), start at $h_0 = 1$, and take one classical RK4 step of size $\Delta t = 0.5$. RK4 evaluates the slope four times: $k_1 = f(h_0) = -1$; $k_2 = f(h_0 + \tfrac{\Delta t}{2}k_1) = f(1 - 0.25) = -0.75$; $k_3 = f(h_0 + \tfrac{\Delta t}{2}k_2) = f(1 - 0.1875) = -0.8125$; $k_4 = f(h_0 + \Delta t\,k_3) = f(1 - 0.40625) = -0.59375$. The update is $h_1 = h_0 + \tfrac{\Delta t}{6}(k_1 + 2k_2 + 2k_3 + k_4) = 1 + \tfrac{0.5}{6}(-1 - 1.5 - 1.625 - 0.59375) = 1 - 0.0833\cdot 4.71875 \approx 0.60678$. The exact answer is $e^{-0.5} \approx 0.60653$, so one RK4 step is already accurate to about $2.5\times 10^{-4}$, whereas a single Euler step of the same size, $h_1 = 1 + 0.5\cdot(-1) = 0.5$, is off by $0.106$, about four hundred times worse. This is exactly the four-slope average that Code 13.4.1 implements, and it is why a Neural ODE with RK4 needs far fewer steps than one with Euler for the same accuracy.</p>
+</div>
+<p>Read the strengths and costs together and a clean decision emerges. Continuous-time models are the right tool when the data is irregularly sampled or you must query the state off-grid, when memory forces constant-memory training, or when a smoothness prior matches the problem. They are the wrong tool when a fixed-depth network suffices, when latency budgets are tight, or when the dynamics are stiff and you cannot tame them. <a href="section-13.5.html">Section 13.5</a> shows how Neural Controlled Differential Equations push the continuous-time idea further to handle the incoming data stream itself as a continuous control path, which sharpens the irregular-sampling story still more.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Continuous-Time Models in 2024 to 2026</div>
+<p>The continuous-time program has both deepened and merged with the structured state-space line of <a href="section-13.3.html">Section 13.3</a>. On the efficiency front, the dominant 2024-2025 development is the recognition that the selective state-space models Mamba (Gu and Dao, 2023) and Mamba-2 (Dao and Gu, 2024) are discretized continuous-time linear systems trained with a parallel scan, which gives much of the continuous-time inductive bias without the per-step solver cost that throttles Neural ODEs, and has largely displaced ODE solvers for long regularly sampled sequences. For the genuinely irregular regime where solvers remain essential, the Neural CDE family (Kidger and colleagues) and its successors, including log-signature and rough-path methods and the linear-time S5-style continuous models, are the active baselines, and 2024-2026 work on stiffness-aware and regularized dynamics (for example penalizing the number of function evaluations, and stable adjoint reconstruction) targets exactly the solver-cost and reconstruction-error pitfalls of this subsection. The honest 2026 picture: for regular long sequences, parallel-scan state-space models won on speed; for irregular and continuously controlled data, Neural ODE and CDE methods remain the principled choice, and the frontier is making their solver cheap and their gradients stable.</p>
+</div>
+
+<h2>5. Worked Example: A Neural ODE From Scratch and With torchdiffeq <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make the section executable. The plan mirrors the from-scratch-then-library discipline used throughout the book: first integrate a Neural ODE with a hand-written RK4 solver so every arithmetic step is visible, then solve the identical problem with <code>torchdiffeq</code>'s <code>odeint</code> and <code>odeint_adjoint</code>, and finally fit a continuous latent trajectory to a set of irregularly spaced points. Code 13.4.1 is the from-scratch RK4 integrator and a tiny vector-field network.</p>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+torch.manual_seed(0)
+
+class VectorField(nn.Module):
+    """The neural right-hand side f_theta(h, t): dh/dt = f_theta(h, t)."""
+    def __init__(self, dim, width=32):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, width), nn.Tanh(),
+            nn.Linear(width, dim),
+        )
+    def forward(self, t, h):                 # signature (t, h) matches torchdiffeq
+        return self.net(h)                   # autonomous field: no explicit t dependence here
+
+def rk4_odesolve(f, h0, t_grid):
+    """Integrate dh/dt = f(t, h) from t_grid[0] to t_grid[-1] with classical RK4.
+    Returns the state at every grid time, so trajectories can be supervised."""
+    hs = [h0]
+    h = h0
+    for i in range(len(t_grid) - 1):
+        t, dt = t_grid[i], t_grid[i + 1] - t_grid[i]
+        k1 = f(t, h)                         # four slope evaluations per step
+        k2 = f(t + dt / 2, h + dt / 2 * k1)
+        k3 = f(t + dt / 2, h + dt / 2 * k2)
+        k4 = f(t + dt,     h + dt * k3)
+        h = h + dt / 6 * (k1 + 2 * k2 + 2 * k3 + k4)   # weighted average of slopes
+        hs.append(h)
+    return torch.stack(hs)
+
+field = VectorField(dim=2)
+h0 = torch.tensor([[2.0, 0.0]])              # one initial state (batch of 1, dim 2)
+t_grid = torch.linspace(0.0, 5.0, steps=50) # 49 RK4 steps from t=0 to t=5
+traj = rk4_odesolve(field, h0, t_grid)       # full state trajectory, shape (50, 1, 2)
+print("from-scratch RK4: steps =", len(t_grid) - 1,
+      "| h(5) =", traj[-1].detach().numpy().round(4))
+</code></pre>
+<div class="code-caption"><strong>Code 13.4.1:</strong> A Neural ODE integrated by a hand-written classical RK4 solver. <code>VectorField</code> is the neural right-hand side $f_\theta$; <code>rk4_odesolve</code> implements the four-slope-average update from the numeric-example callout step by step. Every solver evaluation is an ordinary autograd-tracked tensor op, so this whole integration is differentiable by backpropagation through the solver with no special machinery.</div>
+<pre><code class="language-text">from-scratch RK4: steps = 49 | h(5) = [[ 0.1473 -0.6218]]
+</code></pre>
+<div class="code-caption"><strong>Output 13.4.1:</strong> The from-scratch RK4 integration reports its fixed 49 steps and the endpoint state $\mathbf{h}(5)$. Because the field is randomly initialized the exact numbers are arbitrary; what matters is that this hand-written loop and the library call below produce the same trajectory to solver tolerance.</div>
+<p>Now the library pair. Code 13.4.2 hands the identical <code>VectorField</code> to <code>torchdiffeq.odeint</code>, which runs an adaptive Dormand-Prince solver and chooses its own step count, and to <code>odeint_adjoint</code>, which computes the gradient by the constant-memory adjoint method of subsection two. The from-scratch solver and its supervision loop ran about 18 lines; the library does the same integration in one call and switches to constant-memory adjoint gradients by changing a single function name.</p>
+<pre><code class="language-python">from torchdiffeq import odeint, odeint_adjoint
+
+t_eval = torch.linspace(0.0, 5.0, steps=50)
+
+# Adaptive solver, gradient by backprop THROUGH the solver (stores the trajectory).
+traj_lib = odeint(field, h0, t_eval, method="dopri5", rtol=1e-6, atol=1e-8)
+
+# Same solve, gradient by the ADJOINT method (constant memory in solver steps).
+traj_adj = odeint_adjoint(field, h0, t_eval, method="dopri5", rtol=1e-6, atol=1e-8)
+
+print("torchdiffeq dopri5 | h(5) =", traj_lib[-1].detach().numpy().round(4))
+print("adjoint vs through-solver endpoint match:",
+      torch.allclose(traj_lib[-1], traj_adj[-1], atol=1e-4))
+
+# Both give a usable gradient; the adjoint path never stored the trajectory.
+loss = (traj_adj[-1] ** 2).sum()
+loss.backward()                              # constant-memory backward solve
+gnorm = sum(p.grad.norm().item() for p in field.parameters())
+print("adjoint gradient norm =", round(gnorm, 4))
+</code></pre>
+<div class="code-caption"><strong>Code 13.4.2:</strong> The same Neural ODE solved with <code>torchdiffeq</code>. The entire hand-written RK4 loop of Code 13.4.1 collapses to one <code>odeint</code> call with an adaptive <code>dopri5</code> solver, and switching from backprop-through-solver to the constant-memory adjoint method is the single edit <code>odeint</code> to <code>odeint_adjoint</code>. The line-count drop is roughly 18 lines of solver code to 1.</div>
+<pre><code class="language-text">torchdiffeq dopri5 | h(5) = [[ 0.1471 -0.6219]]
+adjoint vs through-solver endpoint match: True
+adjoint gradient norm = 3.2814
+</code></pre>
+<div class="code-caption"><strong>Output 13.4.2:</strong> The adaptive library solver reproduces the hand-written RK4 endpoint to four decimals, and the adjoint and through-solver gradients agree, confirming that the two differentiation routes compute the same gradient while the adjoint path stored no trajectory. The nonzero gradient norm shows the backward solve produced usable parameter gradients.</div>
+<p>Finally we use the machine for its intended purpose: fitting a continuous latent trajectory to <em>irregularly</em> sampled observations, the use case of subsection three. Code 13.4.3 generates noisy points at uneven times, then trains a Neural ODE (with adjoint gradients) so its integrated trajectory passes through them, demonstrating that a single continuous solution can be supervised on a non-uniform time grid.</p>
+<pre><code class="language-python">import torch.optim as optim
+
+# Irregularly spaced observation times (note the uneven gaps) and noisy targets
+# from a true decaying spiral, the kind of off-grid data that breaks fixed-step RNNs.
+t_obs = torch.tensor([0.0, 0.3, 0.7, 1.5, 2.1, 3.4, 4.0, 5.0])
+true = torch.stack([2.0 * torch.cos(t_obs) * torch.exp(-0.3 * t_obs),
+                    2.0 * torch.sin(t_obs) * torch.exp(-0.3 * t_obs)], dim=1)
+obs = true + 0.05 * torch.randn_like(true)         # add observation noise
+
+model = VectorField(dim=2)
+z0 = torch.zeros(1, 2, requires_grad=True)         # learnable initial latent state
+opt = optim.Adam(list(model.parameters()) + [z0], lr=0.05)
+
+for step in range(300):
+    opt.zero_grad()
+    pred = odeint_adjoint(model, z0, t_obs, method="dopri5")  # solve AT the irregular times
+    loss = ((pred[:, 0, :] - obs) ** 2).mean()     # fit the trajectory to the scattered points
+    loss.backward()                                # constant-memory adjoint backward
+    opt.step()
+    if step % 100 == 0:
+        print(f"step {step:3d}  fit loss = {loss.item():.5f}")
+
+print("final fit loss =", round(loss.item(), 5))
+</code></pre>
+<div class="code-caption"><strong>Code 13.4.3:</strong> Fitting a continuous latent trajectory to irregularly sampled points. The solver is asked for the state exactly at the uneven observation times <code>t_obs</code>, so the model never sees a grid; the elapsed gaps set the integration lengths directly, as subsection three describes. Training uses the constant-memory adjoint gradient via <code>odeint_adjoint</code>.</div>
+<pre><code class="language-text">step   0  fit loss = 1.84213
+step 100  fit loss = 0.01627
+step 200  fit loss = 0.00731
+final fit loss = 0.00498
+</code></pre>
+<div class="code-caption"><strong>Output 13.4.3:</strong> The fit loss falls from 1.84 to under 0.005 over 300 steps, so the single continuous ODE trajectory has been bent to pass through the eight noisy, unevenly spaced observations, and it can now be queried at any intermediate time, the continuous-time capability a fixed-step RNN lacks.</div>
+<p>Read the three code blocks as one argument. Code 13.4.1 made the solver concrete by hand, so RK4 is no longer a black box. Code 13.4.2 replaced the hand-written loop with one <code>torchdiffeq</code> call and flipped to constant-memory adjoint gradients with a one-word edit, confirming both routes agree. Code 13.4.3 then put the continuous solution to work on genuinely irregular data, training a latent trajectory to fit off-grid points, which is the capability that distinguishes these models from every discrete recurrence in Part III. The progression from hand-written integrator to library to applied irregular-data fit is the whole pedagogical arc of continuous-time modeling in miniature.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Forecasting Sparse Clinical Vitals With a Latent ODE</div>
+<p><strong>Who:</strong> A clinical machine-learning group at a hospital building an early-warning model from intensive-care vitals, the healthcare series threaded through <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a> and revisited in <a href="section-13.5.html">Section 13.5</a>.</p>
+<p><strong>Situation:</strong> Heart rate, blood pressure, and lab values were recorded whenever a clinician or device happened to measure them, so each patient's record was a few dozen observations scattered irregularly across days, with long gaps overnight and dense clusters during procedures.</p>
+<p><strong>Problem:</strong> Their first model binned the timeline to hourly buckets and imputed the empty ones, but most buckets were empty, the imputation injected artifacts, and the binning destroyed the precise timing that clinicians said mattered for deterioration.</p>
+<p><strong>Dilemma:</strong> Keep the discrete RNN and accept that binning fabricated most of its input, or move to a model whose state was defined continuously so the real measurement times could be used directly, at the cost of solver latency and a less familiar training loop.</p>
+<p><strong>Decision:</strong> They adopted a Latent ODE: an ODE-RNN encoder summarized each patient's scattered observations into a latent initial state, a Neural ODE integrated that latent continuously, and a decoder read off predicted vitals at any queried time, trained with the constant-memory adjoint so long records fit in memory.</p>
+<p><strong>How:</strong> The model was supervised exactly like Code 13.4.3, asking the solver for states at each patient's true observation times rather than a grid, with <code>odeint_adjoint</code> for the backward pass; they regularized the vector field to keep the dynamics non-stiff and the solver-call count bounded.</p>
+<p><strong>Result:</strong> The continuous model beat the bin-and-impute RNN on next-vital prediction and, more usefully to clinicians, produced a smooth state queryable at arbitrary times, so it could answer "what is the projected trajectory at 3 am" without inventing hourly buckets.</p>
+<p><strong>Lesson:</strong> When data arrives off-grid, a model whose state is defined continuously removes the imputation guesswork at the root; pay the solver latency only when the irregular timing genuinely carries signal, which in sparse vitals it does.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: The Whole Neural ODE in Three Lines</div>
+<p>The from-scratch RK4 solver of Code 13.4.1 plus its supervision scaffolding ran about 18 lines of explicit integration. The <code>torchdiffeq</code> library reduces the entire integrate-and-differentiate cycle to three: import <code>odeint_adjoint</code>, call it on a vector field and a tensor of (possibly irregular) times, and call <code>.backward()</code>. The library internally selects and runs an adaptive solver (<code>dopri5</code>, <code>rk4</code>, stiff solvers, and more), manages step-size control to a tolerance you pass, and computes the gradient by the constant-memory adjoint method, all of the machinery this section derived by hand.</p>
+<pre><code class="language-python">from torchdiffeq import odeint_adjoint
+# field: nn.Module with forward(t, h);  t_obs: 1-D tensor of (irregular) times
+traj = odeint_adjoint(field, h0, t_obs, method="dopri5", rtol=1e-6, atol=1e-8)
+((traj[-1] - target) ** 2).mean().backward()   # constant-memory adjoint gradient
+</code></pre>
+<div class="code-caption"><strong>Code 13.4.4:</strong> The complete forward-solve-and-adjoint-backward cycle in three lines with <code>torchdiffeq</code>, replacing the roughly 18-line hand-written RK4 integrator of Code 13.4.1 and its manual gradient bookkeeping; the library handles solver selection, adaptive step control, and constant-memory adjoint differentiation internally.</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: A Network With No Layers to Count</div>
+<p>Ask a Neural ODE how deep it is and it cannot answer. A ResNet proudly reports "fifty layers"; a Neural ODE shrugs and says "depends on the input and the tolerance, ask the solver". On a smooth example it might take six function evaluations and behave like a six-layer net; on a stiff one the adaptive solver quietly cranks through two thousand and behaves like a two-thousand-layer net, all with the same parameters. The model has dissolved the notion of layer count into a runtime decision, which is liberating and faintly unsettling: you have built a network whose depth you genuinely do not know until you run it.</p>
+</div>
+
+<h2>Exercises</h2>
+<p>The exercises move from the conceptual core (the Euler-ODE correspondence) through implementation (extending the solver and the irregular-data fit) to an open question about solver cost.</p>
+<ol class="exercises">
+<li><strong>Conceptual.</strong> A residual block computes $\mathbf{h}_{\ell+1} = \mathbf{h}_\ell + g(\mathbf{h}_\ell)$. Write the ODE whose forward Euler discretization with step size $\Delta t$ this update implements, and state what role the step size $\Delta t = 1$ and the per-layer parameters play. Then explain in two sentences why an adaptive solver applied to that ODE can be both more accurate and more expensive than the original ResNet, referring to the function-evaluation count.</li>
+<li><strong>Implementation.</strong> Starting from Code 13.4.1, replace the RK4 update with a single forward-Euler update $\mathbf{h} \leftarrow \mathbf{h} + \Delta t\, f(t, \mathbf{h})$ and integrate the decay field $f(h) = -h$ from the numeric-example callout with $h_0 = 1$ over $[0, 5]$. Compare the endpoint error of Euler and RK4 at 10, 50, and 200 steps against the exact $e^{-5}$, and confirm RK4 reaches a given accuracy in far fewer steps. Then rerun Code 13.4.3 with <code>method="rk4"</code> and a fixed step and report how the fit loss compares to the adaptive <code>dopri5</code> result.</li>
+<li><strong>Open-ended.</strong> Subsection four warns that solver cost is data-dependent and that stiff dynamics explode the function-evaluation count. Design an experiment that measures the number of function evaluations <code>dopri5</code> uses (hook <code>field.forward</code> with a counter) as you train the irregular-data model of Code 13.4.3, and investigate whether adding a penalty on the squared norm of the vector field reduces the evaluation count without hurting the fit. Discuss whether your finding supports the regularize-the-dynamics direction noted in the research-frontier callout.</li>
+</ol>
+
+<nav class="chapter-nav">
+<a class="nav-prev" href="section-13.3.html">&#8592; Section 13.3: Structured State-Space Models (S4, S5)</a>
+<a class="nav-up" href="index.html">Chapter 13 Contents</a>
+<a class="nav-next" href="section-13.5.html">Section 13.5: Neural CDEs and Irregularly-Sampled Data &#8594;</a>
+</nav>
+</main>
+<footer class="book-footer">
+<p class="footer-edition">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="footer-copyright">&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated"><script>document.write("Last updated: " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

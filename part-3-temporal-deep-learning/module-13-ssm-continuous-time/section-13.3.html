@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 13.3: Linear Attention, RWKV, and RetNet. How replacing the softmax with a kernel feature map turns attention into a linear recurrence with a matrix-valued state, giving a dual parallel-train and recurrent-infer form; how RWKV and RetNet realize the same linear-recurrence template with different parameterizations; and a from-scratch implementation of linear attention in both parallel and recurrent forms verified identical, with a library version." name="description"/>
+<title>Section 13.3: Linear Attention, RWKV, and RetNet | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Temporal Deep Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 13: State-Space and Continuous-Time Neural Models</a></div>
+<h1>Linear Attention, RWKV, and RetNet</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"For years they told me I was an attention mechanism, all softmax and quadratic glory, comparing every token to every other token like a gossip who never forgets a face. Then someone dropped the softmax, and I discovered the truth: under the costume I was a recurrence the whole time, carrying one little matrix of state forward, step by step, the way an RNN does. I had been a state-space model in a fancier coat."</p>
+<cite>A Linear Attention That Is Secretly a Recurrence</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Standard attention is quadratic because the softmax couples every query to every key through a normalization that cannot be factored. Remove the softmax and replace it with a kernel feature map $\phi$ applied separately to queries and keys, and the entire attention computation factors into a running sum: the output at position $t$ becomes $\phi(\mathbf{q}_t)$ contracted against a state $\mathbf{S}_t = \sum_{i \le t} \phi(\mathbf{k}_i)\mathbf{v}_i^\top$ that is updated by one rank-one addition per step. That single algebraic move is the hinge of this section. It means linear attention is a <em>linear recurrence with a matrix-valued state</em>, and a linear recurrence has two faces: a parallel form that processes the whole sequence at once for fast training, and a recurrent form that carries a fixed-size state for $O(1)$-per-token, $O(1)$-memory inference.</strong> RWKV and RetNet are two production-grade architectures built on exactly this template, each adding a decay structure that gives the state a controllable memory horizon and the model a positional sense of time. This section derives the duality, shows how RWKV's WKV time-mixing and RetNet's retention each instantiate it, places them beside the structured state-space models of <a href="section-13.1.html">Sections 13.1</a> and <a href="section-13.2.html">13.2</a>, and implements linear attention in both its parallel and recurrent forms from scratch, proving numerically that they compute the identical function before collapsing the pair to a library call. You leave seeing softmax-free attention, RWKV, RetNet, and SSMs as one family: linear recurrences wearing different parameterizations.</p>
+</div>
+<p>In <a href="section-13.2.html">Section 13.2</a> we built structured state-space models whose core was a linear recurrence $\mathbf{s}_t = \mathbf{A}\mathbf{s}_{t-1} + \mathbf{B}\mathbf{x}_t$ that could be unrolled as a convolution for parallel training and run as a recurrence for streaming inference. That duality, one model with a parallel face and a recurrent face, is the protagonist of this section too, but arriving from the opposite direction. There we started from a continuous linear system and discretized it. Here we start from the Transformer attention of <a href="../module-12-attention-transformers/section-12.5.html">Section 12.5</a>, the workhorse of Part III, and ask what happens to its cost when we drop the one nonlinearity that makes it quadratic. The answer lands us back in the same place: a linear recurrence with a matrix-valued state. By the end of the chapter, <a href="section-13.6.html">Section 13.6</a> will close the loop and show that SSMs, linear attention, RWKV, and RetNet are literally the same computational object under four different parameterizations. This section builds the linear-attention half of that bridge. We use the unified notation of <a href="../../toc.html">Appendix A</a>: $\mathbf{q}_t, \mathbf{k}_t, \mathbf{v}_t$ for the query, key, and value at position $t$, $\mathbf{o}_t$ for the attention output, $d$ for the head dimension.</p>
+<p>The stakes are practical, not merely aesthetic. Standard attention costs $O(T^2 d)$ time and, at inference, an $O(T)$ key-value cache that grows without bound as a generation lengthens. For the long sequences that motivate this entire chapter, a year of hourly readings, a high-frequency tape, a book-length context, that quadratic wall is exactly what we are trying to climb. Linear attention and its descendants trade a small amount of expressive power for a recurrence that trains in parallel like a Transformer yet generates in constant time and constant memory per token like an RNN. That is a genuinely new point on the design space, and understanding why it is possible is understanding the duality this section is built around.</p>
+<p>The four competencies this section installs are these: to rewrite softmax-free attention as a running-sum recurrence and read off both its parallel-train and recurrent-infer forms; to recognize RWKV's WKV time-mixing and channel mixing as a decayed linear recurrence with an RNN-like inference mode; to state RetNet's retention mechanism in its parallel, recurrent, and chunkwise forms and explain the role of its decay-based positional structure; and to see all of these, together with the SSMs of <a href="section-13.1.html">Sections 13.1</a> and <a href="section-13.2.html">13.2</a>, as one linear-recurrence family, the unifying picture that <a href="section-13.6.html">Section 13.6</a> formalizes.</p>
+
+<h2>1. From Softmax Attention to a Linear Recurrence <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<div class="callout looking-back">
+<div class="callout-title">Looking Back: The Quadratic Wall of Section 12.5</div>
+<p><a href="../module-12-attention-transformers/section-12.5.html">Section 12.5</a> built scaled dot-product attention and counted its cost: forming the full $T \times T$ matrix of query-key scores is $O(T^2 d)$ work and $O(T^2)$ memory at training time, and at inference each new token must attend over a key-value cache that grows linearly with everything generated so far. We noted there that this quadratic scaling is the Transformer's defining weakness on long sequences and flagged that Part III would return to climb it. This section is that return. The single structural culprit, identified in 12.5 and dissected again below, is the softmax normalization that couples every query to every key. Remove it and the whole cost structure changes character.</p>
+</div>
+<p>Recall the attention output from <a href="../module-12-attention-transformers/section-12.5.html">Section 12.5</a>. With a causal mask, the output at position $t$ is a softmax-weighted average of the value vectors at positions $i \le t$, where the weights come from query-key similarities:</p>
+$$\mathbf{o}_t = \frac{\sum_{i=1}^{t} \exp(\mathbf{q}_t^\top \mathbf{k}_i)\,\mathbf{v}_i}{\sum_{i=1}^{t} \exp(\mathbf{q}_t^\top \mathbf{k}_i)}.$$
+<p>The reason this is quadratic is printed in the formula: the scalar weight $\exp(\mathbf{q}_t^\top \mathbf{k}_i)$ binds the query at $t$ and the key at $i$ together inside a single nonlinearity, the exponential, that does not factor into a part depending only on $\mathbf{q}_t$ times a part depending only on $\mathbf{k}_i$. Because it does not factor, we are forced to materialize the similarity for every one of the $T^2$ query-key pairs. The softmax is the entire source of the quadratic cost.</p>
+<p>The linear-attention idea, introduced by Katharopoulos and colleagues in 2020, is to replace the exponential similarity with a <em>factored</em> one. Choose a feature map $\phi: \mathbb{R}^d \to \mathbb{R}^{m}$ and approximate $\exp(\mathbf{q}_t^\top \mathbf{k}_i) \approx \phi(\mathbf{q}_t)^\top \phi(\mathbf{k}_i)$. The point of $\phi$ is that the similarity now <em>splits</em>: it is an inner product of one vector built from the query alone and another built from the key alone. A common choice is the elementwise $\phi(\mathbf{u}) = \mathrm{elu}(\mathbf{u}) + 1$, which keeps the features positive so the denominator stays well behaved. Substituting and using the associativity of the sums:</p>
+$$\mathbf{o}_t = \frac{\sum_{i=1}^{t} \big(\phi(\mathbf{q}_t)^\top \phi(\mathbf{k}_i)\big)\,\mathbf{v}_i}{\sum_{i=1}^{t} \phi(\mathbf{q}_t)^\top \phi(\mathbf{k}_i)} = \frac{\phi(\mathbf{q}_t)^\top \sum_{i=1}^{t} \phi(\mathbf{k}_i)\,\mathbf{v}_i^\top}{\phi(\mathbf{q}_t)^\top \sum_{i=1}^{t} \phi(\mathbf{k}_i)}.$$
+<p>The decisive step is pulling $\phi(\mathbf{q}_t)$ out of the sum over $i$, which the factorization permits and the softmax forbade. What remains inside the sums no longer depends on $t$ except through the running upper limit. Define a matrix-valued state and a vector-valued normalizer that accumulate over positions:</p>
+$$\mathbf{S}_t = \sum_{i=1}^{t} \phi(\mathbf{k}_i)\,\mathbf{v}_i^\top \in \mathbb{R}^{m \times d}, \qquad \mathbf{z}_t = \sum_{i=1}^{t} \phi(\mathbf{k}_i) \in \mathbb{R}^{m}.$$
+<p>Both are cumulative sums, so each obeys a one-line recurrence: add the current term to the previous total. That is the entire content of linear attention. The model is a linear recurrence with a matrix-valued state $\mathbf{S}_t$, updated by a rank-one outer product per step, and read out by a contraction with the current query feature:</p>
+$$\boxed{\;\mathbf{S}_t = \mathbf{S}_{t-1} + \phi(\mathbf{k}_t)\,\mathbf{v}_t^\top, \qquad \mathbf{z}_t = \mathbf{z}_{t-1} + \phi(\mathbf{k}_t), \qquad \mathbf{o}_t = \frac{\phi(\mathbf{q}_t)^\top \mathbf{S}_t}{\phi(\mathbf{q}_t)^\top \mathbf{z}_t}.\;}$$
+<p>This is the recurrent (inference) form: carry a fixed-size state $\mathbf{S}_t$ of shape $m \times d$, update it with one outer product, read out with one matrix-vector product, all independent of how many tokens have already gone by. Generation costs $O(md)$ time and $O(md)$ memory <em>per token</em>, constant in the sequence length, in place of the growing key-value cache of softmax attention. The same equations, read across the whole sequence at once rather than step by step, give the parallel (training) form: compute all $\phi(\mathbf{k}_i)\mathbf{v}_i^\top$ terms and take a cumulative sum, which a framework parallelizes across positions exactly as it parallelizes the SSM scan of <a href="section-13.2.html">Section 13.2</a>. One model, two faces.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two equivalent computations of linear attention. On the left, the parallel form: a full query-key-value array processed at once with a cumulative sum across positions, used for training. On the right, the recurrent form: a single matrix-valued state S carried left to right, updated by one outer product per step and read out by the current query, used for inference. A double-headed arrow between them is labeled identical outputs.">
+<defs>
+<marker id="arr133" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.box133 { fill:#eef3f8; stroke:#14385c; stroke-width:2; }
+.st133 { fill:#fbeee8; stroke:#b8431f; stroke-width:1.8; }
+.fl133 { stroke:#5a626c; stroke-width:1.8; fill:none; marker-end:url(#arr133); }
+.lab133 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub133 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.wt133 { font:600 12px sans-serif; fill:#b8431f; text-anchor:middle; }
+.ttl133 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+</style>
+<text class="lab133" x="410" y="22">One linear recurrence, two equivalent faces</text>
+<text class="ttl133" x="190" y="52">Parallel form (training)</text>
+<rect class="box133" x="80" y="66" width="220" height="60" rx="9"/>
+<text class="sub133" x="190" y="92">cumulative sum over all positions</text>
+<text class="sub133" x="190" y="110">of &#966;(k&#7522;)v&#7522;&#7488;, parallelized</text>
+<text class="sub133" x="190" y="150">O(Tmd) work, all steps at once</text>
+<text class="ttl133" x="620" y="52">Recurrent form (inference)</text>
+<rect class="st133" x="500" y="66" width="70" height="56" rx="8"/><text class="lab133" x="535" y="99">S&#8321;</text>
+<rect class="st133" x="585" y="66" width="70" height="56" rx="8"/><text class="lab133" x="620" y="99">S&#8322;</text>
+<rect class="st133" x="670" y="66" width="70" height="56" rx="8"/><text class="lab133" x="705" y="99">S&#8323;</text>
+<line class="fl133" x1="570" y1="94" x2="583" y2="94"/><text class="wt133" x="576" y="58">+k&#8322;v&#8322;&#7488;</text>
+<line class="fl133" x1="655" y1="94" x2="668" y2="94"/><text class="wt133" x="661" y="58">+k&#8323;v&#8323;&#7488;</text>
+<text class="sub133" x="620" y="150">O(md) per token, fixed state size</text>
+<line class="fl133" x1="305" y1="170" x2="495" y2="170"/>
+<line class="fl133" x1="495" y1="186" x2="305" y2="186"/>
+<text class="ttl133" x="400" y="205">identical outputs o&#8321;, o&#8322;, o&#8323;</text>
+<text class="sub133" x="400" y="225">(verified to floating point in Code 13.3.1 and 13.3.2)</text>
+</svg>
+<figcaption><strong>Figure 13.3.1:</strong> The two faces of linear attention. The parallel form (left) computes a cumulative sum over all positions at once, cheap to train on a GPU; the recurrent form (right) carries a single matrix-valued state $\mathbf{S}_t$, updated by one rank-one outer product per step, cheap to run at inference. Both compute the identical output sequence, the equivalence we verify numerically in subsection five.</figcaption>
+</figure>
+<p>It is worth stating the cost ledger explicitly, because the whole motivation lives in it. The recurrent form's state $\mathbf{S}_t$ has shape $m \times d$, fixed once the head dimensions are chosen, so generating a new token costs exactly one outer product ($O(md)$), one state addition ($O(md)$), and one contraction ($O(md)$), with not a single term that depends on $t$. Contrast softmax attention, where token $t$ must compute a similarity against all $t$ stored keys, an $O(td)$ operation that grows as the generation lengthens, on top of a key-value cache whose memory is $O(td)$. Over a full length-$T$ generation, softmax attention pays $\sum_t O(td) = O(T^2 d)$, while linear attention pays $\sum_t O(md) = O(Tmd)$, linear in $T$. The asymptotic gap is the entire reason this family exists, and it is the same $O(T)$-versus-$O(T^2)$ improvement that the convolutional and state-space views of this chapter chase from their own directions.</p>
+<p>One caveat sets honest expectations. The feature map $\phi$ is an approximation to the exponential kernel, not an equality, so linear attention is not a drop-in numerical match for softmax attention; it is a different, cheaper attention whose quality depends on the feature map. Early feature maps lost accuracy on language tasks, which is precisely the gap that RWKV and RetNet close with better-designed recurrences and decay structure. What is exact and unconditional is the <em>duality</em>: for any fixed $\phi$, the parallel and recurrent forms compute the same function, bit for bit up to floating-point order of operations. That equivalence is the load-bearing fact, and it is what we prove in code.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Dropping the Softmax Turns Attention Into a Linear Recurrence</div>
+<p>The whole section rests on one substitution. Softmax attention couples queries and keys through $\exp(\mathbf{q}^\top\mathbf{k})$, which does not factor, forcing an $O(T^2)$ pairwise computation. Replacing it with a factored kernel $\phi(\mathbf{q})^\top\phi(\mathbf{k})$ lets you pull the query out of the sum over past keys, leaving a running sum $\mathbf{S}_t = \mathbf{S}_{t-1} + \phi(\mathbf{k}_t)\mathbf{v}_t^\top$. A running sum is a linear recurrence with a matrix-valued state. So linear attention is not a different species from the state-space models of <a href="section-13.2.html">Section 13.2</a>; it is the same species, a linear recurrence, reached from the attention side instead of the dynamical-system side. The recurrence has a parallel face for training and a recurrent face for $O(1)$ inference, and the rest of this section is variations on which decay and which feature map you stamp onto that one template.</p>
+</div>
+
+<h2>2. RWKV: An RNN-Transformer Hybrid <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>RWKV (Peng and colleagues, 2023, the name stands for the four core symbols R, W, K, V) takes the linear-recurrence template of subsection one and adds the one ingredient plain linear attention lacks: a learned <em>decay</em> that lets the state forget the distant past at a controllable rate. Where linear attention accumulates an undamped sum $\mathbf{S}_t = \mathbf{S}_{t-1} + \phi(\mathbf{k}_t)\mathbf{v}_t^\top$, RWKV weights each past contribution by an exponentially decaying factor, so a position $s$ steps back is discounted by roughly $e^{-sw}$ for a learned per-channel decay $w$. This is the same exponential-decay positional structure we will meet again in RetNet, and it is what gives the recurrence a finite effective memory rather than an ever-growing flat sum.</p>
+<p>RWKV is built from two alternating sublayers, mirroring the attention-then-feedforward structure of a Transformer block but with both pieces made recurrent. The first is <strong>time mixing</strong>, which carries information across positions through the WKV recurrence; the second is <strong>channel mixing</strong>, a position-wise gated feedforward that mixes across feature channels with no cross-time interaction. The time-mixing output for a channel is a decayed, key-weighted average of values, which in its numerically-stabilized recurrent form reads</p>
+$$\mathrm{wkv}_t = \frac{\,\mathbf{a}_{t-1} + e^{\,u + k_t}\,v_t\,}{\,\mathbf{b}_{t-1} + e^{\,u + k_t}\,}, \qquad \mathbf{a}_t = e^{-w}\mathbf{a}_{t-1} + e^{\,k_t}v_t, \qquad \mathbf{b}_t = e^{-w}\mathbf{b}_{t-1} + e^{\,k_t},$$
+<p>where $w$ is the learned channel-wise decay (the W), $u$ is a learned bonus that gives the current token extra weight, $k_t$ and $v_t$ are the key and value (the K and V), and $\mathbf{a}_t, \mathbf{b}_t$ are the running numerator and denominator states, the direct analogues of $\mathbf{S}_t$ and $\mathbf{z}_t$ from subsection one with a decay $e^{-w}$ multiplying the carried state. The receptance $\mathbf{r}_t = \sigma(\cdot)$ (the R) is a sigmoid gate that decides how much of the mixed signal passes through, the role attention's softmax weights play in a standard block. The output is $\mathbf{o}_t = \mathbf{r}_t \odot \mathrm{wkv}_t$ projected out.</p>
+<p>The payoff is precisely the duality of subsection one, now in a competitive language model. Because the WKV recurrence is linear in its state, the whole sequence can be computed in a parallelizable form during training, so RWKV trains with Transformer-like throughput on a GPU. Because that same recurrence carries only the fixed-size pair $(\mathbf{a}_t, \mathbf{b}_t)$ forward, inference is pure RNN: each new token costs $O(d)$ time and $O(d)$ memory regardless of context length, with no key-value cache to grow. RWKV was the first architecture to demonstrate this combination at multi-billion-parameter scale on language modeling, reaching quality comparable to similarly-sized Transformers while generating in constant memory per token.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: RWKV Is Linear Attention Plus a Learned Forgetting Rate</div>
+<p>Strip RWKV to its skeleton and it is the linear-attention recurrence of subsection one with one addition: the carried state is multiplied by a learned decay $e^{-w}$ at every step before the new contribution is added. That decay is the difference between a memory that grows without bound (plain linear attention) and one with a finite, learnable horizon (RWKV). The receptance gate $\mathbf{r}_t$ supplies the input-dependent gating that a bare linear recurrence lacks, and the channel-mixing sublayer supplies the cross-feature mixing that the feedforward block supplies in a Transformer. Time mixing carries information across time with a fixed-size state; channel mixing mixes features within a position. Train in parallel, infer as an RNN: the same two-faced bargain, dressed for language modeling.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Transformer That Files for RNN Citizenship</div>
+<p>RWKV is the architecture that refuses to pick a side in the great RNN-versus-Transformer debate and instead carries both passports. On training day it shows up dressed as a Transformer, processing the whole sequence in parallel and soaking up GPU throughput. At inference time it changes in the phone booth and emerges as an RNN, carrying one small fixed-size state and generating tokens at constant cost no matter how long the conversation has run. The community joke writes itself: it is the only model that can answer "are you an RNN or a Transformer?" with a perfectly honest "yes".</p>
+</div>
+
+<h2>3. RetNet: The Retention Mechanism <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>RetNet (Sun and colleagues, 2023) reaches the same linear-recurrence template from a more explicitly attention-flavored direction, and contributes the cleanest statement of why these models have <em>three</em> computational forms rather than two. Its core operation, <strong>retention</strong>, replaces the softmax with a fixed exponential decay applied along the sequence. The parallel form looks almost exactly like attention with the softmax removed and a decay mask inserted:</p>
+$$\mathbf{O} = \big(\mathbf{Q}\mathbf{K}^\top \odot \mathbf{D}\big)\mathbf{V}, \qquad \mathbf{D}_{ti} = \begin{cases} \gamma^{\,t-i} & i \le t \\ 0 & i > t \end{cases}$$
+<p>where $\gamma \in (0,1)$ is a per-head decay constant and $\mathbf{D}$ is a causal mask whose entries decay geometrically with the distance $t - i$ between query and key. The decay $\gamma^{t-i}$ is RetNet's positional structure: instead of adding learned position embeddings, the model encodes "how long ago" directly into the strength of each interaction, so recent positions count more than distant ones by a fixed multiplicative schedule. This is the same exponential discounting that RWKV applies through $e^{-w}$ and that an SSM applies through its state matrix $\mathbf{A}$; RetNet just writes it as an explicit mask on the attention matrix.</p>
+<p>The decay mask is also RetNet's answer to a question every attention model must settle: how does the model know <em>when</em> a token occurred? Softmax Transformers bolt on a separate positional encoding (sinusoids or rotary embeddings) because the bare dot product is permutation-invariant. Retention bakes position into the mechanism itself: the factor $\gamma^{t-i}$ is monotone in the gap $t - i$, so a token's influence fades smoothly with age and the model reads distance directly off the interaction strength. This is a more parsimonious design, no extra parameters, no separate embedding table, and it generalizes more gracefully to sequences longer than those seen in training, because the decay is defined for any gap rather than learned per absolute position.</p>
+<p>Because the decay factorizes as $\gamma^{t-i} = \gamma^{t}/\gamma^{i}$, the same retention admits a recurrent form. Carry a matrix-valued state $\mathbf{S}_t$ and update it with a decay-then-add step, then read out with the current query:</p>
+$$\mathbf{S}_t = \gamma\,\mathbf{S}_{t-1} + \mathbf{k}_t\mathbf{v}_t^\top, \qquad \mathbf{o}_t = \mathbf{q}_t^\top \mathbf{S}_t.$$
+<p>This is exactly the linear-attention recurrence of subsection one with a decay $\gamma$ on the carried state and the feature map taken as the identity (no normalizer, since retention drops the denominator). The parallel form trains fast; the recurrent form generates in $O(d^2)$ time and memory per token, constant in context length. RetNet's distinctive third contribution is the <strong>chunkwise</strong> form, a hybrid that splits the sequence into chunks, runs the parallel form <em>within</em> each chunk, and the recurrent form <em>across</em> chunks by carrying the state $\mathbf{S}$ from one chunk to the next. This gives the best of both: parallel throughput inside a chunk and a fixed-size state between chunks, so a very long sequence is trained in $O(T)$ total work with bounded memory, neither the $O(T^2)$ of full parallel attention nor the strict sequential dependency of pure recurrence. The chunkwise form is the practical default for training RetNet on long contexts, and it is the same idea that the chunked scans of <a href="section-13.2.html">Section 13.2</a> use for SSMs.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: Three Forms, One Function, Pick Your Hardware Mood</div>
+<p>Retention is the rare mechanism that lets you choose your computational personality without changing the answer. Feeling parallel and flush with GPU memory? Run the matrix form and let the tensor cores roar. Deployed on a tiny edge chip with a forever-stream? Run the recurrent form and carry one little state. Somewhere in between, training on book-length contexts? Run chunkwise and have it both ways. It is the same function wearing three outfits, and the only thing you are really choosing is how you would like to spend your memory and your parallelism budget that afternoon.</p>
+</div>
+<figure class="diagram">
+<table>
+<thead><tr><th>Form</th><th>Computation</th><th>Time</th><th>Best for</th></tr></thead>
+<tbody>
+<tr><td>parallel</td><td>$(\mathbf{Q}\mathbf{K}^\top \odot \mathbf{D})\mathbf{V}$, decay mask $\mathbf{D}_{ti}=\gamma^{t-i}$</td><td>$O(T^2 d)$</td><td>training on short or moderate $T$</td></tr>
+<tr><td>recurrent</td><td>$\mathbf{S}_t = \gamma\mathbf{S}_{t-1} + \mathbf{k}_t\mathbf{v}_t^\top$, $\;\mathbf{o}_t = \mathbf{q}_t^\top\mathbf{S}_t$</td><td>$O(d^2)$ per token</td><td>autoregressive inference, $O(1)$ memory</td></tr>
+<tr><td>chunkwise</td><td>parallel within chunk, recurrent across chunks (carry $\mathbf{S}$)</td><td>$O(T d^2)$ total</td><td>training on long $T$ with bounded memory</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 13.3.2:</strong> RetNet's three equivalent forms of the retention mechanism. All three compute the same function; they trade parallelism against memory differently. The chunkwise form is the practical sweet spot for long-sequence training, mirroring the chunked associative scans used for the structured state-space models of <a href="section-13.2.html">Section 13.2</a>.</figcaption>
+</figure>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: The Linear-Recurrence Renaissance (2023 to 2026)</div>
+<p>Linear attention, RWKV, and RetNet opened a flood of softmax-free sequence models that the 2024 to 2026 literature has been refining and unifying at speed. RWKV itself advanced through RWKV-5 and RWKV-6 ("Eagle" and "Finch", Peng and colleagues, 2024), which replace the scalar per-channel decay with a matrix-valued, data-dependent decay, narrowing the remaining quality gap to Transformers. Gated Linear Attention (GLA, Yang and colleagues, 2024) and the hardware-efficient "chunk-parallel" training kernels in the <code>flash-linear-attention</code> library made data-dependent gating trainable at scale, and Mamba-2 (Dao and Gu, 2024) proved a formal "state-space duality" showing selective SSMs and a class of masked linear attention are the <em>same</em> computation, which is exactly the bridge <a href="section-13.6.html">Section 13.6</a> builds. DeltaNet and its parallelized 2024 to 2025 variants add a delta-rule (fast-weight) update that lets the state <em>overwrite</em> as well as accumulate, improving associative recall. The throughline for 2026: a single linear-recurrence template, differentiated by its decay and its gating, now spans architectures that were proposed independently, and hybrid stacks that interleave a few full-attention layers with many linear-recurrence layers are the emerging recipe for long-context models.</p>
+</div>
+
+<h2>4. The Unifying Picture: One Recurrence, Four Parameterizations <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Stand back from the three mechanisms and a single shape is visible through all of them, the shape that also describes the structured state-space models of <a href="section-13.1.html">Sections 13.1</a> and <a href="section-13.2.html">13.2</a>. Every one of these models carries a state forward through a linear recurrence of the form "decay the old state, add a contribution from the new input, read out by a projection". Written generically:</p>
+$$\mathbf{S}_t = \mathbf{G}_t \odot \mathbf{S}_{t-1} + \mathbf{k}_t\mathbf{v}_t^\top, \qquad \mathbf{o}_t = \mathbf{q}_t^\top\mathbf{S}_t,$$
+<p>and the four architectures are four choices of the decay $\mathbf{G}_t$ and of how $\mathbf{q}_t, \mathbf{k}_t, \mathbf{v}_t$ are produced. Plain <strong>linear attention</strong> sets the decay to one (no forgetting) and applies a feature map $\phi$ to queries and keys. <strong>RWKV</strong> sets the decay to a learned per-channel constant $e^{-w}$ and adds a receptance gate. <strong>RetNet</strong> sets the decay to a per-head scalar $\gamma$ and uses the identity feature map. A diagonal <strong>structured SSM</strong> (S4, S5, Mamba) sets the decay to its discretized state matrix $\bar{\mathbf{A}}$, which in the selective case is itself input-dependent, exactly the gated decay $\mathbf{G}_t$. The differences that look so large at the architecture level, attention versus state space versus RNN, are differences in three slots of one template.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: SSMs, Linear Attention, RWKV, and RetNet Are One Family</div>
+<p>The four models are not four ideas; they are four fillings of one recurrence, $\mathbf{S}_t = \mathbf{G}_t \odot \mathbf{S}_{t-1} + \mathbf{k}_t\mathbf{v}_t^\top$, $\mathbf{o}_t = \mathbf{q}_t^\top\mathbf{S}_t$. Linear attention: $\mathbf{G}_t = 1$, kernel features. RetNet: $\mathbf{G}_t = \gamma$, identity features. RWKV: $\mathbf{G}_t = e^{-w}$, plus a gate. Diagonal SSM: $\mathbf{G}_t = \bar{\mathbf{A}}$, possibly input-dependent. Every member inherits the duality: a parallel form for training (cumulative sum or associative scan) and a recurrent form for $O(1)$-per-token inference. Once you see the template, a new architecture is just a new choice of decay and gating, and the apparent zoo of softmax-free sequence models collapses to a one-line design space. <a href="section-13.6.html">Section 13.6</a> makes this duality formal.</p>
+</div>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: ARIMA Returns as Linear Attention</div>
+<p>The book's temporal thread promised that each classical idea would return in learned form, and here is one of the cleanest instances. The autoregressive recurrence at the heart of ARIMA in <a href="../../part-2-classical-forecasting/module-05-univariate-forecasting/index.html">Chapter 5</a>, a forecast formed as a fixed linear combination of a running summary of the past, is structurally the same object as the linear-attention update $\mathbf{S}_t = \mathbf{G}_t\odot\mathbf{S}_{t-1} + \mathbf{k}_t\mathbf{v}_t^\top$. ARIMA hand-fixes the coefficients from a fitted model; linear attention learns them, makes the contribution $\mathbf{k}_t\mathbf{v}_t^\top$ data-dependent, and stacks many such recurrences with nonlinear mixing between them. The decay $\mathbf{G}_t$ plays the role of ARIMA's autoregressive memory, the exponential discounting of older terms. Seen this way, RWKV and RetNet are deep, learned, gated descendants of the oldest forecasting recurrence in the book, and the Kalman filter of <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/index.html">Chapter 7</a> is the same loop with an explicit observation model. The thread runs unbroken from a 1970s time-series recurrence to a 2023 language model.</p>
+</div>
+<p>This unification is not just tidy bookkeeping; it is the conceptual backbone of the rest of the chapter and a recurring beat of the whole book's temporal thread. Part II's Kalman filter and the RNN of <a href="../module-10-recurrent-neural-networks/index.html">Chapter 10</a> were already this same loop with a hand-set versus learned transition; here the loop returns once more, now with the transition designed so the recurrence is <em>linear</em> and therefore parallelizable. That linearity is the whole trick: a nonlinear recurrence like the RNN's $\tanh$ cell cannot be unrolled into a parallel scan, because the nonlinearity blocks the associativity that a parallel prefix-sum needs, which is exactly why <a href="../module-10-recurrent-neural-networks/index.html">Chapter 10</a>'s RNNs were stuck with sequential training. Linear attention, RWKV, RetNet, and the SSMs buy back parallel training precisely by keeping the cross-time recurrence linear and pushing all nonlinearity into the per-position feature maps and gates, where it does not obstruct the scan. The bridge of <a href="section-13.6.html">Section 13.6</a> will turn this informal "they are all linear recurrences" into the precise state-space-duality statement that Mamba-2 proved, and <a href="section-13.4.html">Section 13.4</a> will then leave the discrete linear recurrence behind for the continuous-time models, Neural ODEs and their relatives, that handle irregular sampling.</p>
+
+<h2>5. Worked Example: Parallel Equals Recurrent <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make the central claim executable: linear attention computed in its parallel form and in its recurrent form produce the identical output sequence. The plan is the cleanest possible proof of correctness. Implement the parallel form, which materializes the position-by-position cumulative state exactly as a training kernel would; implement the recurrent form, which carries the running state one step at a time exactly as inference would; run both on the same random queries, keys, and values; then assert with <code>np.allclose</code> that every output matches to floating-point precision. If they agree, the duality of subsection one is verified by independent computation. Code 13.3.1 is the parallel form.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(0)
+T, d, m = 6, 4, 5                       # sequence length, value dim, feature-map dim
+
+# Random per-position queries, keys, values for one attention head.
+Q = rng.normal(0, 1.0, size=(T, d))     # queries q_t
+K = rng.normal(0, 1.0, size=(T, d))     # keys    k_t
+V = rng.normal(0, 1.0, size=(T, d))     # values  v_t
+
+def phi(u):
+    """Feature map: elu(u) + 1, kept positive so the normalizer is well behaved."""
+    return np.where(u > 0, u + 1.0, np.exp(u))   # elu(u)+1, here mapped d -> d (m == d path)
+
+def linear_attention_parallel(Q, K, V):
+    """Parallel form: cumulative sum of phi(k) v^T over positions, contracted by phi(q)."""
+    PhiQ, PhiK = phi(Q), phi(K)                  # feature-mapped queries and keys, (T, d)
+    O = np.zeros((T, d))
+    for t in range(T):                           # one cumulative sum per query position
+        S = np.zeros((d, d)); z = np.zeros(d)    # state and normalizer up to t, rebuilt
+        for i in range(t + 1):                   # sum over all i <= t (the causal prefix)
+            S += np.outer(PhiK[i], V[i])         # accumulate phi(k_i) v_i^T
+            z += PhiK[i]                          # accumulate phi(k_i)
+        num = PhiQ[t] @ S                         # phi(q_t)^T S_t
+        den = PhiQ[t] @ z + 1e-6                  # phi(q_t)^T z_t (epsilon for stability)
+        O[t] = num / den
+    return O
+
+O_par = linear_attention_parallel(Q, K, V)
+print("parallel  O[5] =", np.round(O_par[5], 6))
+</code></pre>
+<div class="code-caption"><strong>Code 13.3.1:</strong> Linear attention, parallel form. For each query position $t$ it forms the prefix state $\mathbf{S}_t = \sum_{i \le t}\phi(\mathbf{k}_i)\mathbf{v}_i^\top$ and normalizer $\mathbf{z}_t$ from scratch, then contracts with $\phi(\mathbf{q}_t)$. This mirrors the cumulative-sum training kernel, written explicitly so the recurrent form below can be checked against it.</div>
+<pre><code class="language-text">parallel  O[5] = [ 0.273944 -0.105421  0.486318 -0.041907]
+</code></pre>
+<div class="code-caption"><strong>Output 13.3.1:</strong> The parallel-form output at the final position. This exact vector must be reproduced, independently, by the recurrent form in Code 13.3.2 for the parallel-equals-recurrent duality to be verified.</div>
+<p>Now the recurrent form. Code 13.3.2 carries the running state $\mathbf{S}_t$ and normalizer $\mathbf{z}_t$ forward one step at a time, updating each by a single rank-one addition, exactly the inference recurrence boxed in subsection one. It never rebuilds the prefix sum; it accumulates it. We then compare the two outputs with <code>np.allclose</code>.</p>
+<pre><code class="language-python">def linear_attention_recurrent(Q, K, V):
+    """Recurrent form: carry running state S_t and normalizer z_t, one outer product per step."""
+    PhiQ, PhiK = phi(Q), phi(K)
+    S = np.zeros((d, d)); z = np.zeros(d)        # S_0 = 0, z_0 = 0 (empty history)
+    O = np.zeros((T, d))
+    for t in range(T):                           # single forward pass, no inner loop
+        S = S + np.outer(PhiK[t], V[t])          # S_t = S_{t-1} + phi(k_t) v_t^T
+        z = z + PhiK[t]                           # z_t = z_{t-1} + phi(k_t)
+        O[t] = (PhiQ[t] @ S) / (PhiQ[t] @ z + 1e-6)
+    return O
+
+O_rec = linear_attention_recurrent(Q, K, V)
+print("recurrent O[5] =", np.round(O_rec[5], 6))
+print("parallel == recurrent :", np.allclose(O_par, O_rec))   # the duality, certified
+</code></pre>
+<div class="code-caption"><strong>Code 13.3.2:</strong> Linear attention, recurrent form. The doubly-nested prefix sum of Code 13.3.1 collapses to a single pass with one rank-one update <code>S = S + np.outer(...)</code> per step, the constant-memory inference recurrence. The <code>np.allclose</code> check certifies that the parallel training kernel and the recurrent inference path compute the identical function.</div>
+<pre><code class="language-text">recurrent O[5] = [ 0.273944 -0.105421  0.486318 -0.041907]
+parallel == recurrent : True
+</code></pre>
+<div class="code-caption"><strong>Output 13.3.2:</strong> The recurrent form reproduces the parallel output to floating-point precision, and <code>np.allclose</code> returns True for the whole sequence. The two faces of the linear recurrence are the same function: train in parallel, infer recurrently, with no change in the computed result.</div>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: One Running-State Update by Hand</div>
+<p>Take a tiny head with value dimension $d = 2$ and feature dimension $m = 2$, identity feature map for clarity. Suppose after two tokens the state is $\mathbf{S}_2 = \begin{bmatrix} 1.0 & 0.0 \\ 0.5 & 2.0 \end{bmatrix}$ and normalizer $\mathbf{z}_2 = (1.5,\, 2.0)$. A third token arrives with $\phi(\mathbf{k}_3) = (1.0,\, 0.0)$ and $\mathbf{v}_3 = (4.0,\, 1.0)$. The rank-one update adds the outer product $\phi(\mathbf{k}_3)\mathbf{v}_3^\top = \begin{bmatrix} 4.0 & 1.0 \\ 0.0 & 0.0 \end{bmatrix}$, so $\mathbf{S}_3 = \begin{bmatrix} 5.0 & 1.0 \\ 0.5 & 2.0 \end{bmatrix}$ and $\mathbf{z}_3 = (2.5,\, 2.0)$. Reading out with a query feature $\phi(\mathbf{q}_3) = (2.0,\, 1.0)$: the numerator is $\phi(\mathbf{q}_3)^\top\mathbf{S}_3 = (2{\cdot}5 + 1{\cdot}0.5,\; 2{\cdot}1 + 1{\cdot}2) = (10.5,\, 4.0)$, the denominator is $\phi(\mathbf{q}_3)^\top\mathbf{z}_3 = 2{\cdot}2.5 + 1{\cdot}2.0 = 7.0$, and the output is $(10.5,\, 4.0)/7.0 = (1.5,\, 0.571)$. The whole step is one outer product, one vector add, and one matrix-vector read: constant work, no dependence on how many tokens preceded it. That constancy is the entire inference-time advantage over softmax attention's growing cache.</p>
+</div>
+<p>Read what the pair establishes. Code 13.3.1 computed linear attention the way a training kernel does, as a cumulative sum over positions. Code 13.3.2 computed it the way an inference loop does, as a one-step-at-a-time recurrence with a fixed-size state. They returned the same numbers. That is the parallel-equals-recurrent duality of subsection one, not asserted but demonstrated, and it is the same duality that makes RWKV and RetNet trainable in parallel yet generative in constant memory. From-scratch the two paths took about thirty lines between them; the library shortcut below collapses both to a single call.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Constant-Memory Forecaster for a Streaming Sensor Tape</div>
+<p><strong>Who:</strong> A condition-monitoring team at a wind-turbine operator running an autoregressive model that ingests a never-ending stream of high-frequency vibration and temperature telemetry, the sensor-IoT series threaded through <a href="../../toc.html">Chapter 34</a>, and must emit a forecast every few milliseconds on an edge device.</p>
+<p><strong>Situation:</strong> A Transformer forecaster trained well offline but, deployed, its key-value cache grew linearly with the length of the live stream, so memory climbed without bound and latency drifted upward over a multi-day run until the edge box ran out of RAM.</p>
+<p><strong>Problem:</strong> They needed a model that trains with Transformer-like throughput on their large offline corpus yet runs in strictly constant memory and constant per-step latency once deployed on the stream, indefinitely.</p>
+<p><strong>Dilemma:</strong> Keep the Transformer and periodically truncate the context (cheap, but it forgets slow-developing fault signatures that span hours), or move to a plain RNN (constant memory, but slow to train and weaker on long offline sequences), or adopt a linear-recurrence architecture that promises both.</p>
+<p><strong>Decision:</strong> They switched to a RetNet-style retention backbone, training with the chunkwise form of subsection three on the offline corpus for parallel throughput, and deploying the recurrent form of subsection one on the live tape so each new reading updates a fixed-size state $\mathbf{S}_t$ by one rank-one outer product.</p>
+<p><strong>How:</strong> Training used the chunked parallel kernel; the deployed loop was exactly Code 13.3.2's recurrence, carrying $\mathbf{S}_t$ across the stream with a per-head decay $\gamma$ tuned so the effective memory horizon covered the multi-hour fault signatures.</p>
+<p><strong>Result:</strong> Inference memory and latency became flat lines, independent of how long the stream had run, and the decay-based memory still captured the slow signatures the truncated Transformer had dropped, because $\gamma$ was set from the dependency length rather than from a hard context cutoff.</p>
+<p><strong>Lesson:</strong> When a model must both train on long offline data and run forever on a live stream, a linear recurrence buys both at once: train through the parallel face, deploy through the recurrent face, and set the decay from the longest dependency you must remember, not from a memory budget.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Both Forms in a Single Call</div>
+<p>The two from-scratch paths of Code 13.3.1 and 13.3.2 ran about thirty lines of explicit prefix-sum and recurrence bookkeeping between them. The <code>fla</code> (<code>flash-linear-attention</code>) library implements the chunk-parallel kernel for training and the fused recurrent kernel for inference, both fused on the GPU, behind a single layer: the cumulative-sum state, the decay, the normalizer, and the parallel-versus-recurrent dispatch are all internal. The thirty lines become roughly three.</p>
+<pre><code class="language-python">import torch
+from fla.layers import GatedLinearAttention   # pip install flash-linear-attention
+
+gla = GatedLinearAttention(hidden_size=512, num_heads=8)  # data-dependent decay built in
+x = torch.randn(2, 1024, 512)                              # (batch, length, features)
+y, _ = gla(x)            # parallel chunked kernel for training; pass a state cache for O(1) inference
+print(y.shape)           # torch.Size([2, 1024, 512])
+</code></pre>
+<div class="code-caption"><strong>Code 13.3.3:</strong> The library equivalent. A single <code>GatedLinearAttention</code> layer replaces both hand-written forms of Codes 13.3.1 and 13.3.2 (about thirty lines down to roughly three), with the chunk-parallel training kernel, the recurrent inference kernel, the learned decay, and the normalizer all handled internally by the fused <code>fla</code> kernels.</div>
+<p>The arc of this section is now complete. Subsection one dropped the softmax and found a linear recurrence with two faces; subsections two and three showed RWKV and RetNet stamping a decay onto that recurrence to build competitive language models that train in parallel and infer in constant memory; subsection four collapsed all four models, plus the SSMs of <a href="section-13.2.html">Section 13.2</a>, into one parameterized recurrence; and this worked example proved the parallel-equals-recurrent duality by direct computation. The bridge that <a href="section-13.6.html">Section 13.6</a> will build, the formal state-space duality, is now fully motivated. Before that, <a href="section-13.4.html">Section 13.4</a> turns from discrete linear recurrences to continuous-time dynamics with Neural ODEs.</p>
+
+<h2>Exercises</h2>
+<div class="callout exercise">
+<div class="callout-title">Exercise 13.3.1 (Conceptual): Why the Softmax Forbids Factoring</div>
+<p>Explain in your own words why $\exp(\mathbf{q}^\top\mathbf{k})$ cannot be written as $f(\mathbf{q})^\top g(\mathbf{k})$ for any finite-dimensional $f, g$, whereas a polynomial kernel such as $(\mathbf{q}^\top\mathbf{k})^2$ can. Then state precisely which step of the subsection-one derivation, the pulling of $\phi(\mathbf{q}_t)$ outside the sum over $i$, fails for softmax attention, and connect this to why softmax attention is $O(T^2)$ while linear attention is $O(T)$.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 13.3.2 (Implementation): Add a Decay and Recover RetNet</div>
+<p>Starting from the recurrent linear attention of Code 13.3.2, modify the state update to $\mathbf{S}_t = \gamma\,\mathbf{S}_{t-1} + \phi(\mathbf{k}_t)\mathbf{v}_t^\top$ for a scalar $\gamma \in (0,1)$, and drop the normalizer to match RetNet's retention. Then implement the matching parallel form using the decay mask $\mathbf{D}_{ti} = \gamma^{t-i}$ from subsection three, and verify with <code>np.allclose</code> that the decayed parallel and decayed recurrent forms still agree. Report how the output at the last position changes as $\gamma$ moves from $0.99$ (long memory) to $0.5$ (short memory).</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 13.3.3 (Open-ended): Designing the Decay Slot</div>
+<p>Subsection four expressed linear attention, RWKV, RetNet, and diagonal SSMs as one recurrence $\mathbf{S}_t = \mathbf{G}_t \odot \mathbf{S}_{t-1} + \mathbf{k}_t\mathbf{v}_t^\top$ differing only in the decay $\mathbf{G}_t$. Propose a decay design not covered by the four (for example, an input-dependent gate $\mathbf{G}_t = \sigma(\mathbf{W}_g\mathbf{x}_t)$ as in gated linear attention, or a decay that depends on the time gap between irregularly-sampled observations). Argue what property your choice buys, whether it preserves the parallel-form trainability, and which temporal task from the three running datasets of <a href="../../index.html">this book</a> it would most help. Connect your answer to the continuous-time view that <a href="section-13.4.html">Section 13.4</a> introduces.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-13.2.html">&#8592; 13.2 Structured State-Space Models</a>
+<a class="up" href="index.html">Chapter 13 Contents</a>
+<a class="next" href="section-13.4.html">13.4 Neural ODEs, Latent ODEs, and ODE-RNNs &#8594;</a>
+</nav>
+</main>
+<footer class="book-footer">
+<p class="edition-line">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&copy; 2026 Alexander Apartsin &middot; <a href="../../toc.html">Contents</a></p>
+<p class="last-updated"><script>document.write("Last updated " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

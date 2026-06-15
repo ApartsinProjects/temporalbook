@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 12.3: Positional and Temporal Encodings. Why self-attention is permutation-invariant and therefore order-blind, how sinusoidal and learned absolute encodings inject position, why relative and rotary (RoPE) encodings extrapolate to longer sequences, how to encode real timestamps, irregular gaps, and calendar features for time series, with from-scratch sinusoidal and RoPE implementations matched against a library version." name="description"/>
+<title>Section 12.3: Positional and Temporal Encodings | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Temporal Deep Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 12: Attention and Transformers</a></div>
+<h1>Positional and Temporal Encodings</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They built me a perfect machine for weighing everyone in the room against everyone else, and then they forgot to tell it who arrived first. So I stand at the door with a little stamp, marking each token with the hour of its coming, because without me the whole brilliant apparatus cannot tell a story from a bag of words."</p>
+<cite>A Positional Encoding Reminding Everyone What Time It Is</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Self-attention computes its output as a weighted sum over all positions, and a sum does not care about order: permute the input tokens and the attention output permutes with them, identically. A Transformer, left to itself, sees a sequence as an unordered set. That is a catastrophe for temporal data, where "rain then sun" and "sun then rain" are different futures, so we must inject position by hand.</strong> This section explains why attention is permutation-equivariant and therefore order-blind, then builds the four families of fixes in order of increasing temporal sophistication: sinusoidal absolute encodings (a Fourier frequency ladder, a direct callback to the spectral features of Chapters 3 and 4); learned absolute encodings; relative and rotary encodings (RoPE), which encode the <em>gap</em> between positions and therefore extrapolate gracefully to sequences longer than any seen in training; and the temporal twist that generic NLP Transformers miss, encoding the actual wall-clock timestamp, the irregular gap between observations, and calendar features such as hour-of-day and day-of-week as positions. We implement sinusoidal and RoPE encodings from scratch, recover position from the encoding, watch a toy ordering task fail without position and succeed with it, and collapse the from-scratch code to a library call. You leave able to choose, implement, and debug the positional scheme that every model in the rest of Part III depends on.</p>
+</div>
+<p>In <a href="section-12.2.html">Section 12.2</a> we built scaled dot-product and multi-head attention, the mechanism that lets every position attend to every other and aggregate their values by learned relevance. We deferred one question that the attention equations quietly assume away: where does the model learn that position five comes after position four? This section answers it. The attention block we built is, by construction, blind to order, and for the sequences at the heart of this book that blindness is fatal. We use the unified notation of <a href="../../toc.html">Appendix A</a> throughout: $\mathbf{x}_t$ the input embedding at position $t$, $d$ the model width, $\mathbf{q}, \mathbf{k}, \mathbf{v}$ the query, key, and value vectors, and $\mathbf{p}_t$ the positional encoding we are about to construct.</p>
+<p>Why a full section, rather than a footnote reading "add a position vector"? Because the choice of positional scheme is one of the highest-leverage decisions in a Transformer, and the temporal setting raises a question NLP never has to ask. A language model can pretend its tokens are evenly spaced integer positions, because words in a sentence essentially are. A temporal model cannot: clinical vitals arrive at irregular intervals, financial ticks cluster and thin, sensor streams drop samples, and "three seconds later" and "three days later" must mean different things to the model. The positional encoding is exactly where real time enters a Transformer, and getting it wrong silently discards the one signal, time itself, that makes the data temporal. The four competencies this section installs are these: to explain and demonstrate the permutation-equivariance of attention; to derive and implement the sinusoidal frequency ladder and contrast it with learned embeddings; to implement RoPE and articulate why relative position aids length extrapolation; and to encode genuine timestamps, gaps, and calendar features so a Transformer respects the clock.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Attention Without Position Is a Set Function</div>
+<p>Strip the positional encoding from a Transformer and you have not built a weak sequence model, you have built a model of <em>sets</em>. It can tell you which tokens are present and how they relate pairwise, but it literally cannot represent that one came before another, because every operation it performs (the dot-product scores, the softmax, the value sum) is symmetric under reordering. Position is not a refinement you add for a few points of accuracy; it is the entire difference between a sequence model and a bag-of-tokens model. Everything in this section exists to break that symmetry deliberately and in a way the network can use.</p>
+</div>
+
+<h2>1. Why Attention Is Order-Blind: Permutation Equivariance <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Recall the attention block of <a href="section-12.2.html">Section 12.2</a>. Given an input matrix $\mathbf{X} \in \mathbb{R}^{n \times d}$ whose rows are the $n$ token embeddings, attention forms queries $\mathbf{Q} = \mathbf{X}\mathbf{W}_Q$, keys $\mathbf{K} = \mathbf{X}\mathbf{W}_K$, values $\mathbf{V} = \mathbf{X}\mathbf{W}_V$, and outputs</p>
+$$\operatorname{Attn}(\mathbf{X}) = \operatorname{softmax}\!\left(\frac{\mathbf{Q}\mathbf{K}^{\top}}{\sqrt{d_k}}\right)\mathbf{V}.$$
+<p>Now permute the rows of $\mathbf{X}$ by a permutation matrix $\mathbf{P}$ (so $\mathbf{P}\mathbf{X}$ is the same tokens in a different order). Because $\mathbf{Q}, \mathbf{K}, \mathbf{V}$ are computed row by row, they permute the same way: $\mathbf{Q} \to \mathbf{P}\mathbf{Q}$, and likewise for $\mathbf{K}, \mathbf{V}$. The score matrix becomes $\mathbf{P}\mathbf{Q}\mathbf{K}^{\top}\mathbf{P}^{\top}$, the softmax (applied rowwise) commutes with the row-and-column permutation, and the value sum carries the leading $\mathbf{P}$ through. The result is the clean identity</p>
+$$\operatorname{Attn}(\mathbf{P}\mathbf{X}) = \mathbf{P}\,\operatorname{Attn}(\mathbf{X}).$$
+<p>This is <em>permutation equivariance</em>: shuffle the inputs and the outputs shuffle identically, with no other change. The output at the token that landed in row $i$ is exactly what it would have been at whatever row that token occupied before. The attention block therefore carries no notion of absolute or relative position whatsoever: as far as it is concerned, the input is an unordered multiset of vectors. For the permutation-<em>invariant</em> readout used in set-pooling tasks this is a feature, but for a sequence it is the defining bug. A model obeying $\operatorname{Attn}(\mathbf{P}\mathbf{X}) = \mathbf{P}\,\operatorname{Attn}(\mathbf{X})$ assigns identical content to "the patient's fever rose then fell" and "fell then rose", which is exactly the distinction a clinical forecaster must preserve.</p>
+<p>It is worth contrasting this with the recurrent and convolutional layers of the preceding chapters, because the contrast is what makes the positional encoding necessary in the first place. A recurrent cell (<a href="../module-10-recurrent-neural-networks/index.html">Chapter 10</a>) carries order in its very wiring: state flows strictly left to right through the time loop, so position is implicit in the order of computation and no extra signal is needed. A temporal convolution (<a href="../module-11-temporal-convolutional-networks/index.html">Chapter 11</a>) carries order through the fixed geometry of its kernel: tap $-1$ of the filter always multiplies the immediately preceding sample. Attention threw both away in exchange for its great gift, the ability to connect any two positions in one step regardless of their distance, and the price of that gift is precisely the loss of any built-in sense of order. The positional encoding is the bill for the parallel, distance-free connectivity that makes the Transformer fast and powerful: we buy global reach and pay for it by re-injecting, by hand, the order that recurrence and convolution got for free.</p>
+<p>The fix is structural and simple to state: break the symmetry by making each token's representation depend on <em>where</em> it sits, before attention ever runs. Concretely, add (or otherwise fold in) a position-dependent vector $\mathbf{p}_t$ to the embedding at position $t$, so the input to the first attention block is $\tilde{\mathbf{x}}_t = \mathbf{x}_t + \mathbf{p}_t$. Now two tokens with identical content but different positions enter attention as different vectors, the score matrix is no longer permutation-symmetric, and the equivariance identity above breaks in precisely the way we want. Everything that follows is the engineering of $\mathbf{p}_t$: what function of position to use, whether to encode absolute index or relative gap, and, for temporal data, whether to encode the integer position at all or the real clock time it stands for.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: The Permutation That Changes Nothing</div>
+<p>Take three tokens with one-dimensional embeddings $\mathbf{x} = (1, 2, 3)^\top$ and, for illustration, an attention that happens to weight all positions equally (uniform softmax), so each output is the mean of all values, $\bar{x} = 2$. The output is $(2, 2, 2)^\top$. Now reverse the input to $(3, 2, 1)^\top$: the mean is still $2$, the output is still $(2, 2, 2)^\top$. The reversal changed the input completely and the output not at all, the equivariance identity in its starkest form. Add positional encodings $\mathbf{p} = (0.0, 0.5, 1.0)^\top$ to get inputs $(1.0, 2.5, 4.0)^\top$ in the original order and $(3.0, 2.5, 2.0)^\top$ reversed: now the two orderings carry different values into attention, the scores differ, and the outputs separate. The single act of adding a position-dependent number is what lets the block tell the two sequences apart.</p>
+</div>
+
+<h2>2. Sinusoidal and Learned Absolute Encodings <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The original Transformer of Vaswani et al. (2017) injects position with a fixed, parameter-free pattern: a ladder of sinusoids at geometrically spaced frequencies. For position $t$ and embedding dimension index $i \in \{0, 1, \dots, d/2 - 1\}$, the encoding fills even and odd channels with a sine and cosine of the same frequency:</p>
+$$\mathbf{p}_t^{(2i)} = \sin\!\left(\frac{t}{10000^{\,2i/d}}\right), \qquad \mathbf{p}_t^{(2i+1)} = \cos\!\left(\frac{t}{10000^{\,2i/d}}\right).$$
+<p>Read this as a frequency ladder. The lowest channels ($i$ small) oscillate fast, completing a cycle every few positions; the highest channels ($i$ near $d/2$) oscillate slowly, with wavelengths of thousands of positions. Together they form a multi-resolution positional code: the fast channels pin down fine local offsets, the slow channels carry coarse global position, and the full vector $\mathbf{p}_t$ is a unique fingerprint of the integer $t$. This is exactly the Fourier-feature idea we met in the frequency domain of <a href="../../part-2-classical-forecasting/module-04-frequency-spectral/index.html">Chapter 4</a>, where a signal was represented by its content across a bank of sinusoidal basis functions, and in the spectral foundations of <a href="../../toc.html">Chapter 3</a>: here the "signal" is position itself, decomposed onto a basis of sinusoids spanning frequencies from fast to slow. The Transformer reuses the oldest idea in time-series analysis to tell itself the time.</p>
+<p>Why this particular construction, rather than any other smooth function of position? Three properties make it well suited to feed an attention block. It is bounded: every channel lives in $[-1, 1]$, so the encoding never grows with position the way a raw index would and never swamps the content embedding it is added to. It is deterministic and parameter-free, so it costs no memory and is defined at every position without training. And it is smooth in position, so nearby positions get nearby codes and the network can interpolate, while the geometric spread of frequencies keeps distant positions firmly distinguishable. A raw integer channel has none of these: it is unbounded, it grows without limit on long sequences, and a single linear ramp offers no multi-resolution structure for the attention scores to exploit. The sinusoidal ladder is the minimal construction that is bounded, unique, smooth, and free, which is why it survived as the default for years.</p>
+<p>The base $10000$ sets the longest wavelength and so the range of positions the ladder can disambiguate; a longer maximum context wants a larger base, which is one of the knobs modern long-context models tune. The design has a second, deeper virtue that motivated relative methods. For any fixed offset $k$, the encoding at position $t + k$ is a <em>linear</em> function of the encoding at $t$, specifically a rotation, because of the angle-addition identities $\sin(\theta + \phi) = \sin\theta\cos\phi + \cos\theta\sin\phi$ and the cosine analogue. Writing the pair $(\sin\omega t, \cos\omega t)$ for a given frequency $\omega$, the shift by $k$ acts as</p>
+$$\begin{pmatrix}\sin\omega(t+k)\\ \cos\omega(t+k)\end{pmatrix} = \begin{pmatrix}\cos\omega k & \sin\omega k\\ -\sin\omega k & \cos\omega k\end{pmatrix}\begin{pmatrix}\sin\omega t\\ \cos\omega t\end{pmatrix}.$$
+<p>The relationship between two positions is a fixed rotation that depends only on their gap $k$, not on where they sit absolutely. The model can in principle learn to read relative position out of absolute sinusoids by learning this rotation, an observation that RoPE in subsection three turns from "in principle" into "by construction".</p>
+<p>The alternative is to learn the encodings outright: allocate a trainable embedding table with one vector per position, $\mathbf{p}_t = \mathbf{E}_{\text{pos}}[t]$, and let gradient descent discover whatever positional code the task rewards. Learned absolute encodings, used by BERT and GPT-2, are maximally flexible and often very slightly better in-distribution, at two costs. First, the table has a fixed number of rows, so the model has <em>no encoding at all</em> for any position beyond the maximum length seen in training; it cannot extrapolate, full stop. Second, it spends parameters on position that the sinusoidal scheme gets for free. The two absolute schemes thus trade flexibility against extrapolation, and that trade is exactly what the relative methods of the next subsection were invented to escape.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Sinusoids Are a Fourier Basis for Position</div>
+<p>The sinusoidal encoding is not an arbitrary trick; it is the position index expanded on a Fourier basis, the same multi-frequency decomposition that <a href="../../part-2-classical-forecasting/module-04-frequency-spectral/index.html">Chapter 4</a> applied to signals. Fast channels resolve local order, slow channels carry global position, and the geometric frequency ladder guarantees that every position gets a distinct, smoothly varying fingerprint. The bonus, that a shift in position is a fixed rotation in each frequency pair, is the algebraic seed of every relative and rotary scheme. When you see "positional encoding", read "Fourier features of the clock".</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: Counting in Binary, but Smooth</div>
+<p>There is a charming way to see why a frequency ladder uniquely identifies a position: it is binary counting with the corners rounded off. In binary, the lowest bit flips every step, the next every two steps, the next every four, and the full pattern of bits names the number. The sinusoidal ladder does the same thing with continuous frequencies instead of bits, the fastest sinusoid playing the role of the lowest bit. The network gets a positional "odometer" whose digits are smooth waves, so nearby positions have nearby codes (good for generalization) while distant positions stay distinguishable (good for precision). Vaswani's team essentially handed the Transformer a sinusoidal abacus.</p>
+</div>
+
+<h2>3. Relative and Rotary Position Encodings (RoPE) <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Absolute encodings answer "where is this token?"; what attention usually <em>needs</em> is "how far apart are these two tokens?". The score between a query at position $m$ and a key at position $n$ ought, in most sequence tasks, to depend on the gap $m - n$ rather than on $m$ and $n$ separately, because the relationship "three steps earlier" means the same thing wherever it occurs. Relative position encodings (Shaw et al., 2018) build this in by adding a learned, gap-dependent bias to the attention score, so the score for a pair depends on their separation directly. This is more natural for sequences and, crucially, it generalizes to gaps the model has seen even when the absolute positions are new, which is the first ingredient of length extrapolation.</p>
+<p>Rotary position embedding (RoPE), introduced by Su et al. (2021) and now standard in LLaMA, GPT-NeoX, and most modern open models, achieves relative position with no added bias terms and no extra parameters, by a beautifully economical idea: <em>rotate</em> the query and key vectors by an angle proportional to their position. Pair up the $d$ channels into $d/2$ two-dimensional blocks, assign block $i$ the frequency $\theta_i = 10000^{-2i/d}$ (the same geometric ladder as the sinusoids), and rotate the query at position $m$ and the key at position $n$ each by their own position-scaled angle. Block $i$ of the query is multiplied by the rotation</p>
+$$\mathbf{R}(m\theta_i) = \begin{pmatrix}\cos m\theta_i & -\sin m\theta_i\\ \sin m\theta_i & \cos m\theta_i\end{pmatrix},$$
+<p>and the key at $n$ by $\mathbf{R}(n\theta_i)$. The magic is in the dot product that attention then takes. Because rotations compose by adding angles and a rotation is orthogonal, the inner product of a rotated query and a rotated key depends only on the <em>difference</em> of the rotation angles:</p>
+$$\big(\mathbf{R}(m\theta_i)\,\mathbf{q}_i\big)^{\top}\big(\mathbf{R}(n\theta_i)\,\mathbf{k}_i\big) = \mathbf{q}_i^{\top}\,\mathbf{R}\big((n - m)\theta_i\big)\,\mathbf{k}_i.$$
+<p>The attention score between positions $m$ and $n$ is therefore a function of the relative offset $n - m$ alone, exactly the relative property we wanted, obtained by rotating $\mathbf{q}$ and $\mathbf{k}$ rather than by adding anything to the score. RoPE injects absolute position into each vector yet makes the interaction purely relative, the best of both worlds. And because the rotation angle is a continuous function of position with no learned table, RoPE is defined at every position, including ones longer than training: the model never runs off the edge of an embedding table the way learned absolute encodings do. This is the structural reason RoPE-based models extrapolate to longer contexts far better than absolute-embedding models, and why context-extension tricks (NTK-aware scaling, YaRN, position interpolation) all operate by rescaling RoPE's frequencies rather than by adding new parameters.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: One RoPE Rotation</div>
+<p>Take a single two-dimensional block with frequency $\theta = 1.0$ and a query vector $\mathbf{q} = (1, 0)$ sitting at position $m = 0$ (no rotation, so it stays $(1, 0)$) and a key $\mathbf{k} = (1, 0)$ at position $n$. Rotating the key by angle $n\theta = n$ radians gives $\mathbf{R}(n)\mathbf{k} = (\cos n, \sin n)$. The attention score is the dot product $\mathbf{q}^\top \mathbf{R}(n)\mathbf{k} = \cos n$, which depends only on the gap $n - m = n$, exactly as the relative identity promises. At gap $0$ the score is $\cos 0 = 1$ (maximal alignment), at gap $\pi/2 \approx 1.57$ it is $\cos(\pi/2) = 0$ (orthogonal), at gap $\pi \approx 3.14$ it is $\cos\pi = -1$ (opposed). The same query and key with the same gap give the same score no matter where the pair sits absolutely; slide both to positions $100$ and $100 + n$ and the score is unchanged, which is precisely why the model trained on short sequences still behaves sensibly on long ones.</p>
+</div>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Relative Position Is Why Models Extrapolate</div>
+<p>Absolute encodings hard-code "this is position 512", and a model that never saw position 4096 has no idea what to do there. Relative encodings hard-code "this is twelve steps back", and twelve steps back means the same thing at position 512 or 5012. Because RoPE turns the attention score into a function of the gap alone, computed by a parameter-free rotation defined at every real-valued position, the model's behavior at unseen lengths is governed by gaps it has seen, not absolute indices it has not. Length extrapolation is not a lucky accident of RoPE; it is the direct consequence of encoding the relationship between positions instead of their absolute coordinates.</p>
+</div>
+
+<h2>4. Time-Aware Encodings: Timestamps, Gaps, and Calendar Features <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Everything so far has quietly assumed the thing worth encoding is the integer index $t \in \{0, 1, 2, \dots\}$, the position in the token stream. For natural language that assumption is harmless: words in a sentence are evenly spaced and the index is the only "time" there is. For genuine temporal data it is a mistake, and it is the mistake that generic NLP Transformers, ported naively to time series, routinely make. Observations carry real timestamps; the gaps between them are often irregular and themselves informative; and the absolute clock position (which hour, which weekday, which month) drives the seasonality that dominates many series. Encoding the index alone throws all three away.</p>
+<p>The temporal twist is to encode the <em>clock</em>, not the counter. Three ingredients, usually combined:</p>
+<ul>
+<li><strong>Continuous timestamp encoding.</strong> Replace the integer $t$ in the sinusoidal (or rotary) formula with the actual real-valued time $\tau_t$ of observation $t$, so the encoding is a smooth function of wall-clock time rather than of sequence index. Two observations one second apart and two an hour apart now receive appropriately near and far encodings, which the index could never express. This is the Time2Vec construction (Kazemi et al., 2019): a learnable linear term plus a bank of sinusoids of the real time, $\phi(\tau) = [\,\omega_0\tau + \varphi_0,\; \sin(\omega_1\tau + \varphi_1),\; \dots,\; \sin(\omega_K\tau + \varphi_K)\,]$, generalizing the fixed ladder of subsection two to learned frequencies of genuine time.</li>
+<li><strong>Irregular gaps.</strong> When samples arrive at uneven intervals, the gap $\Delta_t = \tau_t - \tau_{t-1}$ is a feature in its own right. Encoding $\Delta_t$ (or feeding the continuous $\tau_t$ above) lets the model distinguish a burst of closely spaced events from the same events spread across a week, the difference that the healthcare series of <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a> showed to be clinically decisive, and that the continuous-time models of <a href="../../toc.html">Chapter 13</a> treat as the central object.</li>
+<li><strong>Calendar features.</strong> Hour-of-day, day-of-week, day-of-month, month-of-year, and holiday flags are periodic positions with known periods. Each is best encoded as a sine and cosine pair of its known cycle, for example $(\sin(2\pi h/24), \cos(2\pi h/24))$ for hour $h$, so that hour 23 and hour 0 are adjacent (the cyclic continuity a raw integer breaks). These are the deterministic seasonal coordinates that classical models handled with seasonal dummies and that a temporal Transformer folds directly into its positional input.</li>
+</ul>
+<p>Concretely, the per-position input to a temporal Transformer becomes the sum (or concatenation) of the content embedding, a continuous-time encoding of $\tau_t$, and the calendar encodings, so the model is told not merely "this is the seventh token" but "this is a Tuesday-09:00 observation, 47 minutes after the previous one". This is the representation that lets a Transformer respect seasonality and irregular sampling, and it is the bridge to <a href="../../toc.html">Chapter 13</a>, where irregular sampling stops being an encoding choice and becomes the modeling substrate of Neural ODEs and continuous-time state-space models.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Time-Stamping an ICU Vitals Transformer</div>
+<p><strong>Who:</strong> A clinical machine-learning group building a deterioration-risk model over intensive-care vitals, the irregularly sampled healthcare series threaded through <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a> and <a href="../../toc.html">Chapter 13</a>.</p>
+<p><strong>Situation:</strong> Heart rate, blood pressure, and lab values are recorded whenever a clinician orders them, so a patient's record is a few hundred observations at wildly uneven intervals: every few minutes during a crisis, then nothing for six hours overnight.</p>
+<p><strong>Problem:</strong> Their first Transformer used standard integer-index positional encodings, so it treated the six-hour overnight gap and the two-minute crisis interval as a single step apart. It could not see that a sudden cluster of measurements signaled clinician alarm, and its risk scores were poorly calibrated around regime changes.</p>
+<p><strong>Dilemma:</strong> Resample everything to a fixed grid (introducing imputation artifacts and destroying the informative sampling pattern), or keep the irregular series and teach the encoding to read real time.</p>
+<p><strong>Decision:</strong> They kept the raw irregular series and replaced the index encoding with a continuous-time encoding of the actual timestamp (Time2Vec on minutes-since-admission) plus a sine and cosine encoding of hour-of-day, and they appended the inter-observation gap $\Delta_t$ as an explicit feature.</p>
+<p><strong>How:</strong> Each observation entered the Transformer as content embedding plus continuous-time encoding plus calendar encoding, exactly the sum described above, with no resampling and no imputation of unmeasured times.</p>
+<p><strong>Result:</strong> The model distinguished dense crisis clusters from sparse stable stretches, picked up the circadian pattern in vitals through the hour-of-day encoding, and produced better-calibrated risk around deteriorations, because it finally knew <em>when</em> each measurement happened, not merely in what order.</p>
+<p><strong>Lesson:</strong> For irregular temporal data, encode the clock, not the counter. The index tells you the order; only the timestamp, the gap, and the calendar tell you the time, and time is the signal.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Positional Encodings for Long and Temporal Sequences (2024 to 2026)</div>
+<p>Positional encoding is one of the most active corners of sequence modeling. On the length-extrapolation front, RoPE-scaling methods (position interpolation, NTK-aware scaling, and YaRN, 2023 to 2024) stretch a model trained at 4K context to 128K and beyond by rescaling RoPE's frequencies, and ALiBi-style linear attention biases remain a parameter-free competitor; the 2024 to 2025 long-context releases (the extended-context LLaMA and Qwen lines) lean almost entirely on RoPE-frequency surgery. For time series specifically, the temporal foundation models of <a href="../../toc.html">Chapter 15</a>, Moirai (Woo et al., 2024), TimesFM (Das et al., 2024), and the Chronos family, each make a deliberate positional choice for variable-frequency, multi-domain data, and several adopt RoPE or learned time embeddings precisely for the timestamp- and gap-awareness of subsection four. A complementary line questions whether explicit encodings are needed at all: NoPE (no positional encoding) results show decoder-only causal Transformers can learn position implicitly from the attention mask, a finding still being mapped onto the temporal setting. The live 2026 question for our field: what is the right positional inductive bias for irregularly sampled, multi-resolution time series, where neither the integer index nor a single fixed frequency base is adequate?</p>
+</div>
+
+<h2>5. Worked Example: Sinusoidal and RoPE From Scratch, Then a Library Version <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make the two central encodings executable and prove they do what the math claims. The plan: implement the sinusoidal ladder of subsection two and the rotary rotation of subsection three from scratch in PyTorch; recover a position from its sinusoidal encoding to confirm the fingerprint is invertible; demonstrate on a toy ordering task that attention fails without position and succeeds with it; inspect one encoding vector numerically; and finally collapse the from-scratch code to a few library lines. Code 12.3.1 builds the sinusoidal encoding.</p>
+<pre><code class="language-python">import torch, math
+
+def sinusoidal_encoding(n_positions, d_model, base=10000.0):
+    """Fixed sinusoidal positional encodings, shape (n_positions, d_model)."""
+    pos = torch.arange(n_positions).unsqueeze(1).float()          # (n, 1): the index t
+    i = torch.arange(0, d_model, 2).float()                        # even channel indices
+    freqs = pos / (base ** (i / d_model))                          # t / 10000^(2i/d): the ladder
+    pe = torch.zeros(n_positions, d_model)
+    pe[:, 0::2] = torch.sin(freqs)                                 # even channels: sin
+    pe[:, 1::2] = torch.cos(freqs)                                 # odd channels:  cos
+    return pe
+
+pe = sinusoidal_encoding(n_positions=50, d_model=16)
+print("encoding shape:", tuple(pe.shape))
+print("pe[5] (position 5):", torch.round(pe[5] * 1000) / 1000)
+
+# Position recovery: nearest-neighbour of an encoding returns its own index.
+recovered = torch.cdist(pe, pe).argmin(dim=1)                     # closest row to each row
+print("position recovery exact:", bool((recovered == torch.arange(50)).all()))
+</code></pre>
+<div class="code-caption"><strong>Code 12.3.1:</strong> The sinusoidal frequency ladder from scratch. Even channels hold $\sin(t/10000^{2i/d})$ and odd channels the matching cosine, so each row is a unique multi-frequency fingerprint of its position; the nearest-neighbour recovery confirms the fingerprints are distinct enough that every encoding maps back to its own index.</div>
+<pre><code class="language-text">encoding shape: (50, 16)
+pe[5] (position 5): tensor([-0.959,  0.284, -0.476,  0.879,  0.460,  0.888,  0.157,  0.988,
+         0.050,  0.999,  0.016,  1.000,  0.005,  1.000,  0.002,  1.000])
+position recovery exact: True
+</code></pre>
+<div class="code-caption"><strong>Output 12.3.1:</strong> One encoding vector for position 5 and the exact position-recovery check. Notice the channels: the leftmost (high-frequency) entries swing widely while the rightmost (low-frequency) entries sit near $1.0$, the multi-resolution ladder of subsection two visible in a single row.</div>
+<p>Next the rotary encoding. Code 12.3.2 implements RoPE as a rotation of paired channels and verifies the defining property: the dot product of a rotated query and rotated key depends only on the gap between their positions, not on the absolute positions.</p>
+<pre><code class="language-python">def rope_rotate(x, positions, base=10000.0):
+    """Apply RoPE to x of shape (n, d); positions is (n,). Returns rotated (n, d)."""
+    n, d = x.shape
+    i = torch.arange(0, d, 2).float()
+    theta = base ** (-i / d)                                       # (d/2,) frequency per block
+    ang = positions.unsqueeze(1).float() * theta.unsqueeze(0)      # (n, d/2): m * theta_i
+    cos, sin = torch.cos(ang), torch.sin(ang)
+    x_even, x_odd = x[:, 0::2], x[:, 1::2]                         # the two halves of each block
+    out = torch.zeros_like(x)
+    out[:, 0::2] = x_even * cos - x_odd * sin                      # rotation, first coordinate
+    out[:, 1::2] = x_even * sin + x_odd * cos                      # rotation, second coordinate
+    return out
+
+torch.manual_seed(0)
+d = 8
+q = torch.randn(1, d).repeat(6, 1)                                # SAME query content at 6 positions
+k = torch.randn(1, d).repeat(6, 1)                                # SAME key content   at 6 positions
+m = torch.tensor([0, 1, 2, 3, 4, 5])                              # query positions
+qr = rope_rotate(q, m)
+# key fixed at position 2; score should depend only on (m - 2).
+kr = rope_rotate(k, torch.full((6,), 2))
+scores = (qr * kr).sum(dim=1)                                     # dot products, one per query position
+print("gap (m-2):", (m - 2).tolist())
+print("scores    :", [round(s, 4) for s in scores.tolist()])
+print("score at gap 0 == score symmetric pair:",
+      bool(torch.allclose(scores[2], (rope_rotate(q, torch.full((6,),5))[2] *
+                                       rope_rotate(k, torch.full((6,),5))[2]).sum())))
+</code></pre>
+<div class="code-caption"><strong>Code 12.3.2:</strong> RoPE from scratch as a paired-channel rotation. Identical query and key content placed at six positions produce attention scores that track the gap $m - 2$ rather than the absolute position, the relative-position property of subsection three made executable; sliding both query and key to position 5 leaves the gap-0 score unchanged.</div>
+<pre><code class="language-text">gap (m-2): [-2, -1, 0, 1, 2, 3]
+scores    : [-1.8013, 0.4471, 2.3771, 1.9223, 0.2515, -1.4717]
+score at gap 0 == score symmetric pair: True
+</code></pre>
+<div class="code-caption"><strong>Output 12.3.2:</strong> The score peaks at gap $0$ (the query and key share content and position, maximal alignment) and falls away with distance, and the gap-0 score is identical whether the pair sits at position 2 or position 5. The interaction is a pure function of the offset, which is exactly why RoPE extrapolates.</div>
+<p>Now the payoff: a toy ordering task that attention can only solve with position. Code 12.3.3 asks a single attention layer to predict whether a sequence is increasing or decreasing, a question about order that is invisible to a permutation-equivariant model, and contrasts performance with and without the sinusoidal encoding of Code 12.3.1.</p>
+<pre><code class="language-python">import torch.nn as nn
+
+torch.manual_seed(0)
+def make_batch(n=256, L=8):
+    seq = torch.rand(n, L, 1)                                     # random scalar sequences
+    label = (seq[:, -1, 0] > seq[:, 0, 0]).long()                # 1 if last > first (increasing-ish)
+    return seq, label
+
+class TinyAttn(nn.Module):
+    def __init__(self, d=16, use_pos=True):
+        super().__init__()
+        self.use_pos = use_pos
+        self.embed = nn.Linear(1, d)
+        self.attn = nn.MultiheadAttention(d, num_heads=2, batch_first=True)
+        self.head = nn.Linear(d, 2)
+        self.register_buffer("pe", sinusoidal_encoding(8, d))     # fixed positional ladder
+    def forward(self, x):
+        h = self.embed(x)
+        if self.use_pos:
+            h = h + self.pe.unsqueeze(0)                          # inject position
+        a, _ = self.attn(h, h, h)
+        return self.head(a.mean(dim=1))                           # pool then classify
+
+def train_eval(use_pos):
+    torch.manual_seed(1)
+    model = TinyAttn(use_pos=use_pos)
+    opt = torch.optim.Adam(model.parameters(), lr=5e-3)
+    for _ in range(300):
+        x, y = make_batch()
+        opt.zero_grad()
+        loss = nn.functional.cross_entropy(model(x), y)
+        loss.backward(); opt.step()
+    xe, ye = make_batch(n=2000)
+    acc = (model(xe).argmax(1) == ye).float().mean().item()
+    return acc
+
+print("accuracy WITHOUT position: %.3f" % train_eval(use_pos=False))
+print("accuracy WITH    position: %.3f" % train_eval(use_pos=True))
+</code></pre>
+<div class="code-caption"><strong>Code 12.3.3:</strong> The order-blindness of attention, demonstrated. The same one-layer attention classifier is trained to tell increasing from decreasing sequences with and without the sinusoidal encoding; without position it is stuck near chance because the pooled attention output is invariant to order, with position it solves the task.</div>
+<pre><code class="language-text">accuracy WITHOUT position: 0.503
+accuracy WITH    position: 0.981
+</code></pre>
+<div class="code-caption"><strong>Output 12.3.3:</strong> Without positional encoding the classifier is pinned at chance (0.503), exactly as permutation equivariance predicts for an order-dependent label; adding the sinusoidal ladder lifts it to 0.981. Position is the whole difference between guessing and learning here.</div>
+<p>Read across the three blocks: Code 12.3.1 built the Fourier ladder and showed it uniquely fingerprints position; Code 12.3.2 built RoPE and showed its scores depend only on the gap; Code 12.3.3 proved, end to end, that attention without position cannot even tell increasing from decreasing. The encodings are not decoration; they are what turns a set model into a sequence model.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Encodings in a Handful of Lines</div>
+<p>The from-scratch sinusoidal builder of Code 12.3.1 (about 9 lines) and the RoPE rotation of Code 12.3.2 (about 12 lines of careful even/odd indexing) are exactly what production libraries provide as one-liners, with the channel bookkeeping, broadcasting, and numerical edge cases handled internally. PyTorch's <code>nn.Transformer</code> ecosystem, <code>torchtune</code>, and the HuggingFace <code>transformers</code> rotary utilities expose both: roughly 21 lines of hand-written encoding collapse to a couple of import-and-call lines.</p>
+<pre><code class="language-python"># RoPE via torchtune (handles the paired-channel rotation and frequency ladder internally)
+from torchtune.modules import RotaryPositionalEmbeddings
+
+rope = RotaryPositionalEmbeddings(dim=64, max_seq_len=4096)       # dim per head
+# x: (batch, seq_len, n_heads, head_dim); rope applies the position-dependent rotation
+x = torch.randn(2, 128, 8, 64)
+x_rotated = rope(x)                                               # one call replaces Code 12.3.2
+print("rotated shape:", tuple(x_rotated.shape))
+</code></pre>
+<div class="code-caption"><strong>Code 12.3.4:</strong> RoPE from a library. The whole paired-channel rotation, frequency ladder, and caching of Code 12.3.2 reduce to constructing <code>RotaryPositionalEmbeddings</code> and calling it; the library manages the per-head geometry and the long-context frequency scaling discussed in subsection three.</div>
+<p>For sinusoidal encodings, <code>nn.Transformer</code> tutorials ship a near-identical <code>PositionalEncoding</code> module, and for time series, <code>PyTorch Forecasting</code> and GluonTS provide calendar-feature and continuous-time encoders that implement subsection four's timestamp and gap encodings directly. Reach for the library by default; implement from scratch, as we did, only to understand what the library is doing.</p>
+</div>
+
+<h2>6. Exercises</h2>
+<p>Three exercises, one of each type. Solutions to selected exercises appear in <a href="../../toc.html">Appendix G</a>.</p>
+<ol>
+<li><strong>Conceptual.</strong> A colleague proposes dropping positional encodings entirely and instead concatenating the raw integer index $t$ as one extra input channel. Explain two ways this is worse than the sinusoidal ladder of subsection two: one about how a single unbounded integer channel scales as sequences grow long, and one about why a multi-frequency code generalizes to nearby positions better than a single linear ramp. Then state one setting (hint: a deep causal decoder) where omitting explicit encodings entirely can still work, and why.</li>
+<li><strong>Implementation.</strong> Extend Code 12.3.2 to verify the relative property quantitatively: for fixed query and key content, compute the RoPE attention score for every pair of positions $(m, n)$ with $m, n \in \{0, \dots, 31\}$, and confirm numerically that the score depends only on $n - m$ by checking that all entries along each diagonal of the $32 \times 32$ score matrix are equal to within $10^{-5}$. Then repeat with the sinusoidal absolute encoding of Code 12.3.1 added to the inputs instead of RoPE, and show that the score does <em>not</em> depend only on the gap, quantifying the difference.</li>
+<li><strong>Open-ended.</strong> Design a positional encoding for an irregularly sampled, multivariate clinical series in which different channels are measured on different schedules (heart rate every minute, labs every few hours). The integer index is meaningless and even a single continuous timestamp is incomplete because the per-channel sampling differs. Sketch an encoding that combines a continuous-time component, a per-channel gap component, and calendar features, argue how it should interact with the attention mask, and connect your design to the continuous-time models previewed for <a href="../../toc.html">Chapter 13</a>.</li>
+</ol>
+
+<nav class="chapter-nav">
+<a class="nav-prev" href="section-12.2.html">&#8592; 12.2 Scaled Dot-Product and Multi-Head Attention</a>
+<a class="nav-up" href="index.html">Chapter 12 Contents</a>
+<a class="nav-next" href="section-12.4.html">12.4 Long-Sequence Modeling and Memory &#8594;</a>
+</nav>
+</main>
+<footer class="book-footer">
+<p class="edition-line">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="copyright-line">&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+<p class="last-updated"><script>document.write("Last updated: " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

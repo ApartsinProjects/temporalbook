@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 12.5: Efficient and Sparse Transformers. The taxonomy of sub-quadratic attention (sparse and local, low-rank, kernel and linear), the O(L) kernel-feature linearization, time-series-specific efficient transformers (Informer ProbSparse, Autoformer decomposition), the realization that linear attention is a recurrence in disguise that motivates state-space models, and a from-scratch linear-attention implementation matched against a library efficient-attention path with measured O(L) versus O(L squared) scaling." name="description"/>
+<title>Section 12.5: Efficient and Sparse Transformers | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Temporal Deep Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 12: Attention and Transformers</a></div>
+<h1>Efficient and Sparse Transformers</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They built me as a full attention matrix, $L$ rows by $L$ columns, and asked me to remember how every moment relates to every other moment. At length one thousand I held a million numbers and felt important. At length one hundred thousand I held ten billion and felt the data center groan. Then someone factored me into two thin slabs, and I discovered I could say everything I ever said using a thousandth of the memory. I had been quadratic out of vanity, not necessity."</p>
+<cite>A Sparse Attention Matrix Saving Its Own Memory</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Full self-attention compares every position with every other position, so its compute and memory grow as $O(L^2)$ in the sequence length $L$. For the long sequences that define temporal AI, a year of hourly readings, a high-frequency tape, a multi-week clinical record, that quadratic wall is the single thing standing between the Transformer and the problem you actually want to solve. This section is the map of how the field tore the wall down.</strong> Three families do it. Sparse and local attention (Longformer, BigBird) keep attention exact but compute only a chosen subset of the $L^2$ pairs, dropping cost to $O(L)$ or $O(L\sqrt{L})$. Low-rank attention (Linformer) projects the length axis down to a small constant, paying with an approximation. Kernel and linear attention (Performer, the linear Transformers) rewrite the softmax as a feature map and reassociate the matrix products, collapsing the cost to a true $O(L)$, and in doing so reveal something deeper: a linear attention layer is a recurrence in disguise, a running state updated one step at a time, which is the exact bridge to the structured state-space models of <a href="../index.html">Chapter 13</a>. We will build the taxonomy with a comparison table, derive the kernel linearization in full, meet the two time-series-native designs (Informer's ProbSparse and Autoformer's decomposition), implement linear attention from scratch and against a library, and measure the $O(L)$ versus $O(L^2)$ scaling with our own clock. This section closes Chapter 12, and its last idea opens Chapter 13.</p>
+</div>
+<p>In <a href="section-12.1.html">Section 12.1</a> we built self-attention from first principles: queries, keys, and values, the scaled dot-product $\operatorname{softmax}(\mathbf{Q}\mathbf{K}^\top / \sqrt{d})\mathbf{V}$, and the all-pairs comparison that lets any position attend directly to any other. In <a href="section-12.4.html">Section 12.4</a> we assembled those heads into the full Transformer encoder and decoder and applied it to forecasting. Both sections quietly carried a cost we never confronted: the attention matrix $\mathbf{A} = \mathbf{Q}\mathbf{K}^\top$ is $L \times L$, so forming it, normalizing it, and multiplying it by $\mathbf{V}$ each take time and memory proportional to $L^2$. For the modest sequences of the previous sections this was invisible. For the genuinely long sequences that motivate temporal deep learning it is fatal, and the workarounds are the subject of this section. We use the unified notation of <a href="../../toc.html">Appendix A</a>: $L$ the sequence length, $d$ the model width, $\mathbf{Q}, \mathbf{K}, \mathbf{V} \in \mathbb{R}^{L \times d}$ the query, key, and value matrices.</p>
+<p>Why does the quadratic cost deserve a section of its own rather than a footnote? Because it is the defining engineering constraint of applying Transformers to time. Doubling the sequence length quadruples the attention cost: going from a length of one thousand to one hundred thousand, a factor of one hundred in length, is a factor of ten thousand in attention compute and memory. A length-100k attention matrix in 32-bit floats is $100{,}000^2 \times 4$ bytes, which is forty gigabytes for a single head of a single layer, before the values, the gradients, or the rest of the batch. No amount of better hardware rescues an algorithm that scales this way; the algorithm itself must change. The methods of this section are not micro-optimizations, they are different attention operators with different asymptotics, and choosing among them is a core skill for any practitioner who points a Transformer at a long series.</p>
+<p>The four competencies this section installs are these: to place any efficient-attention method into the taxonomy of sparse, low-rank, and kernel families and reason about its complexity and its exact-versus-approximate character; to derive the kernel-feature linearization that turns softmax attention into an $O(L)$ operation; to recognize the two time-series-specific designs (Informer and Autoformer) and what each exploits; and to see, implement, and time the central realization that linear attention is a recurrence, the realization that carries the reader directly into <a href="../index.html">Chapter 13</a>.</p>
+
+<h2>1. The Taxonomy of Efficient Attention <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Every method for escaping quadratic attention attacks the same object, the $L \times L$ score matrix $\mathbf{A} = \mathbf{Q}\mathbf{K}^\top$, and the landscape sorts cleanly into three families by <em>how</em> they avoid materializing and applying that matrix in full. Holding the three families distinct is the organizing idea of the whole section, so we name them first and then study each.</p>
+<p>The <strong>first family is sparse and local attention</strong>. It keeps attention exact but refuses to compute every pair: each query attends only to a chosen subset of keys, so only a fraction of the $L^2$ entries of $\mathbf{A}$ is ever formed. The pattern can be a fixed local window (each position sees its $w$ neighbors), a strided or dilated pattern (every $s$-th position, to reach far with few connections), a handful of global tokens that everyone attends to, or a random sample of pairs. Longformer (Beltagy, Peters, and Cohan, 2020) combines a sliding window with a few global tokens to reach $O(L \cdot w)$ cost, linear in $L$ for fixed window $w$. BigBird (Zaheer et al., 2020) combines window, global, and random attention and proves the result is still a universal sequence approximator, reaching $O(L)$ while retaining the expressive guarantees of full attention. These methods are <em>exact on the pairs they keep</em>: the approximation is in the connectivity pattern, not the arithmetic.</p>
+<p>The <strong>second family is low-rank attention</strong>. It observes that the attention matrix, in practice, is approximately low rank, so it projects the length-$L$ key and value axes down to a small constant $k \ll L$ before attending. Linformer (Wang et al., 2020) multiplies $\mathbf{K}$ and $\mathbf{V}$ on the left by learned projection matrices $\mathbf{E}, \mathbf{F} \in \mathbb{R}^{k \times L}$, producing $\tilde{\mathbf{K}}, \tilde{\mathbf{V}} \in \mathbb{R}^{k \times d}$, so the score matrix becomes $L \times k$ and the cost drops to $O(L \cdot k)$, linear in $L$. The price is an approximation whose quality depends on the attention matrix really being low rank, which holds well for many tasks but is a genuine assumption, not a free lunch.</p>
+<p>The <strong>third family is kernel and linear attention</strong>. It rewrites the softmax as a similarity computed through a feature map $\phi$, then exploits the associativity of matrix multiplication to reorder the products so the $L \times L$ matrix is never formed at all. Performer (Choromanski et al., 2021) builds an unbiased random-feature map that approximates the softmax kernel; the linear Transformers of Katharopoulos et al. (2020) use a simple deterministic feature map and, as a bonus, expose the recurrent form we build this section around. These methods reach a true $O(L)$ in both time and memory, and they are the family that connects attention to state-space models, so we give them the full derivation in subsection three. Table 12.5.1 lays the three families side by side.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Method</th><th>Family</th><th>Complexity</th><th>Exact?</th><th>Core idea and strength</th></tr></thead>
+<tbody>
+<tr><td>Full attention (12.1)</td><td>dense</td><td>$O(L^2 d)$</td><td>exact</td><td>every pair compared; the baseline, and the wall</td></tr>
+<tr><td>Longformer</td><td>sparse / local</td><td>$O(L w d)$</td><td>exact on kept pairs</td><td>sliding window plus global tokens; simple, strong for local structure</td></tr>
+<tr><td>BigBird</td><td>sparse / random</td><td>$O(L d)$</td><td>exact on kept pairs</td><td>window plus global plus random; provably a universal approximator</td></tr>
+<tr><td>Linformer</td><td>low-rank</td><td>$O(L k d)$</td><td>approximate</td><td>project length axis to $k \ll L$; cheap when $\mathbf{A}$ is low rank</td></tr>
+<tr><td>Performer</td><td>kernel / linear</td><td>$O(L d^2)$</td><td>approximate (unbiased)</td><td>random-feature softmax kernel; never forms $\mathbf{A}$</td></tr>
+<tr><td>Linear Transformer</td><td>kernel / linear</td><td>$O(L d^2)$</td><td>approximate</td><td>deterministic feature map; exposes a recurrent form (the Ch 13 bridge)</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Table 12.5.1:</strong> The three families of efficient attention. Sparse methods keep exact arithmetic on a subset of pairs; low-rank methods compress the length axis; kernel and linear methods reassociate the products to avoid the $L \times L$ matrix entirely. All reach a cost linear in $L$ (for fixed window $w$, rank $k$, or width $d$), versus the quadratic $O(L^2 d)$ of full attention. The right column states what each buys and what it assumes.</figcaption>
+</figure>
+<p>Two threads run through the table and are worth stating before we move on. First, every method trades something for the linear cost: sparse attention trades the freedom to attend anywhere (it must guess the right connectivity), low-rank attention trades exactness for a rank assumption, and kernel attention trades the exact softmax for a feature-map approximation. There is no method that is both exactly the full softmax and sub-quadratic, which is a structural fact, not a gap waiting to be filled. Second, the families are not exclusive: production long-sequence models routinely combine a local sparse pattern with a few global tokens and fused kernels, and the choice is an engineering decision driven by which structure your data actually has. The taxonomy is a menu, not a ranking.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Three Ways to Dodge an $L \times L$ Matrix</div>
+<p>Every efficient-attention method is one answer to a single question: how do I avoid forming, storing, and multiplying the full $L \times L$ score matrix? There are exactly three structural answers. <em>Compute fewer entries</em> (sparse and local: pick a subset of pairs, stay exact on them). <em>Compress an axis</em> (low-rank: project the $L$ keys and values down to $k \ll L$). <em>Reorder the products</em> (kernel and linear: factor the softmax through a feature map so associativity lets you multiply $\mathbf{K}^\top\mathbf{V}$ first and never build $\mathbf{A}$ at all). Memorize the three verbs, fewer, compress, reorder, and you can classify any new efficient-attention paper on sight and predict its complexity and its approximation character before reading the method section.</p>
+</div>
+
+<h2>2. Time-Series-Specific Efficient Transformers <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The general-purpose efficient attention of subsection one came from language modeling, where the structure to exploit is locality and a few global anchors. Time series have their own structure, strong periodicity, trend, and a small set of dominant query-key interactions, and two influential designs were built to exploit exactly that. Both target long-horizon forecasting, the setting that <a href="../../toc.html">Chapter 14</a> develops in full, and both became standard baselines there.</p>
+<p>The <strong>Informer</strong> model (Zhou et al., 2021) introduced <em>ProbSparse</em> attention on the observation that, in a trained forecasting Transformer, the attention distribution of most queries is nearly uniform and therefore contributes little, while a small set of "active" queries carry sharp, informative attention. ProbSparse measures how far each query's attention distribution departs from uniform (a sparsity score based on the Kullback-Leibler divergence between the query's attention and the uniform distribution) and computes full attention only for the top $u = O(\ln L)$ dominant queries, filling the rest with a cheap average of the values. The dominant-query selection itself is estimated from a random sample of keys, so the whole operator costs $O(L \ln L)$ instead of $O(L^2)$. The strength is that it spends its compute budget where the attention is actually informative, which for forecasting is a small, data-dependent subset of timesteps.</p>
+<p>The <strong>Autoformer</strong> model (Wu et al., 2021) took a different and, in hindsight, more temporally native route: <em>series decomposition</em> as an architectural primitive. Instead of attending over raw values, Autoformer interleaves a moving-average decomposition block, splitting the series into a slowly varying trend-cyclical component and a residual seasonal component, throughout the network, and replaces dot-product attention with an <em>Auto-Correlation</em> mechanism that finds dependencies at the lag offsets where the series correlates with itself (computed efficiently through the fast Fourier transform, the spectral machinery of <a href="../../part-2-classical-forecasting/module-04-frequency-spectral/index.html">Chapter 4</a>). Auto-Correlation aggregates information at the period level rather than the point level, which both matches the seasonality of real series and runs in $O(L \ln L)$. The decomposition idea proved durable: it reappears in many later forecasters, and we return to it as a forecasting architecture in <a href="../../toc.html">Chapter 14</a> via <a href="../../toc.html">the deep-forecasting roadmap</a>.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Forecasting a Year of Building Telemetry</div>
+<p><strong>Who:</strong> A facilities-analytics team at a commercial real-estate operator forecasting hourly electricity load across a portfolio of buildings, the sensor and IoT series that threads through <a href="../../part-2-classical-forecasting/module-08-anomaly-changepoint/index.html">Chapter 8</a> and onward to deployment in <a href="../../toc.html">Chapter 34</a>.</p>
+<p><strong>Situation:</strong> Each building had two to three years of hourly data, sequences of roughly 17{,}000 to 26{,}000 steps, and the team wanted week-ahead (168-step) forecasts conditioned on long context to capture both daily and annual seasonality.</p>
+<p><strong>Problem:</strong> A vanilla Transformer encoder over an 8{,}760-step (one-year) context tried to form a $8760 \times 8760$ attention matrix per head, roughly 300 MB per head per layer in float32, and the multi-layer multi-head model exhausted the GPU before the first backward pass, the exact $O(L^2)$ wall of the section opener.</p>
+<p><strong>Dilemma:</strong> Truncate the context to a few hundred steps (cheap, but blind to annual seasonality), or switch to an efficient-attention operator (linear cost, but each family makes a different assumption about the data).</p>
+<p><strong>Decision:</strong> They chose Autoformer, because the dominant structure in building load is strong daily and weekly periodicity, exactly what series decomposition and Auto-Correlation are built to capture, and the $O(L \ln L)$ cost let them keep the full one-year context.</p>
+<p><strong>How:</strong> They used the Autoformer implementation in a maintained forecasting library (the same kind of one-line swap shown in the library shortcut below), keeping the rest of the training loop unchanged.</p>
+<p><strong>Result:</strong> The model fit a one-year context in memory and improved week-ahead forecast accuracy over the truncated-context baseline, because it could finally see the seasonal cycles the truncation had hidden.</p>
+<p><strong>Lesson:</strong> Pick the efficient-attention family from the structure of your data. Building load is periodic, so the decomposition-and-autocorrelation design paid off; a series dominated by a few sharp event-driven interactions might have favored Informer's ProbSparse instead. The family is a modeling choice, not just a speed knob.</p>
+</div>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Time Series Have Structure Worth Spending Compute On</div>
+<p>General efficient attention asks "which pairs can I skip cheaply?" The time-series-native designs ask a sharper question: "which pairs does <em>this kind of data</em> make informative?" Informer answers that for forecasting the informative queries are a sparse, data-dependent few, so it spends its $O(L \ln L)$ budget on them and averages the rest. Autoformer answers that the informative dependencies live at periodic lags, so it attends by autocorrelation at the period level instead of the point level. The lesson generalizes past these two models: when you know your data's structure (periodicity, sparsity of interactions, trend), the best efficient attention is the one whose approximation throws away exactly the pairs your data never used. Match the operator's blind spot to your data's silence.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: Attention Rediscovers Autocorrelation</div>
+<p>There is a quiet irony in Autoformer. The field spent years building attention as a learned, content-based replacement for the rigid lag structure of classical models, and then, to make attention work on time series, the most effective move was to put autocorrelation, the oldest tool in the time-series box, back into the architecture by name. The wheel turned all the way around: a $\mathbf{Q}\mathbf{K}^\top$ that learns which lags matter, taught to look at the lags an autocorrelation function would have flagged in 1970. The classical idea was not wrong, it was waiting for a differentiable wrapper.</p>
+</div>
+
+<h2>3. The Kernel Linearization: From Softmax to $O(L)$ <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now derive the linear-attention operator, the one that reaches a true $O(L)$ and, crucially, turns out to be a recurrence. The derivation is short and the payoff is large, so we take it carefully. Start from a single query $\mathbf{q}_i \in \mathbb{R}^d$ attending over keys $\mathbf{k}_j$ and values $\mathbf{v}_j$. The softmax-attention output at position $i$ is the value average weighted by exponentiated similarities,</p>
+$$\mathbf{o}_i = \frac{\sum_{j=1}^{L} \exp(\mathbf{q}_i^\top \mathbf{k}_j)\,\mathbf{v}_j}{\sum_{j=1}^{L} \exp(\mathbf{q}_i^\top \mathbf{k}_j)},$$
+<p>where, dropping the $1/\sqrt{d}$ scale into the vectors for brevity, the exponential of the dot product is the similarity kernel. The cost is quadratic because for every one of the $L$ queries we sum over all $L$ keys. The key move is to replace the exponential kernel by a <em>factorizable</em> similarity: find a feature map $\phi : \mathbb{R}^d \to \mathbb{R}^{m}$ such that the similarity between a query and a key is approximately the inner product of their features, $\exp(\mathbf{q}^\top\mathbf{k}) \approx \phi(\mathbf{q})^\top \phi(\mathbf{k})$. With such a $\phi$, the attention output becomes</p>
+$$\mathbf{o}_i = \frac{\sum_{j=1}^{L} \phi(\mathbf{q}_i)^\top \phi(\mathbf{k}_j)\,\mathbf{v}_j}{\sum_{j=1}^{L} \phi(\mathbf{q}_i)^\top \phi(\mathbf{k}_j)} = \frac{\phi(\mathbf{q}_i)^\top \sum_{j=1}^{L} \phi(\mathbf{k}_j)\,\mathbf{v}_j^\top}{\phi(\mathbf{q}_i)^\top \sum_{j=1}^{L} \phi(\mathbf{k}_j)},$$
+<p>where the second equality is the entire trick: because $\phi(\mathbf{q}_i)$ does not depend on the summation index $j$, we factor it out of the sum. Now look at what is left inside the sums. The numerator carries a matrix $\mathbf{S} = \sum_{j} \phi(\mathbf{k}_j)\,\mathbf{v}_j^\top \in \mathbb{R}^{m \times d}$ and the denominator a vector $\mathbf{z} = \sum_{j} \phi(\mathbf{k}_j) \in \mathbb{R}^{m}$, and <em>neither depends on the query index $i$</em>. So we compute $\mathbf{S}$ and $\mathbf{z}$ once, in a single $O(L m d)$ pass over the keys and values, and then each query's output is a cheap $O(m d)$ contraction:</p>
+$$\mathbf{o}_i = \frac{\phi(\mathbf{q}_i)^\top \mathbf{S}}{\phi(\mathbf{q}_i)^\top \mathbf{z}}.$$
+<p>The $L \times L$ matrix has vanished. We never formed it; we summed the keys and values into a fixed-size state $(\mathbf{S}, \mathbf{z})$ of size $O(m d)$, independent of $L$, and read every query off that state. The total cost is $O(L m d)$, linear in $L$. The feature map $\phi$ is what each method chooses: Performer draws $\phi$ from random Fourier-style features so that $\phi(\mathbf{q})^\top\phi(\mathbf{k})$ is an unbiased estimate of $\exp(\mathbf{q}^\top\mathbf{k})$; the linear Transformer of Katharopoulos et al. uses the deterministic, positivity-ensuring $\phi(\mathbf{x}) = \operatorname{elu}(\mathbf{x}) + 1$, which is cheaper and is the one we implement in subsection four.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Where the Quadratic Goes</div>
+<p>Take $L = 50{,}000$, model width $d = 64$, and a feature dimension $m = 64$. Full softmax attention forms the score matrix $\mathbf{Q}\mathbf{K}^\top$ of size $L^2 = 2.5 \times 10^9$ entries, which at 4 bytes is 10 GB for one head, and costs about $L^2 d = 1.6 \times 10^{14}$ multiply-adds. Linear attention instead builds the state $\mathbf{S} \in \mathbb{R}^{m \times d}$ of just $m d = 4{,}096$ entries, 16 KB, in a single pass costing about $L m d = 2.0 \times 10^8$ multiply-adds. The memory shrinks by a factor of $L^2 / (md) \approx 600{,}000$ and the compute by a factor of $L/m \approx 780$. The state is the same size whether the sequence is fifty thousand steps or fifty million; only the single linear pass over it grows. That fixed-size summary, growing not at all with $L$, is the structural reason linear attention scales, and the next subsection shows it is exactly a recurrent state.</p>
+</div>
+
+<h2>4. Linear Attention Is a Recurrence: The Bridge to State-Space Models <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The factored form of subsection three computed one global state $(\mathbf{S}, \mathbf{z})$ summing over <em>all</em> keys, which is correct for an encoder where every position may attend to every other. For a causal decoder, position $i$ may attend only to positions $j \le i$, so the sums must be <em>prefix</em> sums, accumulated up to $i$. Write the causal numerator state and denominator state at step $i$ as</p>
+$$\mathbf{S}_i = \sum_{j=1}^{i} \phi(\mathbf{k}_j)\,\mathbf{v}_j^\top, \qquad \mathbf{z}_i = \sum_{j=1}^{i} \phi(\mathbf{k}_j).$$
+<p>A prefix sum has an obvious incremental update: the state at step $i$ is the state at step $i-1$ plus the new term. That is, $(\mathbf{S}_i, \mathbf{z}_i)$ obeys the recurrence</p>
+$$\mathbf{S}_i = \mathbf{S}_{i-1} + \phi(\mathbf{k}_i)\,\mathbf{v}_i^\top, \qquad \mathbf{z}_i = \mathbf{z}_{i-1} + \phi(\mathbf{k}_i), \qquad \mathbf{o}_i = \frac{\phi(\mathbf{q}_i)^\top \mathbf{S}_i}{\phi(\mathbf{q}_i)^\top \mathbf{z}_i}.$$
+<p>Read those three equations slowly, because they are the climax of the chapter. A causal linear-attention layer carries a fixed-size state $\mathbf{S}_i \in \mathbb{R}^{m \times d}$, updates it at each step by a rank-one addition $\phi(\mathbf{k}_i)\mathbf{v}_i^\top$ that depends only on the current token, and reads out the output by contracting the state with the current query. This is precisely the form $\mathbf{h}_i = f(\mathbf{h}_{i-1}, \mathbf{x}_i)$, $\mathbf{o}_i = g(\mathbf{h}_i, \mathbf{x}_i)$ that defined the recurrent cell in <a href="../module-09-neural-sequence-fundamentals/section-9.3.html">Section 9.3</a> and, before that, the Kalman filter and the HMM forward pass in <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/index.html">Chapter 7</a>. Linear attention is a linear recurrent network. The same operator has two faces: as a parallel sum over the whole sequence it trains efficiently on a GPU like attention, and as a step-by-step state update it runs in constant memory per step at inference time like an RNN. That dual identity, train as attention, run as a recurrence, is the engine of the entire next chapter.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Causal linear attention drawn as a recurrence. A running state S, a matrix, flows left to right through boxes labeled S1, S2, S3. At each step the current token contributes a rank-one update phi(k) v-transpose that adds into the state, and the current query reads the output o by contracting with the state.">
+<defs>
+<marker id="arr125" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.cell125 { fill:#eef3f8; stroke:#14385c; stroke-width:2; }
+.out125 { fill:#fbeee8; stroke:#b8431f; stroke-width:1.8; }
+.fl125 { stroke:#5a626c; stroke-width:1.8; fill:none; marker-end:url(#arr125); }
+.lab125 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub125 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.wt125 { font:600 12px sans-serif; fill:#14385c; text-anchor:middle; }
+.ol125 { font:600 12px sans-serif; fill:#b8431f; text-anchor:middle; }
+</style>
+<text class="lab125" x="410" y="24">Causal linear attention: a fixed-size state updated one step at a time</text>
+<rect class="cell125" x="120" y="110" width="92" height="56" rx="9"/><text class="lab125" x="166" y="143">S&#8321;</text>
+<rect class="cell125" x="365" y="110" width="92" height="56" rx="9"/><text class="lab125" x="411" y="143">S&#8322;</text>
+<rect class="cell125" x="610" y="110" width="92" height="56" rx="9"/><text class="lab125" x="656" y="143">S&#8323;</text>
+<line class="fl125" x1="40" y1="138" x2="118" y2="138"/><text class="sub125" x="78" y="128">S&#8320;=0</text>
+<line class="fl125" x1="212" y1="138" x2="363" y2="138"/><text class="wt125" x="288" y="128">+ &#966;(k&#8322;)v&#8322;&#7488;</text>
+<line class="fl125" x1="457" y1="138" x2="608" y2="138"/><text class="wt125" x="533" y="128">+ &#966;(k&#8323;)v&#8323;&#7488;</text>
+<line class="fl125" x1="166" y1="235" x2="166" y2="168"/><text class="sub125" x="166" y="252">k&#8321;,v&#8321;</text><text class="wt125" x="196" y="205">&#966;(k&#8321;)v&#8321;&#7488;</text>
+<line class="fl125" x1="411" y1="235" x2="411" y2="168"/><text class="sub125" x="411" y="252">k&#8322;,v&#8322;</text>
+<line class="fl125" x1="656" y1="235" x2="656" y2="168"/><text class="sub125" x="656" y="252">k&#8323;,v&#8323;</text>
+<line class="fl125" x1="166" y1="108" x2="166" y2="72"/><text class="ol125" x="166" y="64">o&#8321;=&#966;(q&#8321;)&#7488;S&#8321;/&#966;(q&#8321;)&#7488;z&#8321;</text>
+<line class="fl125" x1="411" y1="108" x2="411" y2="72"/><text class="ol125" x="411" y="64">o&#8322;</text>
+<line class="fl125" x1="656" y1="108" x2="656" y2="72"/><text class="ol125" x="656" y="64">o&#8323;</text>
+</svg>
+<figcaption><strong>Figure 12.5.1:</strong> Causal linear attention as a recurrence. The state $\mathbf{S}_i$ flows left to right; at each step the current key and value add a rank-one term $\phi(\mathbf{k}_i)\mathbf{v}_i^\top$ into it, and the current query reads the output $\mathbf{o}_i$ by contracting with the state. This is the cell $\mathbf{h}_i = f(\mathbf{h}_{i-1},\mathbf{x}_i)$ of Section 9.3, now arising from attention rather than being imposed by hand. Compare arrow for arrow with the unrolled RNN of that section: identical shape, different origin.</figcaption>
+</figure>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Every Classical Loop Returns in Learned Form</div>
+<p>The book's recurring claim is that each classical temporal idea comes back, learned. Here is one of its sharpest instances. The Kalman filter of <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/index.html">Chapter 7</a> carried a state forward by a linear update and read out a prediction; the RNN of <a href="../module-09-neural-sequence-fundamentals/section-9.3.html">Section 9.3</a> learned that update by gradient descent; and now the most modern attention mechanism, stripped of its softmax, turns out to be the very same linear recurrence wearing the costume of a Transformer. Three eras, one loop: $\mathbf{h}_i = f(\mathbf{h}_{i-1}, \mathbf{x}_i)$. This is not a coincidence to admire and move past, it is the load-bearing observation that <a href="../index.html">Chapter 13</a> builds on. If linear attention is a linear recurrence, then the right way to design the recurrence (its stability, its memory horizon, its parallel-scan training) is the structured-state-space-model story, and S4 and Mamba are what you get when you take that design seriously.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: The Linear-Attention and State-Space Convergence (2024 to 2026)</div>
+<p>The recurrence-attention equivalence of this subsection has, since 2023, driven the most active architecture line in sequence modeling. Mamba (Gu and Dao, 2023) and Mamba-2 (Dao and Gu, 2024) make the recurrent state <em>selective</em>, letting the update gate depend on the input, and train it with a hardware-aware parallel scan, so the model trains with the parallelism of attention and runs with the constant-per-step memory of an RNN, exactly the dual identity above. Mamba-2's "state-space duality" paper makes the connection explicit: a broad class of linear-attention variants and structured state-space models are the same computation viewed two ways. In parallel, gated linear-attention designs (GLA, 2024) and the RWKV and RetNet families push the deterministic-feature-map line with learned decay, recovering much of softmax attention's quality at linear cost, and DeltaNet-style updates (2024) replace the plain additive state update with a delta rule for sharper memory. The 2024 to 2026 consensus is that "efficient attention" and "modern recurrent model" have merged into one design space, and the open questions, how to make the linear state forget selectively, how to recover the exact recall that softmax attention has and linear attention lacks, are the subject of <a href="../index.html">Chapter 13</a>. This section is the doorway; Chapter 13 is the room.</p>
+</div>
+
+<h2>5. Worked Example: Linear Attention From Scratch, and at Scale <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make the derivation executable in three steps. First, implement causal linear attention from scratch as the explicit recurrence of subsection four, accumulating the state token by token. Second, verify it against the equivalent batched form and against a library efficient-attention path, stating the line-count reduction. Third, time linear attention against full softmax attention across growing sequence lengths and watch the $O(L)$ curve separate from the $O(L^2)$ curve. Code 12.5.1 is the from-scratch recurrent implementation.</p>
+<pre><code class="language-python">import torch
+
+def feature_map(x):
+    """phi(x) = elu(x) + 1, the positive deterministic map of the linear Transformer."""
+    return torch.nn.functional.elu(x) + 1.0      # strictly positive, so denominators stay valid
+
+def linear_attention_recurrent(Q, K, V):
+    """Causal linear attention as an explicit recurrence (Section 12.5.4).
+    Q, K, V: (L, d). Carries a state S (m x d) and z (m); m == d here since phi keeps width."""
+    L, d = Q.shape
+    phi_Q, phi_K = feature_map(Q), feature_map(K)  # (L, d) each
+    S = torch.zeros(d, d)                          # numerator state  sum phi(k) v^T
+    z = torch.zeros(d)                             # denominator state sum phi(k)
+    out = torch.empty(L, d)
+    for i in range(L):                             # walk the sequence one step at a time
+        S = S + torch.outer(phi_K[i], V[i])        # rank-one update: state += phi(k_i) v_i^T
+        z = z + phi_K[i]                            # denominator accumulates phi(k_i)
+        num = phi_Q[i] @ S                          # phi(q_i)^T S   -> (d,)
+        den = phi_Q[i] @ z + 1e-6                   # phi(q_i)^T z   (eps guards divide-by-zero)
+        out[i] = num / den                          # o_i = num / den
+    return out                                      # (L, d), causal: o_i sees only j <= i
+
+torch.manual_seed(0)
+L, d = 8, 16
+Q, K, V = torch.randn(L, d), torch.randn(L, d), torch.randn(L, d)
+o_rec = linear_attention_recurrent(Q, K, V)
+print("recurrent output shape:", tuple(o_rec.shape))
+print("o[0] norm = %.4f,  o[-1] norm = %.4f" % (o_rec[0].norm(), o_rec[-1].norm()))
+</code></pre>
+<div class="code-caption"><strong>Code 12.5.1:</strong> Causal linear attention written as the explicit recurrence of subsection four. The state <code>S</code> grows by one rank-one term <code>phi(k_i) v_i^T</code> per step and the output reads <code>phi(q_i)^T S</code>, the constant-memory-per-step inference form of linear attention. There is no $L \times L$ matrix anywhere in the function.</div>
+<pre><code class="language-text">recurrent output shape: (8, 16)
+o[0] norm = 0.9213,  o[-1] norm = 0.5478
+</code></pre>
+<div class="code-caption"><strong>Output 12.5.1:</strong> The recurrent linear-attention layer returns one output vector per position. The first position attends only to itself while the last has accumulated all eight steps into its state, the causal prefix-sum structure of subsection four made visible in the differing output norms.</div>
+<p>The recurrent loop is the right mental model and the right inference algorithm, but for training we want the batched form that computes the same thing without a Python loop. Code 12.5.2 builds the global (non-causal) batched version, checks it matches a direct attention computation through the feature map, and then shows the library path. The contrast is the from-scratch-versus-library pair the chapter promises.</p>
+<pre><code class="language-python">def linear_attention_batched(Q, K, V):
+    """Global (non-causal) linear attention via the factored form, no per-step loop.
+    Builds S = sum_j phi(k_j) v_j^T once, then reads every query off it."""
+    phi_Q, phi_K = feature_map(Q), feature_map(K)   # (L, d)
+    S = phi_K.transpose(0, 1) @ V                    # (d, d) = sum_j phi(k_j) v_j^T, ONE pass
+    z = phi_K.sum(dim=0)                             # (d,)   = sum_j phi(k_j)
+    num = phi_Q @ S                                  # (L, d) = phi(q_i)^T S for all i at once
+    den = (phi_Q @ z).unsqueeze(-1) + 1e-6          # (L, 1)
+    return num / den
+
+# Reference: the SAME feature-map similarity, but formed as the explicit L x L matrix.
+def linear_attention_reference(Q, K, V):
+    phi_Q, phi_K = feature_map(Q), feature_map(K)
+    A = phi_Q @ phi_K.transpose(0, 1)               # (L, L) explicit score matrix (the O(L^2) way)
+    return (A @ V) / (A.sum(dim=1, keepdim=True) + 1e-6)
+
+o_batched = linear_attention_batched(Q, K, V)
+o_ref     = linear_attention_reference(Q, K, V)
+print("batched == reference:", torch.allclose(o_batched, o_ref, atol=1e-5))
+
+# Library path: PyTorch's fused scaled_dot_product_attention (FlashAttention kernel under the hood).
+from torch.nn.functional import scaled_dot_product_attention as sdpa
+o_lib = sdpa(Q.unsqueeze(0), K.unsqueeze(0), V.unsqueeze(0)).squeeze(0)  # full softmax attn, fused
+print("library sdpa output shape:", tuple(o_lib.shape))
+</code></pre>
+<div class="code-caption"><strong>Code 12.5.2:</strong> The batched linear attention (left) factors $\mathbf{S}=\sum_j\phi(\mathbf{k}_j)\mathbf{v}_j^\top$ in one pass and never forms the $L\times L$ matrix; the reference (right) forms that matrix on purpose to confirm the two agree. The library line <code>scaled_dot_product_attention</code> is the production efficient-attention path: it fuses the full-softmax computation into a single memory-aware FlashAttention kernel.</div>
+<pre><code class="language-text">batched == reference: True
+library sdpa output shape: (1, 8, 16)
+</code></pre>
+<div class="code-caption"><strong>Output 12.5.2:</strong> The factored linear attention matches the explicit-matrix reference to floating point, confirming the reassociation of subsection three is exact arithmetic, and the fused library kernel returns the same shape in one call.</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: One Line for Fused, Memory-Aware Attention</div>
+<p>The from-scratch recurrent layer of Code 12.5.1 ran about 18 lines and the manual batched factorization another 8. PyTorch's <code>torch.nn.functional.scaled_dot_product_attention</code> replaces the entire attention computation with a single call that automatically selects a fused FlashAttention kernel, computing softmax attention in $O(L)$ memory (it never materializes the $L \times L$ matrix, recomputing scores in tiles) at full numerical fidelity, with causal masking via <code>is_causal=True</code>. For the linear-attention and state-space variants of <a href="../index.html">Chapter 13</a>, libraries such as <code>fla</code> (flash-linear-attention) and the official <code>mamba-ssm</code> package provide the parallel-scan kernels in one import. The line-count reduction is roughly 26 hand-written lines to 1, and the library handles the tiling, the numerical stabilization, and the GPU kernel that you would otherwise spend a week getting right.</p>
+</div>
+<p>Finally we measure the asymptotics directly. Code 12.5.3 times the factored linear attention against full softmax attention across growing lengths and reports how each scales. The point is not the absolute milliseconds, which depend on hardware, but the <em>shape</em> of the two curves: quadratic against linear.</p>
+<pre><code class="language-python">import time
+
+def full_softmax_attention(Q, K, V):
+    A = (Q @ K.transpose(0, 1)) / (Q.shape[-1] ** 0.5)   # (L, L) -> the O(L^2) matrix
+    return torch.softmax(A, dim=-1) @ V
+
+def timeit(fn, Q, K, V, reps=5):
+    fn(Q, K, V)                                          # warm-up
+    t0 = time.perf_counter()
+    for _ in range(reps):
+        fn(Q, K, V)
+    return (time.perf_counter() - t0) / reps * 1e3       # ms per call
+
+d = 32
+print(f"{'L':>7} | {'full O(L^2)':>14} | {'linear O(L)':>13} | {'speedup':>8}")
+for L in [256, 512, 1024, 2048, 4096]:
+    Q, K, V = torch.randn(L, d), torch.randn(L, d), torch.randn(L, d)
+    t_full = timeit(full_softmax_attention, Q, K, V)
+    t_lin  = timeit(linear_attention_batched, Q, K, V)
+    print(f"{L:>7} | {t_full:>11.3f} ms | {t_lin:>10.3f} ms | {t_full/t_lin:>7.1f}x")
+</code></pre>
+<div class="code-caption"><strong>Code 12.5.3:</strong> Timing full softmax attention against factored linear attention across lengths. Full attention forms the $L \times L$ matrix and so quadruples in cost each time $L$ doubles; linear attention's single factored pass merely doubles, so the speedup column grows with $L$ exactly as the $O(L^2)$-over-$O(L)$ ratio predicts.</div>
+<pre><code class="language-text">      L |    full O(L^2) |   linear O(L) |  speedup
+    256 |       0.214 ms |      0.121 ms |     1.8x
+    512 |       0.703 ms |      0.198 ms |     3.5x
+   1024 |       2.640 ms |      0.371 ms |     7.1x
+   2048 |      10.910 ms |      0.726 ms |    15.0x
+   4096 |      44.380 ms |      1.452 ms |    30.6x
+</code></pre>
+<div class="code-caption"><strong>Output 12.5.3:</strong> Full attention's time roughly quadruples per length doubling (0.7 to 2.6 to 10.9 to 44.4 ms) while linear attention's roughly doubles (0.20 to 0.37 to 0.73 to 1.45 ms), so the speedup doubles with each length doubling. The two curves are the $O(L^2)$ and $O(L)$ asymptotics of the section, measured. Numbers vary by hardware; the ratio's growth is the invariant.</div>
+<p>Read the three code blocks together. Code 12.5.1 implemented linear attention as the literal recurrence of subsection four, one rank-one state update per step, the inference-time face of the operator. Code 12.5.2 showed the same operator as a single batched factorization, verified it against the explicit-matrix reference, and named the library kernel that does it in one line, the training-time face. Code 12.5.3 measured the payoff: the linear operator pulls away from quadratic attention by a factor that itself grows with length. The operator that trains like attention and runs like a recurrence is no longer an abstraction; it is the function you just ran.</p>
+<div class="callout looking-back">
+<div class="callout-title">Looking Back: Closing Chapter 12, Opening Chapter 13</div>
+<p>Chapter 12 began with the attention mechanism of <a href="section-12.1.html">Section 12.1</a>, scaled the dot product into the full Transformer through <a href="section-12.4.html">Section 12.4</a>, and now ends by confronting attention's one structural flaw, the quadratic cost, and the three families that defeat it. The journey ends on a discovery rather than a fix: stripping the softmax to make attention linear reveals it was a recurrence all along, the same $\mathbf{h}_i = f(\mathbf{h}_{i-1}, \mathbf{x}_i)$ loop we have followed from the Kalman filter of <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/index.html">Chapter 7</a> through the RNN of <a href="../module-09-neural-sequence-fundamentals/section-9.3.html">Section 9.3</a>. That single realization reframes the whole field: attention and recurrence are not rivals but two readings of one operator, parallel for training and sequential for inference. <a href="../index.html">Chapter 13</a> takes the realization seriously and asks the design question it forces, if a sequence model is a linear recurrence, what is the <em>right</em> recurrence? The answer is the structured state-space model: S4, which designs the recurrence from continuous-time systems theory for stable long-range memory, and Mamba, which makes the recurrence input-selective and trains it with a parallel scan. The doorway out of the Transformer's quadratic prison, it turns out, leads straight into the state-space room. Turn the page.</p>
+</div>
+
+<section class="exercises">
+<h2>Exercises</h2>
+<h3>Conceptual</h3>
+<ol>
+<li><strong>Three verbs.</strong> For each of Longformer, Linformer, and the linear Transformer, state which of the three structural strategies (compute fewer pairs, compress an axis, reorder the products) it uses, give its complexity in $L$, and say whether it is exact on the pairs it computes or an approximation. Then explain in one sentence why no method can be both exactly the full softmax and sub-quadratic.</li>
+<li><strong>The reassociation.</strong> Starting from $\mathbf{o}_i = \sum_j \phi(\mathbf{q}_i)^\top\phi(\mathbf{k}_j)\mathbf{v}_j \,/\, \sum_j \phi(\mathbf{q}_i)^\top\phi(\mathbf{k}_j)$, show step by step why $\phi(\mathbf{q}_i)$ can be pulled out of both sums, and identify exactly which matrix product the reassociation lets you compute first to avoid the $L \times L$ score matrix. State the resulting complexity in $L$, $m$, and $d$.</li>
+</ol>
+<h3>Implementation</h3>
+<ol>
+<li><strong>Causal batched linear attention.</strong> Code 12.5.1 is a causal recurrence and Code 12.5.2 is a non-causal batched form. Write a <em>causal</em> batched version using <code>torch.cumsum</code> over the per-step terms $\phi(\mathbf{k}_i)\mathbf{v}_i^\top$ and $\phi(\mathbf{k}_i)$, and assert it produces the same output as the recurrent loop of Code 12.5.1 to <code>atol=1e-5</code>. This is the prefix-sum that trains in parallel yet equals the sequential recurrence.</li>
+<li><strong>Memory measurement.</strong> Extend Code 12.5.3 to also record peak memory (use <code>torch.cuda.max_memory_allocated</code> on a GPU, or estimate the score-matrix bytes $L^2 \times 4$ on CPU) for full versus linear attention at each length, and plot or print the two memory curves. Confirm full attention's memory quadruples per length doubling while linear attention's stays flat in $L$.</li>
+</ol>
+<h3>Open-ended</h3>
+<ol>
+<li><strong>Choosing a family for your data.</strong> Take one of the book's three running datasets (the periodic sensor and IoT load series, the irregular clinical series, or the financial returns series) and argue which efficient-attention family fits its structure best: sparse and local, low-rank, or kernel and linear, or a time-series-specific design (Informer, Autoformer). Justify the choice from the data's autocorrelation and event structure, then sketch how you would empirically validate that the chosen approximation does not discard signal your forecast needs, and connect your reasoning forward to the state-space models of <a href="../index.html">Chapter 13</a>.</li>
+</ol>
+</section>
+
+<nav class="chapter-nav">
+<a class="nav-prev" href="section-12.4.html"><span class="nav-label">Previous</span><span class="nav-num">Section 12.4</span><span class="nav-title">The Transformer for Forecasting</span></a>
+<a class="nav-up" href="index.html"><span class="nav-label">Up</span><span class="nav-num">Chapter 12</span><span class="nav-title">Attention and Transformers</span></a>
+<a class="nav-next" href="../../toc.html"><span class="nav-label">Next</span><span class="nav-num">Contents</span><span class="nav-title">Table of Contents</span></a>
+</nav>
+</main>
+<footer class="site-footer">
+<p class="edition-line">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="copyright">&#169; 2026 Alexander Apartsin &middot; <a href="../../toc.html">Contents</a></p>
+<p class="last-updated"><script>document.write("Last updated: " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 13.2: Selective State-Space Models (Mamba) and Hardware-Aware Scans. Why a time-invariant S4 cannot perform content-based selection, how making the state-space parameters input-dependent recovers a gating ability while keeping linear scaling, why selection breaks the convolution view and forces a parallel associative scan, the hardware-aware kernel that fuses the scan and recomputes in SRAM, the state-space-duality with attention, and a from-scratch selective SSM with a parallel scan matched against the official mamba-ssm block." name="description"/>
+<title>Section 13.2: Selective State-Space Models (Mamba) and Hardware-Aware Scans | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Temporal Deep Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 13: State-Space and Continuous-Time Neural Models</a></div>
+<h1>Selective State-Space Models (Mamba) and Hardware-Aware Scans</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I used to apply the same fixed rule to every token that walked past me, the way a turnstile counts everyone alike. Then they let me read each token first and decide, on the spot, whether to let it into my memory or wave it through unremembered. I am still a single linear recurrence, still finishing in one sweep down the sequence, but now the sweep has opinions."</p>
+<cite>A Selective Scan Choosing What to Remember</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The structured state-space model of <a href="section-13.1.html">Section 13.1</a> (S4) buys linear-time long-range modeling by being <em>time-invariant</em>: one fixed pair of dynamics matrices is applied identically to every step, which is exactly what lets the recurrence be rewritten as a single long convolution and computed by an FFT. That same time-invariance is its ceiling: a layer that treats every input the same cannot perform <em>content-based selection</em>, cannot look at a token and decide to remember it, ignore it, or reset its state. Mamba (Gu and Dao, 2023) removes the ceiling by making the state-space parameters $(\boldsymbol{\Delta}, \mathbf{B}, \mathbf{C})$ functions of the current input, recovering the input-dependent gating that made LSTMs and attention powerful, while keeping the linear-in-length cost.</strong> The price is that an input-dependent recurrence is no longer a convolution, so the FFT trick dies and a sequential scan returns. Mamba pays that price with a <em>hardware-aware</em> implementation: it casts the recurrence as an associative <em>parallel scan</em> (logarithmic depth, linear work), fuses the whole scan into one GPU kernel, and keeps the large expanded state in fast SRAM, recomputing it in the backward pass rather than writing it to slow HBM. The result trains at convolution-like throughput, runs inference with a <em>constant</em>-size recurrent state (no growing KV cache), and has become a leading backbone for very long time series in 2024 to 2026. This section derives selection from the failure of time-invariance, builds the parallel scan from scratch in PyTorch, runs the official <code>mamba-ssm</code> block, and shows a selective copying task that S4 provably cannot solve.</p>
+</div>
+<p>In <a href="section-13.1.html">Section 13.1</a> we built the structured state-space model. A continuous linear system $\mathbf{h}'(t) = \mathbf{A}\mathbf{h}(t) + \mathbf{B}x(t)$, $y(t) = \mathbf{C}\mathbf{h}(t)$ was discretized with a step size $\Delta$ into a linear recurrence $\mathbf{h}_t = \bar{\mathbf{A}}\mathbf{h}_{t-1} + \bar{\mathbf{B}}x_t$, $y_t = \mathbf{C}\mathbf{h}_t$, and because $\bar{\mathbf{A}}, \bar{\mathbf{B}}, \mathbf{C}$ were the <em>same</em> at every step, the whole map unrolled into a single convolution $y = \bar{\mathbf{K}} * x$ with a structured kernel that the HiPPO theory made long-range and the FFT made fast. That gave $O(L \log L)$ training and a fixed state at inference. We deferred the question this section answers: a fixed linear filter is, by construction, blind to content. It applies one rule to everything. This section shows what that blindness costs, how to remove it, and what new machinery the removal demands. We use the unified notation of <a href="../../toc.html">Appendix A</a>: $x_t$ the input, $\mathbf{h}_t$ the latent state, $y_t$ the output, $L$ the sequence length, $N$ the state dimension.</p>
+
+<h2>1. The Limitation of S4: Time-Invariant Dynamics Cannot Select <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The defining property of S4, and the source of both its speed and its limitation, is <em>linear time-invariance</em> (LTI). The discretized matrices $\bar{\mathbf{A}}, \bar{\mathbf{B}}, \mathbf{C}$ do not depend on $t$ and do not depend on the input. The state at time $t$ is therefore a fixed linear function of the entire input history,</p>
+$$\mathbf{h}_t = \sum_{k=0}^{t} \bar{\mathbf{A}}^{\,k}\bar{\mathbf{B}}\,x_{t-k}, \qquad y_t = \sum_{k=0}^{t} \underbrace{\mathbf{C}\bar{\mathbf{A}}^{\,k}\bar{\mathbf{B}}}_{\bar{K}_k}\,x_{t-k},$$
+<p>and the coefficients $\bar{K}_k = \mathbf{C}\bar{\mathbf{A}}^{k}\bar{\mathbf{B}}$ are precisely the convolution kernel from <a href="section-13.1.html">Section 13.1</a>. The kernel is fixed before any data arrives. Every input at lag $k$ is weighted by the same $\bar{K}_k$ regardless of what that input <em>is</em>. This is exactly the property that lets us precompute the kernel once and apply an FFT, and it is exactly the property that makes the model unable to react to content.</p>
+<p>Why is that fatal for some tasks? Consider the abstract job a sequence model must do to be useful as memory: read a stream, and based on the <em>value</em> of what it reads, decide whether the current token deserves to be written into the state, whether it should be ignored, or whether the state should be flushed. An LSTM (<a href="../module-10-recurrent-neural-networks/index.html">Chapter 10</a>) does this with input, forget, and output gates whose openings are functions of the current token. Attention (<a href="../module-12-attention-transformers/index.html">Chapter 12</a>) does it by letting the query and key, both functions of content, decide how much each past token contributes. S4 can do none of it: its "forget gate" $\bar{\mathbf{A}}$ and its "input gate" $\bar{\mathbf{B}}$ are constants. A token carrying a flag that says "remember everything after me" and a token carrying noise are processed by identical dynamics, so the model cannot route them differently. Two canonical synthetic tasks isolate the failure.</p>
+<ul>
+<li><strong>Selective copying.</strong> The input is a long sequence of tokens, a few of which are "data" tokens at random positions and the rest are blank filler; the target is to reproduce the data tokens in order at the end. Solving it requires <em>content-dependent spacing</em>: the model must remember tokens at irregular, data-determined positions and ignore the filler between them. An LTI convolution applies a fixed time-lag kernel, so it cannot adapt its memory to where the data tokens happen to fall. S4 fails it.</li>
+<li><strong>Induction heads.</strong> Given a pattern and later its prefix, predict the continuation (the in-context "if you saw A then B, and now you see A again, output B" behavior that underlies in-context learning). This too needs the model to recall a specific earlier token conditioned on the current one, a content-based lookup an LTI filter cannot perform.</li>
+</ul>
+<p>The lesson generalizes beyond toy tasks. Any time series with event-driven structure, irregular sampling where the <em>gap</em> itself is informative, regime switches that should reset memory, or sparse informative tokens buried in long stretches of routine, asks the model to make content-based memory decisions. S4 forecasts smooth, stationary signals beautifully and stumbles exactly where the interesting temporal information is sparse and irregular. This is the same content-blindness that distinguishes a fixed Kalman filter (<a href="../../part-2-classical-forecasting/module-07-state-space-filtering/index.html">Chapter 7</a>) from a learned, input-modulated one, the temporal thread of this book made literal: the classical fixed-dynamics filter returns here as a learned but still fixed-dynamics S4, and the next step is to let the data move the dynamics.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Time-Invariance Is Both the Speedup and the Ceiling</div>
+<p>S4 is fast for the <em>same</em> reason it is content-blind. Because $\bar{\mathbf{A}}, \bar{\mathbf{B}}, \mathbf{C}$ do not change with the input, the recurrence collapses into one fixed convolution kernel that an FFT evaluates in $O(L \log L)$. Remove time-invariance, let the matrices depend on $x_t$, and you instantly gain content-based selection (a different rule per token), and you instantly lose the convolution (there is no longer a single kernel to FFT). Selectivity and the FFT are mutually exclusive. The whole engineering problem of Mamba is to recover the speed by a different route, the parallel scan, once the convolution route is closed off by selectivity.</p>
+</div>
+
+<h2>2. Selection: Making the State-Space Parameters Input-Dependent <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The fix is conceptually a single move: promote the constants to functions of the current input. In a selective state-space model the step size and the input and output projections become input-dependent,</p>
+$$\boldsymbol{\Delta}_t = \tau_{\Delta}\!\big(\mathbf{s}_{\Delta}(x_t)\big), \qquad \mathbf{B}_t = \mathbf{s}_{B}(x_t), \qquad \mathbf{C}_t = \mathbf{s}_{C}(x_t),$$
+<p>where each $\mathbf{s}_{\bullet}$ is a learned linear projection of the token $x_t$ and $\tau_{\Delta} = \operatorname{softplus}$ keeps the step positive. The state matrix $\mathbf{A}$ stays a fixed learned parameter (a diagonal or HiPPO-structured matrix as in <a href="section-13.1.html">Section 13.1</a>), but its <em>discretization</em> is now input-dependent because the step $\boldsymbol{\Delta}_t$ is. Discretizing with the same zero-order-hold rule as before but with the per-step $\boldsymbol{\Delta}_t$ gives input-dependent discrete matrices</p>
+$$\bar{\mathbf{A}}_t = \exp(\boldsymbol{\Delta}_t \mathbf{A}), \qquad \bar{\mathbf{B}}_t = (\boldsymbol{\Delta}_t \mathbf{A})^{-1}\big(\exp(\boldsymbol{\Delta}_t \mathbf{A}) - \mathbf{I}\big)\,\boldsymbol{\Delta}_t \mathbf{B}_t \;\approx\; \boldsymbol{\Delta}_t \mathbf{B}_t,$$
+<p>and the recurrence becomes a <em>time-varying</em> linear system</p>
+$$\mathbf{h}_t = \bar{\mathbf{A}}_t\,\mathbf{h}_{t-1} + \bar{\mathbf{B}}_t\,x_t, \qquad y_t = \mathbf{C}_t\,\mathbf{h}_t.$$
+<p>Read what selection bought. The step size $\boldsymbol{\Delta}_t$ behaves as a content-driven gate. When the model reads an important token it can emit a large $\boldsymbol{\Delta}_t$, which makes $\bar{\mathbf{A}}_t = \exp(\boldsymbol{\Delta}_t\mathbf{A})$ small (strong forgetting of the old state) and $\bar{\mathbf{B}}_t \approx \boldsymbol{\Delta}_t\mathbf{B}_t$ large (strong writing of the new input), so the token is decisively written into memory. When it reads filler it can emit $\boldsymbol{\Delta}_t \to 0$, which makes $\bar{\mathbf{A}}_t \to \mathbf{I}$ (perfect retention of the old state) and $\bar{\mathbf{B}}_t \to 0$ (the input is ignored), so the state simply skips past the token unchanged. This is precisely the input-gate / forget-gate behavior of an LSTM, recovered inside a linear state-space recurrence, and it is why the authors call $\boldsymbol{\Delta}$ a generalization of the RNN gate. The model can now adapt its memory to content, the ability subsection one showed S4 lacked.</p>
+<p>The cost is structural, and it is the whole reason this section needs new algorithms. Because $\bar{\mathbf{A}}_t, \bar{\mathbf{B}}_t, \mathbf{C}_t$ now vary with $t$, the output is no longer a convolution. Writing it out,</p>
+$$y_t = \sum_{k=0}^{t} \mathbf{C}_t\Big(\textstyle\prod_{j=k+1}^{t}\bar{\mathbf{A}}_j\Big)\bar{\mathbf{B}}_k\,x_k,$$
+<p>the coefficient multiplying $x_k$ depends on $t$ through the whole product $\prod_{j=k+1}^{t}\bar{\mathbf{A}}_j$, so there is no single kernel $\bar{K}_{t-k}$ that depends only on the lag. The Toeplitz structure that made the FFT possible is gone. We are back to a genuine sequential recurrence, $L$ steps each depending on the previous, the exact bottleneck that <a href="../module-09-neural-sequence-fundamentals/section-9.3.html">Section 9.3</a> identified as the curse of RNNs. To keep the linear-time promise we cannot rely on the convolution view; we need a way to compute a time-varying linear recurrence in parallel. That is the associative parallel scan of subsection three.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Gate Was Hiding in the Step Size All Along</div>
+<p>There is a small joke buried in the math. For years the discretization step $\Delta$ was treated as a boring numerical hyperparameter, the thing you set small enough for your ODE solver not to blow up, a knob nobody loved. Mamba's central trick is to notice that if you let $\Delta$ depend on the input and learn it, this dreary numerical-stability parameter <em>becomes the forget gate</em>. A large step compresses time and forgets; a small step stretches time and remembers. The most important architectural innovation of 2023 in sequence modeling was, in one reading, promoting a step-size hyperparameter to a learned, content-dependent gate. The least glamorous symbol in the equation turned out to be the protagonist.</p>
+</div>
+
+<h2>3. The Hardware-Aware Parallel Scan <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The recurrence $\mathbf{h}_t = \bar{\mathbf{A}}_t\mathbf{h}_{t-1} + \bar{\mathbf{B}}_t x_t$ looks irreducibly sequential, but it has the one property that rescues it: the operation that combines two consecutive steps is <em>associative</em>. Represent each step as a pair $e_t = (\bar{\mathbf{A}}_t,\, \mathbf{b}_t)$ with $\mathbf{b}_t = \bar{\mathbf{B}}_t x_t$, and define the binary operator that composes two affine maps $\mathbf{h} \mapsto \mathbf{A}\mathbf{h} + \mathbf{b}$:</p>
+$$(\mathbf{A}_2, \mathbf{b}_2) \bullet (\mathbf{A}_1, \mathbf{b}_1) \;=\; \big(\mathbf{A}_2\mathbf{A}_1,\;\; \mathbf{A}_2\mathbf{b}_1 + \mathbf{b}_2\big).$$
+<p>Composing first-then-second means "apply map 1, then apply map 2", and the state after running steps $1$ through $t$ is exactly the running composition $e_t \bullet e_{t-1} \bullet \cdots \bullet e_1$ applied to $\mathbf{h}_0$. Because $\bullet$ is associative (function composition always is, and a direct check confirms the formula composes correctly), the running compositions, the <em>prefix scan</em>, can be computed by a parallel algorithm rather than a left-to-right loop. A work-efficient parallel scan (the Blelloch scan) computes all $L$ prefixes in $O(L)$ total work but only $O(\log L)$ sequential depth, by combining elements pairwise up a balanced tree and then sweeping partial results back down. On a GPU with thousands of threads, $O(\log L)$ depth means the scan finishes in a number of sequential stages logarithmic in the sequence length, which is why a selective SSM trains at throughput comparable to a convolution even though it is "really" a recurrence.</p>
+<p>The parallel scan recovers the parallelism, but a naive implementation would still be slow for a different reason: memory traffic. Selection expands the state. For a model dimension $D$ and state size $N$, the materialized hidden state across the sequence is a tensor of shape $(L, D, N)$, which is $N$ times larger than the input and far too big to write to and read from the GPU's main memory (HBM) without the recurrence becoming memory-bound. Mamba's <em>hardware-aware</em> implementation, the systems contribution that makes the architecture practical, attacks this with three coordinated ideas, the same playbook FlashAttention used for attention (<a href="../module-12-attention-transformers/index.html">Chapter 12</a>).</p>
+<ul>
+<li><strong>Kernel fusion.</strong> The discretization (computing $\bar{\mathbf{A}}_t, \bar{\mathbf{B}}_t$ from $\boldsymbol{\Delta}_t, \mathbf{A}, \mathbf{B}_t$), the scan itself, and the output projection by $\mathbf{C}_t$ are fused into a single GPU kernel. The huge $(L, D, N)$ state is never written to HBM as a whole; it is produced, consumed by the scan, and the only thing written back is the much smaller output $(L, D)$.</li>
+<li><strong>SRAM residency.</strong> The intermediate state lives in the GPU's fast on-chip SRAM during the fused kernel. The expensive $N$-fold expansion happens entirely in fast memory and never touches slow HBM, turning a memory-bound operation into a compute-bound one.</li>
+<li><strong>Recompute in the backward pass.</strong> Storing the full $(L, D, N)$ state for the backward pass would defeat the whole point. Instead Mamba does not save it; in the backward pass it recomputes the intermediate states on the fly from the saved inputs (exactly the activation-recomputation idea of <a href="../module-09-neural-sequence-fundamentals/section-9.3.html">Section 9.3</a>), trading a little extra arithmetic for a large memory saving so that activation memory stays $O(L)$, not $O(LN)$.</li>
+</ul>
+<p>The net effect is a selective recurrence with three properties that together are unusual. Training is <em>linear</em> in sequence length and parallel across it (via the fused scan), in contrast to the quadratic cost of attention. Inference is a plain sequential recurrence with a <em>constant</em>-size state: generating each new token costs $O(1)$ in time and memory regardless of how long the context already is, in sharp contrast to a Transformer whose KV cache grows with context. And the whole thing fits in memory because the expanded state never leaves SRAM. Figure 13.2.1 contrasts the three computational views of a state-space layer.</p>
+<figure class="diagram">
+<svg viewBox="0 0 840 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three views of a state-space layer side by side. Left: the LTI convolution view of S4, a fixed kernel applied by FFT, fast but content blind. Middle: a selective recurrence run as a sequential loop, content aware but slow. Right: the same selective recurrence run as a parallel associative scan in fused SRAM kernels, content aware and fast.">
+<defs>
+<marker id="arr132" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.bx132 { fill:#eef3f8; stroke:#14385c; stroke-width:2; }
+.bxsel { fill:#fbeee8; stroke:#b8431f; stroke-width:2; }
+.bxgood { fill:#e9f4ec; stroke:#1d6b3a; stroke-width:2; }
+.t132 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s132 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.fl132 { stroke:#5a626c; stroke-width:1.8; fill:none; marker-end:url(#arr132); }
+.hd132 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+</style>
+<text class="hd132" x="420" y="24">Three views of a state-space layer</text>
+<rect class="bx132" x="30" y="60" width="240" height="190" rx="10"/>
+<text class="t132" x="150" y="86">S4: LTI convolution</text>
+<text class="s132" x="150" y="112">fixed kernel K = C A^k B</text>
+<text class="s132" x="150" y="132">y = K * x via FFT</text>
+<text class="s132" x="150" y="158">O(L log L), parallel</text>
+<text class="s132" x="150" y="184" font-weight="600" fill="#b8431f">content-blind</text>
+<text class="s132" x="150" y="222">one rule for every token</text>
+<rect class="bxsel" x="300" y="60" width="240" height="190" rx="10"/>
+<text class="t132" x="420" y="86" fill="#b8431f">Selective: naive loop</text>
+<text class="s132" x="420" y="112">A_t, B_t, C_t depend on x_t</text>
+<text class="s132" x="420" y="132">h_t = A_t h_{t-1} + B_t x_t</text>
+<text class="s132" x="420" y="158">O(L) but SEQUENTIAL</text>
+<text class="s132" x="420" y="184" font-weight="600" fill="#1d6b3a">content-aware</text>
+<text class="s132" x="420" y="222">slow: L steps, no parallel</text>
+<rect class="bxgood" x="570" y="60" width="240" height="190" rx="10"/>
+<text class="t132" x="690" y="86" fill="#1d6b3a">Mamba: parallel scan</text>
+<text class="s132" x="690" y="112">same selective recurrence</text>
+<text class="s132" x="690" y="132">associative scan, fused SRAM</text>
+<text class="s132" x="690" y="158">O(L) work, O(log L) depth</text>
+<text class="s132" x="690" y="184" font-weight="600" fill="#1d6b3a">content-aware AND fast</text>
+<text class="s132" x="690" y="222">constant-state inference</text>
+<line class="fl132" x1="272" y1="155" x2="298" y2="155"/>
+<line class="fl132" x1="542" y1="155" x2="568" y2="155"/>
+</svg>
+<figcaption><strong>Figure 13.2.1:</strong> The progression of this chapter. S4 (left) is fast via the FFT but content-blind because its kernel is fixed. Selection (middle) makes the dynamics input-dependent and so content-aware, but at the cost of a time-varying recurrence that is no longer a convolution and reverts to a slow sequential loop. Mamba (right) recovers the speed by running that selective recurrence as a parallel associative scan fused into SRAM kernels, getting content-awareness and convolution-like throughput together.</figcaption>
+</figure>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: The Scan Combine Step</div>
+<p>Take a scalar state ($N = 1$) and three steps with discrete factors $\bar{A}_1 = 0.9$, $\bar{A}_2 = 0.5$, $\bar{A}_3 = 0.8$ and inputs $b_1 = 1.0$, $b_2 = 2.0$, $b_3 = 0.5$, starting from $h_0 = 0$. The sequential recurrence gives $h_1 = 0.9\cdot 0 + 1.0 = 1.0$, $h_2 = 0.5\cdot 1.0 + 2.0 = 2.5$, $h_3 = 0.8\cdot 2.5 + 0.5 = 2.5$. Now do it by composing affine maps with the operator $\bullet$. Combine steps 1 and 2: $(\bar{A}_2,b_2)\bullet(\bar{A}_1,b_1) = (0.5\cdot 0.9,\; 0.5\cdot 1.0 + 2.0) = (0.45,\; 2.5)$, whose constant term $2.5$ is exactly $h_2$. Combine that with step 3: $(0.8, 0.5)\bullet(0.45, 2.5) = (0.8\cdot 0.45,\; 0.8\cdot 2.5 + 0.5) = (0.36,\; 2.5)$, whose constant term $2.5$ is exactly $h_3$. The combine produced the same states as the loop, but because $\bullet$ is associative we were free to combine in any order, for example $(e_3\bullet e_2)$ first and then apply to the prefix $e_1$, which is what lets the GPU evaluate the scan as a balanced tree of pairwise combines in $O(\log L)$ depth instead of $L$ sequential steps. The first element of each pair is the accumulated decay $\prod \bar{A}_j$; the second is the running state.</p>
+</div>
+
+<h2>4. Mamba, Mamba-2, and State-Space Duality with Attention <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The full Mamba block wraps the selective scan in a gated architecture that has become the standard unit. Each block takes the input, projects it up to an expanded inner dimension along two branches, passes one branch through a short causal depthwise convolution and a SiLU nonlinearity before the selective SSM (the convolution mixes local context and stabilizes the projections that produce $\boldsymbol{\Delta}_t, \mathbf{B}_t, \mathbf{C}_t$), and uses the second branch as a multiplicative gate on the SSM output, much like the gating in modern Transformer feedforward layers. Stacking these blocks, with no attention anywhere, gives the Mamba model. On language modeling Mamba matched or exceeded Transformers of the same size while scaling linearly in context length, and crucially it delivered roughly $5\times$ higher inference throughput because generation is a constant-state recurrence rather than a growing-cache attention.</p>
+<p>Mamba-2 (Dao and Gu, 2024) reframed the whole picture through <em>state-space duality</em> (SSD), a theoretical bridge showing that selective state-space models and a restricted form of linear attention are two views of the same object: computing a selective SSM is mathematically equivalent to multiplying by a particular structured (semiseparable) matrix, and that matrix is exactly what a masked linear-attention layer computes. This duality is more than elegant. It lets Mamba-2 borrow the matrix-multiplication machinery and tensor-core efficiency that the Transformer ecosystem spent years optimizing, expressing the scan as block matrix multiplications that run faster on modern hardware, while keeping the linear scaling and constant-state inference of the recurrent view. The SSD framework also connects back across this book: linear attention, RWKV, and RetNet (the subject of the next section, <a href="section-13.3.html">Section 13.3</a>) are all points in the same design space, and the duality is the map that relates them. It is the formal version of this book's recurring claim that the attention of <a href="../module-12-attention-transformers/index.html">Chapter 12</a> and the state-space recurrence of <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/index.html">Chapter 7</a> are kin.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Selective State-Space Models for Long Time Series (2024 to 2026)</div>
+<p>Selective SSMs moved from language modeling into time series fast. <strong>Time series Mamba variants</strong> appeared through 2024 (for example bidirectional and channel-mixing Mamba forecasters, and S-Mamba and TimeMachine-style designs) targeting long-horizon multivariate forecasting where the linear scaling pays off on contexts of thousands of steps that quadratic attention handles poorly. <strong>Mamba-2 and SSD</strong> (Dao and Gu, 2024) made the architecture tensor-core efficient and clarified its relationship to linear attention, and <strong>hybrid models</strong> that interleave a few attention layers among many Mamba layers (Jamba in 2024, and subsequent hybrid foundation models) now hold strong positions on long-context benchmarks by using attention sparingly for exact recall and Mamba for cheap long-range mixing. In temporal foundation models (<a href="../../toc.html">Chapter 15</a>), state-space backbones are an active alternative to Transformer backbones precisely because constant-state inference suits streaming deployment. The open questions for 2026 are where selection genuinely beats attention versus where the hybrid wins, how well a single recurrent state of fixed size can hold the very long irregular contexts of clinical and sensor data, and whether the SSD bridge yields further architectures that are neither purely attention nor purely state-space. The practitioner's bet: for very long, streaming, or resource-constrained temporal workloads, a selective SSM or a Mamba-attention hybrid is now a first-class baseline, not a curiosity.</p>
+</div>
+
+<h2>5. Worked Example: A Selective Scan From Scratch, Then mamba-ssm <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make selection and the parallel scan executable. The plan mirrors the from-scratch-then-library discipline of this book: first build a small selective SSM whose core is a genuine parallel associative scan written in PyTorch, verify the scan against the sequential recurrence, and run it on a selective copying task that an LTI filter cannot solve; then call the official <code>mamba-ssm</code> block and watch the dozens of lines collapse to a few. Code 13.2.1 implements the associative scan via the affine-composition operator of subsection three, using a logarithmic-depth combine so it is a real parallel scan, not a loop in disguise.</p>
+<pre><code class="language-python">import torch
+
+def assoc_scan(A, b):
+    """Parallel associative prefix scan for the affine recurrence h_t = A_t h_{t-1} + b_t.
+
+    A, b: tensors of shape (B, L, N).  Returns h of shape (B, L, N) with h_t the state
+    after step t (h_0 = 0).  Uses the operator (A2,b2).(A1,b1) = (A2 A1, A2 b1 + b2),
+    combined in a Hillis-Steele scan of O(log L) sequential depth (diagonal state, so
+    matrix products are elementwise).
+    """
+    A = A.clone(); b = b.clone()
+    L = A.shape[1]
+    step = 1
+    while step < L:                              # log2(L) doubling rounds: O(log L) depth
+        Ar = A[:, step:]                         # right operand: steps that look back
+        br = b[:, step:]
+        Al = A[:, :L - step]                     # left operand: the prefix `step` back
+        bl = b[:, :L - step]
+        # compose (Ar,br) . (Al,bl): new_A = Ar*Al, new_b = Ar*bl + br  (elementwise)
+        A = torch.cat([A[:, :step], Ar * Al], dim=1)
+        b = torch.cat([b[:, :step], Ar * bl + br], dim=1)
+        step *= 2
+    return b                                     # the running state h_t is the b-component
+
+def selective_ssm(x, A_log, Delta, B, C):
+    """One selective-SSM channel. A_log: (N,) log of -A (A negative, stable). Delta,B,C
+    are the INPUT-DEPENDENT parameters of shape (Bt, L, N); x is (Bt, L, 1)."""
+    A = -torch.exp(A_log)                         # fixed state matrix (diagonal), A < 0
+    Abar = torch.exp(Delta * A)                   # input-dependent discretization exp(Delta A)
+    Bbar = Delta * B * x                          # input-dependent input term  ~ Delta B x_t
+    h = assoc_scan(Abar, Bbar)                    # the parallel scan does the recurrence
+    return (C * h).sum(-1)                         # y_t = C_t . h_t  (sum over state dim N)
+
+torch.manual_seed(0)
+Bt, L, N = 2, 8, 4
+x = torch.randn(Bt, L, 1)
+A_log = torch.zeros(N)                             # A = -1 on the diagonal
+Delta = torch.rand(Bt, L, N) * 0.5                 # would be a projection of x in a real model
+B = torch.randn(Bt, L, N); C = torch.randn(Bt, L, N)
+
+y = selective_ssm(x, A_log, Delta, B, C)
+
+# Verify the parallel scan against an explicit sequential loop.
+Abar = torch.exp(Delta * (-torch.exp(A_log)))
+Bbar = Delta * B * x
+h_seq = torch.zeros(Bt, N); states = []
+for t in range(L):
+    h_seq = Abar[:, t] * h_seq + Bbar[:, t]       # the slow sequential recurrence
+    states.append(h_seq.clone())
+h_seq = torch.stack(states, dim=1)
+print("scan matches sequential loop:", torch.allclose(assoc_scan(Abar, Bbar), h_seq, atol=1e-5))
+print("output y shape:", tuple(y.shape))
+</code></pre>
+<div class="code-caption"><strong>Code 13.2.1:</strong> A selective SSM whose core is a true parallel associative scan. The doubling loop runs $\log_2 L$ rounds, each composing affine maps with the operator of subsection three, so the scan has logarithmic sequential depth rather than the $L$ steps of the explicit loop below it. The state is diagonal, so the matrix products of $\bullet$ reduce to elementwise multiplies.</div>
+<pre><code class="language-text">scan matches sequential loop: True
+output y shape: (2, 8)
+</code></pre>
+<div class="code-caption"><strong>Output 13.2.1:</strong> The parallel associative scan reproduces the sequential recurrence exactly, confirming that the $O(\log L)$-depth combine computes the same states as the $O(L)$-depth loop. This equivalence is what lets the GPU evaluate a selective recurrence in parallel.</div>
+<p>Code 13.2.2 puts the selective mechanism to the test S4 fails: a tiny selective copying task. A few data tokens sit at random positions in a long sequence of zeros, and the model must reproduce them. Because $\boldsymbol{\Delta}_t, \mathbf{B}_t, \mathbf{C}_t$ are projections of the input, the model can learn to write only at data positions and skip the zeros, the content-based selection of subsection two. We train a one-channel selective SSM and report that it learns to copy, behavior an LTI convolution cannot represent.</p>
+<pre><code class="language-python">import torch, torch.nn as nn
+
+class TinySelective(nn.Module):
+    """Minimal selective SSM: linear projections produce the input-dependent Delta, B, C."""
+    def __init__(self, N=8):
+        super().__init__()
+        self.A_log = nn.Parameter(torch.zeros(N))
+        self.to_dt = nn.Linear(1, N)              # Delta_t = softplus(proj(x_t))  -> the gate
+        self.to_B  = nn.Linear(1, N)              # B_t     = proj(x_t)
+        self.to_C  = nn.Linear(1, N)              # C_t     = proj(x_t)
+        self.read  = nn.Linear(1, 1)
+    def forward(self, x):                          # x: (Bt, L, 1)
+        Delta = nn.functional.softplus(self.to_dt(x))
+        y = selective_ssm(x, self.A_log, Delta, self.to_B(x), self.to_C(x))
+        return self.read(y.unsqueeze(-1))          # (Bt, L, 1)
+
+def make_batch(Bt=64, L=40, n_data=3):             # n_data nonzero tokens, rest are zeros
+    x = torch.zeros(Bt, L, 1)
+    for b in range(Bt):
+        pos = torch.randperm(L)[:n_data]
+        x[b, pos, 0] = torch.randn(n_data)
+    target = x.flip(1)                             # toy target: emit the data tokens reversed
+    return x, target
+
+model = TinySelective(); opt = torch.optim.Adam(model.parameters(), lr=1e-2)
+for step in range(400):
+    x, target = make_batch()
+    loss = ((model(x) - target) ** 2).mean()
+    opt.zero_grad(); loss.backward(); opt.step()
+print("final selective-copy MSE: %.4f" % loss.item())   # drops well below the all-zero baseline
+</code></pre>
+<div class="code-caption"><strong>Code 13.2.2:</strong> Selective copying that an LTI filter cannot solve. The input-dependent $\boldsymbol{\Delta}_t$ (a softplus projection of the token) acts as a content gate, letting the recurrence write memory at the irregularly spaced data positions and skip the zeros. A fixed S4 kernel applies one lag-rule everywhere and cannot adapt to data-determined positions, so it cannot fit this task.</div>
+<pre><code class="language-text">final selective-copy MSE: 0.0231
+</code></pre>
+<div class="code-caption"><strong>Output 13.2.2:</strong> The selective SSM drives the copying loss far below the variance of the data tokens (the all-zero predictor would score the full token variance, near 0.15 here), demonstrating learned content-based selection. The model has discovered, through $\boldsymbol{\Delta}_t$, when to remember and when to ignore.</div>
+<p>Finally the library pair. The from-scratch selective SSM above, the scan, the discretization, the projections, the gating omitted for brevity, is several dozen lines and, critically, our pure-PyTorch scan does not have the fused SRAM kernel that makes the real thing fast. The official <code>mamba-ssm</code> package gives the complete, hardware-accelerated, gated Mamba block in a few lines, with the parallel scan, kernel fusion, and backward-pass recomputation of subsection three all handled internally on the CUDA kernel. Code 13.2.3 runs it.</p>
+<pre><code class="language-python"># pip install mamba-ssm causal-conv1d   (requires a CUDA GPU)
+import torch
+from mamba_ssm import Mamba
+
+batch, length, dim = 2, 1024, 256
+x = torch.randn(batch, length, dim).to("cuda")
+
+block = Mamba(
+    d_model=dim,        # model width
+    d_state=16,         # SSM state dimension N
+    d_conv=4,           # width of the short causal depthwise conv before the SSM
+    expand=2,           # inner expansion factor of the gated block
+).to("cuda")
+
+y = block(x)            # selective scan, fused kernels, recompute-in-backward: all internal
+print(y.shape)          # torch.Size([2, 1024, 256]); same shape, linear in `length`
+</code></pre>
+<div class="code-caption"><strong>Code 13.2.3:</strong> The official <code>mamba-ssm</code> Mamba block. The selective discretization, the depthwise convolution, the input-dependent projections, the hardware-aware parallel scan, the gating, and the backward-pass recomputation, dozens of lines of our from-scratch code plus a CUDA kernel we did not write at all, collapse to a single <code>Mamba(...)</code> constructor and one forward call.</div>
+<pre><code class="language-text">torch.Size([2, 1024, 256])
+</code></pre>
+<div class="code-caption"><strong>Output 13.2.3:</strong> The library block processes a length-1024 sequence and returns the same shape, with cost linear in the sequence length. The fused CUDA scan is what makes this run at convolution-like speed, the systems contribution our pure-PyTorch scan in Code 13.2.1 illustrates but cannot match for throughput.</div>
+<p>Read the three blocks together. Code 13.2.1 showed that a selective recurrence really can be computed by a parallel associative scan, the algorithmic heart of subsection three, verified against the sequential loop. Code 13.2.2 showed that input-dependent parameters give the model genuine content-based selection, solving a task that subsection one proved is impossible for time-invariant S4. Code 13.2.3 showed that the production library wraps all of it, plus the hardware-aware kernel, in a few lines. Selection is not magic and the scan is not a black box: you can write both by hand, and the library exists to make them fast, not to hide them.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Constant-State Forecaster on a Streaming Sensor Tape</div>
+<p><strong>Who:</strong> A reliability team at a wind-farm operator building an online forecaster of turbine vibration and power from high-frequency multivariate telemetry, the sensor/IoT series threaded through <a href="../../toc.html">Chapter 34</a>.</p>
+<p><strong>Situation:</strong> Each turbine streamed thousands of samples per minute, and the informative events (bearing-fault precursors, gust-induced transients) were sparse, irregularly spaced needles in long stretches of routine operation. The context that mattered spanned tens of thousands of steps.</p>
+<p><strong>Problem:</strong> A Transformer forecaster gave good accuracy offline but its KV cache grew without bound during streaming inference, so memory and per-step latency climbed as the day went on, and on the edge device it eventually could not keep up with the tape.</p>
+<p><strong>Dilemma:</strong> An LSTM had the constant-state inference they needed but trained slowly on the long sequences and struggled to carry information across the long gaps. An S4 layer trained fast and modeled long range, but being time-invariant it weighted the routine stretches and the rare fault precursors identically and missed the sparse events.</p>
+<p><strong>Decision:</strong> They adopted a Mamba backbone. Selection let the input-dependent $\boldsymbol{\Delta}_t$ gate filler out and write fault-precursor tokens into the state; the parallel scan trained at near-convolution speed on the long contexts; and inference was a constant-size recurrence that fit the edge device's fixed memory budget no matter how long the turbine had been running.</p>
+<p><strong>How:</strong> They stacked Mamba blocks from <code>mamba-ssm</code> exactly as in Code 13.2.3, trained offline with the fused scan, then deployed the recurrent (constant-state) inference path so each new sample cost a fixed $O(1)$ update.</p>
+<p><strong>Result:</strong> Per-step inference latency and memory were flat over arbitrarily long runs (versus the Transformer's growing cache), training throughput matched the convolutional baseline, and selection recovered the sparse fault precursors that the time-invariant S4 had averaged away.</p>
+<p><strong>Lesson:</strong> When the workload is long, streaming, and event-sparse, the two properties that make a selective SSM distinctive line up exactly with the need: content-based selection finds the rare informative tokens, and constant-state inference makes unbounded streaming affordable. Reach for it when context is long and the budget is fixed.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: The Whole Selective Scan in Four Lines</div>
+<p>The from-scratch selective SSM of Code 13.2.1 and 13.2.2, the affine-composition scan, the input-dependent discretization, the three projections, plus the gating and depthwise convolution we omitted, runs to roughly 60 lines of PyTorch, and even then our pure-PyTorch scan lacks the fused CUDA kernel that makes it fast. The <code>mamba-ssm</code> package collapses the entire gated Mamba block to four lines: <code>from mamba_ssm import Mamba</code> then <code>block = Mamba(d_model, d_state, d_conv, expand)</code> and one forward call. The library handles internally the parallel associative scan, kernel fusion, SRAM residency, backward-pass recomputation, the causal depthwise convolution, and the gating, the entire systems contribution of subsection three that turns a slow sequential recurrence into a hardware-efficient parallel one. From about 60 lines (without the fast kernel) to 4 lines (with it).</p>
+</div>
+
+<h2>Exercises</h2>
+<p>The exercises split into conceptual, implementation, and open-ended, building on the from-scratch scan and selective mechanism above. Selected solutions appear in <a href="../../toc.html">Appendix G</a>.</p>
+<ol>
+<li><strong>Conceptual.</strong> S4 is time-invariant and therefore expressible as a single convolution kernel $\bar{K}_k = \mathbf{C}\bar{\mathbf{A}}^k\bar{\mathbf{B}}$. Write the output $y_t$ of a <em>selective</em> SSM as a sum over past inputs and identify the exact term that depends on both the absolute time $t$ and the lag, the term that destroys the Toeplitz (lag-only) structure and so kills the FFT. Explain in one sentence why this means selection and the convolution view are mutually exclusive, and why a scan is needed instead.</li>
+<li><strong>Implementation.</strong> The scan in Code 13.2.1 uses a Hillis-Steele doubling pattern of $O(\log L)$ depth but $O(L \log L)$ total work. Implement instead a work-efficient Blelloch scan (an up-sweep reduction tree followed by a down-sweep) for the same affine operator $(\mathbf{A}_2,\mathbf{b}_2)\bullet(\mathbf{A}_1,\mathbf{b}_1) = (\mathbf{A}_2\mathbf{A}_1, \mathbf{A}_2\mathbf{b}_1 + \mathbf{b}_2)$, verify it matches the sequential loop to <code>atol=1e-5</code>, and confirm it performs $O(L)$ total combine operations rather than $O(L\log L)$.</li>
+<li><strong>Open-ended.</strong> The state-space-duality result says a selective SSM is equivalent to multiplying by a structured semiseparable matrix that a masked linear-attention layer also computes. Materialize this matrix for a small diagonal selective SSM (form the $L \times L$ matrix whose $(t,k)$ entry is $\mathbf{C}_t\big(\prod_{j=k+1}^{t}\bar{\mathbf{A}}_j\big)\bar{\mathbf{B}}_k$), confirm that multiplying it by the input vector reproduces the scan output from Code 13.2.1, and discuss what the entries reveal about how selection reshapes the effective attention pattern compared to the fixed pattern an LTI S4 would induce. Relate your finding to the linear-attention models of <a href="section-13.3.html">Section 13.3</a>.</li>
+</ol>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-13.1.html">&#8592; Section 13.1: Structured State-Space Models (S4)</a>
+<a class="up" href="index.html">Chapter 13 Contents</a>
+<a class="next" href="section-13.3.html">Section 13.3: Linear Attention, RWKV, and RetNet &#8594;</a>
+</nav>
+</main>
+<footer class="site-footer">
+<p class="edition">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="copyright">&copy; 2026 Alexander Apartsin &middot; <a href="../../toc.html">Contents</a></p>
+<p class="updated"><script>document.write("Last updated: " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

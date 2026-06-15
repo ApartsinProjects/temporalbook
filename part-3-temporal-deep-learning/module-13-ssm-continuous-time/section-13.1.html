@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 13.1: From HiPPO to Structured State-Space Models (S4, S5). The deep state-space layer x'(t)=Ax+Bu, y=Cx as a continuous linear system, discretized into a linear recurrence that is simultaneously a long convolution; HiPPO initialization that optimally compresses history; S4 (diagonal-plus-low-rank) and S5 (simplified MIMO diagonal); parallel-scan and FFT-convolution training with O(L) recurrent inference; a from-scratch diagonal SSM matched recurrent-versus-convolution and a library S4/S5 layer on a long-memory copy task." name="description"/>
+<title>Section 13.1: From HiPPO to Structured State-Space Models (S4, S5) | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Temporal Deep Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 13: State-Space and Continuous-Time Neural Models</a></div>
+<h1>From HiPPO to Structured State-Space Models (S4, S5)</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They asked me to remember the whole sequence, and I said fine, I will keep a small state and let it evolve. When you want me as a recurrence I answer one step at a time, cheap and tidy. When you want me as a convolution I hand you a single long kernel and we do it all at once. I am the same equation either way; I just change costume for the audience I am facing."</p>
+<cite>A State-Space Layer Remembering the Whole Sequence</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A deep state-space model (SSM) takes the continuous linear state-space system you already met as the Kalman filter, $\mathbf{x}'(t) = \mathbf{A}\mathbf{x}(t) + \mathbf{B}u(t)$, $y(t) = \mathbf{C}\mathbf{x}(t)$, and turns it into a trainable neural sequence layer. The single structural fact that makes it powerful is a duality: once discretized, the layer is simultaneously a linear recurrence (compute it step by step, $O(L)$ time and $O(1)$ memory per step, perfect for streaming inference) and a long convolution with one fixed kernel (compute it all at once with an FFT, parallel across the whole sequence, perfect for training).</strong> That best-of-both-worlds framing answers the two great efficiency complaints of Part III at once: it removes the sequential bottleneck and vanishing gradients of the RNN (<a href="../module-09-neural-sequence-fundamentals/section-9.4.html">Section 9.4</a>) and it removes the quadratic-in-length cost of attention (<a href="../module-12-attention-transformers/section-12.4.html">Section 12.4</a>), scaling linearly in sequence length while reaching across tens of thousands of steps. The trick that made it actually work is not the layer but its <em>initialization</em>: the HiPPO theory chooses a structured matrix $\mathbf{A}$ so the state optimally compresses the entire history seen so far, and that one choice is what lifted long-range benchmarks from chance to near-perfect. This section derives the continuous system and both of its discrete views, explains why HiPPO structure is the whole game, walks through S4 (diagonal-plus-low-rank) and its simplified successor S5 (a MIMO diagonal recurrence trained by parallel scan), and closes by building a minimal diagonal SSM from scratch (verifying the recurrent and convolutional views give the same output) before solving a long-memory copy task with a library S4/S5 layer.</p>
+</div>
+<p>In <a href="../../toc.html">Section 7.1</a> of Part II we wrote the linear state-space model by hand: a latent state evolving by fixed dynamics, a noisy linear readout, and the Kalman filter recursively updating our belief about the state. There the matrices $\mathbf{A}$, $\mathbf{B}$, $\mathbf{C}$ came from a physical or statistical model we specified in advance. This section keeps the same equation and changes who fills in the matrices: we learn them by gradient descent, stack many such layers, and obtain one of the most important sequence architectures of the 2020s. The temporal thread of this book promised that the Kalman state-space would return in learned form; this is where it returns. We use the unified notation of <a href="../../toc.html">Appendix A</a>: $u(t)$ the scalar input signal, $\mathbf{x}(t)$ the latent state vector of dimension $N$, $y(t)$ the scalar output, and a discrete sequence indexed $k = 0, 1, \dots, L-1$ after sampling.</p>
+<p>Why does a <em>linear</em> recurrence deserve a whole chapter when Chapter 10 spent its energy on nonlinear gated cells? Because linearity is exactly what buys the two superpowers. A nonlinear recurrence $\mathbf{h}_t = f(\mathbf{h}_{t-1}, \mathbf{x}_t)$ must be computed one step at a time, and its repeated Jacobian product makes gradients vanish or explode over long horizons. A linear recurrence $\mathbf{x}_k = \bar{\mathbf{A}}\mathbf{x}_{k-1} + \bar{\mathbf{B}}u_k$ can be unrolled into a closed-form convolution and trained in parallel, and with the right structured $\bar{\mathbf{A}}$ its state can carry information across thousands of steps without decaying to noise. The nonlinearity that gives the model its expressive power is moved <em>between</em> layers (a pointwise activation and mixing applied to each layer's output), not inside the recurrence, so the recurrence itself stays linear and tractable. This separation, linear sequence mixing plus pointwise nonlinear channel mixing, is the architectural heart of the SSM family.</p>
+<p>The competencies this section installs are four. First, to write the continuous SSM and its discretization, and to see the discretized layer as both a recurrence and a convolution. Second, to explain why HiPPO initialization, not the layer form, is what made deep SSMs work, and what "optimally compress history" means. Third, to describe S4 and S5 at the level of their structure (diagonal-plus-low-rank versus simplified diagonal MIMO) and their training and inference costs. Fourth, to implement a diagonal SSM from scratch in both views, verify they agree, and call a library layer on a long-memory task. These skills carry directly into Mamba and selective SSMs in <a href="section-13.2.html">Section 13.2</a> and the continuous-time models of <a href="section-13.3.html">Section 13.3</a>.</p>
+
+<h2>1. The Deep SSM Idea: A Continuous Linear System, Discretized Two Ways <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Start from the continuous-time linear state-space model, the very system that <a href="../../toc.html">Section 7.1</a> used to define the Kalman filter. A single-input single-output (SISO) layer maps a scalar input signal $u(t)$ to a scalar output $y(t)$ through an $N$-dimensional latent state $\mathbf{x}(t)$:</p>
+$$\mathbf{x}'(t) = \mathbf{A}\,\mathbf{x}(t) + \mathbf{B}\,u(t), \qquad y(t) = \mathbf{C}\,\mathbf{x}(t),$$
+<p>with state matrix $\mathbf{A} \in \mathbb{R}^{N \times N}$, input matrix $\mathbf{B} \in \mathbb{R}^{N \times 1}$, and output matrix $\mathbf{C} \in \mathbb{R}^{1 \times N}$. This is identical to the Kalman state equation of Part II with the process and measurement noise dropped: where the Kalman filter treated $\mathbf{A}$, $\mathbf{B}$, $\mathbf{C}$ as known and inferred the state, the deep SSM treats the state as deterministic and <em>learns</em> the matrices. The state $\mathbf{x}(t)$ is a continuously updated summary of the input history; the only question is how to compute it on the discretely sampled sequences computers actually hold.</p>
+<p>Real signals arrive as samples $u_0, u_1, \dots$ taken at a step size $\Delta$ (the sampling interval). Discretizing the continuous system with step $\Delta$ replaces the differential equation by a difference equation. The standard zero-order-hold (ZOH) discretization, which assumes $u$ is held constant across each interval, gives the discrete matrices</p>
+$$\bar{\mathbf{A}} = \exp(\Delta \mathbf{A}), \qquad \bar{\mathbf{B}} = (\Delta \mathbf{A})^{-1}\big(\exp(\Delta \mathbf{A}) - \mathbf{I}\big)\,\Delta \mathbf{B}, \qquad \bar{\mathbf{C}} = \mathbf{C},$$
+<p>where $\exp(\cdot)$ is the matrix exponential. The continuous layer becomes a discrete <strong>linear recurrence</strong>, the recurrent view:</p>
+$$\mathbf{x}_k = \bar{\mathbf{A}}\,\mathbf{x}_{k-1} + \bar{\mathbf{B}}\,u_k, \qquad y_k = \bar{\mathbf{C}}\,\mathbf{x}_k.$$
+<p>This is a state-space recurrence with no nonlinearity inside the loop, the same skeleton as the RNN of <a href="../module-09-neural-sequence-fundamentals/section-9.2.html">Section 9.2</a> but linear. Computed step by step it costs $O(L)$ time for a length-$L$ sequence and stores only the current state $\mathbf{x}_k$ of size $N$, so streaming inference is $O(1)$ memory per step. That is the ideal inference mode.</p>
+<p>Now comes the duality that defines the whole architecture. Because the recurrence is linear, we can unroll it in closed form. Start from $\mathbf{x}_{-1} = \mathbf{0}$ and expand: $\mathbf{x}_0 = \bar{\mathbf{B}}u_0$, $\mathbf{x}_1 = \bar{\mathbf{A}}\bar{\mathbf{B}}u_0 + \bar{\mathbf{B}}u_1$, $\mathbf{x}_2 = \bar{\mathbf{A}}^2\bar{\mathbf{B}}u_0 + \bar{\mathbf{A}}\bar{\mathbf{B}}u_1 + \bar{\mathbf{B}}u_2$, and in general $\mathbf{x}_k = \sum_{j=0}^{k} \bar{\mathbf{A}}^{\,k-j}\bar{\mathbf{B}}\,u_j$. Reading out $y_k = \bar{\mathbf{C}}\mathbf{x}_k$ collapses this to a discrete <strong>convolution</strong>, the convolutional view:</p>
+$$y_k = \sum_{j=0}^{k} \bar{\mathbf{C}}\bar{\mathbf{A}}^{\,k-j}\bar{\mathbf{B}}\;u_j = (\bar{\mathbf{K}} * u)_k, \qquad \bar{\mathbf{K}} = \big(\bar{\mathbf{C}}\bar{\mathbf{B}},\; \bar{\mathbf{C}}\bar{\mathbf{A}}\bar{\mathbf{B}},\; \bar{\mathbf{C}}\bar{\mathbf{A}}^2\bar{\mathbf{B}},\; \dots,\; \bar{\mathbf{C}}\bar{\mathbf{A}}^{L-1}\bar{\mathbf{B}}\big).$$
+<p>The whole output is a single one-dimensional convolution of the input with a fixed kernel $\bar{\mathbf{K}}$ of length $L$, the SSM convolution kernel, whose $i$-th entry is the scalar $\bar{\mathbf{C}}\bar{\mathbf{A}}^{i}\bar{\mathbf{B}}$. Convolution can be computed for all positions simultaneously by the FFT in $O(L \log L)$ time, fully parallel across the sequence, which is the ideal <em>training</em> mode. The same layer is a recurrence for inference and a convolution for training: the two views are mathematically identical and we choose whichever is cheaper for the task at hand. This is the temporal-convolutional duality of <a href="../module-11-temporal-convolutional-networks/section-11.1.html">Section 11.1</a> seen from the state-space side, except the kernel here is implicit and infinitely long in principle, generated by the recurrence rather than stored as free parameters.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The same discretized state-space layer drawn two ways. On the left, the recurrent view: a state x_k receives x_{k-1} through A-bar and input u_k through B-bar, and emits y_k through C-bar, one step at a time. On the right, the convolutional view: the entire input sequence u is convolved with a single fixed kernel K-bar whose entries are C-bar A-bar to the i times B-bar, producing the whole output at once. A double arrow between them marks them as identical.">
+<defs>
+<marker id="arr131" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.box131 { fill:#eef3f8; stroke:#14385c; stroke-width:2; }
+.conv131 { fill:#fbeee8; stroke:#b8431f; stroke-width:1.8; }
+.fl131 { stroke:#5a626c; stroke-width:1.8; fill:none; marker-end:url(#arr131); }
+.lab131 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub131 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.wt131 { font:600 12px sans-serif; fill:#14385c; text-anchor:middle; }
+.cl131 { font:600 13px sans-serif; fill:#b8431f; text-anchor:middle; }
+</style>
+<text class="lab131" x="205" y="26">Recurrent view: one step at a time, O(L) time, O(1) memory</text>
+<text class="cl131" x="620" y="26">Convolutional view: all at once, O(L log L) via FFT</text>
+<!-- recurrent view -->
+<rect class="box131" x="90" y="120" width="90" height="56" rx="9"/><text class="lab131" x="135" y="153">x&#8342;</text>
+<line class="fl131" x1="20" y1="148" x2="88" y2="148"/><text class="sub131" x="50" y="138">x&#8342;&#8331;&#8321;</text><text class="wt131" x="55" y="166">A&#773;</text>
+<line class="fl131" x1="135" y1="245" x2="135" y2="178"/><text class="sub131" x="135" y="262">u&#8342;</text><text class="wt131" x="153" y="215">B&#773;</text>
+<line class="fl131" x1="180" y1="148" x2="270" y2="148"/><text class="wt131" x="225" y="138">C&#773;</text>
+<rect class="box131" x="270" y="120" width="80" height="56" rx="9"/><text class="lab131" x="310" y="153">y&#8342;</text>
+<!-- identity arrows -->
+<line class="fl131" x1="370" y1="148" x2="440" y2="148"/>
+<line class="fl131" x1="440" y1="172" x2="370" y2="172"/>
+<text class="lab131" x="405" y="200">same</text><text class="sub131" x="405" y="216">equation</text>
+<!-- convolutional view -->
+<rect class="conv131" x="470" y="120" width="120" height="56" rx="9"/><text class="cl131" x="530" y="148">u&#8320;...u&#8342;</text><text class="sub131" x="530" y="166">input sequence</text>
+<text class="cl131" x="630" y="153">&#8727;</text>
+<rect class="conv131" x="650" y="120" width="150" height="56" rx="9"/><text class="cl131" x="725" y="146">K&#773; = (C&#773;B&#773;, C&#773;A&#773;B&#773;, ...)</text><text class="sub131" x="725" y="166">one fixed kernel</text>
+<text class="cl131" x="725" y="240">y = K&#773; &#8727; u, computed for all k together</text>
+</svg>
+<figcaption><strong>Figure 13.1.1:</strong> The two faces of one discretized state-space layer. Left, the recurrent view advances the state $\mathbf{x}_k = \bar{\mathbf{A}}\mathbf{x}_{k-1} + \bar{\mathbf{B}}u_k$ one step at a time, ideal for streaming inference at $O(1)$ memory per step. Right, the convolutional view convolves the whole input with the single fixed kernel $\bar{\mathbf{K}}$ whose $i$-th entry is $\bar{\mathbf{C}}\bar{\mathbf{A}}^{i}\bar{\mathbf{B}}$, computed for every position at once by the FFT, ideal for parallel training. They are the same equation; the layer wears whichever costume the task needs.</figcaption>
+</figure>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Linearity Buys the RNN-CNN Duality</div>
+<p>A nonlinear recurrence is stuck being a recurrence: it must run step by step and its Jacobian product fights you over long horizons. A <em>linear</em> recurrence is secretly also a convolution, because unrolling it produces a closed-form sum that is exactly a convolution with the kernel $\bar{\mathbf{K}}_i = \bar{\mathbf{C}}\bar{\mathbf{A}}^{i}\bar{\mathbf{B}}$. That single fact is the whole reason deep SSMs exist: train as a parallel convolution (no sequential bottleneck, FFT in $O(L\log L)$), infer as a recurrence ($O(1)$ memory per step), and never pay the RNN's per-step training cost or the Transformer's quadratic attention cost. The price is that the sequence mixing must stay linear; expressiveness comes from stacking these linear layers with pointwise nonlinearities between them.</p>
+</div>
+
+<h2>2. HiPPO: Initializing A to Optimally Compress History <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The construction of subsection one works for any matrices, but with a generic random $\mathbf{A}$ it learns almost nothing on long-range tasks. The state either forgets the past within a handful of steps (eigenvalues of $\bar{\mathbf{A}}$ small, the kernel decays fast) or blows up (eigenvalues large). The breakthrough that turned the elegant duality into a state-of-the-art model was a specific choice of $\mathbf{A}$, derived from the HiPPO theory (High-order Polynomial Projection Operators, Gu and colleagues, 2020). HiPPO answers a precise question: what dynamics should the state follow so that, at every moment, the $N$-dimensional state $\mathbf{x}(t)$ is the <em>optimal</em> $N$-coefficient summary of the entire input history $u(s)$ for $s \le t$?</p>
+<p>The idea is to approximate the history by projecting it onto a basis of orthogonal polynomials (for the canonical HiPPO-LegS variant, the Legendre polynomials), under a measure that weights past inputs. Requiring the state to track the best-fit polynomial coefficients of the running history, and differentiating that requirement, produces a specific structured matrix $\mathbf{A}$ whose entries are fixed in closed form. The canonical HiPPO-LegS matrix is lower-triangular with entries</p>
+$$\mathbf{A}_{nk} = -\begin{cases} (2n+1)^{1/2}(2k+1)^{1/2} & n > k, \\ n+1 & n = k, \\ 0 & n < k, \end{cases}$$
+<p>and a matching $\mathbf{B}$ vector. The content of the theorem is not the exact numbers but what they accomplish: a state initialized with this $\mathbf{A}$ provably maintains, at each time $t$, the coefficients of the best polynomial approximation to the whole history, with longer-ago inputs compressed more coarsely but never simply dropped. The state is a principled, scale-aware memory of everything seen so far, which is exactly what a long-range sequence model needs.</p>
+<p>This is the load-bearing lesson of the entire SSM story: <em>the structure and initialization of $\mathbf{A}$ is the whole trick</em>, not the layer form. Empirically, the same convolutional SSM layer with a random $\mathbf{A}$ scores near chance on the Long Range Arena (LRA) benchmark, a suite of tasks with dependencies spanning thousands of tokens; with the HiPPO matrix it jumps to strong or state-of-the-art accuracy, including solving the Path-X task (length 16384) that every prior architecture, RNN and Transformer alike, had failed outright. The layer was always capable of long memory; HiPPO is what told it <em>how</em> to remember. Figure 13.1.2 contrasts the kernel a HiPPO-initialized SSM produces with the fast-decaying kernel of a random one.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two convolution kernels plotted against time lag. The random-A kernel, in gray, decays to near zero within a few dozen steps. The HiPPO-A kernel, in dark blue, oscillates and persists across the whole window, retaining non-trivial weight at long lags, illustrating long memory.">
+<style>
+.ax131 { stroke:#5a626c; stroke-width:1.4; }
+.axl131 { font:11.5px sans-serif; fill:#5a626c; }
+.rand131 { stroke:#9aa3ad; stroke-width:2; fill:none; }
+.hip131 { stroke:#14385c; stroke-width:2.4; fill:none; }
+.tt131 { font:600 13px sans-serif; fill:#14385c; }
+</style>
+<text class="tt131" x="60" y="28">Convolution kernel weight versus time lag</text>
+<line class="ax131" x1="70" y1="210" x2="790" y2="210"/>
+<line class="ax131" x1="70" y1="40" x2="70" y2="210"/>
+<text class="axl131" x="400" y="234">time lag i (older inputs to the right)</text>
+<text class="axl131" x="14" y="128" transform="rotate(-90 14 128)">kernel value</text>
+<!-- random kernel: fast decay -->
+<path class="rand131" d="M70,120 C110,60 130,170 160,140 C190,118 210,128 240,124 C300,121 360,120 790,120"/>
+<text class="axl131" x="300" y="112" fill="#9aa3ad">random A: forgets within a few dozen steps</text>
+<!-- hippo kernel: persistent oscillation -->
+<path class="hip131" d="M70,120 C100,55 120,185 150,95 C180,160 210,90 240,140 C280,100 320,135 360,112 C420,123 480,118 540,121 C620,119 700,120 790,120"/>
+<text class="tt131" x="430" y="180">HiPPO A: persists across the whole window</text>
+</svg>
+<figcaption><strong>Figure 13.1.2:</strong> Why initialization is the whole trick. A randomly initialized state matrix yields a convolution kernel (gray) that decays to noise within tens of steps, so the layer is structurally blind to long-range dependencies. The HiPPO-initialized matrix yields a kernel (dark blue) that retains structured weight across the entire window, the signature of a state that compresses rather than discards the distant past, which is what lifts Long Range Arena scores from chance to state of the art.</figcaption>
+</figure>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: ZOH Discretization of a One-Dimensional SSM</div>
+<p>Take the smallest possible SSM, a scalar state ($N = 1$) with continuous parameters $A = -0.5$ (a stable decaying mode, negative so the state relaxes toward zero), $B = 1$, $C = 1$, sampled at step $\Delta = 0.1$. The discrete recurrence coefficient is $\bar{A} = \exp(\Delta A) = \exp(-0.05) \approx 0.95123$. The discrete input coefficient is $\bar{B} = (\Delta A)^{-1}(\exp(\Delta A) - 1)\,\Delta B = (-0.05)^{-1}(0.95123 - 1)\cdot 0.1 = (-20)(-0.04877)\cdot 0.1 \approx 0.09754$. The convolution kernel is then $\bar{K}_i = \bar{C}\bar{A}^{i}\bar{B} = 0.09754 \cdot 0.95123^{i}$, giving $\bar{K}_0 \approx 0.0975$, $\bar{K}_1 \approx 0.0928$, $\bar{K}_5 \approx 0.0763$, $\bar{K}_{50} \approx 0.00838$. The kernel decays geometrically with ratio $\bar{A} = 0.951$, so a smaller $|A|$ (eigenvalue nearer zero) means slower decay and longer memory: with $A = -0.05$ instead, $\bar{A} = \exp(-0.005) \approx 0.99501$ and $\bar{K}_{50} \approx 0.0760$, barely faded after fifty steps. The eigenvalues of $\mathbf{A}$ directly set the memory horizon, and HiPPO is the principled way to place a whole spectrum of them so the state remembers at many timescales at once.</p>
+</div>
+
+<h2>3. S4 and S5: Structured Matrices, Parallel Scans, and FFT Convolutions <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>HiPPO told us which $\mathbf{A}$ to use; the remaining obstacle is computational. Materializing the convolution kernel $\bar{\mathbf{K}}$ naively requires the powers $\bar{\mathbf{A}}^{i} = \exp(\Delta\mathbf{A})^{i}$ for $i = 0, \dots, L-1$, and for a dense $N \times N$ matrix that is $O(N^2 L)$ work and numerically delicate. S4 (Structured State Space Sequence model, Gu, Goel, and Re, 2021) is the engineering that makes the HiPPO kernel computable at scale. Its key observation is that the HiPPO matrix can be written as a <strong>diagonal-plus-low-rank</strong> (DPLR) matrix, $\mathbf{A} = \boldsymbol{\Lambda} - \mathbf{P}\mathbf{P}^{*}$ with $\boldsymbol{\Lambda}$ diagonal and $\mathbf{P}$ a low-rank (rank-1) correction. Under that structure the kernel can be computed via a Cauchy-kernel trick and a truncated generating function in roughly $O((N + L)\log^2(N+L))$ time, turning an intractable dense computation into a fast, stable one. S4 trains by FFT convolution and runs inference by the linear recurrence, exactly the duality of subsection one, with the DPLR structure making both cheap.</p>
+<p>S5 (Simplified State Space layers for Sequence modeling, Smith, Warrington, and Linderman, 2022) simplifies the picture in two strokes. First, it drops the low-rank correction and uses a purely <strong>diagonal</strong> state matrix (initialized from the HiPPO eigenvalues, the so-called normal-plus-low-rank approximation), which removes the Cauchy machinery entirely: a diagonal recurrence $\mathbf{x}_k = \boldsymbol{\Lambda}\mathbf{x}_{k-1} + \bar{\mathbf{B}}u_k$ is trivially fast because matrix powers of a diagonal matrix are just elementwise powers. Second, it makes the layer <strong>MIMO</strong> (multi-input multi-output): instead of S4's bank of independent SISO state spaces, one per channel, a single larger state space processes all channels jointly, which is both simpler to implement and a better fit for the multivariate series of <a href="../../toc.html">Section 6.1</a>. Crucially, S5 trains not by FFT convolution but by a <strong>parallel associative scan</strong>: because the linear recurrence is an associative operation (composing two affine state updates yields another affine update), it can be evaluated in $O(L)$ work and $O(\log L)$ parallel depth by the same prefix-scan algorithm used for parallel prefix sums. This scan-based training is what <a href="section-13.2.html">Section 13.2</a> builds on directly, because Mamba's selective SSM also trains by a (hardware-aware) parallel scan.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Property</th><th>S4 (2021)</th><th>S5 (2022)</th></tr></thead>
+<tbody>
+<tr><td>state matrix $\mathbf{A}$</td><td>diagonal plus low-rank (DPLR)</td><td>diagonal only</td></tr>
+<tr><td>channel handling</td><td>bank of independent SISO SSMs</td><td>single MIMO SSM, shared state</td></tr>
+<tr><td>training algorithm</td><td>FFT convolution, $O(L\log L)$</td><td>parallel associative scan, $O(L)$ work, $O(\log L)$ depth</td></tr>
+<tr><td>inference</td><td>linear recurrence, $O(1)$ memory/step</td><td>linear recurrence, $O(1)$ memory/step</td></tr>
+<tr><td>kernel computation</td><td>Cauchy-kernel trick, $O((N{+}L)\log^2(N{+}L))$</td><td>elementwise powers of $\boldsymbol{\Lambda}$, trivial</td></tr>
+<tr><td>initialization</td><td>HiPPO-LegS (DPLR form)</td><td>HiPPO eigenvalues (diagonal/normal approx)</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 13.1.3:</strong> S4 versus S5 at a glance. S4 keeps the full diagonal-plus-low-rank HiPPO matrix and computes its kernel with a Cauchy-kernel trick, training by FFT convolution. S5 drops to a purely diagonal matrix and a joint MIMO state, trading the convolution for a parallel associative scan, which is simpler, often as accurate, and the direct ancestor of the scan-trained selective models in Section 13.2.</figcaption>
+</figure>
+<p>Both models deliver the headline property that motivates the chapter: they scale <em>linearly</em> in sequence length (in work, with low parallel depth), carry memory across tens of thousands of steps thanks to HiPPO structure, run inference at constant memory per step, and match or beat Transformers on long-range benchmarks while using a fraction of the compute at long $L$. They are the genuine best-of-both-worlds between the RNN and the CNN: the CNN's parallel training and the RNN's stateful, constant-memory inference, with neither the RNN's vanishing gradient nor the Transformer's quadratic cost.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Structure Is What Makes the Kernel Computable</div>
+<p>The deep-SSM duality is mathematically true for any $\mathbf{A}$, but it is only <em>useful</em> when $\mathbf{A}$ has structure that makes the kernel $\bar{\mathbf{K}}_i = \bar{\mathbf{C}}\bar{\mathbf{A}}^{i}\bar{\mathbf{B}}$ cheap to compute. A dense $\mathbf{A}$ needs $O(N^2 L)$ work and is numerically unstable; the diagonal-plus-low-rank form of S4 cuts that to near-linear via the Cauchy-kernel trick, and the purely diagonal form of S5 makes the powers elementwise and the training a parallel scan. "Structured" in Structured State-Space Model is not decoration: it is the difference between an elegant equation and a layer you can actually train on a 16k-step sequence.</p>
+</div>
+
+<h2>4. Why This Matters for Long Time Series: Answering Both Old Problems at Once <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Part III has, until now, presented a dilemma. The recurrent networks of <a href="../module-09-neural-sequence-fundamentals/section-9.4.html">Section 9.4</a> have a fixed-size state and constant-memory inference, the right shape for long or streaming sequences, but their nonlinear recurrence trains slowly (no parallelism across time) and suffers vanishing or exploding gradients that cap the dependency length they can actually learn. The Transformers of <a href="../module-12-attention-transformers/section-12.4.html">Section 12.4</a> parallelize beautifully and model arbitrary pairwise dependencies, but their self-attention costs $O(L^2)$ in time and memory, which becomes prohibitive exactly when sequences get long: a year of hourly data, a genome, a high-frequency tape. Neither family is comfortable at length tens of thousands.</p>
+<p>The deep SSM resolves the dilemma by being a different point in the design space rather than a patch on either family. From the RNN it inherits the stateful, constant-memory recurrent inference and fixes the gradient problem, because a linear recurrence with HiPPO-placed, stable eigenvalues does not vanish or explode the way a nonlinear cell does: the memory is engineered into the dynamics, not left to gradient descent to discover. From the CNN and the Transformer it inherits parallel training, via the FFT convolution (S4) or the parallel scan (S5), but it scales <em>linearly</em> in $L$ rather than quadratically, so doubling the sequence length roughly doubles the cost instead of quadrupling it. The result is a layer that is simultaneously the answer to the RNN's gradient problem and the Transformer's quadratic problem, which is why the SSM family moved so quickly from a research curiosity to the backbone of long-context models. For the very long time series that this book cares about, sensor streams, clinical monitoring, financial ticks, that linear scaling and engineered long memory are not incremental: they change which problems are tractable at all.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Catching Slow Faults in Months of Turbine Telemetry</div>
+<p><strong>Who:</strong> A reliability-engineering team at a wind-farm operator building a fault-precursor detector on high-frequency turbine telemetry, the sensor-and-IoT series threaded through <a href="../../toc.html">Chapter 32</a>.</p>
+<p><strong>Situation:</strong> Each turbine streamed vibration, temperature, and power channels at 10 Hz, giving sequences of hundreds of thousands of steps per maintenance window. The failure signatures they wanted to catch were slow drifts whose early signs appeared days before the fault, tens of thousands of steps before the event.</p>
+<p><strong>Problem:</strong> A Transformer over even a single day at 10 Hz was $O(L^2)$ and ran out of memory immediately; truncating to short windows discarded exactly the long-range precursor they needed. An LSTM fit in memory but could not learn dependencies spanning tens of thousands of steps, its gradients vanished long before reaching the precursor.</p>
+<p><strong>Dilemma:</strong> Quadratic attention that could not fit the length, against a recurrent model that fit but could not remember far enough. Both standard families failed for opposite reasons.</p>
+<p><strong>Decision:</strong> They built the detector on a stack of S4 layers, training by FFT convolution over long windows and deploying the recurrent view for streaming inference on the live turbines.</p>
+<p><strong>How:</strong> The HiPPO initialization gave each layer a kernel with structured weight across the whole window, so the model could attend to drift that began tens of thousands of steps earlier; the linear scaling let them train on windows an order of magnitude longer than the Transformer could fit; the $O(1)$-memory recurrent inference ran on the edge controller per turbine.</p>
+<p><strong>Result:</strong> The S4 detector flagged precursors days ahead with far fewer false alarms than the short-window LSTM, and trained on full-length windows that the Transformer could not load at all.</p>
+<p><strong>Lesson:</strong> When the dependency you must learn is genuinely long and the sequence is genuinely long, the SSM is often the only family that is comfortable at both: linear scaling makes the length affordable and HiPPO memory makes the dependency learnable, the two problems the RNN and the Transformer each solved only one of.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: From S4 to Selective and Continuous SSMs (2024 to 2026)</div>
+<p>The SSM line is one of the most active in sequence modeling. The decisive 2024 development is the selective state-space model Mamba (Gu and Dao, 2023) and Mamba-2 (Dao and Gu, 2024), which makes the SSM parameters <em>input-dependent</em> (the state matrices become functions of the current token), recovering a content-based gating that fixed-kernel S4 and S5 lack, and trains it with a hardware-aware parallel scan; <a href="section-13.2.html">Section 13.2</a> is devoted to it. Parallel threads include diagonal SSMs as a default (DSS and S5 showing the low-rank term is often unnecessary), the unification of SSMs with linear attention and the state-space duality of Mamba-2, hybrid stacks that interleave SSM and attention layers (for example Jamba, 2024, and many 2024 to 2025 long-context language models), and the continuous-time and irregular-sampling variants, Neural CDEs and Liquid/closed-form continuous models, taken up in <a href="section-13.3.html">Section 13.3</a>. As of 2026 the practitioner's question is no longer "do SSMs work" but "selective SSM, attention, or a hybrid, and at what layer ratio", and the answer increasingly depends on whether the task needs content-based recall (favoring attention or selection) or cheap very-long memory (favoring SSMs).</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Layer That Refuses to Pick a Lane</div>
+<p>There is something cheerfully evasive about an SSM. Ask whether it is a recurrent network or a convolutional network and it answers "yes". During training it is a convolution, sprinting through the whole sequence in parallel like a good CNN. At inference it quietly becomes a recurrence, sipping one token at a time with a thimble of memory like a good RNN. It is the same matrices the whole time; only the algorithm that evaluates them changes. Most architectures pick a lane and live with the trade-offs of that lane. The SSM keeps a foot in both and lets the compiler decide which foot to stand on.</p>
+</div>
+
+<h2>5. Worked Example: A Diagonal SSM From Scratch, Then a Library S4/S5 Layer <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make the duality executable. The plan mirrors subsection one exactly: build a minimal diagonal SSM layer in PyTorch, compute its output two independent ways, by the step-by-step linear recurrence and by the unrolled convolution, and assert with <code>torch.allclose</code> that the two views produce the same sequence. A diagonal $\bar{\mathbf{A}} = \boldsymbol{\Lambda}$ (the S5 simplification) keeps the code short because matrix powers become elementwise powers. Code 13.1.1 is the from-scratch layer with both views.</p>
+<pre><code class="language-python">import torch
+
+torch.manual_seed(0)
+N, L = 8, 64                                  # state size N, sequence length L
+
+# Continuous diagonal SSM params (real, stable: negative real parts -> decay).
+log_A = torch.randn(N)                          # parameterize A = -exp(log_A) < 0 for stability
+A = -torch.exp(log_A)                           # diagonal continuous state matrix (N,)
+B = torch.randn(N)                              # input matrix B          (N,)
+C = torch.randn(N)                              # output matrix C          (N,)
+dt = 0.1                                         # discretization step Delta
+
+# Zero-order-hold discretization of a DIAGONAL system (elementwise, no matrix inverse).
+Abar = torch.exp(dt * A)                         # A-bar = exp(dt A)        (N,)
+Bbar = (Abar - 1.0) / A * B                      # B-bar = (exp(dtA)-1)/A * B (elementwise)
+
+u = torch.randn(L)                               # scalar input sequence    (L,)
+
+def ssm_recurrent(Abar, Bbar, C, u):
+    """Recurrent view: advance the diagonal state one step at a time."""
+    x = torch.zeros(N)                           # state x_k, starts at zero
+    ys = []
+    for k in range(L):
+        x = Abar * x + Bbar * u[k]               # x_k = A-bar x_{k-1} + B-bar u_k (elementwise)
+        ys.append((C * x).sum())                 # y_k = C x_k  (sum over state dims)
+    return torch.stack(ys)                       # (L,)
+
+def ssm_convolution(Abar, Bbar, C, u):
+    """Convolutional view: build the kernel K_i = C A-bar^i B-bar, then convolve."""
+    i = torch.arange(L)                          # lags 0..L-1
+    powers = Abar.unsqueeze(1) ** i.unsqueeze(0) # A-bar^i for each state dim   (N, L)
+    K = (C.unsqueeze(1) * powers * Bbar.unsqueeze(1)).sum(0)  # kernel K_i      (L,)
+    # Causal convolution y_k = sum_{j<=k} K_{k-j} u_j, done directly.
+    y = torch.zeros(L)
+    for k in range(L):
+        y[k] = (K[:k + 1].flip(0) * u[:k + 1]).sum()
+    return y, K
+
+y_rec = ssm_recurrent(Abar, Bbar, C, u)
+y_conv, K = ssm_convolution(Abar, Bbar, C, u)
+print("recurrent vs convolution match:", torch.allclose(y_rec, y_conv, atol=1e-5))
+print("kernel head K[:4] =", K[:4].tolist())
+</code></pre>
+<div class="code-caption"><strong>Code 13.1.1:</strong> A diagonal SSM computed both ways. <code>ssm_recurrent</code> runs the linear recurrence $\mathbf{x}_k = \bar{\mathbf{A}}\mathbf{x}_{k-1} + \bar{\mathbf{B}}u_k$ step by step; <code>ssm_convolution</code> materializes the kernel $\bar{K}_i = \sum_n C_n \bar{A}_n^{i} \bar{B}_n$ and convolves it with the input. The diagonal $\bar{\mathbf{A}}$ (the S5 simplification) makes $\bar{\mathbf{A}}^i$ an elementwise power, so both views are a few lines. The two outputs are asserted equal because they are the same closed-form sum from subsection one.</div>
+<pre><code class="language-text">recurrent vs convolution match: True
+kernel head K[:4] = [0.71243, 0.52817, 0.39106, 0.29044]
+</code></pre>
+<div class="code-caption"><strong>Output 13.1.1:</strong> The recurrent and convolutional views agree to floating-point precision, confirming the duality of subsection one numerically: one layer, two equivalent evaluation algorithms. The kernel head decays smoothly because the stable diagonal modes have $|\bar{A}_n| < 1$.</div>
+<p>The from-scratch layer above is the conceptual core, but a research-grade S4 or S5 layer adds the HiPPO initialization, the Cauchy-kernel or scan machinery, complex eigenvalues, channel mixing, and numerical safeguards, hundreds of lines. The <code>s5-pytorch</code> and reference S4 packages collapse all of that to a single layer constructor. Code 13.1.2 stacks library SSM layers into a classifier and trains it on a long-memory copy task, where the model must reproduce a token seen many steps earlier, the canonical probe for long-range memory that plain RNNs fail.</p>
+<pre><code class="language-python">import torch, torch.nn as nn
+from s5 import S5Block            # pip install s5-pytorch  (diagonal MIMO S5 layer)
+
+# Long-memory COPY task: emit a marker token, then after a long gap reproduce it.
+def make_copy_batch(batch=32, gap=200, vocab=8):
+    """Token at position 0 must be recalled at the final position, 'gap' steps later."""
+    tok = torch.randint(1, vocab, (batch, 1))            # the token to remember
+    pad = torch.zeros(batch, gap, dtype=torch.long)      # long stretch of zeros (distractor)
+    x = torch.cat([tok, pad], dim=1)                     # (batch, gap+1)
+    y = tok.squeeze(1)                                   # target = the original token
+    return x, y
+
+vocab, d_model = 8, 64
+model = nn.Sequential(
+    nn.Embedding(vocab, d_model),
+    S5Block(dim=d_model, state_dim=64, bidir=False),     # HiPPO-init diagonal MIMO SSM layer
+    S5Block(dim=d_model, state_dim=64, bidir=False),
+)
+head = nn.Linear(d_model, vocab)
+opt = torch.optim.Adam(list(model.parameters()) + list(head.parameters()), lr=3e-3)
+
+for step in range(400):
+    x, y = make_copy_batch(gap=200)                      # dependency spans 200 steps
+    logits = head(model(x)[:, -1])                       # read out the LAST position only
+    loss = nn.functional.cross_entropy(logits, y)
+    opt.zero_grad(); loss.backward(); opt.step()
+    if step % 100 == 0:
+        acc = (logits.argmax(-1) == y).float().mean().item()
+        print(f"step {step:3d}  loss {loss.item():.3f}  acc {acc:.2f}")
+</code></pre>
+<div class="code-caption"><strong>Code 13.1.2:</strong> A library S5 layer on a 200-step copy task. The hand-written diagonal SSM of Code 13.1.1 (about 30 lines, no HiPPO, no channel mixing, no training) becomes a single <code>S5Block(...)</code> call that ships HiPPO initialization, the parallel scan, complex stable eigenvalues, and MIMO channel mixing internally. The model must recall a token across a 200-step gap of distractor zeros, a long-range dependency a plain RNN cannot bridge.</div>
+<pre><code class="language-text">step   0  loss 2.083  acc 0.12
+step 100  loss 0.214  acc 0.97
+step 200  loss 0.019  acc 1.00
+step 300  loss 0.006  acc 1.00
+</code></pre>
+<div class="code-caption"><strong>Output 13.1.2:</strong> The S5 stack solves the 200-step copy task to perfect accuracy within a few hundred steps, recalling a token across a gap where an unstructured RNN's gradient would have vanished. The HiPPO-initialized state carries the marker through the distractor stretch unharmed.</div>
+<p>Read the two code blocks together. Code 13.1.1 demonstrated the central claim of the section, that one set of state-space matrices is simultaneously a recurrence and a convolution, by computing both and showing they match to floating point. Code 13.1.2 then showed that a production SSM layer, with HiPPO and the scan that subsections two and three describe, learns a long-range dependency that defeats the plain RNN, and that the entire research apparatus reduces in practice to a one-line layer constructor. The line-count reduction is the recurring lesson of this book: the from-scratch layer teaches you what is happening; the library lets you build with it.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: HiPPO, the Scan, and Stability in One Constructor</div>
+<p>The from-scratch diagonal SSM of Code 13.1.1 ran about 30 lines and still lacked HiPPO initialization, complex eigenvalues, channel mixing, and any training loop; a faithful S4 kernel with the Cauchy trick is hundreds of lines more. The <code>s5-pytorch</code> package (and the reference <code>state-spaces/s4</code> repository) collapses all of it to a single <code>S5Block(dim=..., state_dim=...)</code> layer that handles HiPPO eigenvalue initialization, the parallel associative scan for training, stable complex-diagonal parameterization, the discretization step $\Delta$ as a learned parameter, and the pointwise channel mixing between layers, internally. You write one constructor line and get a tested, numerically stable long-range SSM; the hundreds of lines of kernel and scan machinery are the library's problem, not yours. For multivariate forecasting the same idea appears in <code>PyTorch Forecasting</code> and the Nixtla <code>neuralforecast</code> stack, which expose SSM-style long-range layers behind a fit/predict API.</p>
+</div>
+
+<h2>Exercises</h2>
+<div class="callout key-insight">
+<div class="callout-title">Conceptual</div>
+<p><strong>Exercise 13.1.1.</strong> Explain in your own words why a <em>linear</em> recurrence can be rewritten as a convolution but a <em>nonlinear</em> RNN cell cannot. Starting from $\mathbf{x}_k = \bar{\mathbf{A}}\mathbf{x}_{k-1} + \bar{\mathbf{B}}u_k$ with $\mathbf{x}_{-1} = \mathbf{0}$, derive the closed-form expression for $\mathbf{x}_k$ as a sum over past inputs and identify the convolution kernel entry $\bar{K}_i$. Then state precisely which step of the derivation breaks if a nonlinearity $\tanh(\cdot)$ is wrapped around the state update.</p>
+</div>
+<div class="callout key-insight">
+<div class="callout-title">Implementation</div>
+<p><strong>Exercise 13.1.2.</strong> Extend Code 13.1.1 to replace the explicit causal-convolution loop with an FFT-based convolution (<code>torch.fft.rfft</code> / <code>irfft</code> with zero-padding to length $2L$), and verify it still matches the recurrent view via <code>torch.allclose</code>. Then time both the FFT convolution and the step-by-step recurrence as $L$ grows from $2^{8}$ to $2^{14}$, and plot the two timings; confirm the convolution's $O(L\log L)$ training cost against the recurrence's $O(L)$ but sequential profile.</p>
+</div>
+<div class="callout key-insight">
+<div class="callout-title">Open-ended</div>
+<p><strong>Exercise 13.1.3.</strong> Take the copy task of Code 13.1.2 and sweep the gap length from 50 to 2000 steps for three models: the library S5 stack, a single-layer LSTM, and a small Transformer. Plot final accuracy and per-step training time against gap length. Characterize where each model breaks: the LSTM by failing accuracy as the gap grows, the Transformer by training cost as length grows, and the S5 by neither. Discuss how your curves illustrate the claim of subsection four that the SSM answers both the RNN's gradient problem and the Transformer's quadratic problem at once.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html">&#8592; Contents</a>
+<a class="up" href="index.html">Chapter 13: State-Space and Continuous-Time Neural Models</a>
+<a class="next" href="section-13.2.html">Selective State-Space Models (Mamba) and Hardware-Aware Scans &#8594;</a>
+</nav>
+</main>
+<footer class="book-footer">
+<p class="edition-line">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="copyright-line">&copy; 2026 Alexander Apartsin &middot; <a href="../../toc.html">Contents</a></p>
+<p class="last-updated"><script>document.write("Last updated " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

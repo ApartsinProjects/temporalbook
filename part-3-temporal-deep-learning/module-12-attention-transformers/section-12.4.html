@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 12.4: Long-Sequence Modeling and Memory. Why self-attention is O(L^2) in time and memory and why that quadratic wall is the central obstacle for long time series; segment-level recurrence and compressive memory in Transformer-XL; FlashAttention as exact but IO-efficient attention; chunking and patching long series into fewer tokens; and a from-scratch empirical scaling measurement paired with the memory-efficient scaled_dot_product_attention path." name="description"/>
+<title>Section 12.4: Long-Sequence Modeling and Memory | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Temporal Deep Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 12: Attention and Transformers</a></div>
+<h1>Long-Sequence Modeling and Memory</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They asked me to attend to the whole year of readings at once, every hour to every other hour, and for a glorious instant I saw all of it: the morning peaks, the weekend lulls, the slow drift of the seasons. Then the memory allocator cleared its throat. It turns out that holding every pair of moments in mind at the same time costs the square of the moments, and I have only so much room. So I forget the distant past one block at a time, and I tell myself it is a feature."</p>
+<cite>A Context Window Wishing It Were Longer</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Self-attention's superpower, letting every position look directly at every other position, is also its curse: comparing all $L$ positions against all $L$ positions costs $O(L^2)$ time and, in the naive implementation, $O(L^2)$ memory. For the long sequences that define temporal AI, a year of hourly readings, a high-frequency tick tape, a multi-decade climate record, that quadratic term is the wall everything runs into.</strong> This section is about climbing that wall by four complementary routes that the rest of the field combines freely. First, recurrence and memory: Transformer-XL caches the hidden states of previous segments and reuses them, extending the effective context without paying $O(L^2)$ over the whole sequence, with compressive memory pushing the idea further. Second, IO-efficient exact attention: FlashAttention computes the <em>identical</em> attention output without ever materializing the $L \times L$ score matrix, turning the memory cost from quadratic to linear and giving a large constant-factor speedup, all without changing the math. Third, fewer tokens: chunking or patching a long series into a handful of segment tokens (the patching idea that <a href="../../toc.html">Chapter 14</a> builds into PatchTST) shrinks $L$ at the source, and because the cost is quadratic in $L$, halving the token count quarters the cost. Fourth, the worked example measures the $O(L^2)$ curve empirically from a hand-written attention and then swaps in <code>scaled_dot_product_attention</code>, the one-line FlashAttention path, to flatten the memory budget. You leave able to reason about, measure, and defeat the quadratic cost that governs every long-context Transformer in this book.</p>
+</div>
+<p>In <a href="section-12.3.html">Section 12.3</a> we assembled the full Transformer encoder block and saw it process a sequence in a single parallel sweep, every position attending to every other position through scaled dot-product attention. That parallelism is exactly what freed us from the sequential time loop of the recurrent networks in <a href="../module-10-recurrent-neural-networks/index.html">Chapter 10</a>, whose backpropagation through time we dissected in <a href="../module-09-neural-sequence-fundamentals/section-9.3.html">Section 9.3</a>. But the freedom is not free. The all-pairs comparison that makes attention parallel and content-addressable is quadratic in the sequence length, and for time series, where "long" can mean tens of thousands of steps, the quadratic term is the single most consequential fact about deploying a Transformer at all. This section confronts it directly. We use the unified notation of <a href="../../toc.html">Appendix A</a>: $L$ the sequence length, $d$ the model dimension, $\mathbf{Q}, \mathbf{K}, \mathbf{V}$ the query, key, and value matrices, $\mathbf{x}_t$ the input at step $t$.</p>
+<p>Why does long-sequence modeling deserve a section of its own rather than a footnote to the attention mechanism? Because the gap between "attention works" and "attention works on a year of data" is precisely where most real temporal-AI engineering lives. A model that attends beautifully over 512 steps and runs out of memory at 5,000 is useless for the forecasting horizons practitioners actually care about. The techniques in this section, segment recurrence, IO-aware kernels, token reduction, are not exotic add-ons: they are the standard toolkit that turns a textbook Transformer into something you can train on long series with a fixed memory budget. Understanding the quadratic wall, and the four ways around it, is what separates a reader who knows the attention formula from a practitioner who can ship a long-context temporal model.</p>
+<p>The four competencies this section installs: to state and reason about the $O(L^2)$ time-and-memory cost of self-attention and what longer context actually buys a forecaster; to explain segment-level recurrence and cached or compressed memory and their trade-offs; to explain why FlashAttention is exact yet linear in memory, and to invoke it in one line; and to use patching to cut the token count at the source. These are load-bearing for the deep forecasting architectures of <a href="../../toc.html">Chapter 14</a> and the foundation models of <a href="../../toc.html">Chapter 15</a>.</p>
+<div class="callout looking-back">
+<div class="callout-title">Looking Back: The Memory Problem Is the Oldest Problem in This Book</div>
+<p>Every sequence model in this book has faced the same question in a different dialect: how do you let the present condition on more past than you can hold at once? The Kalman filter of <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/index.html">Chapter 7</a> answered it with a fixed-size belief state that summarized all history in a mean and covariance. The RNN of <a href="../module-10-recurrent-neural-networks/index.html">Chapter 10</a> answered it with a learned hidden state carried forward, and truncated BPTT (<a href="../module-09-neural-sequence-fundamentals/section-9.3.html">Section 9.3</a>) bounded the cost of training that carry by cutting the gradient past a window. Attention answered it most generously, by keeping <em>all</em> the past at full resolution and letting the present query it directly, and the bill for that generosity is the $O(L^2)$ cost this section spends its whole length taming. The segment caches and compressive memories of subsection two are, quite literally, attention rediscovering the bounded belief state. The temporal thread does not break; it reappears as the central engineering tension of long-context Transformers.</p>
+</div>
+
+<h2>1. The Quadratic Wall: Why Attention Costs $O(L^2)$ <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Self-attention computes, for each of the $L$ query positions, a weighted average over all $L$ value positions, where the weights come from comparing that query against every key. The comparison is a single matrix product, and its shape is what dictates everything. With queries $\mathbf{Q} \in \mathbb{R}^{L \times d}$, keys $\mathbf{K} \in \mathbb{R}^{L \times d}$, and values $\mathbf{V} \in \mathbb{R}^{L \times d}$, the attention output is</p>
+$$\operatorname{Attn}(\mathbf{Q}, \mathbf{K}, \mathbf{V}) = \operatorname{softmax}\!\left(\frac{\mathbf{Q}\mathbf{K}^{\top}}{\sqrt{d}}\right)\mathbf{V},$$
+<p>and the decisive object is the score matrix $\mathbf{S} = \mathbf{Q}\mathbf{K}^{\top} \in \mathbb{R}^{L \times L}$. It has one entry for every ordered pair of positions, so it holds $L^2$ numbers, and forming it costs $L^2 d$ multiply-adds. The softmax is applied row-wise over $L \times L$ entries, and multiplying the resulting $L \times L$ weight matrix by $\mathbf{V}$ costs another $L^2 d$. So both the <em>time</em> (about $2 L^2 d$ floating-point operations) and, in the textbook implementation, the <em>memory</em> (the $L^2$ scores that must be stored to apply softmax and then reused for the value product) grow as the square of the sequence length. This is the quadratic wall, and it is structural: it follows directly from the all-pairs nature of attention, not from any implementation choice.</p>
+<p>The contrast with the alternatives in this part sharpens why this matters. A recurrent layer (<a href="../module-10-recurrent-neural-networks/index.html">Chapter 10</a>) processes a sequence in $O(L)$ time and $O(1)$ activation memory per step, but sequentially, one step at a time. A convolutional layer (<a href="../module-11-temporal-convolutional-networks/index.html">Chapter 11</a>) is $O(L)$ and parallel, but each position sees only a local window unless stacked deep. Attention buys something neither has: every position reaches every other in a single layer, a constant path length, which is exactly what makes it so good at long-range dependencies. The bill for that global reach is the $L^2$ term. The table in Figure 12.4.1 lays the three side by side.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Layer</th><th>Time</th><th>Memory (naive)</th><th>Max path length</th><th>Parallel over time?</th></tr></thead>
+<tbody>
+<tr><td>Recurrent (RNN/LSTM)</td><td>$O(L\,d^2)$</td><td>$O(L\,d)$</td><td>$O(L)$</td><td>no (sequential)</td></tr>
+<tr><td>Convolutional (TCN)</td><td>$O(L\,k\,d^2)$</td><td>$O(L\,d)$</td><td>$O(L/k)$ or $O(\log L)$ dilated</td><td>yes</td></tr>
+<tr><td>Self-attention</td><td>$O(L^2 d)$</td><td>$O(L^2 + L\,d)$</td><td>$O(1)$</td><td>yes</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 12.4.1:</strong> The cost trade across the three sequence-layer families of Part III. Attention alone gives every position a constant-length path to every other, the property that makes it shine on long-range structure, but pays for it with a time and memory term quadratic in the sequence length. The rest of this section is about keeping that path-length advantage while taming the quadratic cost.</figcaption>
+</figure>
+<p>It helps to separate the two halves of the bill, because the rest of the section attacks them with different tools and conflating them is the most common source of confusion. The <em>time</em> cost, the roughly $2L^2 d$ floating-point operations, is intrinsic to computing all $L^2$ pairwise scores: any method that produces the exact dense attention output must, somewhere, account for every pair, so there is no exact sub-quadratic-time full attention. The <em>memory</em> cost, by contrast, splits into two pieces of very different character. The values, queries, and keys are each only $L \times d$, linear in length and negligible. It is the intermediate $L \times L$ score (and softmax-weight) matrix that is quadratic, and crucially that matrix is a transient: it is produced, consumed by the softmax and the value product, and could in principle be discarded. The naive implementation stores it anyway, which is the artifact FlashAttention removes in subsection three. So when we say attention is "quadratic", we should really say its time is irreducibly quadratic while its memory is quadratic only by default, a distinction that turns out to be the whole game.</p>
+<p>What does longer context actually buy a forecaster, given that it costs so much? The honest answer is: it depends on how far the genuine dependencies reach. For a series whose informative structure is local (an autoregressive process where last week predicts next week and the distant past adds nothing), a long context wastes compute on positions that carry no signal, and a modest window forecasts just as well. For a series with long seasonal or regime structure (hourly electricity demand with yearly seasonality, where the same calendar week last year is genuinely informative), context that reaches back a full period is what lets the model see the pattern at all, and a short window is blind to it. The practical lesson, which subsection four turns into an engineering principle, is that you want context long enough to cover the longest real dependency and no longer, because every extra position you attend over costs quadratically and pays only if it carries signal.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: The Score Matrix Memory Budget</div>
+<p>Take a single attention head over a sequence of $L = 10{,}000$ steps (roughly fourteen months of hourly data) in 32-bit floats (4 bytes). The score matrix $\mathbf{S} = \mathbf{Q}\mathbf{K}^{\top}$ holds $L^2 = 10^8$ entries, which is $10^8 \cdot 4 = 4 \times 10^8$ bytes, about $400$ MB, for one head, one layer, one sequence in the batch. The softmax weights are another $400$ MB. A model with $8$ heads and $6$ layers, holding all score matrices live for the backward pass, would need $8 \cdot 6 \cdot 400\,\text{MB} \approx 19$ GB just for attention scores, before any value vectors, parameters, or optimizer state. Double the sequence to $L = 20{,}000$ and the score memory quadruples to about $76$ GB: the sequence doubled, the bill quadrupled. By contrast the value tensor $\mathbf{V}$ scales only linearly: at $d = 64$ it is $L \cdot d \cdot 4 = 10{,}000 \cdot 64 \cdot 4 \approx 2.6$ MB per head, utterly negligible beside the scores. The number to remember: it is the $L \times L$ score matrix, not the data itself, that breaks the memory budget, and that is precisely the term FlashAttention in subsection three refuses to store.</p>
+</div>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Cost Is Quadratic Because Attention Compares All Pairs</div>
+<p>There is no clever reformulation that makes exact full attention sub-quadratic in <em>time</em>, because the mechanism is defined as an all-pairs comparison: $L$ queries each scored against $L$ keys is $L^2$ comparisons, full stop. Everything in this section either (a) reduces the number of pairs you actually compare (sparsity, patching, segment recurrence) or (b) computes the same $L^2$ comparisons without ever storing the $L \times L$ result (FlashAttention), or both. Holding that dichotomy in mind, fewer pairs versus same pairs cheaper memory, organizes the entire long-context literature. The quadratic time is intrinsic to exact dense attention; the quadratic memory is an implementation artifact that FlashAttention removes.</p>
+</div>
+
+<h2>2. Recurrence and Memory: Transformer-XL and Compressive Caches <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The first route around the wall borrows the very idea that attention was supposed to replace: recurrence, but at the level of <em>segments</em> rather than individual steps. The observation is simple. If a sequence of length $L$ is too long to attend over at once, split it into segments of length $\ell$ and process them one after another. Naively this discards all context at each segment boundary, so the model can never see further back than $\ell$. Transformer-XL (Dai et al., 2019) fixes this with segment-level recurrence: when processing the current segment, it caches the hidden states computed for the <em>previous</em> segment and lets the current queries attend to them, with the cached states held fixed (no gradient flows into them). The current segment's keys and values are thus extended by the previous segment's cached representations, so a query at the start of segment $n$ can attend back into segment $n-1$ without that segment being recomputed.</p>
+<p>The accounting is the point. Each segment still attends over only $O(\ell)$ positions of its own plus $O(\ell)$ cached positions, so per-segment cost stays $O(\ell^2)$, not $O(L^2)$. Processing $L/\ell$ segments in sequence gives total cost $O\!\left(\frac{L}{\ell} \cdot \ell^2\right) = O(L\,\ell)$, linear in the full length for a fixed segment size. Yet because each segment's cache reaches one segment further back, and that segment's representations were themselves informed by the segment before it, the effective context grows with depth: a network of $N$ layers can propagate information across roughly $N \cdot \ell$ steps through the chain of caches, far beyond the $\ell$ any single attention sees. Transformer-XL also introduced relative positional encodings so that the same cached state means "three steps before the current query" regardless of which absolute segment it came from, which is what makes the cache reusable across segment boundaries. Figure 12.4.2 sketches the cached-segment mechanism.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three segments processed left to right. Each segment attends within itself and back into the cached, gradient-frozen states of the previous segment, so context reaches one segment further back per layer.">
+<defs>
+<marker id="arr124" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+<marker id="arrC124" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b8431f"/></marker>
+</defs>
+<style>
+.seg124 { fill:#eef3f8; stroke:#14385c; stroke-width:2; }
+.cache124 { fill:#fbeee8; stroke:#b8431f; stroke-width:1.8; stroke-dasharray:5 4; }
+.lab124 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub124 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.cl124 { font:600 12px sans-serif; fill:#b8431f; text-anchor:middle; }
+.fl124 { stroke:#5a626c; stroke-width:1.8; fill:none; marker-end:url(#arr124); }
+.cf124 { stroke:#b8431f; stroke-width:1.6; fill:none; marker-end:url(#arrC124); stroke-dasharray:5 4; }
+</style>
+<text class="lab124" x="410" y="26">Segment-level recurrence: each segment attends back into the previous cache</text>
+<rect class="seg124" x="70" y="120" width="170" height="64" rx="9"/><text class="lab124" x="155" y="148">Segment n-1</text><text class="sub124" x="155" y="168">length &#8467;</text>
+<rect class="seg124" x="325" y="120" width="170" height="64" rx="9"/><text class="lab124" x="410" y="148">Segment n</text><text class="sub124" x="410" y="168">length &#8467;</text>
+<rect class="seg124" x="580" y="120" width="170" height="64" rx="9"/><text class="lab124" x="665" y="148">Segment n+1</text><text class="sub124" x="665" y="168">length &#8467;</text>
+<line class="fl124" x1="155" y1="118" x2="155" y2="80"/>
+<line class="fl124" x1="410" y1="118" x2="410" y2="80"/>
+<line class="fl124" x1="665" y1="118" x2="665" y2="80"/>
+<text class="sub124" x="155" y="72">attend within</text>
+<text class="sub124" x="410" y="72">attend within</text>
+<text class="sub124" x="665" y="72">attend within</text>
+<path class="cf124" d="M 325 200 Q 280 230 235 200"/>
+<path class="cf124" d="M 580 200 Q 535 230 490 200"/>
+<text class="cl124" x="280" y="248">cached states (frozen)</text>
+<text class="cl124" x="535" y="248">cached states (frozen)</text>
+</svg>
+<figcaption><strong>Figure 12.4.2:</strong> Transformer-XL segment recurrence. Each segment attends within itself (gray) and back into the gradient-frozen cached states of the previous segment (dashed orange), so context reaches one segment further back per layer while per-segment cost stays $O(\ell^2)$. Relative positional encodings make the cache reusable regardless of absolute segment index.</figcaption>
+</figure>
+<p>Compressive memory pushes the cache idea one step further. The Compressive Transformer (Rae et al., 2020) keeps the short-term cache of Transformer-XL but adds a second, longer-term memory into which old cached states are <em>compressed</em> rather than discarded: when states age out of the short cache, a learned compression (for example a strided convolution or pooling) maps every $c$ old states into one summary state, so a memory of fixed size covers a much longer span at coarser resolution. The trade-off is explicit and intuitive: recent context is stored at full resolution for precise short-range attention, distant context is stored compressed for cheap long-range gist, and the compression rate $c$ tunes how far back the coarse memory reaches per slot. The Infini-attention work (2024) and other recent compressive schemes carry the same bargain into the modern long-context era.</p>
+<p>It is worth being concrete about why this matters specifically for time series rather than just for language, where these methods were born. A language model rarely needs to attend ten thousand tokens back to a single word; a forecaster routinely needs last year's same season, which at hourly resolution is nearly nine thousand steps in the past. The seasonal structure of temporal data is exactly the kind of long-range, low-frequency, aggregate dependency that compression preserves well: the coarse memory of "last winter ran cold and demand was high" survives a strided pooling, even though the specific noisy reading of a specific hour does not. This is the happy case for compressive memory, and it is one reason long-context Transformers for forecasting (<a href="../../toc.html">Chapter 14</a>) and the foundation models of <a href="../../toc.html">Chapter 15</a> can lean on bounded memories without losing the seasonal signal that drives the forecast.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: A Transformer Reinventing the Diary</div>
+<p>There is something endearing about watching attention, the mechanism that triumphantly abolished the recurrent hidden state, quietly grow one back the moment the sequences get long. Transformer-XL caches the recent past like a diary's last few pages kept open on the desk; the Compressive Transformer summarizes the older pages into one-line entries and files them away; Infini-attention keeps a fixed-size scrapbook that never overflows. Strip away the matrices and it is the same instinct every overwhelmed note-taker has had: you cannot keep every page in front of you, so you keep the recent ones in full, compress the rest to gist, and trust that the gist is enough. The RNN of <a href="../module-10-recurrent-neural-networks/index.html">Chapter 10</a> would like a word about who abolished whom.</p>
+</div>
+<p>The trade-offs across these memory schemes are worth naming plainly because they recur in every long-context design. Caching (Transformer-XL) is lossless within its window and free of extra parameters, but its reach is bounded by cache size times depth, and the cache costs memory proportional to that size. Compression buys longer reach for the same memory by accepting resolution loss on the distant past, which is the right call exactly when distant context matters in aggregate but not in fine detail, the usual situation for long-horizon forecasting where last year's seasonal shape matters more than last year's specific noisy hour. The unifying view, and the one that connects this subsection to the temporal thread of the book, is that a cached or compressed memory is doing for a Transformer what the hidden state did for the RNN of <a href="../module-10-recurrent-neural-networks/index.html">Chapter 10</a> and what the belief state did for the filter of <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/index.html">Chapter 7</a>: carrying a bounded summary of the past forward in time so the present can condition on more history than it can hold at once.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: A Cache Turns Quadratic-Over-the-Whole into Quadratic-Per-Segment</div>
+<p>The core arithmetic of segment recurrence is the move from $O(L^2)$ over the entire sequence to $O(\ell^2)$ per segment with $L/\ell$ segments, hence $O(L\,\ell)$ overall: linear in the full length once the segment size is fixed. You do not get all-pairs attention over the full sequence (a query in segment $n$ cannot attend to segment $n-5$ directly), but you get a graded reach that extends with depth and, with compression, with a fixed-size coarse memory. The price of linearity is that distant context is reached indirectly, through the chain of caches, rather than in one hop. This is the same bias-versus-cost bargain that truncated BPTT made in <a href="../module-09-neural-sequence-fundamentals/section-9.3.html">Section 9.3</a>, now wearing an attention costume.</p>
+</div>
+
+<h2>3. FlashAttention: Exact Attention, Linear Memory <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The second route is the most surprising, because it changes nothing about the mathematics and yet removes the quadratic memory term entirely. FlashAttention (Dao et al., 2022; FlashAttention-2, Dao 2023; FlashAttention-3, 2024) observes that the $O(L^2)$ memory of naive attention is not inherent to the computation but to the choice to <em>materialize</em> the full $L \times L$ score matrix in slow GPU memory (HBM) before applying softmax. The output of attention is a row-wise weighted average, and a weighted average can be computed incrementally, block by block, without ever holding all the scores at once. FlashAttention does exactly this: it tiles $\mathbf{Q}$, $\mathbf{K}$, and $\mathbf{V}$ into blocks, loads a block pair into fast on-chip SRAM, computes that block's partial scores and partial softmax, and accumulates into a running output using the online (streaming) softmax that maintains a running maximum and normalizer so the result is numerically identical to the all-at-once softmax. The $L \times L$ matrix is never written to HBM.</p>
+<p>The consequences are large and worth stating precisely. The output is <em>exact</em>, bit-for-bit equivalent to standard attention up to floating-point reordering, so FlashAttention is not an approximation like the sparse methods of <a href="section-12.5.html">Section 12.5</a>: it is the same function computed in a smarter order. The memory drops from $O(L^2)$ to $O(L)$, because only the running output, the running softmax statistics, and the current small blocks live in memory, never the full score matrix. And, somewhat against intuition, it is also <em>faster</em> in wall-clock time despite doing the same or slightly more arithmetic, because attention on modern GPUs is memory-bandwidth bound, not compute bound: the bottleneck is moving the $L \times L$ scores between fast and slow memory, and by never moving them FlashAttention saves the dominant cost. The result is the standard kernel behind essentially every long-context Transformer trained since 2023. Figure 12.4.3 contrasts the two memory profiles.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Property</th><th>Naive attention</th><th>FlashAttention</th></tr></thead>
+<tbody>
+<tr><td>score matrix in memory</td><td>full $L \times L$ materialized in HBM</td><td>never materialized; tiled in SRAM</td></tr>
+<tr><td>memory cost</td><td>$O(L^2)$</td><td>$O(L)$</td></tr>
+<tr><td>time cost</td><td>$O(L^2 d)$, bandwidth bound</td><td>$O(L^2 d)$ flops, far fewer HBM reads/writes</td></tr>
+<tr><td>output</td><td>exact</td><td>exact (same value, streaming softmax)</td></tr>
+<tr><td>wall-clock (long $L$)</td><td>baseline</td><td>typically $2$ to $4\times$ faster</td></tr>
+<tr><td>how to invoke</td><td>hand-written $\mathbf{Q}\mathbf{K}^{\top}$ then softmax then $\mathbf{V}$</td><td><code>F.scaled_dot_product_attention(q, k, v)</code></td></tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 12.4.3:</strong> Naive versus FlashAttention. Both compute the identical attention output; FlashAttention simply never stores the $L \times L$ score matrix, tiling the computation so only small blocks and running statistics live in fast memory. The memory term collapses from quadratic to linear and the wall-clock improves because attention is memory-bandwidth bound.</figcaption>
+</figure>
+<p>For the time-series practitioner the engineering message is concrete: long-context attention is no longer a memory question but a time question, and the time is manageable. Once the $O(L^2)$ memory wall is gone, the binding constraint on how long a sequence you can attend over becomes the $O(L^2)$ <em>compute</em>, which grows more gently in wall-clock and is what the token-reduction of subsection four attacks. Modern long-context engineering layers these: FlashAttention to kill the memory term, patching to cut the token count, and (where exactness can be relaxed) the sparse and linear attentions of <a href="section-12.5.html">Section 12.5</a> to bend the compute term sub-quadratic. In PyTorch the FlashAttention path is a single function, <code>torch.nn.functional.scaled_dot_product_attention</code>, which dispatches to a fused FlashAttention kernel when the hardware and dtypes allow and falls back to a memory-efficient kernel otherwise. We exercise that path in subsection five.</p>
+<p>One conceptual point deserves emphasis because it is the source of most confusion about FlashAttention versus the sparse methods of the next section. FlashAttention does not change <em>which</em> pairs are compared: it still computes the full dense $L \times L$ attention, every query against every key, so it does not reduce the asymptotic time and it does not approximate anything. What it changes is the <em>schedule</em> of the computation, the order in which blocks are loaded, multiplied, and accumulated, so that the memory traffic and the peak storage are minimized. It is a systems optimization, not an algorithmic one, which is exactly why it can be a drop-in replacement that no one has to reason about numerically: the function it computes is unchanged. The sparse and linear attentions of <a href="section-12.5.html">Section 12.5</a> make the opposite choice, changing which pairs are compared (an algorithmic, approximate move) to bend the time itself sub-quadratic. The two are complementary: you can run a sparse attention through a FlashAttention-style kernel and get both savings at once.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Speedup From Doing Less Moving, Not Less Math</div>
+<p>The first time you meet FlashAttention it feels like a cheat. It does the same number of multiplications as naive attention, sometimes a few more, and yet it runs several times faster and uses a fraction of the memory. The trick is that on a modern GPU the arithmetic is nearly free and the <em>moving of numbers</em> between the fast on-chip memory and the big slow memory is what costs you. Naive attention writes a $400$-megabyte score matrix out to slow memory and reads it all back just to take a softmax; FlashAttention keeps the work on-chip and never makes that round trip. It is the computational equivalent of realizing that the slow part of cooking was not the chopping but the trips to the far pantry, so you bring a small shelf next to the stove. Same recipe, same ingredients, a quarter of the walking.</p>
+</div>
+
+<h2>4. Fewer Tokens: Chunking and Patching the Series <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The third route is the bluntest and often the most effective: if the cost is quadratic in the number of tokens, reduce the number of tokens. A point-wise Transformer over a time series treats every individual timestep as one token, so a sequence of $L$ steps is $L$ tokens and the cost is $O(L^2)$. But a single timestep of a time series carries very little information on its own (one temperature reading, one tick of price), unlike a word in a sentence, so spending a whole token on it is wasteful. Patching groups consecutive timesteps into a patch and treats each patch as one token: split the length-$L$ series into patches of $P$ steps (optionally overlapping with stride $S$), flatten each patch into a vector, linearly project it to the model dimension, and feed the resulting $L/S$ patch tokens to the Transformer. The token count drops from $L$ to about $L/S$, and because the cost is quadratic, that is a quadratic saving: a stride of $16$ cuts the token count $16$-fold and the attention cost roughly $256$-fold.</p>
+<p>This is precisely the design that PatchTST (Nie et al., 2023) made the backbone of strong long-horizon forecasting, and that <a href="../../toc.html">Chapter 14</a> develops in full as a deep forecasting architecture. Two further ideas travel with it. First, patching gives attention a more semantically meaningful unit to attend over: a patch of, say, $24$ hourly steps is a day, and attending day-to-day is both cheaper and arguably more natural than attending hour-to-hour across a year. Second, channel independence, processing each variate of a multivariate series with a shared per-channel Transformer rather than mixing channels into each token, keeps the token dimension small and the model robust, a choice <a href="../../toc.html">Chapter 14</a> examines against channel-mixing alternatives. Patching is the source-side lever: it shrinks $L$ before attention ever runs, and it composes freely with the FlashAttention of subsection three (which makes the remaining attention cheap) and the segment recurrence of subsection two (which extends reach across patches).</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: How Far Patching Cuts the Bill</div>
+<p>Take the same $L = 10{,}000$-step hourly series. Point-wise tokenization gives $10{,}000$ tokens and a score matrix of $10^8$ entries, the $400$ MB per head of subsection one. Patch it with non-overlapping patches of $P = 24$ steps (one day per patch): the token count falls to $10{,}000 / 24 \approx 417$ tokens, the score matrix to $417^2 \approx 1.7 \times 10^5$ entries, about $0.7$ MB, a reduction of roughly $24^2 = 576$-fold in attention memory and cost. Even an aggressive overlapping scheme with stride $S = 8$ gives $1{,}250$ tokens and a $1{,}250^2 \approx 1.6 \times 10^6$-entry score matrix, about $6$ MB, still a $64$-fold cut. The lesson the quadratic makes vivid: a linear reduction in token count is a quadratic reduction in attention cost, which is why patching, not a clever kernel, is frequently the highest-leverage change for a long-series Transformer.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Year of Telemetry Through a Long-Context Forecaster</div>
+<p><strong>Who:</strong> A reliability team at a wind-farm operator building a Transformer to forecast turbine power output from a year of ten-minute SCADA telemetry, the sensor-IoT series threaded through <a href="../../toc.html">Chapter 14</a>.</p>
+<p><strong>Situation:</strong> One year at ten-minute resolution is about $52{,}000$ steps per channel. A point-wise Transformer over even a $20{,}000$-step input window exhausted the $40$ GB GPU on the score matrices alone, before the model trained a single step.</p>
+<p><strong>Problem:</strong> They needed context long enough to capture both the daily wind cycle (about $144$ steps) and multi-week weather regimes (thousands of steps), while fitting training in a single GPU's memory.</p>
+<p><strong>Dilemma:</strong> Three levers. Shorten the context, which fit easily but threw away the multi-week regime signal the forecast most needed. Keep the full context with naive attention, which did not fit. Reduce tokens and use an IO-efficient kernel, which required reworking the input pipeline.</p>
+<p><strong>Decision:</strong> They patched the series into non-overlapping $36$-step patches (six-hour blocks), cutting $20{,}000$ steps to about $556$ patch tokens, and routed the attention through <code>scaled_dot_product_attention</code> so the remaining attention used the FlashAttention kernel.</p>
+<p><strong>How:</strong> A linear patch-embedding layer projected each $36$-step patch to the model dimension exactly as PatchTST prescribes, channel-independently per turbine signal, and the encoder block of <a href="section-12.3.html">Section 12.3</a> ran unchanged except that its attention call was the one-line fused path.</p>
+<p><strong>Result:</strong> Training fit in $12$ GB with room to spare, ran roughly three times faster per step than the naive path, and the six-hour patches still resolved the daily cycle while the long token window covered multi-week regimes, improving horizon accuracy over the short-context baseline.</p>
+<p><strong>Lesson:</strong> Patching and FlashAttention are complementary, not competing: patching cuts the token count quadratically at the source, FlashAttention makes whatever attention remains memory-cheap, and together they turn an out-of-memory model into a fast, long-context one. Reach for the source-side token cut first; it is the larger lever.</p>
+</div>
+
+<h2>5. Worked Example: Measuring the $O(L^2)$ Curve, Then Flattening It <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make the quadratic wall executable and then knock it down. The plan: implement scaled dot-product attention from scratch so the $L \times L$ score matrix is explicit, measure its time and peak memory as the sequence length grows and confirm the quadratic scaling empirically, then swap in the one-line <code>scaled_dot_product_attention</code> (the FlashAttention path) and watch the memory budget flatten from quadratic to linear, the same output computed a smarter way. Code 12.4.1 is the from-scratch attention with an explicit score matrix.</p>
+<pre><code class="language-python">import torch
+import torch.nn.functional as F
+
+def naive_attention(q, k, v):
+    """Textbook scaled dot-product attention: materializes the full L x L score matrix."""
+    d = q.shape[-1]
+    scores = (q @ k.transpose(-2, -1)) / d ** 0.5   # S = Q K^T / sqrt(d), shape (..., L, L)
+    weights = torch.softmax(scores, dim=-1)         # row-wise softmax over all L keys
+    return weights @ v                              # weighted average of values, (..., L, d)
+
+# A single head: batch 1, L positions, head dim 64.
+torch.manual_seed(0)
+L, d = 512, 64
+q = torch.randn(1, L, d)
+k = torch.randn(1, L, d)
+v = torch.randn(1, L, d)
+
+out_naive = naive_attention(q, k, v)
+print("output shape :", tuple(out_naive.shape))
+# The score matrix that dominates memory: L x L entries, here 512 x 512.
+print("score entries:", L * L, "=> %.2f MB at fp32" % (L * L * 4 / 1e6))
+</code></pre>
+<div class="code-caption"><strong>Code 12.4.1:</strong> From-scratch scaled dot-product attention. The line <code>scores = q @ k.transpose(-2, -1)</code> materializes the full $L \times L$ matrix that subsection one identified as the source of the quadratic memory cost; everything downstream operates on it. This explicit version is what we measure for scaling, and what FlashAttention will compute without ever storing.</div>
+<pre><code class="language-text">output shape : (1, 512, 64)
+score entries: 262144 => 1.05 MB at fp32
+</code></pre>
+<div class="code-caption"><strong>Output 12.4.1:</strong> The naive attention output and the size of its score matrix at $L = 512$. Already one megabyte for a short sequence; the next measurement shows how that one term grows quadratically as the sequence lengthens.</div>
+<p>Now we measure the scaling. Code 12.4.2 runs the naive attention at a range of sequence lengths, times each, and reads the theoretical score-matrix memory, confirming empirically that doubling the length quadruples both the work and the dominant memory term. This is the $O(L^2)$ curve of subsection one, measured rather than asserted.</p>
+<pre><code class="language-python">import time
+
+def measure(fn, L, d=64, reps=5):
+    """Median wall-clock of an attention call at sequence length L, plus score-matrix bytes."""
+    q = torch.randn(1, L, d); k = torch.randn(1, L, d); v = torch.randn(1, L, d)
+    ts = []
+    for _ in range(reps):
+        t0 = time.perf_counter()
+        fn(q, k, v)
+        ts.append(time.perf_counter() - t0)
+    ts.sort()
+    return ts[len(ts) // 2], L * L * 4 / 1e6   # median seconds, score MB
+
+print(" L      time(ms)   scoreMB   time-ratio-vs-prev")
+prev = None
+for L in [256, 512, 1024, 2048, 4096]:
+    t, mb = measure(naive_attention, L)
+    ratio = "%.2f" % (t / prev) if prev else "  -"
+    print("%5d   %7.2f   %7.1f     %s" % (L, t * 1e3, mb, ratio))
+    prev = t
+</code></pre>
+<div class="code-caption"><strong>Code 12.4.2:</strong> Empirical scaling of naive attention. As $L$ doubles, the score-matrix memory (the <code>scoreMB</code> column) quadruples exactly, and the measured time ratio against the previous length trends toward $4\times$, confirming the $O(L^2)$ growth that subsection one derived from the all-pairs structure.</div>
+<pre><code class="language-text"> L      time(ms)   scoreMB   time-ratio-vs-prev
+  256      0.31       0.3       -
+  512      0.94       1.0     3.03
+ 1024      3.42       4.2     3.64
+ 2048     13.51      16.8     3.95
+ 4096     53.88      67.1     3.96
+</code></pre>
+<div class="code-caption"><strong>Output 12.4.2:</strong> The score memory quadruples on every length doubling (0.3, 1.0, 4.2, 16.8, 67.1 MB), and the time ratio converges to about $4\times$ as the $L^2$ term dominates the smaller linear overheads. The quadratic wall, measured directly. Exact times vary by machine; the ratios are the invariant.</div>
+<p>Finally we flatten the memory budget. Code 12.4.3 replaces the entire hand-written attention with the single call <code>F.scaled_dot_product_attention</code>, the PyTorch FlashAttention path, and verifies the output is identical to the naive version (exact, not approximate) while never materializing the $L \times L$ score matrix. This is the from-scratch-to-library pair: roughly four lines of explicit score-and-softmax logic in Code 12.4.1 collapse to one fused call that is exact, faster, and linear in memory.</p>
+<pre><code class="language-python"># The library shortcut: one fused call dispatches to FlashAttention / memory-efficient attention.
+out_flash = F.scaled_dot_product_attention(q, k, v)   # exact attention, never stores L x L scores
+
+print("outputs match naive :", torch.allclose(out_naive, out_flash, atol=1e-5))
+
+# Memory budget comparison at a long length: naive stores L x L; the fused path does not.
+for L in [4096, 8192, 16384]:
+    naive_score_mb = L * L * 4 / 1e6                  # the materialized score matrix
+    flash_extra_mb = L * 64 * 4 / 1e6                 # only running output/stats: linear in L
+    print("L=%-6d naive scoreMB=%9.1f   flash extraMB=%6.2f   ratio=%.0fx"
+          % (L, naive_score_mb, flash_extra_mb, naive_score_mb / flash_extra_mb))
+</code></pre>
+<div class="code-caption"><strong>Code 12.4.3:</strong> The FlashAttention library shortcut and an exactness check. The four explicit lines of Code 12.4.1 (matmul, scale, softmax, matmul) become the single fused call <code>F.scaled_dot_product_attention(q, k, v)</code>, which produces the identical output (the <code>allclose</code> passes) while storing only $O(L)$ running statistics instead of the $O(L^2)$ score matrix.</div>
+<pre><code class="language-text">outputs match naive : True
+L=4096   naive scoreMB=     67.1   flash extraMB=  1.05   ratio=64x
+L=8192   naive scoreMB=    268.4   flash extraMB=  2.10   ratio=128x
+L=16384  naive scoreMB=   1073.7   flash extraMB=  4.19   ratio=256x
+</code></pre>
+<div class="code-caption"><strong>Output 12.4.3:</strong> The fused path reproduces the naive output exactly while its memory grows only linearly: at $L = 16{,}384$ the naive score matrix needs over a gigabyte and the FlashAttention path about four megabytes, a $256\times$ reduction that widens as $L$ grows. Same math, linear memory.</div>
+<p>Read the three blocks together. Code 12.4.1 made the $L \times L$ score matrix explicit; Code 12.4.2 measured its time and memory growing quadratically with length, the wall made visible; Code 12.4.3 computed the same attention output with one fused call whose memory grows only linearly, the wall removed for the memory dimension. The pedagogical payoff is that the quadratic memory cost is not a law of nature but an implementation choice, and one line of modern PyTorch opts out of it while leaving the mathematics, and the result, untouched. The remaining quadratic <em>time</em> is what patching (subsection four) and the sparse attentions of <a href="section-12.5.html">Section 12.5</a> address next.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Long Context in Temporal AI (2024 to 2026)</div>
+<p>Long-sequence modeling is one of the most active fronts touching this book. FlashAttention-3 (2024) specializes the kernel for Hopper-class GPUs and pushes attention close to hardware peak, while ring attention and sequence-parallel schemes shard a single very long sequence across many devices to reach context lengths in the hundreds of thousands. On the architecture side, the selective state-space models Mamba (Gu and Dao, 2023) and Mamba-2 (Dao and Gu, 2024) and the gated linear-attention family sidestep the quadratic term entirely with a linear recurrence trained by parallel scan, the subject of <a href="../module-13-ssm-continuous-time/index.html">Chapter 13</a>, and hybrids that interleave a few full-attention layers with many linear-recurrent ones are a leading recipe for long-context efficiency. In time series specifically, patch-based long-context forecasters (PatchTST and its successors in <a href="../../toc.html">Chapter 14</a>) and the temporal foundation models of <a href="../../toc.html">Chapter 15</a> (Chronos, Moirai, TimesFM, Lag-Llama) all lean on these efficiencies to ingest long histories. Infini-attention (2024) revives compressive memory for unbounded context within a fixed budget. The 2026 practitioner's synthesis: FlashAttention for exact memory-cheap attention, patching to cut tokens at the source, and a linear-recurrent or sparse layer where exactness can be traded for sub-quadratic time, composed as the task length demands.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Long-Context Attention in One Line</div>
+<p>The from-scratch attention of Code 12.4.1 ran four explicit tensor operations and, at long sequence lengths, would materialize a multi-gigabyte score matrix and likely run out of memory. The modern path is a single function call: <code>torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)</code> computes the identical attention, automatically dispatches to a fused FlashAttention or memory-efficient kernel based on the hardware and dtypes, applies the causal mask without ever building it densely, and uses $O(L)$ memory instead of $O(L^2)$. It handles the score tiling, the streaming softmax, the numerical stabilization, and the backward pass internally, replacing roughly four lines of explicit logic (and an out-of-memory crash at long $L$) with one line that is exact, faster, and memory-linear. For patch-based inputs, <code>nn.TransformerEncoderLayer</code> on the reduced token sequence routes through the same fused path.</p>
+<pre><code class="language-python">import torch.nn.functional as F
+
+# Exact, memory-efficient, causally masked attention in one call.
+out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+</code></pre>
+<div class="code-caption"><strong>Code 12.4.4:</strong> The one-line long-context attention path. This single call subsumes the four-line naive attention of Code 12.4.1, the causal masking, and the $O(L^2) \to O(L)$ memory reduction of FlashAttention, dispatching to the best available fused kernel automatically.</div>
+</div>
+
+<section class="exercises">
+<h2>Exercises</h2>
+<p><strong>Conceptual.</strong> A colleague proposes doubling the input context length of a point-wise time-series Transformer from $4{,}000$ to $8{,}000$ steps to capture longer seasonality, and budgets for a $2\times$ increase in attention memory. Explain why that budget is wrong, give the correct factor, and state precisely which term in the cost grows that way and why. Then explain why switching to FlashAttention changes the memory part of the answer but not the time part.</p>
+<p><strong>Implementation.</strong> Extend Code 12.4.2 to also measure peak memory empirically (use <code>torch.cuda.max_memory_allocated</code> on a GPU, resetting with <code>torch.cuda.reset_peak_memory_stats</code> before each call, or estimate on CPU from tensor sizes). Plot measured peak memory of <code>naive_attention</code> against $L$ and overlay <code>F.scaled_dot_product_attention</code>. Confirm the naive curve is quadratic and the fused curve is linear, and report the crossover length beyond which the naive path no longer fits in your device's memory.</p>
+<p><strong>Open-ended.</strong> Implement a minimal Transformer-XL-style segment cache: process a long series in segments of length $\ell$, and at each segment let the queries attend to the concatenation of the current keys/values and the previous segment's detached keys/values. Compare forecasting accuracy and peak memory against (a) point-wise full attention over the whole series and (b) independent per-segment attention with no cache, on a series with a dependency longer than $\ell$. Discuss where the cached version's graded reach helps and where it still falls short of full attention, connecting your findings to the cache-versus-compression trade-off of subsection two.</p>
+</section>
+
+<nav class="chapter-nav">
+<a class="nav-prev" href="section-12.3.html">&#8592; Previous: 12.3 The Transformer Block</a>
+<a class="nav-up" href="index.html">Chapter 12 Contents</a>
+<a class="nav-next" href="section-12.5.html">Next: 12.5 Efficient and Sparse Transformers &#8594;</a>
+</nav>
+</main>
+<footer class="book-footer">
+<p>Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+<p><script>document.write("Last updated: " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>
