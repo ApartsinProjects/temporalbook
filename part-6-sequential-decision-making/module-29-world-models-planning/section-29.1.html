@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 29.1: Latent Environment Models. A world model is a learned generative model of an environment's dynamics in a compact latent space, exactly the temporal latent-state lineage of the Kalman filter, HMM, and structured state-space model put to work for control. We define the latent transition, observation decoder, and reward heads; assemble encoder, latent transition, decoder, and reward predictor; revisit Ha and Schmidhuber's VAE plus MDN-RNN plus controller; and train a tiny latent dynamics model from scratch before reducing it to a library equivalent." name="description"/>
+<title>Section 29.1: Latent Environment Models | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Sequential Decision Making</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 29: World Models and Planning</a></div>
+<h1>Latent Environment Models</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I keep a small clay model of the world on my desk. It is wrong in a hundred ways I cannot see, but it lets me drop a stone and watch where the ripples go before I ever wet my hands. When the real river surprises me, I press a thumb into the clay and try again."</p>
+<cite>An Agent's Private Simulator of a World It Half Understands</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A world model is a learned, generative model of an environment's dynamics that an agent runs in a compact latent space: from a stream of observations and actions it infers a low-dimensional latent state, predicts how that state evolves, and from the predicted state reconstructs what it would observe and what reward it would receive. Once you have that, you can plan and learn entirely inside the model, "imagining" thousands of futures without touching the real environment.</strong> The decisive idea of this section is that a world model is not a new species of object: it is exactly the temporal latent-state model of Part II, the Kalman filter, the HMM, and the structured state-space model, now learned end to end and pointed at control rather than forecasting. The same triple $(\text{state transition},\ \text{observation map},\ \text{output head})$ that defined the linear-Gaussian state-space model in <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/index.html">Chapter 7</a> reappears here as $(\text{latent transition},\ \text{decoder},\ \text{reward head})$, with the linear maps replaced by neural networks and the model fit by gradient descent on reconstruction and prediction. This section defines those three heads, assembles the four components (encoder, latent transition, decoder, reward predictor), revisits Ha and Schmidhuber's original "World Models" as the canonical first instance, explains why latent imagination is worth the trouble and where its compounding error bites, and then trains a tiny latent dynamics model from scratch and rolls it forward in latent space before collapsing the whole construction to a library equivalent. You leave able to read, build, and reason about the learned simulators that the rest of Chapter 29 plans inside.</p>
+</div>
+<p>In <a href="../module-28-sequence-models-decision/index.html">Chapter 28</a> we treated decision making as sequence modeling: condition a sequence model on past states, actions, and returns, and let it emit the next action directly, no model of the world required. That is one half of the field. This chapter is the other half. Instead of mapping histories straight to actions, we learn a <em>model of the environment itself</em>, a simulator the agent carries in its head, and then plan or train a policy by rolling that simulator forward. The model-based reinforcement learning of <a href="../module-26-advanced-rl/section-26.1.html">Section 26.1</a> already made the case that a learned dynamics model can dramatically cut the number of real environment interactions a policy needs; here we make that model <em>latent</em>, compact, and generative, which is what lets it scale to pixels and long horizons. Throughout we use the unified notation of <a href="../../toc.html">Appendix A</a>: $\mathbf{o}_t$ for the observation, $\mathbf{a}_t$ for the action, $\mathbf{z}_t$ for the latent state, $r_t$ for the reward.</p>
+<p>The reason a world model deserves a chapter of its own, rather than a footnote to model-based RL, is that the choice to model dynamics in a <em>learned latent space</em> changes what is possible. A model that predicts raw pixels one step ahead is a forecaster; a model that infers a small latent state, predicts <em>that</em>, and decodes only when it needs to look is a simulator the agent can run cheaply for hundreds of steps. The compactness is what makes imagination affordable, and affordable imagination is what lets an agent learn a policy from a handful of real episodes (the Dreamer line of <a href="section-29.2.html">Section 29.2</a>) or search over thousands of imagined plans (the planning of <a href="section-29.3.html">Section 29.3</a>). Get the latent model right and the agent learns from its own dreams; get it wrong and the agent confidently plans inside a hallucination.</p>
+<p>The four competencies this section installs are these: to write a world model as a latent transition, an observation decoder, and a reward head, and to recognize that triple as the learned descendant of the state-space model of <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/index.html">Chapter 7</a>; to name the four trainable components and the reconstruction-plus-prediction objective that fits them; to explain why latent imagination is cheap and where compounding rollout error limits it; and to implement a tiny latent dynamics model, roll it out in latent space, and compare a from-scratch build against a library equivalent. These are the load-bearing skills for the Dreamer agents, planners, and learned-simulator methods of the rest of Chapter 29.</p>
+
+<h2>1. What a World Model Is: A Learned Latent State-Space Model <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Strip a world model to its mathematics and you find an object you already know. The agent never sees the true state of the environment; it sees observations $\mathbf{o}_t$ (pixels, sensor vectors, vitals) that are noisy, high-dimensional shadows of some underlying state. A world model posits a compact <em>latent</em> state $\mathbf{z}_t$ that (i) evolves through time as a function of itself and the action taken, and (ii) generates the observation and the reward. Written as a generative model, with an action $\mathbf{a}_t$ chosen at each step, the dynamics are a latent transition, an observation decoder, and a reward head:</p>
+$$\mathbf{z}_t \sim p_\theta(\mathbf{z}_t \mid \mathbf{z}_{t-1}, \mathbf{a}_{t-1}), \qquad \mathbf{o}_t \sim p_\theta(\mathbf{o}_t \mid \mathbf{z}_t), \qquad r_t \sim p_\theta(r_t \mid \mathbf{z}_t).$$
+<p>The first line is the <strong>latent transition model</strong>: it says where the state goes next given where it is and what the agent does. The second is the <strong>observation model</strong> or <strong>decoder</strong>: it says what the world looks like from a given latent state. The third is the <strong>reward head</strong>: it predicts the scalar reward the agent would collect in that state. To <em>use</em> the model the agent also needs to go the other way, from an observation back to a latent state, which is the job of an inference network or <strong>encoder</strong> $q_\phi(\mathbf{z}_t \mid \mathbf{o}_t, \mathbf{z}_{t-1}, \mathbf{a}_{t-1})$, the learned analogue of the filtering update.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: The Kalman/HMM/SSM Lineage Put to Work for Control</div>
+<p>Look hard at the three equations above and you are looking at the linear-Gaussian state-space model of <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/index.html">Chapter 7</a>, $\mathbf{z}_t = \mathbf{A}\mathbf{z}_{t-1} + \mathbf{B}\mathbf{a}_{t-1} + \text{noise}$, $\mathbf{o}_t = \mathbf{C}\mathbf{z}_t + \text{noise}$, with two changes and nothing else. First, the linear maps $\mathbf{A}, \mathbf{B}, \mathbf{C}$ become neural networks $p_\theta$, so the transition and decoder can be nonlinear. Second, we add a reward head, because a forecaster only needs to predict observations but an <em>agent</em> needs to predict consequence. The Kalman filter computed the posterior over the latent state in closed form; the world model's encoder $q_\phi$ learns that same filtering update by amortized inference. The HMM (also <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/index.html">Chapter 7</a>) is the discrete-state version of the same recurrence, and it returns again as the discrete latent of RSSM in <a href="section-29.2.html">Section 29.2</a>. The structured and continuous-time neural state-space models of <a href="../../part-3-temporal-deep-learning/module-13-ssm-continuous-time/index.html">Chapter 13</a> are the same lineage made deep and efficient. A world model is therefore not a new idea but an old one wearing a controller: the temporal latent-state recurrence $\mathbf{z}_t = f(\mathbf{z}_{t-1}, \mathbf{a}_{t-1})$, $\mathbf{o}_t = g(\mathbf{z}_t)$ that has threaded this entire book, now learned end to end and used to imagine futures an agent can act on.</p>
+</div>
+<p>The latent state earns its place by being <em>small</em>. Where the observation $\mathbf{o}_t$ might be a $64 \times 64 \times 3$ image (over twelve thousand numbers), the latent $\mathbf{z}_t$ might be a vector of thirty. Rolling the transition forward in that thirty-dimensional space is cheap; reconstructing the full image at every imagined step would not be. So the world model does its long-horizon thinking entirely in latent space, decoding to pixels only when a human (or a loss function) needs to look. This is the same compression-then-predict logic as the representation learning of <a href="../../toc.html">Chapter 16</a> and the latent-variable generative models of <a href="../../toc.html">Chapter 17</a>: learn a compact code in which the dynamics are simple, and prediction becomes tractable.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Model the Dynamics Where They Are Simple</div>
+<p>The central design commitment of a world model is to predict the future in a learned latent space rather than in observation space. Pixels are a terrible coordinate system for dynamics: a one-pixel translation of an object is an enormous change in the raw image yet a tiny change in the world. The encoder's job is to find coordinates $\mathbf{z}_t$ in which "the object moved a little" is a small change, so that the transition model $p_\theta(\mathbf{z}_t \mid \mathbf{z}_{t-1}, \mathbf{a}_{t-1})$ only has to learn smooth, low-dimensional dynamics. This is exactly why a learned latent state-space model can imagine long futures that a pixel-space predictor cannot: it forecasts in the coordinate system where the physics is simplest, and it pays the cost of decoding to pixels only when it must.</p>
+</div>
+
+<h2>2. The Four Components and Their Objective <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A practical world model has four trainable parts, and it is worth fixing their names and jobs because the rest of the chapter refers to them constantly. The <strong>encoder</strong> $q_\phi(\mathbf{z}_t \mid \mathbf{o}_t, \cdots)$ maps an observation (and usually the previous latent and action) to a distribution over the current latent state: it is amortized filtering, the learned Kalman update. The <strong>latent transition model</strong> $p_\theta(\mathbf{z}_t \mid \mathbf{z}_{t-1}, \mathbf{a}_{t-1})$ predicts the next latent from the current one and the action; it is almost always recurrent or a state-space cell, because the latent must summarize an unboundedly long history, and in <a href="../../toc.html">RSSM</a> form (recurrent state-space model, the workhorse of <a href="section-29.2.html">Section 29.2</a>) it carries both a deterministic recurrent path and a stochastic latent. The <strong>decoder</strong> $p_\theta(\mathbf{o}_t \mid \mathbf{z}_t)$ reconstructs the observation from the latent, and the <strong>reward predictor</strong> $p_\theta(r_t \mid \mathbf{z}_t)$ predicts reward from the latent. The encoder and decoder together are a temporal autoencoder; the transition makes it predictive; the reward head makes it useful for control.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The four components of a world model. An observation o-t enters an encoder which produces a latent state z-t. A latent transition model carries z-t-1 plus action a-t-1 to z-t. From z-t a decoder reconstructs the observation o-hat-t and a reward head predicts r-hat-t. The latent transition lets the model roll forward in latent space without observations.">
+<defs>
+<marker id="arr291" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.box291 { fill:#eef3f8; stroke:#14385c; stroke-width:2; }
+.gen291 { fill:#fbeee8; stroke:#b8431f; stroke-width:1.8; }
+.fl291 { stroke:#5a626c; stroke-width:1.8; fill:none; marker-end:url(#arr291); }
+.lab291 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub291 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.gl291 { font:600 12px sans-serif; fill:#b8431f; text-anchor:middle; }
+</style>
+<text class="lab291" x="410" y="24">Encoder, latent transition, decoder, reward head</text>
+<!-- observation in -->
+<text class="sub291" x="70" y="158">o&#8348;</text>
+<line class="fl291" x1="88" y1="152" x2="148" y2="152"/>
+<rect class="box291" x="150" y="124" width="110" height="56" rx="9"/><text class="lab291" x="205" y="149">encoder</text><text class="sub291" x="205" y="168">q&#966;</text>
+<!-- to latent -->
+<line class="fl291" x1="260" y1="152" x2="338" y2="152"/>
+<rect class="box291" x="340" y="120" width="100" height="64" rx="9"/><text class="lab291" x="390" y="150">z&#8348;</text><text class="sub291" x="390" y="170">latent state</text>
+<!-- transition self loop from left -->
+<rect class="box291" x="305" y="232" width="170" height="48" rx="9"/><text class="lab291" x="390" y="252">transition p&#952;</text><text class="sub291" x="390" y="270">z&#8348;&#8331;&#8321;, a&#8348;&#8331;&#8321; &#8594; z&#8348;</text>
+<line class="fl291" x1="390" y1="232" x2="390" y2="186"/>
+<!-- decoder -->
+<line class="fl291" x1="440" y1="142" x2="558" y2="120"/>
+<rect class="gen291" x="560" y="92" width="120" height="52" rx="9"/><text class="lab291" x="620" y="117">decoder</text><text class="sub291" x="620" y="135">o&#770;&#8348;</text>
+<!-- reward head -->
+<line class="fl291" x1="440" y1="162" x2="558" y2="184"/>
+<rect class="gen291" x="560" y="160" width="120" height="52" rx="9"/><text class="lab291" x="620" y="185">reward head</text><text class="sub291" x="620" y="203">r&#770;&#8348;</text>
+<text class="gl291" x="410" y="306">imagination = run the transition in latent space, decode only when needed</text>
+</svg>
+<figcaption><strong>Figure 29.1.1:</strong> The four trainable components of a latent world model. The encoder $q_\phi$ infers the latent $\mathbf{z}_t$ from the observation (amortized filtering); the recurrent transition $p_\theta$ predicts the next latent from the previous latent and action; the decoder reconstructs the observation and the reward head predicts reward, both from the latent. Imagination runs the transition alone, decoding only when an observation or reward is actually needed.</figcaption>
+</figure>
+<p>All four are trained jointly by maximizing a single objective that combines reconstruction and prediction, the evidence lower bound (ELBO) of the latent-variable models of <a href="../../toc.html">Chapter 17</a> extended with a reward term. For a sequence of observations, actions, and rewards it reads, in its standard form,</p>
+$$\mathcal{L}(\theta, \phi) = \sum_{t} \underbrace{\mathbb{E}_{q_\phi}\!\big[\log p_\theta(\mathbf{o}_t \mid \mathbf{z}_t)\big]}_{\text{reconstruction}} + \underbrace{\mathbb{E}_{q_\phi}\!\big[\log p_\theta(r_t \mid \mathbf{z}_t)\big]}_{\text{reward}} - \underbrace{\beta\, \mathrm{KL}\!\big(q_\phi(\mathbf{z}_t \mid \mathbf{o}_t, \cdots) \,\|\, p_\theta(\mathbf{z}_t \mid \mathbf{z}_{t-1}, \mathbf{a}_{t-1})\big)}_{\text{prediction / dynamics consistency}}.$$
+<p>Read the three terms in plain language. The reconstruction term forces the latent to retain enough information about the observation that the decoder can rebuild it (the autoencoder pressure). The reward term forces the latent to carry whatever predicts reward (the control pressure). The KL term is the one that makes it a <em>dynamics</em> model rather than a per-frame autoencoder: it pulls the encoder's posterior over $\mathbf{z}_t$ toward what the transition model <em>predicted</em> $\mathbf{z}_t$ would be from the previous step, so the transition learns to anticipate the very codes the encoder produces. That alignment is exactly what lets the agent later drop the encoder and roll the transition forward on its own. This reconstruction-plus-prediction structure is the temporal sibling of the representation-learning objectives of <a href="../../toc.html">Chapter 16</a> and the variational generative models of <a href="../../toc.html">Chapter 17</a>, accessed through the book map at <a href="../../toc.html">Contents</a>.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The KL Term Is What Makes the Model Imagine</div>
+<p>A temporal autoencoder with only a reconstruction loss learns to compress each frame but learns nothing about how frames follow one another, so it cannot be rolled forward without observations. The dynamics-consistency term, the KL between the encoder's posterior and the transition's prior, is precisely what couples the present latent to the predicted latent and teaches the transition to forecast the codes the encoder will emit. After training, the agent imagines by sampling $\mathbf{z}_t \sim p_\theta(\mathbf{z}_t \mid \mathbf{z}_{t-1}, \mathbf{a}_{t-1})$ from the transition prior alone, with no observation in sight, because that prior has been trained to match what the encoder would have inferred. Reconstruction gives you a code; the KL gives you a simulator.</p>
+</div>
+
+<h2>3. Ha and Schmidhuber's "World Models": The Canonical First Example <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The architecture that named the field is Ha and Schmidhuber's 2018 "World Models", and it maps cleanly onto the four components of subsection two, which is why it is the right first example. Their agent has three pieces with memorable initials. The <strong>V</strong> (vision) is a variational autoencoder that compresses each frame $\mathbf{o}_t$ into a small latent $\mathbf{z}_t$: that is the encoder and decoder. The <strong>M</strong> (memory) is a mixture-density recurrent network, an MDN-RNN, that predicts the distribution of the next latent $\mathbf{z}_{t+1}$ from the current latent, the action, and a recurrent hidden state: that is the latent transition model, made probabilistic with a mixture of Gaussians so it can represent the genuinely multimodal "what happens next" of a stochastic environment. The <strong>C</strong> (controller) is a tiny linear policy mapping the latent and the memory state to an action. The striking part of their result is the third piece.</p>
+<p>Because the V and M components together form a differentiable, runnable simulator, the controller can be trained <em>entirely inside the model's own dream</em>: roll the MDN-RNN forward from an imagined start, let the controller act, accumulate imagined reward, and optimize the controller to maximize it, never touching the real environment during policy search. Ha and Schmidhuber trained the controller inside the dream of a car-racing and a VizDoom environment and then transferred it back, showing that a policy learned purely in imagination can act competently in reality, provided the dream is faithful enough. They also noted the failure mode that defines the whole enterprise: a controller optimizing against an imperfect model will find and exploit the model's hallucinations, racking up dream reward that does not exist in the real world, which is why later work (the Dreamer line of <a href="section-29.2.html">Section 29.2</a>) adds temperature and uncertainty to keep the controller honest.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: Learning to Drive Without a Road</div>
+<p>There is something delightful about the World Models result: the agent learns to play the game by playing a hallucinated copy of the game that it dreamed up itself, then wakes up and is good at the real one. It is the reinforcement-learning equivalent of a musician practicing a piece in their head on a long flight and stepping off the plane able to perform it. The catch is equally human: if you only ever rehearse in your imagination, you start believing your imagination, and the agent will cheerfully "discover" that flooring the accelerator through an imagined wall earns points, because in its dream the wall is negotiable. The model is a confident liar, and the whole art of Chapter 29 is keeping the agent appropriately skeptical of it.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Surgical Robotics Team Rehearses in a Learned Simulator</div>
+<p><strong>Who:</strong> A robotics group at a medical-device company developing a policy for a tissue-manipulation arm, working from camera observations of a deformable phantom.</p>
+<p><strong>Situation:</strong> Real interaction was scarce and expensive: each episode on the physical rig required a sterile setup, a fresh phantom, and a technician, so collecting the hundreds of thousands of steps a model-free policy would need was out of the question.</p>
+<p><strong>Problem:</strong> They needed a competent grasp-and-retract policy but could afford only a few thousand real interaction steps, far below what direct policy learning from pixels demands.</p>
+<p><strong>Dilemma:</strong> Train model-free on the rig (safe gradients but impossibly data-hungry), or learn a world model from the limited real data and train the policy in imagination (data-efficient but exposed to model error that, on a surgical device, could be dangerous if trusted blindly).</p>
+<p><strong>Decision:</strong> They built a latent world model (encoder, recurrent latent transition, decoder, reward head) on the few thousand real steps, exactly the four components of subsection two, and trained the policy mostly in imagined latent rollouts, the Ha-and-Schmidhuber recipe of learning the controller inside the dream.</p>
+<p><strong>How:</strong> The decoder and reward head let them <em>inspect</em> the dream: engineers decoded imagined rollouts back to images and checked them against held-out real episodes, and they capped imagination horizons short (the compounding-error limit of subsection four) so the policy never optimized against far-future hallucinations.</p>
+<p><strong>Result:</strong> The policy reached competent behavior using roughly an order of magnitude fewer real episodes than a model-free baseline, and the decoded-dream inspection caught two cases where the model hallucinated the phantom snapping back unrealistically, which they fixed by collecting targeted real data in those regimes.</p>
+<p><strong>Lesson:</strong> A latent world model buys data efficiency by moving most learning into imagination, but the decoder is not just for training: it is the window that lets you audit the dream before you trust a policy trained inside it.</p>
+</div>
+
+<h2>4. Why Latent World Models: Cheap Imagination and Its Limit <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The payoff of a latent world model is that imagination is cheap, and cheap imagination changes the economics of learning to act. Every interaction with a real environment costs something: a robot's wear, a patient's risk, a trading account's capital, a simulator's wall-clock. A learned model lets the agent generate as many <em>imagined</em> transitions as it wants for the price of a forward pass through a small recurrent network, so it can plan, evaluate candidate actions, and even train an entire policy without spending real interaction. This is the data-efficiency argument of model-based RL from <a href="../module-26-advanced-rl/section-26.1.html">Section 26.1</a>, now sharpened by the latent representation: because the rollout happens in a thirty-dimensional latent space and never decodes to pixels, a thousand-step imagined trajectory costs a thousand small matrix-vector products, not a thousand image generations. Compactness is what makes long-horizon imagination affordable, and long-horizon imagination is what planning and policy learning need.</p>
+<p>The limit on all of this is <strong>compounding error</strong>, and it is the single most important caveat in the chapter. A world model is fit to predict <em>one step</em> ahead, but imagination chains many one-step predictions, feeding each predicted latent back in as the input to the next prediction. Small per-step errors accumulate: the model's predicted latent drifts away from where the true latent would be, and because the next prediction is conditioned on the already-wrong latent, the error grows, often faster than linearly, as the horizon lengthens. After enough imagined steps the rollout has wandered into a region of latent space the model never saw during training, where its predictions are unconstrained fiction. This is the same distribution-shift mechanism that limited the open-loop forecasters of <a href="../../part-3-temporal-deep-learning/module-09-neural-sequence-fundamentals/index.html">Chapter 9</a> and the imitation policies of <a href="../module-27-control-imitation/index.html">Chapter 27</a>: a model trained on one-step ground-truth inputs is asked to consume its own multi-step outputs, and the two distributions diverge.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: How Far Can You Dream Before the Dream Drifts?</div>
+<p>Model a simple compounding-error process: suppose each imagined step adds a fixed expected latent error $\epsilon = 0.02$ (in normalized latent units) and the transition has a per-step error-amplification factor $\gamma = 1.15$ (errors from earlier steps grow by 15% each step because the model is mildly unstable off its training distribution). The accumulated error after $H$ imagined steps is the geometric sum $E(H) = \epsilon \sum_{s=0}^{H-1} \gamma^{s} = \epsilon\,\frac{\gamma^{H} - 1}{\gamma - 1}$. At $H = 5$ steps, $E = 0.02 \cdot \frac{1.15^{5} - 1}{0.15} \approx 0.02 \cdot 6.74 = 0.135$, still small. At $H = 15$ steps, $E = 0.02 \cdot \frac{1.15^{15} - 1}{0.15} \approx 0.02 \cdot 47.6 = 0.95$, now comparable to the scale of the latent itself: the dream has drifted as far as a typical state is large. At $H = 25$, $E \approx 0.02 \cdot \frac{1.15^{25}-1}{0.15} \approx 0.02 \cdot 213 = 4.3$, pure fiction. The lesson the arithmetic teaches is why Dreamer-style agents (<a href="section-29.2.html">Section 29.2</a>) cap imagination horizons at roughly ten to twenty steps: long enough for the value bootstrap to see useful future reward, short enough that the geometric blow-up has not yet taken over. The horizon you can trust is set by the amplification factor $\gamma$, which is precisely what a stable, well-regularized transition model keeps near one.</p>
+</div>
+<p>The practical response to compounding error is a recurring theme of the chapter: keep imagined horizons short, bootstrap value beyond the horizon with a learned value function rather than rolling out further (the Dreamer trick of <a href="section-29.2.html">Section 29.2</a>), and train the model to be calibrated about its own uncertainty so the agent can discount imagined transitions the model is unsure about (the planning-under-uncertainty theme of <a href="section-29.3.html">Section 29.3</a>). The compact latent helps here too: a low-dimensional state is easier to keep on its training manifold than a high-dimensional one, so latent rollouts drift more slowly than pixel rollouts. But no amount of cleverness removes the caveat entirely, and the honest summary is that a world model is a trustworthy oracle for a few steps and a confident fabulist for many.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Scaling Latent World Models (2024 to 2026)</div>
+<p>Latent world models are in an unusually active phase. DreamerV3 (Hafner et al., 2023) showed that a single latent-world-model agent with fixed hyperparameters solves more than 150 tasks across very different domains, including collecting diamonds in Minecraft from scratch, the first general demonstration that one latent simulator recipe transfers across worlds. On the perception side, TD-MPC2 (Hansen et al., 2024) drops pixel reconstruction entirely and learns the latent transition and reward directly in a self-supervised latent, planning with model-predictive control over the learned model, and scales cleanly to a single agent mastering dozens of continuous-control tasks. The frontier through 2025 and into 2026 is the <em>generative video world model</em>: systems such as Genie (Bruce et al., 2024) and its successors, and the playable-environment video models from several labs, treat a large action-conditioned video generator as a world model you can step through frame by frame, blurring the line between this section's latent simulators and the generative temporal models of <a href="../../toc.html">Chapter 17</a>. The open questions for 2026 are the same two this section raised, now at scale: how to keep long imagined rollouts on the training manifold (compounding error), and how to learn a latent in which the dynamics are simple enough to plan in (representation), with reward-free, reconstruction-free latents like TD-MPC2's the most promising current answer.</p>
+</div>
+
+<h2>5. Worked Example: A Tiny Latent Dynamics Model, From Scratch and By Library <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now build the smallest honest world model: an encoder, a recurrent latent transition, a decoder, and a reward head, trained on collected rollouts and then rolled forward in latent space. The environment is deliberately minimal so the whole thing runs in seconds and the numbers are inspectable: a 1-D "slider" world whose true hidden state is a position and velocity, observed only through a noisy 8-D observation vector, with an action that nudges the velocity and a reward that peaks at the origin. The point is not the task but the machinery: collect rollouts, fit the four components on reconstruction plus one-step prediction plus reward, then imagine forward from a real start using only the transition and compare the imagined latent rollout against the true next observations. Code 29.1.1 generates the data.</p>
+<pre><code class="language-python">import torch, torch.nn as nn
+
+torch.manual_seed(0)
+OBS, LAT, ACT, T = 8, 4, 1, 12          # obs dim, latent dim, action dim, rollout length
+
+def collect_rollouts(n_eps=400):
+    """A tiny slider world: hidden (pos, vel); obs is a noisy linear lift to 8-D."""
+    proj = torch.randn(OBS, 2) * 0.7    # fixed lift from true 2-D state to 8-D obs
+    O, A, R = [], [], []
+    for _ in range(n_eps):
+        pos, vel = torch.randn(()) * 0.5, torch.zeros(())
+        os_, as_, rs_ = [], [], []
+        for t in range(T):
+            a = torch.randn(()) * 0.3                 # random exploratory action
+            vel = 0.9 * vel + 0.3 * a                 # action nudges velocity
+            pos = pos + 0.1 * vel                     # velocity moves position
+            state = torch.stack([pos, vel])
+            obs = proj @ state + 0.05 * torch.randn(OBS)   # noisy observation
+            rew = torch.exp(-(pos ** 2))              # reward peaks at the origin
+            os_.append(obs); as_.append(a.view(1)); rs_.append(rew.view(1))
+        O.append(torch.stack(os_)); A.append(torch.stack(as_)); R.append(torch.stack(rs_))
+    return torch.stack(O), torch.stack(A), torch.stack(R)   # (n_eps, T, dim)
+
+O, A, R = collect_rollouts()
+print("observations", tuple(O.shape), "actions", tuple(A.shape), "rewards", tuple(R.shape))
+</code></pre>
+<div class="code-caption"><strong>Code 29.1.1:</strong> Collecting rollouts from a tiny slider environment. The true hidden state is a 2-D (position, velocity); the agent sees only a noisy 8-D lift of it, takes a scalar action that nudges velocity, and earns reward that peaks at the origin. These are the observation, action, and reward streams a world model is trained to explain.</div>
+<pre><code class="language-text">observations (400, 12, 8) actions (400, 12, 1) rewards (400, 12, 1)</code></pre>
+<div class="code-caption"><strong>Output 29.1.1:</strong> The collected dataset: 400 episodes of length 12, each with 8-D observations, scalar actions, and scalar rewards. This is the raw experience the latent world model must compress and learn to predict.</div>
+<p>Code 29.1.2 defines the four components from scratch and trains them on the combined reconstruction, one-step prediction, and reward objective of subsection two (we use a deterministic latent and an MSE surrogate for the ELBO to keep the example small and readable; the stochastic-latent KL version is the RSSM of <a href="section-29.2.html">Section 29.2</a>). The transition is a GRU cell, the recurrent heart of the latent dynamics.</p>
+<pre><code class="language-python">class WorldModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.encoder = nn.Sequential(nn.Linear(OBS, 32), nn.Tanh(), nn.Linear(32, LAT))
+        self.trans   = nn.GRUCell(ACT, LAT)          # latent transition: (z_{t-1}, a) -> z_t
+        self.decoder = nn.Sequential(nn.Linear(LAT, 32), nn.Tanh(), nn.Linear(32, OBS))
+        self.reward  = nn.Sequential(nn.Linear(LAT, 32), nn.Tanh(), nn.Linear(32, 1))
+
+    def forward(self, obs, act):
+        z = self.encoder(obs[:, 0])                  # infer first latent from first obs
+        rec, pred, rew = [], [], []
+        for t in range(T):
+            rec.append(self.decoder(z))              # reconstruct current observation
+            rew.append(self.reward(z))               # predict current reward
+            z = self.trans(act[:, t], z)             # roll latent forward one step
+            pred.append(self.decoder(z))             # predict NEXT observation from rolled z
+        return torch.stack(rec, 1), torch.stack(pred, 1), torch.stack(rew, 1)
+
+wm = WorldModel(); opt = torch.optim.Adam(wm.parameters(), lr=3e-3)
+for epoch in range(300):
+    rec, pred, rew = wm(O, A)
+    loss = ((rec - O) ** 2).mean()                          # reconstruction
+    loss = loss + ((pred[:, :-1] - O[:, 1:]) ** 2).mean()   # one-step prediction (dynamics)
+    loss = loss + ((rew - R) ** 2).mean()                   # reward head
+    opt.zero_grad(); loss.backward(); opt.step()
+print("final train loss = %.5f" % loss.item())
+</code></pre>
+<div class="code-caption"><strong>Code 29.1.2:</strong> The four components from scratch, trained jointly. The encoder infers the first latent, the GRU transition rolls it forward one step per action, the decoder both reconstructs the current observation and predicts the next, and the reward head predicts reward. The three loss terms are exactly the reconstruction, prediction, and reward terms of subsection two's objective.</div>
+<pre><code class="language-text">final train loss = 0.01382</code></pre>
+<div class="code-caption"><strong>Output 29.1.2:</strong> Training converges to a small combined loss, meaning the latent code reconstructs observations, the transition predicts the next observation, and the reward head tracks reward, the three jobs of a world model all being done at once.</div>
+<p>Now the payoff: imagination. Code 29.1.3 encodes a single real starting observation, then rolls the latent transition forward using only the actions, never feeding in any further observation, and decodes each imagined latent to compare against the true observation the environment actually produced. This is a latent rollout, the operation every planner and Dreamer agent in this chapter relies on, and it lets us put a concrete number on the compounding error of subsection four.</p>
+<pre><code class="language-python">@torch.no_grad()
+def imagine(wm, obs0, actions):
+    """Encode ONE real observation, then dream forward using only actions."""
+    z = wm.encoder(obs0)                         # the only time we look at the real world
+    imagined = []
+    for t in range(actions.shape[0]):
+        z = wm.trans(actions[t:t+1], z)          # pure latent rollout, no observation
+        imagined.append(wm.decoder(z))           # decode only to inspect the dream
+    return torch.cat(imagined, 0)
+
+ep = 0                                            # imagine one held-out-style episode
+imagined = imagine(wm, O[ep, 0:1], A[ep, :-1, :].squeeze(0))
+true_next = O[ep, 1:]                             # the observations that really happened
+per_step = ((imagined - true_next) ** 2).mean(dim=1)   # imagination error per horizon step
+for h in [0, 2, 5, 8, 10]:
+    print("horizon %2d  imagine-vs-true MSE = %.4f" % (h + 1, per_step[h].item()))
+</code></pre>
+<div class="code-caption"><strong>Code 29.1.3:</strong> A latent rollout. After encoding a single real observation, the model dreams forward purely in latent space, driven only by the action sequence, and decodes each imagined latent to compare against the observation the environment truly produced. The growing per-step error is compounding error made measurable.</div>
+<pre><code class="language-text">horizon  1  imagine-vs-true MSE = 0.0094
+horizon  3  imagine-vs-true MSE = 0.0161
+horizon  6  imagine-vs-true MSE = 0.0292
+horizon  9  imagine-vs-true MSE = 0.0497
+horizon 11  imagine-vs-true MSE = 0.0719</code></pre>
+<div class="code-caption"><strong>Output 29.1.3:</strong> The numeric-example payoff: the imagined latent rollout matches the true next observation tightly at one step (MSE 0.0094) and drifts steadily as the horizon grows (to 0.0719 at eleven steps), the compounding error of subsection four seen in real numbers. The dream is trustworthy for a few steps and degrades thereafter, exactly the limit that caps imagination horizons.</div>
+<p>Read the three code blocks as one demonstration. Code 29.1.1 collected experience; Code 29.1.2 fit the four components on reconstruction, prediction, and reward; Code 29.1.3 encoded one real observation and dreamed the rest, watching the dream drift. That is the entire world-model loop in miniature, and every elaborate agent in this chapter is this loop scaled up: bigger encoder, stochastic latent, longer rollouts, a policy trained inside them.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: The Same Latent World Model in a Few Lines</div>
+<p>The from-scratch model of Code 29.1.2 plus the rollout of Code 29.1.3 ran roughly 35 lines of explicit encoder, transition, decoder, reward head, and hand-written imagination loop. Production world-model libraries collapse that to a configuration plus a fit call. The Dreamer family ships as reference implementations (the official <code>danijar/dreamerv3</code> repository) where the RSSM encoder, recurrent stochastic transition, decoder, reward and continuation heads, and the imagination rollout are all built and trained by a single agent object: you specify the latent and recurrent sizes and call <code>train</code> on an environment, and the library handles the stochastic-latent KL objective, the free-bits regularization, the imagination horizon, and the value bootstrap that our toy version omitted. The same construction is available through general model-based RL toolkits.</p>
+<pre><code class="language-python"># Sketch of the library-level interface (DreamerV3-style); see danijar/dreamerv3.
+import dreamerv3
+from dreamerv3 import embodied
+
+config = dreamerv3.Agent.configs['defaults']        # latent size, RSSM, horizons preset
+config = config.update({'rssm.deter': 256, 'rssm.stoch': 32})
+agent  = dreamerv3.Agent(obs_space, act_space, config)
+# embodied.run.train(agent, env, replay, logger, args)  # encoder+transition+decoder
+#                                                        # +reward, ELBO, imagination: all internal
+</code></pre>
+<p>What the library handles internally that we wrote by hand: the encoder and decoder networks, the recurrent stochastic-state transition (RSSM), the joint reconstruction-plus-KL-plus-reward objective, the imagination rollout with its capped horizon, and the value bootstrap beyond it. Roughly 35 lines of explicit world-model code become about 4 lines of configuration, with the stochastic-latent machinery our toy version skipped now included and battle-tested.</p>
+</div>
+
+<h2>Exercises</h2>
+<div class="callout exercise">
+<div class="callout-title">Exercise 29.1.1 (Conceptual): The State-Space Lineage</div>
+<p>Write down the linear-Gaussian state-space model of <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/index.html">Chapter 7</a> (transition, observation) and place it next to the world-model triple of subsection one (latent transition, decoder, reward head). State precisely which two changes turn the former into the latter, and explain why a forecaster does not need the reward head but an agent does. Then identify which component of the world model plays the role of the Kalman filter's measurement-update step, and justify calling it "amortized filtering".</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 29.1.2 (Implementation): Make the Dream Drift Faster and Slower</div>
+<p>Starting from Code 29.1.1 through 29.1.3, run two interventions and report the per-horizon imagination MSE for each. First, increase the observation noise in <code>collect_rollouts</code> from <code>0.05</code> to <code>0.2</code> and retrain: does the one-step error rise, and does the long-horizon drift get worse faster? Second, keep the original noise but train only on the reconstruction term (delete the one-step prediction and reward terms in Code 29.1.2): show that reconstruction alone produces a model that decodes single observations well but whose imagined rollouts diverge almost immediately, the empirical version of the "KL is what makes it imagine" insight.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 29.1.3 (Open-ended): Bound the Trustworthy Horizon</div>
+<p>Using the compounding-error model of the subsection-four numeric example, $E(H) = \epsilon\,(\gamma^{H}-1)/(\gamma-1)$, fit $\epsilon$ and $\gamma$ to the per-horizon MSE curve your Code 29.1.3 produced (a simple log-domain regression suffices). From the fitted $\gamma$, estimate the horizon at which imagination error reaches a chosen tolerance (say, the scale of a typical observation), and discuss how this estimated trustworthy horizon would inform the imagination-horizon hyperparameter of a Dreamer-style agent (<a href="section-29.2.html">Section 29.2</a>). What would you change about the model or training to push that horizon out?</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="nav-prev" href="index.html">&#8592; Contents</a>
+<a class="nav-up" href="index.html">Chapter 29: World Models and Planning</a>
+<a class="nav-next" href="section-29.2.html">Dreamer and Recurrent World Models &#8594;</a>
+</nav>
+</main>
+<footer class="site-footer">
+<p class="edition-line">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="copyright">&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+<p class="last-updated"><script>document.write("Last updated: " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

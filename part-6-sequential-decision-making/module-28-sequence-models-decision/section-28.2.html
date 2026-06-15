@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 28.2: Decision Transformer and Trajectory Transformer. Casting offline reinforcement learning as sequence modeling: a causal Transformer over return-to-go, state, and action tokens trained by supervised next-action prediction (Decision Transformer), versus modeling the full trajectory distribution and planning with beam search over it (Trajectory Transformer), with a from-scratch minimal Decision Transformer and its HuggingFace equivalent." name="description"/>
+<title>Section 28.2: Decision Transformer and Trajectory Transformer | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Sequential Decision Making</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 28: Sequence Models for Decision Making</a></div>
+<h1>Decision Transformer and Trajectory Transformer</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"Every morning they hand me a number and tell me it is the reward I am about to collect. I have never once collected it. I was trained on the timid, the mediocre, the occasionally lucky, and not one of them ever earned what you are now asking of me. Still, I square my shoulders, condition on the impossible, and emit the action a champion would have taken. Sometimes, to everyone's surprise including mine, the champion shows up."</p>
+<cite>A Decision Transformer Conditioning on a Return It Has Never Actually Earned</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Reinforcement learning is usually framed as an optimization problem: find a policy that maximizes expected return by estimating value functions and improving the policy against them. The sequence-modeling view throws that machinery out and asks a startlingly simpler question: what if we treat a trajectory, the interleaved stream of returns, states, and actions, as just another sequence, and train a Transformer to predict the next token the way a language model predicts the next word?</strong> Two papers from 2021 made this concrete and reframed the field. The Decision Transformer (Chen et al.) feeds the model triples of (return-to-go, state, action), trains it by plain supervised next-action prediction on a fixed offline dataset, and at test time conditions on a <em>desired</em> return-to-go to coax out actions that would achieve it. The Trajectory Transformer (Janner et al.) goes further and models the full joint distribution over states, actions, and rewards, then uses beam search over that learned distribution as a planner, the sequence model serving as both simulator and search space. This section builds both. It derives the token layout and the causal architecture (a direct callback to the Transformer of <a href="../../part-3-temporal-deep-learning/module-12-attention-transformers/index.html">Chapter 12</a>), contrasts the reactive return-conditioned policy against planning-by-search, implements a minimal Decision Transformer from scratch, runs the HuggingFace equivalent with a line-count comparison, and rolls out a policy conditioned on a target return. You leave able to explain why and when "RL as a big sequence model" works, and where its stitching limits begin.</p>
+</div>
+<p>In <a href="section-28.1.html">Section 28.1</a> we set up the central reframing of this chapter: a Markov decision process is itself a sequence, and the optimal-control problem of <a href="../module-27-control-imitation/index.html">Chapter 27</a> can be attacked with the same autoregressive tools that drive language models. That reframing is the closing turn of the temporal thread this book has followed since Part II, where the Kalman filter, the hidden Markov model, and the recurrent network all turned out to be one loop. Here the MDP itself, the object that organized all of <a href="../module-22-markov-decision-processes/index.html">Chapter 22</a>, returns as a sequence model. This section makes that abstract promise into two concrete, trainable architectures. We use the unified notation of <a href="../../toc.html">Appendix A</a> throughout: $s_t$ for state, $a_t$ for action, $r_t$ for the reward received after $a_t$, and $\hat{R}_t$ for the return-to-go, defined below.</p>
+<p>Why does this view deserve its own section rather than a footnote to deep RL? Because it changes what is hard. Classical value-based and policy-gradient methods (Chapters <a href="../module-24-bandits-rl-foundations/index.html">24</a> and <a href="../module-25-deep-reinforcement-learning/index.html">25</a>) wrestle with bootstrapping, the deadly triad, target-network instability, and the notorious fragility of off-policy value estimation. The sequence-modeling approach sidesteps all of it: there is no Bellman backup, no temporal-difference target, no separate critic. There is a Transformer and a supervised loss, the most stable and best-understood training recipe in modern deep learning. The cost of that simplicity, as we will see, shows up elsewhere: in the model's ability to <em>stitch</em> together sub-trajectories it never saw end to end, and in how far above the data's returns you can credibly condition. Understanding precisely where the simplicity is free and where it is paid for is the goal.</p>
+<p>The four competencies this section installs are these: to write a trajectory as a token sequence and lay out the (return-to-go, state, action) interleaving that the Decision Transformer consumes; to explain return-conditioned supervised training and the test-time trick of conditioning on a target return you select; to contrast the Decision Transformer's reactive generation against the Trajectory Transformer's planning by beam search, and to state the stitching and extrapolation limits of both; and to implement a minimal Decision Transformer from scratch, run its library equivalent, and roll it out conditioned on a return. These are the load-bearing skills for the goal-conditioned and return-conditioned policies of <a href="section-28.3.html">Section 28.3</a> and the world-model planners of <a href="../module-29-world-models-planning/index.html">Chapter 29</a>.</p>
+
+<h2>1. The Decision Transformer: Return-Conditioned Sequence Modeling <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The Decision Transformer (Chen et al., 2021) begins with a single representational decision that determines everything else: it represents a trajectory not as a list of transitions to be valued, but as a flat sequence of tokens to be modeled autoregressively. The trajectory of a length-$T$ episode becomes</p>
+$$\tau \;=\; \big(\hat{R}_1,\, s_1,\, a_1,\; \hat{R}_2,\, s_2,\, a_2,\; \dots,\; \hat{R}_T,\, s_T,\, a_T\big),$$
+<p>three tokens per timestep, in the fixed order return-to-go, then state, then action. The key quantity is the <em>return-to-go</em> $\hat{R}_t$, the sum of rewards from the current step to the end of the episode,</p>
+$$\hat{R}_t \;=\; \sum_{t'=t}^{T} r_{t'},$$
+<p>not the reward received at $t$ and not the discounted value, but the raw remaining return. Placing $\hat{R}_t$ <em>before</em> $s_t$ and $a_t$ in the token order is the whole trick: when the model predicts the action token $a_t$, the return-to-go it should achieve is already in its context, so the action is generated conditioned on a target outcome rather than on a value estimate. The return-to-go decreases as the episode progresses (each step spends some of the remaining budget), which gives the model a running account of how much performance is still expected of it.</p>
+<p>The architecture is a causal (decoder-only) Transformer, exactly the GPT-style stack of <a href="../../part-3-temporal-deep-learning/module-12-attention-transformers/index.html">Chapter 12</a>, with one twist in the embedding layer. Each of the three token types gets its own linear embedding into the model dimension $d$: a return embedding, a state embedding, and an action embedding. A per-timestep positional embedding is added so that the three tokens sharing a timestep also share a time index. The embedded sequence of length $3T$ flows through the standard masked multi-head self-attention blocks, and a causal mask ensures each token attends only to tokens at or before it, which is what makes generation autoregressive. The output at each action position is passed through a prediction head to produce $\hat{a}_t$. Figure 28.2.1 shows the token layout and the causal attention pattern.</p>
+<figure class="diagram">
+<svg viewBox="0 0 840 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A Decision Transformer token layout. Three timesteps each contribute three tokens in order return-to-go, state, action. Tokens are embedded, positionally encoded by timestep, and passed through a causal Transformer. The action token at each step is predicted from everything at or before it, including that step's return-to-go and state.">
+<defs>
+<marker id="arr282" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.rtg282 { fill:#fbeee8; stroke:#b8431f; stroke-width:1.8; }
+.st282 { fill:#eef3f8; stroke:#14385c; stroke-width:1.8; }
+.ac282 { fill:#e8f3ec; stroke:#1f7a44; stroke-width:1.8; }
+.tk282 { font:600 13px sans-serif; text-anchor:middle; }
+.lab282 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub282 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.fl282 { stroke:#5a626c; stroke-width:1.6; fill:none; marker-end:url(#arr282); }
+</style>
+<text class="lab282" x="420" y="24">One timestep contributes three tokens: return-to-go, state, action</text>
+<text class="lab282" x="420" y="44" font-size="12" fill="#5a626c">the action token is predicted from everything at or before it</text>
+<!-- token row -->
+<g>
+<rect class="rtg282" x="40"  y="150" width="78" height="44" rx="8"/><text class="tk282" x="79"  y="177" fill="#b8431f">R&#770;&#8321;</text>
+<rect class="st282"  x="128" y="150" width="78" height="44" rx="8"/><text class="tk282" x="167" y="177" fill="#14385c">s&#8321;</text>
+<rect class="ac282"  x="216" y="150" width="78" height="44" rx="8"/><text class="tk282" x="255" y="177" fill="#1f7a44">a&#8321;</text>
+<rect class="rtg282" x="320" y="150" width="78" height="44" rx="8"/><text class="tk282" x="359" y="177" fill="#b8431f">R&#770;&#8322;</text>
+<rect class="st282"  x="408" y="150" width="78" height="44" rx="8"/><text class="tk282" x="447" y="177" fill="#14385c">s&#8322;</text>
+<rect class="ac282"  x="496" y="150" width="78" height="44" rx="8"/><text class="tk282" x="535" y="177" fill="#1f7a44">a&#8322;</text>
+<rect class="rtg282" x="600" y="150" width="78" height="44" rx="8"/><text class="tk282" x="639" y="177" fill="#b8431f">R&#770;&#8323;</text>
+<rect class="st282"  x="688" y="150" width="78" height="44" rx="8"/><text class="tk282" x="727" y="177" fill="#14385c">s&#8323;</text>
+<rect class="ac282"  x="776" y="150" width="60" height="44" rx="8"/><text class="tk282" x="806" y="177" fill="#1f7a44">a&#8323;</text>
+</g>
+<!-- timestep brackets -->
+<text class="sub282" x="167" y="218">timestep 1</text>
+<text class="sub282" x="447" y="218">timestep 2</text>
+<text class="sub282" x="713" y="218">timestep 3</text>
+<!-- predicted actions above -->
+<line class="fl282" x1="255" y1="148" x2="255" y2="112"/><text class="sub282" x="255" y="104">predict a&#770;&#8321;</text>
+<line class="fl282" x1="535" y1="148" x2="535" y2="112"/><text class="sub282" x="535" y="104">predict a&#770;&#8322;</text>
+<line class="fl282" x1="806" y1="148" x2="806" y2="112"/><text class="sub282" x="806" y="104">predict a&#770;&#8323;</text>
+<!-- causal flow under -->
+<line class="fl282" x1="40" y1="248" x2="836" y2="248"/>
+<text class="sub282" x="420" y="270">causal self-attention: each token sees only tokens to its left</text>
+<text class="sub282" x="420" y="300" fill="#b8431f">return-to-go (orange) sits before state and action, so the action is conditioned on the target outcome</text>
+</svg>
+<figcaption><strong>Figure 28.2.1:</strong> The Decision Transformer token layout. Each timestep emits three tokens in the order $(\hat{R}_t, s_t, a_t)$; a causal Transformer predicts the action token $\hat{a}_t$ from all tokens at or before it, which always includes that step's return-to-go and state. Because the return-to-go token precedes the action, the action is generated conditioned on the remaining return the model is asked to achieve.</figcaption>
+</figure>
+<p>Training is supervised and almost embarrassingly simple. Given an offline dataset of trajectories (collected by any policy, expert, random, or a mixture), compute the return-to-go for every timestep by a reverse cumulative sum, tokenize each trajectory, and train the Transformer to predict each action token from the preceding context with a standard regression or classification loss. For continuous actions the objective is mean-squared error between predicted and recorded action; for discrete actions it is cross-entropy. There is no reward model, no value function, no policy-improvement step: just maximum-likelihood next-action prediction. The loss for one trajectory is</p>
+$$\mathcal{L}(\theta) \;=\; \frac{1}{T}\sum_{t=1}^{T} \big\| a_t - \pi_\theta(\hat{R}_t, s_t \mid \tau_{<t}) \big\|^2,$$
+<p>where $\tau_{<t}$ is all tokens before the action position at step $t$ and $\pi_\theta$ is the Transformer's action head. This is identical in form to the autoregressive language-model loss of <a href="../../part-3-temporal-deep-learning/module-12-attention-transformers/index.html">Chapter 12</a>; the only thing that makes it reinforcement learning is the presence of the return-to-go token in the conditioning context.</p>
+<p>The genuinely clever part is test time. Having trained the model to predict the action that, in the data, accompanied a given return-to-go and state, we now <em>invert the conditioning</em>: we choose a target return-to-go $\hat{R}_1$ that we would like to achieve (typically high, often at or slightly above the best return in the dataset), feed it together with the initial state $s_1$, and let the model generate $\hat{a}_1$. We execute that action in the environment, observe the reward $r_1$ and next state $s_2$, decrement the target by the reward received ($\hat{R}_2 = \hat{R}_1 - r_1$), and repeat. The model has learned the conditional "given that this much return was achieved from here, what action was taken?" and we exploit it as a controller by demanding a return and reading off the matching action. The policy is purely reactive: at each step it conditions on the current return-to-go and state and emits an action, with no explicit search or planning.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Computing Return-to-Go Along a Trajectory</div>
+<p>Take a five-step episode with rewards $(r_1, \dots, r_5) = (1, 0, 2, 0, 3)$, total return $6$. The return-to-go at each step is the suffix sum, computed by a single reverse cumulative sum from the end:</p>
+<p>$\hat{R}_5 = r_5 = 3$; $\hat{R}_4 = r_4 + \hat{R}_5 = 0 + 3 = 3$; $\hat{R}_3 = r_3 + \hat{R}_4 = 2 + 3 = 5$; $\hat{R}_2 = r_2 + \hat{R}_3 = 0 + 5 = 5$; $\hat{R}_1 = r_1 + \hat{R}_2 = 1 + 5 = 6$.</p>
+<p>So the return-to-go sequence is $(6, 5, 5, 3, 3)$, monotonically nonincreasing as expected (it spends down a fixed budget), and $\hat{R}_1$ equals the episode's total return. At test time we would instead <em>set</em> $\hat{R}_1$ ourselves, say to $8$ (above this trajectory's $6$), and decrement by each realized reward: after collecting $r_1 = 1$ the target becomes $\hat{R}_2 = 8 - 1 = 7$, telling the model "seven units of return still expected of you". The numeric subtlety: conditioning on $8$ asks for performance never seen in this episode, which is exactly the extrapolation question of subsection three.</p>
+</div>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Return Token Turns a Language Model Into a Policy</div>
+<p>Strip away the vocabulary and a Decision Transformer is a vanilla causal language model trained with a standard supervised loss. The single ingredient that converts "predict the next token" into "act to achieve a goal" is the return-to-go token placed before each action. In training it tells the model which return accompanied each action, so the model learns a return-conditioned action distribution. At test time it becomes a control knob: you write down the return you want and the model returns the action consistent with having wanted it. No Bellman equation, no critic, no policy gradient. Reinforcement learning becomes conditional sequence generation, and all the stability and scaling lessons of large-scale language modeling transfer directly.</p>
+</div>
+
+<h2>2. The Trajectory Transformer: Modeling and Planning Over Full Trajectories <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The Trajectory Transformer (Janner et al., 2021) shares the founding insight, treat the trajectory as a sequence, but draws a different conclusion from it. Where the Decision Transformer models only the conditional action distribution and acts reactively, the Trajectory Transformer models the <em>full joint distribution</em> over everything in the trajectory, states, actions, and rewards alike, and then uses that learned distribution as a planner. It is the difference between learning to imitate good behavior given a goal, and learning a complete probabilistic simulator of the environment that you can search through.</p>
+<p>Concretely, the Trajectory Transformer tokenizes the trajectory as the interleaved stream of states, actions, and rewards (and, in the original work, the return-to-go as well),</p>
+$$\tau \;=\; \big(s_1, a_1, r_1,\; s_2, a_2, r_2,\; \dots,\; s_T, a_T, r_T\big),$$
+<p>and a critical implementation choice is that continuous state and action dimensions are <em>discretized</em> into bins, so the model becomes a fully autoregressive categorical model over discrete tokens, factorizing the joint as a product of per-token conditionals exactly like a language model over text:</p>
+$$p_\theta(\tau) \;=\; \prod_{i=1}^{N} p_\theta\big(\tau_i \mid \tau_{<i}\big),$$
+<p>where $\tau_i$ ranges over all $N$ tokens of the discretized trajectory. Training is again straightforward maximum likelihood: a GPT-style causal Transformer trained to predict every next token, state dimensions, action dimensions, and rewards included. The model has learned to <em>roll the environment forward</em>: given a partial trajectory it can sample plausible continuations, which makes it a learned simulator.</p>
+<p>The decisive difference is what happens at decision time. Because the model can score and sample whole futures, planning becomes a search over sequences, and the Trajectory Transformer uses <strong>beam search</strong>, the same algorithm that decodes machine-translation and language models, with one modification: instead of ranking candidate continuations by their log-likelihood, it ranks them by their predicted cumulative reward (or return-to-go). The planner expands a beam of candidate action sequences, uses the model to simulate the states and rewards each would produce, keeps the highest-reward beams, and extends them, finally executing the first action of the best plan and replanning at the next step (receding-horizon control, the model-predictive-control idea from <a href="../module-27-control-imitation/index.html">Chapter 27</a>). The sequence model is thus doing double duty: it is the dynamics model that simulates futures and the value signal that ranks them. Figure 28.2.2 contrasts the two architectures' decision procedures.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Aspect</th><th>Decision Transformer</th><th>Trajectory Transformer</th></tr></thead>
+<tbody>
+<tr><td>what is modeled</td><td>conditional action distribution $p(a_t \mid \hat{R}_t, s_t, \tau_{<t})$</td><td>full joint $p(s, a, r)$ over the trajectory</td></tr>
+<tr><td>token stream</td><td>$(\hat{R}_t, s_t, a_t)$ triples</td><td>$(s_t, a_t, r_t)$ (discretized), often plus $\hat{R}_t$</td></tr>
+<tr><td>action selection</td><td>reactive: condition on target return, emit action</td><td>planning: beam search over simulated futures</td></tr>
+<tr><td>role of the model</td><td>return-conditioned policy</td><td>simulator and reward-ranking planner</td></tr>
+<tr><td>compute at test time</td><td>one forward pass per step (cheap)</td><td>many forward passes per step (beam search, costly)</td></tr>
+<tr><td>continuous values</td><td>embedded directly</td><td>discretized into per-dimension bins</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 28.2.2:</strong> Decision Transformer versus Trajectory Transformer. Both treat the trajectory as a sequence and train by next-token prediction, but the Decision Transformer models only the conditional action distribution and acts reactively on a target return, while the Trajectory Transformer models the full joint distribution and plans by beam search over simulated futures, paying far more test-time compute for the ability to look ahead.</figcaption>
+</figure>
+<p>Modeling the full joint buys two things the reactive policy lacks. First, an explicit world model: the Trajectory Transformer can answer "what would happen if I took this action sequence?", which the Decision Transformer never represents. Second, the planner can in principle <em>stitch</em>, recombine fragments of different training trajectories into a high-reward plan never seen whole, because beam search composes continuations across the learned distribution rather than copying a single demonstrated path. The price is test-time cost: every decision now runs a beam search of many model evaluations, where the Decision Transformer needed one forward pass. The two papers thus stake out the ends of a spectrum: maximal simplicity and speed at one end, maximal lookahead and compositionality at the other.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: We Discretized the Universe and Called It Planning</div>
+<p>There is something gloriously brazen about the Trajectory Transformer's central move. Faced with a continuous robot whose joint angles live in $\mathbb{R}^{17}$, it shrugs, chops every dimension into a few hundred bins, and declares the whole of physics to be a vocabulary. The cheetah's gallop, the hopper's hop, the friction of the floor: all just tokens now, no different in principle from the words of a sentence. And then, having reduced control to spelling, it plans the way a translation model decodes a sentence: beam search, the workhorse that turns "le chat" into "the cat", repurposed to turn a start state into an optimal gait. It should not work nearly as well as it does. That it works at all is a small monument to the idea that a good enough sequence model does not much care what its tokens used to mean.</p>
+</div>
+
+<h2>3. Reactive Versus Planning: Strengths, Stitching, and Extrapolation Limits <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The contrast between the two architectures is not merely implementational; it exposes the genuine strengths and the genuine limits of the sequence-modeling approach to decision making. The Decision Transformer's strength is its simplicity and stability: a supervised loss, no bootstrapping, no critic, and a test-time cost of one forward pass per action. Its corresponding weakness is that it is fundamentally an imitator. It reproduces the action that, in the data, accompanied a given return-and-state, which means it can only reliably reach returns that the data demonstrates are reachable from states the data visited. The Trajectory Transformer's strength is lookahead: by planning over a learned simulator it can compose behavior and react to its own predicted consequences. Its weakness is the cost and the compounding error of long-horizon simulation, plus the discretization that throws away precision in continuous domains.</p>
+<p>The sharpest limit, and the one most worth internalizing, is <strong>stitching</strong>. Suppose the offline dataset contains a trajectory that goes well from A to B and a separate trajectory that goes well from B to C, but no single trajectory from A to C. An ideal offline RL method should learn the A-to-C route by stitching the two sub-trajectories at their shared state B; dynamic-programming methods (which propagate value backward through B) can do this naturally. The vanilla Decision Transformer often cannot: because it conditions on return-to-go and imitates, it has no mechanism to realize that the high-return continuation from B can be glued onto the path that reaches B. It tends to reproduce whole demonstrated behaviors rather than recombine their pieces. This is the single most cited limitation of return-conditioned imitation, and it is the gap that the goal-conditioned and dynamic-programming-augmented methods of <a href="section-28.3.html">Section 28.3</a> were designed to close. The Trajectory Transformer's beam search has a better (though still imperfect) shot at stitching, because search can compose continuations the data never showed end to end.</p>
+<p>The second limit is <strong>extrapolation in the return token</strong>. At test time we can write any number we like into $\hat{R}_1$, including returns far above anything in the dataset. The model has no training signal for "what action achieves a return nobody ever achieved", so conditioning too aggressively produces out-of-distribution behavior that does not reliably deliver the requested return. Empirically, performance improves as you raise the target toward the dataset's best return and then plateaus or degrades beyond it: the model can match the best behavior it saw but cannot invent superhuman behavior from sub-optimal data by wishful conditioning. The practical recipe is to set the target return at or just slightly above the maximum return in the dataset, not at some fantasy ceiling.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Conditioning Is Imitation, Not Optimization</div>
+<p>Return-conditioned sequence modeling does not optimize anything at test time; it imitates a return-conditional. The model answers "what action accompanied this return-to-go in the data?", so it is bounded by the data in two precise ways. It cannot reliably produce returns above what the data demonstrates (extrapolation limit), and it does not automatically recombine sub-trajectories that share a state into a better whole (stitching limit). Dynamic-programming RL escapes both because the Bellman backup propagates value across trajectories and beyond observed returns. The sequence-modeling view trades that optimization power for supervised stability. Knowing which trade you are making tells you when to reach for a Decision Transformer (clean, near-expert offline data; you want the best demonstrated behavior) and when to reach for value-based offline RL or a planner (sub-optimal, fragmentary data that needs stitching).</p>
+</div>
+
+<h2>4. Practical Training: Offline Datasets, Context, and Return Targets <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Both architectures are <em>offline</em> methods: they train on a fixed, previously collected dataset of trajectories and never interact with the environment during learning, which is what makes the supervised framing possible and what ties this section to the offline-RL setting introduced in <a href="section-28.1.html">Section 28.1</a>. The standard benchmark is <strong>D4RL</strong> (Datasets for Deep Data-Driven RL), a suite of fixed datasets for continuous-control tasks (HalfCheetah, Hopper, Walker2d, the AntMaze navigation tasks, and others) at several data-quality levels: <code>medium</code> (a partially trained policy), <code>medium-replay</code> (the replay buffer of a training run, a noisy mixture), <code>medium-expert</code> (a mix of mediocre and expert), and <code>expert</code>. The data-quality axis is exactly where the stitching limit of subsection three shows itself: Decision Transformers are strong on <code>medium-expert</code> and <code>expert</code> data (clean behavior to imitate) and comparatively weaker on the fragmentary <code>medium-replay</code> and the maze tasks that demand stitching.</p>
+<p>Three hyperparameters dominate practical performance. The first is <strong>context length</strong> $K$: how many recent timesteps (hence $3K$ tokens for a Decision Transformer) the model attends over. Surprisingly short contexts often suffice, the original Decision Transformer used $K=20$ to $K=30$ for most tasks, because the return-to-go token already summarizes the future the model is aiming for, so it does not need a long history to act well. The second is the <strong>target return</strong> at evaluation, set per the extrapolation guidance of subsection three (at or just above the dataset maximum). The third is the usual Transformer machinery: model size, learning-rate warmup, and dropout, all inherited unchanged from <a href="../../part-3-temporal-deep-learning/module-12-attention-transformers/index.html">Chapter 12</a>. A practical subtlety: states are typically normalized (subtract mean, divide by standard deviation computed over the dataset) and returns are often scaled by a task-specific constant so the return token lives on a numerically convenient range, a small preprocessing detail that materially affects training stability.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Warehouse Robotics Team Picks Offline RL Over Online Fine-Tuning</div>
+<p><strong>Who:</strong> A robotics team at a fulfillment-center automation company training a pick-and-place controller for a robotic arm sorting parcels onto conveyor lanes.</p>
+<p><strong>Situation:</strong> They had eighteen months of logged teleoperation and scripted-policy data, millions of (state, action, reward) transitions at mixed quality, but every minute of live robot time was expensive and a bad exploratory action risked damaging hardware or jamming the line.</p>
+<p><strong>Problem:</strong> They needed a controller that improved on the logged behavior without any online exploration, because online trial-and-error on physical hardware was operationally unacceptable.</p>
+<p><strong>Dilemma:</strong> Value-based offline RL (such as conservative Q-learning) could in principle stitch and exceed the data but was notoriously finicky to tune and prone to value-overestimation blowups on their heterogeneous logs. A Decision Transformer was far more stable to train but, being an imitator, would be bounded by the best behavior in the logs and would struggle to stitch across the fragmentary scripted episodes.</p>
+<p><strong>Decision:</strong> They shipped a Decision Transformer first as the stable baseline, conditioning at evaluation on a target return set to the 95th percentile of logged episode returns, and ran a value-based stitcher in parallel as a research track.</p>
+<p><strong>How:</strong> They tokenized the logs into (return-to-go, state, action) triples with context $K=20$, normalized states per the subsection-four recipe, and trained to convergence with a plain supervised loss in a few hours on a single GPU, no environment interaction and no reward model.</p>
+<p><strong>Result:</strong> The Decision Transformer matched the best demonstrated picking behavior reliably and shipped within a sprint, where the value-based method took weeks of tuning to beat it and only on the subset of tasks that genuinely needed stitching.</p>
+<p><strong>Lesson:</strong> When clean-to-mixed offline data exists and online exploration is forbidden, return-conditioned sequence modeling is the fast, stable first move; reach for value-based offline RL only when the task provably needs the stitching the imitator cannot do.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: From Decision Transformer to Generalist Agents (2024 to 2026)</div>
+<p>The sequence-modeling view of decision making has become one of the most active frontiers in the field. The stitching limit of subsection three has been directly attacked: the Q-learning Decision Transformer (QDT) and related work distill a value function back into the return labels so the supervised model inherits dynamic-programming's stitching, and Elastic Decision Transformers (2023) and similar variants adapt the context to recover stitching behavior. The reactive-versus-planning axis has been generalized by Diffuser and Decision Diffuser, which model trajectories with a diffusion process and plan by guided sampling rather than beam search, often stitching better than either 2021 architecture. The biggest shift is scale and generality: Gato (2022) and the open-source JAT (2024) train a single Transformer across hundreds of control, vision, and language tasks as one token stream, the Decision Transformer recipe pushed to a generalist agent; Multi-Game Decision Transformers play dozens of Atari games from one model. And the connection to large language models has closed the loop: methods that cast RL fine-tuning of LLMs as return-conditioned or trajectory sequence modeling reuse exactly the machinery of this section. The 2026 takeaway: "decision making as sequence modeling" is no longer a niche reframing but a unifying recipe linking offline RL, planning, and foundation models, with the world-model planners of <a href="../module-29-world-models-planning/index.html">Chapter 29</a> as its natural next chapter.</p>
+</div>
+
+<h2>5. Worked Example: A Decision Transformer From Scratch, Then HuggingFace <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make the architecture executable. The plan mirrors the from-scratch-then-library pattern used throughout this book: first build a minimal Decision Transformer as a GPT-style block over (return, state, action) tokens and train it on a tiny offline dataset, watching the loss fall; then run the HuggingFace <code>DecisionTransformerModel</code>, the same architecture in a few lines, and note the line-count reduction; finally roll the model out conditioned on a target return. Code 28.2.1 is the from-scratch model and its token embedding, the heart of the architecture.</p>
+<pre><code class="language-python">import torch, torch.nn as nn
+
+class MinimalDT(nn.Module):
+    """A from-scratch Decision Transformer: GPT block over (R, s, a) tokens."""
+    def __init__(self, state_dim, act_dim, d=128, n_heads=4, n_layers=3, K=20):
+        super().__init__()
+        self.act_dim, self.d, self.K = act_dim, d, K
+        # One linear embedding per token TYPE (the only twist over a plain GPT).
+        self.embed_R = nn.Linear(1, d)             # return-to-go  -> R^d
+        self.embed_s = nn.Linear(state_dim, d)     # state         -> R^d
+        self.embed_a = nn.Linear(act_dim, d)       # action        -> R^d
+        self.embed_t = nn.Embedding(K, d)          # per-timestep positional embedding
+        self.ln = nn.LayerNorm(d)
+        block = nn.TransformerEncoderLayer(d, n_heads, 4 * d,
+                                           batch_first=True, activation="gelu")
+        self.transformer = nn.TransformerEncoder(block, n_layers)
+        self.predict_a = nn.Linear(d, act_dim)     # action prediction head
+
+    def forward(self, R, s, a, t):                 # each is (B, K, dim)
+        B, K = R.shape[0], R.shape[1]
+        pos = self.embed_t(t)                       # (B, K, d) shared by the 3 tokens
+        tok_R = self.embed_R(R) + pos
+        tok_s = self.embed_s(s) + pos
+        tok_a = self.embed_a(a) + pos
+        # Interleave to (R1,s1,a1, R2,s2,a2, ...): stack then reshape to length 3K.
+        seq = torch.stack([tok_R, tok_s, tok_a], dim=2).reshape(B, 3 * K, self.d)
+        seq = self.ln(seq)
+        mask = torch.triu(torch.ones(3 * K, 3 * K), diagonal=1).bool()  # causal mask
+        h = self.transformer(seq, mask=mask)        # (B, 3K, d)
+        h = h.reshape(B, K, 3, self.d)
+        return self.predict_a(h[:, :, 1])           # predict a_t from the STATE position
+</code></pre>
+<div class="code-caption"><strong>Code 28.2.1:</strong> A minimal Decision Transformer. The only structural difference from a plain causal Transformer (Chapter 12) is the three type-specific token embeddings and the interleaving of $(\hat{R}_t, s_t, a_t)$ into a length-$3K$ sequence; the action is predicted from the hidden state at the <em>state</em> position, which sees that step's return and state but not yet its action.</div>
+<p>Code 28.2.2 generates a tiny offline dataset, computes return-to-go by reverse cumulative sum (the operation of the subsection-one numeric example), and trains the model with the plain supervised action-prediction loss. The point is to watch a supervised loss, nothing more exotic, drive an RL policy.</p>
+<pre><code class="language-python">torch.manual_seed(0)
+state_dim, act_dim, K, N = 4, 2, 20, 256
+
+# Toy offline dataset: N trajectories of length K with random rewards.
+states  = torch.randn(N, K, state_dim)
+actions = torch.randn(N, K, act_dim)
+rewards = torch.randn(N, K, 1)
+# Return-to-go = reverse cumulative sum of rewards along time (subsection 1).
+rtg = torch.flip(torch.cumsum(torch.flip(rewards, [1]), dim=1), [1])
+times = torch.arange(K).unsqueeze(0).expand(N, K)
+
+model = MinimalDT(state_dim, act_dim, K=K)
+opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+for epoch in range(200):
+    pred_a = model(rtg, states, actions, times)     # (N, K, act_dim)
+    loss = ((pred_a - actions) ** 2).mean()         # supervised next-action MSE
+    opt.zero_grad(); loss.backward(); opt.step()
+    if epoch % 50 == 0:
+        print(f"epoch {epoch:3d}  action-MSE = {loss.item():.4f}")
+</code></pre>
+<div class="code-caption"><strong>Code 28.2.2:</strong> Training the from-scratch Decision Transformer by supervised next-action prediction on a toy offline dataset. The return-to-go is the reverse cumulative sum of rewards; the loss is plain mean-squared error between predicted and recorded actions, with no value function or reward model anywhere.</div>
+<pre><code class="language-text">epoch   0  action-MSE = 1.0421
+epoch  50  action-MSE = 0.7233
+epoch 100  action-MSE = 0.5489
+epoch 150  action-MSE = 0.4602
+</code></pre>
+<div class="code-caption"><strong>Output 28.2.2:</strong> The supervised action-prediction loss falls steadily, confirming the model is learning the return-conditioned action distribution from offline data. On this random toy set the loss plateaus above zero because there is no real structure to fit; on D4RL it would fall much further.</div>
+<p>Now the library equivalent. The full from-scratch model and training loop above ran roughly 50 lines including the architecture. HuggingFace ships the identical architecture as <code>DecisionTransformerModel</code>; Code 28.2.3 instantiates it and runs a forward pass in about a dozen lines, with the token embedding, interleaving, causal masking, and prediction heads all internal.</p>
+<pre><code class="language-python">from transformers import DecisionTransformerConfig, DecisionTransformerModel
+
+cfg = DecisionTransformerConfig(state_dim=state_dim, act_dim=act_dim,
+                                max_ep_len=4096, hidden_size=128, n_layer=3)
+hf_dt = DecisionTransformerModel(cfg)             # the SAME architecture, prebuilt
+
+# One forward pass: the library takes the four token streams directly.
+B = 8
+out = hf_dt(
+    states=torch.randn(B, K, state_dim),
+    actions=torch.randn(B, K, act_dim),
+    returns_to_go=torch.randn(B, K, 1),
+    timesteps=torch.arange(K).unsqueeze(0).expand(B, K),
+    attention_mask=torch.ones(B, K),
+    return_dict=True,
+)
+print("predicted action shape:", tuple(out.action_preds.shape))
+</code></pre>
+<div class="code-caption"><strong>Code 28.2.3:</strong> The HuggingFace Decision Transformer. The roughly 50 lines of from-scratch architecture and embedding logic in Code 28.2.1 collapse to a config and one constructor call; the three type embeddings, the $3K$ interleaving, the causal mask, and the action head are all handled internally, leaving only the four token streams to supply.</div>
+<pre><code class="language-text">predicted action shape: (8, 20, 2)
+</code></pre>
+<div class="code-caption"><strong>Output 28.2.3:</strong> The library model emits one predicted action per timestep for the whole batch, matching the from-scratch model's interface. The architectures are identical; the library replaces about 50 lines of embedding and masking bookkeeping with a single constructor.</div>
+<p>Finally we roll the model out conditioned on a target return. Code 28.2.4 implements the test-time loop of subsection one: pick a desired initial return-to-go, and at each step feed the recent context, predict an action, step a (stub) environment, observe the reward, and decrement the return-to-go by the reward received. This is the inversion that turns the trained predictor into a controller.</p>
+<pre><code class="language-python">@torch.no_grad()
+def rollout(model, env_step, s0, target_return, K=20, horizon=20):
+    """Roll out conditioned on a target return; decrement RTG by realized reward."""
+    s, R = s0, float(target_return)                 # initial state, desired return-to-go
+    states  = torch.zeros(1, K, state_dim)
+    actions = torch.zeros(1, K, act_dim)
+    rtgs    = torch.zeros(1, K, 1)
+    times   = torch.arange(K).unsqueeze(0)
+    total_reward = 0.0
+    for t in range(horizon):
+        i = min(t, K - 1)
+        states[0, i] = s
+        rtgs[0, i, 0] = R                           # the target return-to-go (subsection 1)
+        a = model(rtgs, states, actions, times)[0, i]   # predicted action at this step
+        actions[0, i] = a
+        s, r = env_step(s, a)                       # step the environment
+        total_reward += r
+        R = R - r                                   # spend the realized reward (R_{t+1}=R_t - r_t)
+    return total_reward
+
+# Stub environment: reward = -||action|| (a placeholder; swap for a real Gym env).
+def env_step(s, a):
+    return torch.randn(state_dim), float(-(a ** 2).sum())
+
+got = rollout(model, env_step, torch.randn(state_dim), target_return=10.0)
+print(f"target return = 10.0   achieved return = {got:.3f}")
+</code></pre>
+<div class="code-caption"><strong>Code 28.2.4:</strong> Return-conditioned rollout. The desired return is written into the return-to-go token at every step and decremented by each realized reward, exactly the test-time inversion of subsection one; against a real Gymnasium environment this loop is the entire deployment path of a Decision Transformer.</div>
+<pre><code class="language-text">target return = 10.0   achieved return = -8.214
+</code></pre>
+<div class="code-caption"><strong>Output 28.2.4:</strong> The rollout runs end to end and reports the return actually achieved against the one requested. On this untrained-for-control stub the achieved return does not match the (arbitrary) target, illustrating the extrapolation limit of subsection three: conditioning on a return the data never supports does not conjure it.</div>
+<p>Step back and read what the four code blocks establish together. Code 28.2.1 built the Decision Transformer's defining structure, three type embeddings interleaved into a causal sequence. Code 28.2.2 trained it with a plain supervised loss, no RL machinery in sight. Code 28.2.3 reproduced the architecture in a dozen library lines. Code 28.2.4 inverted the trained predictor into a return-conditioned controller. The pedagogical payoff is that the entire pipeline, offline data to deployed policy, is ordinary supervised sequence modeling with one extra token type, which is exactly why the approach inherits the stability of language-model training.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Offline RL Sequence Models in d3rlpy</div>
+<p>Beyond HuggingFace's architecture-only <code>DecisionTransformerModel</code>, the offline-RL library <code>d3rlpy</code> ships a full training-and-evaluation pipeline for Decision Transformers (and for value-based offline methods such as CQL and IQL for comparison). What took the roughly 50 lines of dataset construction, return-to-go computation, training loop, and rollout across Codes 28.2.1 through 28.2.4 collapses to a few lines: load a D4RL dataset, construct a <code>DecisionTransformer</code> with a context size and target return, call <code>.fit()</code>, and evaluate. The library handles return-to-go computation, state normalization, the context windowing of subsection four, and the conditioned rollout internally, and exposes the target-return knob directly so you can sweep the extrapolation behavior of subsection three with a single argument.</p>
+<pre><code class="language-python">import d3rlpy
+dataset, env = d3rlpy.datasets.get_d4rl("hopper-medium-v0")     # standard offline benchmark
+dt = d3rlpy.algos.DecisionTransformerConfig(context_size=20).create(device="cuda:0")
+dt.fit(dataset, n_steps=100_000)                                # full supervised training
+# Evaluate conditioned on a target return at or just above the dataset max (subsection 3).
+evaluator = d3rlpy.metrics.EnvironmentEvaluator(env, target_return=3600.0)
+print("normalized score:", evaluator(dt, dataset))
+</code></pre>
+<p>The line-count reduction is roughly tenfold over the from-scratch pipeline, and crucially the library's defaults (normalization, return scaling, context windowing) are the ones tuned to actually reach published D4RL scores, which a naive from-scratch implementation usually does not without the same care.</p>
+</div>
+<div class="callout looking-back">
+<div class="callout-title">Looking Back: The MDP Returns as a Sequence Model</div>
+<p>This section completes one of the book's longest temporal-thread arcs. The Markov decision process organized <a href="../module-22-markov-decision-processes/index.html">Chapter 22</a> as a problem of value functions and Bellman backups; the same MDP now returns, in <a href="section-28.1.html">Section 28.1</a> and here, as a sequence to be modeled by the very Transformer of <a href="../../part-3-temporal-deep-learning/module-12-attention-transformers/index.html">Chapter 12</a>. The Kalman filter became the RNN; the HMM became the latent-variable model and the belief-state agent; and now the MDP becomes a causal language model over returns, states, and actions. The lesson the thread has taught at every stop holds again: a classical structure, restated as a sequence and learned by gradient descent, inherits both the power and the pathologies of sequence models, here the stability of supervised training and the stitching and extrapolation limits of imitation.</p>
+</div>
+
+<h2>6. Summary and Exercises</h2>
+<p>This section recast offline reinforcement learning as sequence modeling through two architectures. The Decision Transformer represents a trajectory as $(\hat{R}_t, s_t, a_t)$ triples, trains a causal Transformer by supervised next-action prediction, and acts by conditioning on a desired return-to-go, a reactive, return-conditioned policy with the stability of language-model training. The Trajectory Transformer models the full joint distribution over states, actions, and rewards and plans by beam search over that learned simulator, trading test-time compute for lookahead and a better shot at stitching. The contrast exposes the approach's two structural limits: return-conditioned imitation cannot reliably exceed the data's returns (extrapolation) and does not automatically recombine sub-trajectories (stitching), the gaps that <a href="section-28.3.html">Section 28.3</a> and the planners of <a href="../module-29-world-models-planning/index.html">Chapter 29</a> address. We built a minimal Decision Transformer, ran the HuggingFace equivalent at a fraction of the line count, and rolled out a return-conditioned controller.</p>
+<p>The exercises below come in three types: conceptual (reason about the architecture and its limits), implementation (extend the code), and open-ended (explore a research direction).</p>
+<ol class="exercises">
+<li><strong>Conceptual.</strong> Explain precisely why placing the return-to-go token <em>before</em> the state and action tokens (rather than after) is essential to the Decision Transformer working as a controller at test time. What would break if the order were $(s_t, a_t, \hat{R}_t)$? Then describe, using the stitching example of subsection three (a good A-to-B trajectory and a good B-to-C trajectory but no A-to-C), why a vanilla Decision Transformer typically fails to find the A-to-C route while a value-based offline method can.</li>
+<li><strong>Implementation.</strong> Extend the from-scratch model of Code 28.2.1 to support <em>discrete</em> actions by replacing the action embedding with an <code>nn.Embedding</code> and the regression head with a classification head, and switch the training loss in Code 28.2.2 from mean-squared error to cross-entropy. Then add a target-return sweep to the rollout of Code 28.2.4: run the rollout for target returns in $\{0, 1, 2, \dots, 10\}$ and plot achieved return against requested return, reproducing in miniature the plateau-then-degrade extrapolation curve of subsection three.</li>
+<li><strong>Open-ended.</strong> The stitching limit of subsection three motivated a family of fixes (the Q-learning Decision Transformer, the Decision Diffuser, Elastic Decision Transformer). Pick one from the research-frontier callout, read its paper, and write a one-page explanation of the specific mechanism by which it recovers stitching that the vanilla Decision Transformer lacks. State clearly what it adds (a value function, a diffusion process, an adaptive context) and what it costs (extra training, extra compute, extra hyperparameters) relative to the plain return-conditioned recipe.</li>
+</ol>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-28.1.html">&#8592; 28.1 Reinforcement Learning as Sequence Modeling</a>
+<a class="up" href="index.html">Chapter 28 Contents</a>
+<a class="next" href="section-28.3.html">28.3 Return-Conditioned and Goal-Conditioned Policies &#8594;</a>
+</nav>
+</main>
+<footer class="book-footer">
+<p class="edition-line">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="copyright">&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+<p class="last-updated"><script>document.write("Last updated " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

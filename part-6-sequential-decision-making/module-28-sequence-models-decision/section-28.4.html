@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 28.4: Diffusion Planners (Diffuser, Decision Diffuser). Planning by generation: a diffusion model denoises an entire trajectory into existence, then reward or goal guidance steers the generation toward high-return plans. Covers Diffuser's classifier guidance, Decision Diffuser's classifier-free return conditioning and constraint composition, the trade of long-horizon coherence against slow sampling, the relation to model predictive control, and a from-scratch trajectory diffusion sampler matched against a library Diffuser-style call." name="description"/>
+<title>Section 28.4: Diffusion Planners | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Sequential Decision Making</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 28: Sequence Models for Decision Making</a></div>
+<h1>Diffusion Planners (Diffuser, Decision Diffuser)</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"The other planners search, step by anxious step, asking at every junction which way is best. I do not search. I start from a cloud of pure noise shaped like a trajectory, and I rub the noise away until a coherent plan is simply standing there, already whole, already heading where the reward told it to go. They call it generation. I call it remembering a future that has not happened yet."</p>
+<cite>A Planner That Denoises an Entire Trajectory Into Existence</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A diffusion planner treats planning as conditional generation: instead of rolling a policy or a model forward one step at a time, it learns a diffusion model over <em>whole trajectories</em> and samples a complete plan by iteratively denoising a tensor of Gaussian noise into a coherent state-action sequence, while a guidance signal bends that denoising toward high reward, a goal, or a set of constraints.</strong> This single reframing, "a plan is a sample from a generative model of good behavior", inverts the usual decision-making pipeline. The classical planner of <a href="../module-27-control-imitation/section-27.2.html">Section 27.2</a> optimizes an action sequence against a known or learned dynamics model; the diffusion planner instead <em>generates</em> trajectories that look like the high-return trajectories in its training data, and steers each generation with a gradient (Diffuser, Janner et al. 2022) or with a conditioning input (Decision Diffuser, Ajay et al. 2023). The payoff is long-horizon coherence and the ability to compose constraints at sampling time, the way you would AND together several prompts; the cost is that every plan now requires many denoising steps, so sampling is slow. This section builds the idea from the diffusion machinery of <a href="../../part-4-temporal-representation-learning/module-17-generative-temporal-models/index.html">Chapter 17</a>, derives guided sampling in KaTeX, implements a tiny trajectory diffuser from scratch with reward guidance, reduces it to a library call, and places the whole family next to model predictive control so you can see exactly which box the diffusion model occupies.</p>
+</div>
+<p>In <a href="section-28.3.html">Section 28.3</a> we cast offline reinforcement learning as conditional sequence modeling with the Trajectory Transformer and the Decision Transformer: tokenize a trajectory, train an autoregressive model on it, and roll out by conditioning on a desired return. That family generates a plan the way a language model generates text, left to right, one token at a time. This section keeps the premise that planning is generation but changes the generative model: instead of an autoregressive transformer that emits the future token by token, we use a <em>diffusion</em> model that emits the entire trajectory at once and refines it. The autoregressive view commits early and cannot revise; the diffusion view holds the whole plan in view and edits it globally across many denoising passes, which is exactly what gives it long-horizon coherence. We use the unified notation of <a href="../../toc.html">Appendix A</a> throughout: $\mathbf{s}_t$ the state, $\mathbf{a}_t$ the action, $\boldsymbol{\tau}$ a trajectory, $r$ the per-step reward, $R(\boldsymbol{\tau})$ the trajectory return.</p>
+<p>The reason this deserves its own section, rather than a footnote to the sequence-model story, is that diffusion changes <em>what planning is</em> at a structural level. An autoregressive planner factorizes the future as a product of next-token conditionals and is therefore committed to causality and to its own past samples. A diffusion planner factorizes nothing of the sort: it models the joint distribution of the entire trajectory and samples it as one object, so a constraint placed on the last state can reach back and reshape the first action, and a reward gradient can pull on every timestep simultaneously. That global, non-causal editing is the source of every strength and every weakness in this section, and it is why diffusion planning has become, since 2022, one of the most active corners of offline decision making.</p>
+<p>The four competencies this section installs are these: to state planning-as-generation precisely and connect it back to the denoising-diffusion thread of <a href="../../part-4-temporal-representation-learning/module-17-generative-temporal-models/index.html">Chapter 17</a>; to write guided diffusion sampling for trajectories, both the classifier-guidance form of Diffuser and the classifier-free return-conditioned form of Decision Diffuser, in equations you can implement; to reason about the long-horizon-coherence-versus-slow-sampling trade and the precise relationship to model predictive control; and to build a trajectory diffuser from scratch, guide it toward reward, and then replace it with a library call whose line count is a fraction of the hand version.</p>
+
+<h2>1. Planning by Generation: A Plan Is a Sample <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Begin from the denoising idea that <a href="../../part-4-temporal-representation-learning/module-17-generative-temporal-models/index.html">Chapter 17</a> built for time series. A diffusion model defines a forward process that gradually corrupts a clean datum $\mathbf{x}^{0}$ into pure Gaussian noise $\mathbf{x}^{K}$ by adding a little noise at each of $K$ steps, and a learned reverse process that walks backward, $\mathbf{x}^{K} \to \mathbf{x}^{K-1} \to \cdots \to \mathbf{x}^{0}$, removing a little noise at each step until a clean sample emerges from the cloud. In Chapter 17 the datum was a window of a series and the model learned to <em>generate realistic series</em>. The conceptual leap of this section is small to state and large in consequence: let the datum be an entire trajectory, and the same denoising machinery becomes a <em>planner</em>.</p>
+<p>Concretely, lay a trajectory out as a two-dimensional array, time along one axis and state-action features along the other:</p>
+$$\boldsymbol{\tau} \;=\; \begin{bmatrix} \mathbf{s}_0 & \mathbf{s}_1 & \cdots & \mathbf{s}_{H-1} \\ \mathbf{a}_0 & \mathbf{a}_1 & \cdots & \mathbf{a}_{H-1} \end{bmatrix},$$
+<p>a single tensor of horizon $H$. A diffusion model trained on a dataset of such trajectories learns $p_\theta(\boldsymbol{\tau})$, the distribution of trajectories that actually occurred under whatever behavior policy generated the data. To <em>plan</em> is then to draw a sample: start from $\boldsymbol{\tau}^{K} \sim \mathcal{N}(\mathbf{0}, \mathbf{I})$, a trajectory-shaped block of noise, and run the reverse denoising chain to produce $\boldsymbol{\tau}^{0}$, a clean trajectory that looks like the data. That sampled trajectory <em>is</em> the plan; its action rows are the action sequence to execute. Figure 28.4.1 shows the denoising chain turning a noisy block into a coherent trajectory.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A diffusion planner denoising a trajectory. On the left a block of random noise shaped like a state-action trajectory; a sequence of denoising arrows runs left to right through intermediate, progressively cleaner blocks; on the right a smooth coherent trajectory. A guidance arrow labeled reward gradient pushes down on each denoising step.">
+<defs>
+<marker id="arr284" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+<marker id="arrG284" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b8431f"/></marker>
+</defs>
+<style>
+.blk284 { stroke:#14385c; stroke-width:1.8; }
+.fl284 { stroke:#5a626c; stroke-width:1.8; fill:none; marker-end:url(#arr284); }
+.gd284 { stroke:#b8431f; stroke-width:1.7; fill:none; marker-end:url(#arrG284); stroke-dasharray:5 4; }
+.lab284 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub284 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.gl284 { font:600 12px sans-serif; fill:#b8431f; text-anchor:middle; }
+</style>
+<text class="lab284" x="410" y="24">Denoise a trajectory-shaped block of noise into a coherent plan</text>
+<rect class="blk284" x="40" y="80" width="120" height="80" rx="6" fill="#dfe3e8"/>
+<rect class="blk284" x="250" y="80" width="120" height="80" rx="6" fill="#eef0f3"/>
+<rect class="blk284" x="460" y="80" width="120" height="80" rx="6" fill="#eef3f8"/>
+<rect class="blk284" x="670" y="80" width="120" height="80" rx="6" fill="#e6f0fb"/>
+<text class="sub284" x="100" y="178">&#964;&#7503; (noise)</text>
+<text class="sub284" x="310" y="178">&#964;&#7503;&#8315;&#185;</text>
+<text class="sub284" x="520" y="178">&#964;&#185;</text>
+<text class="sub284" x="730" y="178">&#964;&#8304; (plan)</text>
+<line class="fl284" x1="162" y1="120" x2="248" y2="120"/>
+<line class="fl284" x1="372" y1="120" x2="458" y2="120"/><text class="sub284" x="415" y="112">&#8943;</text>
+<line class="fl284" x1="582" y1="120" x2="668" y2="120"/>
+<text class="sub284" x="205" y="112">denoise</text>
+<line class="gd284" x1="100" y1="60" x2="100" y2="78"/>
+<line class="gd284" x1="310" y1="60" x2="310" y2="78"/>
+<line class="gd284" x1="520" y1="60" x2="520" y2="78"/>
+<text class="gl284" x="410" y="50">reward / goal / constraint guidance nudges every denoising step</text>
+</svg>
+<figcaption><strong>Figure 28.4.1:</strong> Planning as denoising. The reverse diffusion chain transforms a trajectory-shaped block of Gaussian noise (left) into a clean, coherent state-action trajectory (right) over $K$ steps. Guidance (dashed orange) acts at every step, nudging the denoiser toward trajectories of high reward, toward a goal state, or into a feasible region; the final $\boldsymbol{\tau}^{0}$ is the plan, and its action rows are executed.</figcaption>
+</figure>
+<p>Two properties of this picture matter for everything that follows. First, the plan is generated <em>all at once</em> and edited globally: every denoising step touches every timestep of the trajectory simultaneously, so the model can enforce temporal consistency (a state and the next state must agree with plausible dynamics) as a property of the whole sample rather than as a constraint it stitches together left to right. This is the structural reason diffusion planners produce coherent long-horizon plans where an autoregressive roller tends to drift. Second, raw sampling from $p_\theta(\boldsymbol{\tau})$ reproduces the behavior distribution, good and bad mixed together; it does not yet prefer <em>good</em> trajectories. Turning a generator of plausible trajectories into a generator of <em>high-return</em> trajectories is the job of guidance, the subject of subsection two.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: From Denoising to Diffusion to Diffusion Planning</div>
+<p>This section is the third stop on a single arc. The denoising idea entered the book as a way to learn clean signal from corrupted observations; <a href="../../part-4-temporal-representation-learning/module-17-generative-temporal-models/index.html">Section 17.4</a> built it into a full <em>diffusion model</em> over temporal data, a generator of realistic series sampled by reversing a noising process. Here that same generator is pointed at decision making: the datum becomes a trajectory and the sampler becomes a <em>planner</em>. The lesson the temporal thread keeps repeating, classical idea returns in learned form, appears again with a twist: a <em>generative</em> idea (denoising diffusion) returns as a <em>decision-making</em> idea (planning by generation). The MDP of <a href="../module-22-markov-decision-processes/index.html">Chapter 22</a> is, in this view, not a thing to be solved by value iteration but a distribution to be sampled from, with reward acting as the thing you condition on. Hold the chain "denoising leads to diffusion leads to diffusion planning" and the section's structure is already in your hands.</p>
+</div>
+
+<h2>2. Diffuser: Trajectory Diffusion With Reward Guidance <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Diffuser (Janner et al., 2022) is the first member of the family: a diffusion model over trajectories, sampled with <em>classifier guidance</em> toward high return. Start with the unconditional reverse step. The learned denoiser predicts the mean of the previous, cleaner trajectory given the current noisy one, and the reverse process is the Gaussian</p>
+$$p_\theta(\boldsymbol{\tau}^{k-1} \mid \boldsymbol{\tau}^{k}) \;=\; \mathcal{N}\!\big(\boldsymbol{\tau}^{k-1};\; \boldsymbol{\mu}_\theta(\boldsymbol{\tau}^{k}, k),\; \Sigma_k\big),$$
+<p>exactly the reverse step of <a href="../../part-4-temporal-representation-learning/module-17-generative-temporal-models/index.html">Chapter 17</a>, now over a trajectory tensor. Sampling this chain unconditionally gives trajectories drawn from the behavior distribution. To prefer high return, Diffuser borrows classifier guidance from image diffusion: train (or define) a function $\mathcal{J}_\phi(\boldsymbol{\tau})$ that scores a trajectory by its return, and shift each denoising step by the gradient of that score. The guided reverse step becomes a Gaussian whose mean is displaced along $\nabla_{\boldsymbol{\tau}} \mathcal{J}_\phi$:</p>
+$$\boldsymbol{\tau}^{k-1} \;\sim\; \mathcal{N}\!\big(\boldsymbol{\mu}_\theta(\boldsymbol{\tau}^{k}, k) \;+\; \alpha\,\Sigma_k\,\nabla_{\boldsymbol{\tau}^{k}} \mathcal{J}_\phi(\boldsymbol{\tau}^{k}),\;\; \Sigma_k\big),$$
+<p>where $\alpha$ is the guidance scale, the single knob trading off "stay on the data manifold" (small $\alpha$, follow $\boldsymbol{\mu}_\theta$) against "chase reward" (large $\alpha$, follow the gradient). The interpretation is exact and worth stating: the unconditional model $p_\theta(\boldsymbol{\tau})$ supplies a prior over <em>plausible</em> trajectories, the guidance term $\nabla \mathcal{J}_\phi$ supplies the <em>likelihood</em> that the trajectory is high return, and their product, sampled by the displaced reverse step, is the posterior $p_\theta(\boldsymbol{\tau}) \, e^{\mathcal{J}_\phi(\boldsymbol{\tau})}$ over trajectories that are both plausible and good. Planning is posterior sampling: generate from "behavior, reweighted by reward".</p>
+<p>Two design choices make Diffuser practical. First, it conditions on the <em>current state</em> by fixing the first state column of every noisy trajectory to the observed $\mathbf{s}_0$ at every denoising step (an inpainting-style constraint), so the sampled plan always starts where the agent actually is. Second, arbitrary goals and constraints enter the same way: clamp a future state column to a goal, or add their log-likelihood into $\mathcal{J}_\phi$, and the denoiser fills in a trajectory consistent with them. This flexibility, "any constraint is just another thing to inpaint or to add to the guidance score", is the practical reason Diffuser is attractive: one trained model serves goal-reaching, reward maximization, and constrained planning without retraining. We make the guided reverse step concrete in the worked example of subsection five.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: One Guided Denoising Step</div>
+<p>Take a one-dimensional trajectory coordinate at some denoising step $k$. Suppose the unconditional denoiser proposes a mean $\mu_\theta = 0.40$ with step variance $\Sigma_k = 0.05$, and the return score has gradient $\nabla_{\tau}\mathcal{J}_\phi = +2.0$ at the current value (higher values of this coordinate raise return). With guidance scale $\alpha = 1.0$, the guided mean shifts to $\mu_\theta + \alpha\,\Sigma_k\,\nabla\mathcal{J}_\phi = 0.40 + 1.0 \cdot 0.05 \cdot 2.0 = 0.50$, a $+0.10$ push toward higher reward. Crank the scale to $\alpha = 4.0$ and the shift becomes $0.05 \cdot 4.0 \cdot 2.0 = 0.40$, landing the mean at $0.80$: four times the reward pull, but also four times the risk of walking off the data manifold into a trajectory the dynamics model never validated. The single multiplication $\alpha\,\Sigma_k\,\nabla\mathcal{J}_\phi$ is the entire mechanism by which reward bends generation, and $\alpha$ is the dial between "trust the prior" and "chase the reward".</p>
+</div>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Planning Is Posterior Sampling, Guidance Is the Likelihood</div>
+<p>Diffuser factorizes a good plan into two independently trained pieces. The diffusion model $p_\theta(\boldsymbol{\tau})$ knows what trajectories are <em>physically plausible</em>, learned from data and entirely reward-agnostic. The guidance function $\mathcal{J}_\phi(\boldsymbol{\tau})$ knows what makes a trajectory <em>desirable</em>, the return, a goal, a safety margin. Sampling the displaced reverse step draws from their product, the posterior over plausible-and-desirable trajectories. The clean consequence: you can change the objective at test time, swap the reward, add a constraint, retarget the goal, by editing only $\mathcal{J}_\phi$, while reusing the one expensive thing, the trajectory diffusion model, unchanged. Decision making becomes "fix the prior over behavior once, then re-aim with a cheap likelihood whenever the task changes".</p>
+</div>
+
+<h2>3. Decision Diffuser: Classifier-Free Conditioning and Constraint Composition <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Classifier guidance needs a separately trained, differentiable return model $\mathcal{J}_\phi$, and its gradient can be noisy and hard to tune. The Decision Diffuser (Ajay et al., 2023) removes that dependency by switching to <em>classifier-free</em> guidance, the technique that made conditional image diffusion robust. The idea: train a single denoiser that takes the conditioning information $\mathbf{y}$ (a desired return, a skill, a constraint) as a direct input, and train it on both the conditional task and, with some probability, an unconditional task where the conditioning is dropped. At sampling time, combine the two predictions to amplify the conditioning. Writing $\hat{\boldsymbol{\epsilon}}_\theta(\boldsymbol{\tau}^{k}, \mathbf{y}, k)$ for the conditional noise prediction and $\hat{\boldsymbol{\epsilon}}_\theta(\boldsymbol{\tau}^{k}, \varnothing, k)$ for the unconditional one, the guided prediction is the extrapolation</p>
+$$\hat{\boldsymbol{\epsilon}} \;=\; \hat{\boldsymbol{\epsilon}}_\theta(\boldsymbol{\tau}^{k}, \varnothing, k) \;+\; w\,\big[\hat{\boldsymbol{\epsilon}}_\theta(\boldsymbol{\tau}^{k}, \mathbf{y}, k) - \hat{\boldsymbol{\epsilon}}_\theta(\boldsymbol{\tau}^{k}, \varnothing, k)\big],$$
+<p>with guidance weight $w \ge 0$: at $w = 0$ the sample is unconditional, at $w = 1$ it is plainly conditional, and at $w > 1$ the conditioning is amplified, pushing the trajectory more strongly toward the requested return or goal. No separate classifier, no external gradient; the conditioning lives inside the one denoiser. A second deliberate choice in Decision Diffuser is to diffuse over <em>states only</em> and recover actions with a small inverse-dynamics model $\mathbf{a}_t = f_\psi(\mathbf{s}_t, \mathbf{s}_{t+1})$, which sidesteps the difficulty of diffusing noisy, often discrete action sequences.</p>
+<p>The property that makes Decision Diffuser more than a tidier Diffuser is <em>constraint composition</em> at sampling time. Because classifier-free guidance is an arithmetic on noise predictions, multiple conditions compose by adding their guidance terms. To plan a trajectory that is simultaneously high return AND reaches a goal AND avoids a region, condition on each factor $\mathbf{y}_1, \mathbf{y}_2, \mathbf{y}_3$ and sum the per-condition extrapolations:</p>
+$$\hat{\boldsymbol{\epsilon}} \;=\; \hat{\boldsymbol{\epsilon}}_\theta(\boldsymbol{\tau}^{k}, \varnothing, k) \;+\; \sum_{i} w_i\,\big[\hat{\boldsymbol{\epsilon}}_\theta(\boldsymbol{\tau}^{k}, \mathbf{y}_i, k) - \hat{\boldsymbol{\epsilon}}_\theta(\boldsymbol{\tau}^{k}, \varnothing, k)\big],$$
+<p>which samples, approximately, from the product of the per-condition distributions, the trajectories that satisfy all conditions at once. This is the decision-making analogue of composing prompts in image generation: you specify behavior by ANDing together constraints you never trained jointly, and the sampler finds a plan in their intersection. Each weight $w_i$ sets how hard that constraint pulls, so a soft preference and a hard requirement coexist by choosing different $w_i$. The composition is approximate, the factors are not truly independent, but in practice it lets one trained model serve a combinatorial space of tasks specified only at test time.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: Planning by Vibes, Then Sharpening Them</div>
+<p>Classifier-free guidance has a faintly absurd shape when you say it out loud. The model makes two guesses about which way to denoise: one while squinting at the goal you handed it, and one while deliberately ignoring the goal entirely, pretending it was told nothing. Then it takes the <em>difference</em> of those two guesses, the part that is "because of the goal", and leans into it harder than either guess alone. It is planning by computing "what would I do if I cared" minus "what would I do if I did not", and then caring about that difference roughly $w$ times as much as is strictly reasonable. Turn $w$ up too far and the planner becomes a caricature of goal-seeking, producing trajectories so eager to satisfy the condition that they forget how physics works.</p>
+</div>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Conditioning Inside the Model Buys Composability</div>
+<p>Moving the objective from an external classifier (Diffuser) to a conditioning input of the denoiser (Decision Diffuser) is not a cosmetic refactor; it changes what you can do at sampling time. Once each objective is a guidance term computed from the denoiser itself, objectives <em>add</em>. You can plan for return, then add a goal, then add a safety constraint, each as one more extrapolation term with its own weight, none of them trained together, and sample a plan in their intersection. The single trained trajectory model becomes a programmable planner whose task is written, at test time, as a weighted sum of conditions. This compositionality, not a marginal quality gain, is the reason classifier-free conditioning became the default for diffusion planning.</p>
+</div>
+
+<h2>4. Strengths, Costs, and the Relation to Model Predictive Control <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Diffusion planners earn three concrete strengths from the all-at-once generative view. <em>Long-horizon coherence</em>: because the whole trajectory is denoised jointly, temporal consistency is a property of the sample rather than something accumulated step by step, so plans stay coherent over horizons where an autoregressive roller or a one-step model drifts and compounds error. <em>Constraint composition</em>: as subsection three showed, goals, rewards, and safety constraints combine at sampling time by adding guidance terms, so one trained model serves a combinatorial family of tasks. <em>Multimodality</em>: a diffusion model represents a full distribution over trajectories, so when several good plans exist (go left or go right around the obstacle) it can sample any of them rather than collapsing to a blurred average, the failure mode that plagues unimodal regressors and squashes distinct options into an infeasible mean.</p>
+<p>The dominant cost is equally concrete: <em>sampling is slow</em>. Producing one plan requires running the reverse chain for $K$ denoising steps (commonly tens to hundreds), each a full forward pass of the denoiser over the whole trajectory, and guidance adds a gradient evaluation per step. Against a reactive policy that emits an action in one forward pass, a diffusion plan is orders of magnitude more expensive to produce, which is why deployment leans on faster samplers (DDIM and few-step distilled samplers), on replanning less often, and on warm-starting from the previous plan. A secondary cost is that the plan is only as good as the data: pure offline training means the model can only recombine behavior it has seen, and guidance pushed too hard ($\alpha$ or $w$ too large) walks off the data manifold into trajectories the implicit dynamics never validated.</p>
+<p>The relationship to model predictive control (MPC), the receding-horizon optimizer of <a href="../module-27-control-imitation/section-27.2.html">Section 27.2</a>, is the cleanest way to place diffusion planning in the decision-making landscape. MPC repeats a loop: at the current state, optimize an action sequence over a finite horizon against a dynamics model and a cost, execute the first action, observe the new state, and replan. A diffusion planner slots directly into that loop with the diffusion model playing the role of <em>the planner</em>: at the current state, sample a guided trajectory over the horizon (this replaces the inner optimization), execute the first action, observe, and resample. Figure 28.4.2 lines up the two box by box.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Receding-horizon stage</th><th>Classical MPC (Section 27.2)</th><th>Diffusion planner (this section)</th></tr></thead>
+<tbody>
+<tr><td>horizon model</td><td>explicit dynamics $\mathbf{s}_{t+1} = f(\mathbf{s}_t, \mathbf{a}_t)$</td><td>implicit, inside the trajectory diffusion model $p_\theta(\boldsymbol{\tau})$</td></tr>
+<tr><td>inner planning</td><td>optimize the action sequence (gradient, sampling, or shooting)</td><td>sample a guided trajectory by reverse diffusion</td></tr>
+<tr><td>objective</td><td>cost function minimized by the optimizer</td><td>return guidance $\mathcal{J}_\phi$ or conditioning $\mathbf{y}$</td></tr>
+<tr><td>constraints</td><td>hard constraints in the optimizer</td><td>inpainting and composed guidance terms</td></tr>
+<tr><td>execution</td><td>apply first action, observe, replan</td><td>apply first action, observe, resample</td></tr>
+<tr><td>multimodality</td><td>single optimum returned</td><td>full distribution; can sample distinct plans</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 28.4.2:</strong> Diffusion planning as model predictive control with a generative planner. Every stage of the receding-horizon loop has a counterpart; the diffusion model replaces both the explicit dynamics model and the inner trajectory optimizer with a single learned sampler, and reward enters as guidance rather than as a cost the optimizer minimizes.</figcaption>
+</figure>
+<p>Reading the table top to bottom makes the trade legible. MPC gives you an explicit model and hard constraints and a single optimum, at the price of needing that model and of unimodal answers; diffusion planning gives you a learned implicit model, soft composable constraints, and multimodal plans, at the price of slow sampling and a manifold you can fall off. The two are not rivals so much as the same receding-horizon skeleton with a different inner planner, which is exactly how the world-models-and-planning material of <a href="../module-29-world-models-planning/index.html">Chapter 29</a> will frame learned planning in general.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Diffusion Planning and Policies (2024 to 2026)</div>
+<p>Diffusion for decision making has moved fast since Diffuser (2022) and Decision Diffuser (2023). On the robotics side, <em>Diffusion Policy</em> (Chi et al., 2023) put a diffusion model at the action head of a visuomotor policy and became a default for imitation learning, with 2024 to 2025 work (consistency-distilled and one-step diffusion policies, flow-matching policies) attacking the slow-sampling cost so the planner can run at control rate. <em>Hierarchical and goal-conditioned diffusion planners</em> (for example HDMI and hierarchical Diffuser variants, 2023 to 2024) plan a coarse subgoal trajectory and refine it, extending the coherent horizon. <em>AdaptDiffuser</em> and self-evolving variants generate synthetic high-reward trajectories to bootstrap beyond the offline data. A parallel thread replaces stochastic diffusion with <em>flow matching</em> for cheaper, straighter sampling paths, and 2025 work folds diffusion planning into large multimodal and world-model stacks (diffusion forcing, the planning side of video and world models in <a href="../module-29-world-models-planning/index.html">Chapter 29</a>). The live questions for 2026: cut the sampling cost enough for real-time control, keep guidance from leaving the data manifold, and scale composition to many simultaneous constraints.</p>
+</div>
+
+<h2>5. Worked Example: A Trajectory Diffuser From Scratch, Then a Library Call <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make the whole idea executable on a problem small enough to read end to end. The task is a one-dimensional point-mass that should travel from a start position to a goal: a trajectory is a length-$H$ sequence of positions, "good" trajectories are smooth and end near the goal, and we train a tiny diffusion model on a dataset of such smooth trajectories, then plan by guided sampling toward a goal we pick at test time. Code 28.4.1 builds the dataset, the noise schedule, and a minimal denoiser, the diffusion machinery of <a href="../../part-4-temporal-representation-learning/module-17-generative-temporal-models/index.html">Chapter 17</a> applied to trajectories.</p>
+<pre><code class="language-python">import torch, torch.nn as nn
+
+torch.manual_seed(0)
+H, K = 24, 50                       # trajectory horizon, number of diffusion steps
+
+# Dataset: smooth trajectories (random start, random goal, straight line + wiggle).
+def sample_traj(n):
+    t = torch.linspace(0, 1, H)
+    start = torch.rand(n, 1) * 2 - 1
+    goal  = torch.rand(n, 1) * 2 - 1
+    base  = start + (goal - start) * t                 # straight line start -> goal
+    wig   = 0.05 * torch.sin(torch.rand(n, 1) * 6 * t * 6.28)
+    return (base + wig).unsqueeze(-1)                  # (n, H, 1): a batch of trajectories
+
+data = sample_traj(4096)
+
+# Cosine-ish linear noise schedule (alpha-bar), the Chapter 17 forward process.
+betas = torch.linspace(1e-4, 0.05, K)
+abar  = torch.cumprod(1 - betas, dim=0)               # alpha-bar_k = prod (1 - beta)
+
+# Minimal denoiser: predict the noise epsilon added to a trajectory at step k.
+class Denoiser(nn.Module):
+    def __init__(self, h=128):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(H + 1, h), nn.SiLU(),
+                                 nn.Linear(h, h), nn.SiLU(), nn.Linear(h, H))
+    def forward(self, x, k):                           # x: (B, H, 1), k: (B,)
+        z = torch.cat([x.squeeze(-1), k.float().unsqueeze(-1) / K], dim=-1)
+        return self.net(z).unsqueeze(-1)               # predicted noise, (B, H, 1)
+
+model = Denoiser()
+opt = torch.optim.Adam(model.parameters(), lr=2e-3)
+for step in range(1500):                              # train epsilon-prediction objective
+    x0 = data[torch.randint(0, len(data), (256,))]
+    k  = torch.randint(0, K, (256,))
+    eps = torch.randn_like(x0)
+    ab = abar[k].view(-1, 1, 1)
+    xk = ab.sqrt() * x0 + (1 - ab).sqrt() * eps       # forward-noise to step k
+    loss = ((model(xk, k) - eps) ** 2).mean()         # learn to predict the noise
+    opt.zero_grad(); loss.backward(); opt.step()
+print("final denoise loss = %.4f" % loss.item())
+</code></pre>
+<div class="code-caption"><strong>Code 28.4.1:</strong> The trajectory diffusion model from scratch: a dataset of smooth point-mass trajectories, a linear noise schedule giving $\bar\alpha_k$, and a small noise-prediction denoiser trained with the standard $\lVert \boldsymbol{\epsilon} - \hat{\boldsymbol{\epsilon}}_\theta\rVert^2$ objective of Chapter 17, now applied to whole trajectories rather than series windows.</div>
+<pre><code class="language-text">final denoise loss = 0.0121
+</code></pre>
+<div class="code-caption"><strong>Output 28.4.1:</strong> The denoiser converges to a small noise-prediction error, confirming it has learned the manifold of smooth trajectories it will later be asked to sample from and steer.</div>
+<p>With a trained denoiser we can plan. Code 28.4.2 runs the guided reverse chain of subsection two: at each denoising step it takes the unconditional denoiser mean, then adds the reward-gradient guidance term $\alpha\,\Sigma_k\,\nabla_{\boldsymbol{\tau}}\mathcal{J}$ that pulls the trajectory toward ending at a chosen goal, and it pins the start position by inpainting at every step. The guidance here is the Diffuser form: an explicit differentiable score on the trajectory.</p>
+<pre><code class="language-python">@torch.no_grad()
+def _eps(x, k):                                       # denoiser noise prediction at step k
+    kk = torch.full((x.shape[0],), k, dtype=torch.long)
+    return model(x, kk)
+
+def plan(start, goal, alpha=1.0, n=1):
+    x = torch.randn(n, H, 1)                          # tau^K: trajectory-shaped noise
+    for k in reversed(range(K)):                      # reverse chain K-1 ... 0
+        ab, b = abar[k], betas[k]
+        eps = _eps(x, k)
+        mu = (x - b / (1 - ab).sqrt() * eps) / (1 - b).sqrt()   # unconditional mean mu_theta
+        # Classifier guidance: J = -||x[:, -1] - goal||^2 (high return = ends at goal).
+        with torch.enable_grad():
+            xg = x.clone().requires_grad_(True)
+            J = -((xg[:, -1, 0] - goal) ** 2).sum()   # return score
+            grad, = torch.autograd.grad(J, xg)        # nabla_tau J
+        mu = mu + alpha * b * grad                    # displaced mean: mu_theta + alpha*Sigma*grad
+        x = mu + (b.sqrt() * torch.randn_like(x) if k > 0 else 0)
+        x[:, 0, 0] = start                            # inpaint the start (condition on s_0)
+    return x
+
+traj = plan(start=-0.8, goal=0.9, alpha=1.5, n=1)[0, :, 0]
+print("planned start = %+.3f  end = %+.3f  (goal +0.900)" % (traj[0], traj[-1]))
+print("max step size = %.4f  (smooth if small)" % traj.diff().abs().max())
+</code></pre>
+<div class="code-caption"><strong>Code 28.4.2:</strong> Guided planning by reverse diffusion. Each step forms the unconditional denoiser mean, displaces it by the return-gradient term $\alpha\,\Sigma_k\,\nabla_{\boldsymbol{\tau}}\mathcal{J}$ toward ending at the goal, then inpaints the observed start, the exact displaced-mean reverse step of subsection two.</div>
+<pre><code class="language-text">planned start = -0.800  end = +0.872  (goal +0.900)
+max step size = 0.0613  (smooth if small)
+</code></pre>
+<div class="code-caption"><strong>Output 28.4.2:</strong> The sampled plan starts exactly at the pinned start ($-0.800$) and ends close to the guided goal ($+0.872$ versus the requested $+0.900$), while staying smooth (small max step), demonstrating that reward guidance bent generation toward the objective without leaving the smooth-trajectory manifold.</div>
+<p>The from-scratch version above is roughly 40 lines of denoiser, schedule, training loop, and guided sampler. A library collapses the diffusion machinery, the noise schedule, the training step, and the sampler to a handful of calls; you supply only the trajectory shape and the guidance. Code 28.4.3 sketches the Diffuser-style library equivalent, the same plan in a fraction of the lines.</p>
+<pre><code class="language-python"># Library / reference equivalent (diffuser-style API; pip install diffuser).
+from diffuser.models import TemporalUnet, GaussianDiffusion
+from diffuser.guides import ValueGuide, GuidedPolicy
+
+# Trajectory denoiser + diffusion process: schedule, training, sampling all internal.
+unet  = TemporalUnet(horizon=H, transition_dim=1)
+diff  = GaussianDiffusion(unet, horizon=H, n_timesteps=K)      # wraps the whole reverse chain
+diff.fit(data)                                                 # one call: the training loop of Code 28.4.1
+
+# Return guide + guided sampler: classifier guidance of subsection 2, handled internally.
+guide  = ValueGuide.from_goal(goal=0.9)                        # J = -||end - goal||^2
+policy = GuidedPolicy(diff, guide, scale=1.5)                  # alpha = 1.5
+traj   = policy(start=-0.8)                                    # guided reverse diffusion, one call
+</code></pre>
+<div class="code-caption"><strong>Code 28.4.3:</strong> The library equivalent of the entire from-scratch pipeline. The schedule, the noise-prediction training loop of Code 28.4.1, the displaced-mean guided reverse chain of Code 28.4.2, and the start-inpainting are all internal to <code>GaussianDiffusion</code> and <code>GuidedPolicy</code>; the user supplies only the trajectory shape, the data, and the guidance.</div>
+<p>The line count drops from roughly 40 (denoiser, schedule, training loop, guided sampler, inpainting) to about 8, with the forward noising, the noise-prediction objective, the reverse chain, the guidance displacement, and the conditioning all handled inside the library. Read the three blocks together: Code 28.4.1 trained the trajectory diffusion model of subsection one, Code 28.4.2 turned it into a planner with the displaced-mean guided reverse step of subsection two, and Code 28.4.3 showed that a production library is the same computation behind a few method calls. The pedagogical payoff is that a diffusion planner is not magic: it is a noise-prediction model and a guided reverse loop, both of which you can write, and a library merely packages.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Composing Constraints for a Warehouse Robot</div>
+<p><strong>Who:</strong> A planning team at a logistics company deploying mobile robots that must route across a warehouse floor shared with human pickers, building on the offline trajectory data the fleet already logs.</p>
+<p><strong>Situation:</strong> They had a large offline dataset of past robot routes (states and velocities) but no clean reward model, and the set of tasks changed daily: reach a shelf, avoid a temporarily closed aisle, keep clear of a charging zone, all specified the morning of a shift.</p>
+<p><strong>Problem:</strong> Training a fresh policy for every combination of goal, avoidance region, and speed limit was infeasible; the combinations were the point, and they were known only at deployment time, not at training time.</p>
+<p><strong>Dilemma:</strong> A reactive learned policy would need retraining per task combination. A classical MPC stack (Section 27.2) needed an accurate dynamics model of a cluttered, partly stochastic floor they did not have. They needed one model that accepted a new task specification at test time.</p>
+<p><strong>Decision:</strong> They trained a single Decision-Diffuser-style state-trajectory model on the logged routes with classifier-free conditioning, plus a small inverse-dynamics model to recover wheel commands, so each shift's task became a composition of guidance terms rather than a new training run.</p>
+<p><strong>How:</strong> Each morning the dispatcher specified the task as a weighted sum of conditions, goal shelf, closed-aisle avoidance, charging-zone keep-out, with per-constraint weights $w_i$ exactly as in subsection three, and the planner sampled routes in the intersection, replanning on each new observation in an MPC-style loop. Slow sampling was acceptable because routes were planned at the second scale, not the control scale.</p>
+<p><strong>Result:</strong> One trained model served the changing daily task set; new keep-out regions were added by appending a guidance term with no retraining, and the composed plans stayed coherent across the long cross-floor horizons where their previous step-by-step planner had drifted into the shelving.</p>
+<p><strong>Lesson:</strong> Diffusion planning pays off precisely where tasks are compositional and specified late: train the trajectory model once on logged behavior, then write each new task as a weighted sum of guidance terms at deployment. The slow-sampling cost is a non-issue when planning runs far below control rate.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Diffusion Planners and Policies Off the Shelf</div>
+<p>Beyond the research <code>diffuser</code> reference code of Code 28.4.3, the production path for diffusion-based decision making runs through a few maintained stacks. The <code>diffusion_policy</code> library (Chi et al.) ships training and inference for diffusion <em>action</em> policies with both CNN and transformer denoisers and DDIM fast sampling, and integrates with imitation-learning datasets. For offline RL more broadly, <code>d3rlpy</code> and <code>clean-offline-rl</code> style repos provide trajectory datasets, evaluation harnesses, and baselines (including Decision Transformer from <a href="section-28.3.html">Section 28.3</a>) so a diffusion planner can be benchmarked against the sequence-model and value-based families on the same D4RL tasks. The pattern is the same as everywhere in this book: the from-scratch denoiser and guided sampler teach you the mechanism in 40 lines; a library gives you a tuned UNet denoiser, a fast sampler, the guidance plumbing, and a benchmark harness so you build planners instead of rebuilding diffusion.</p>
+</div>
+<div class="callout looking-back">
+<div class="callout-title">Looking Back: Three Ways to Generate a Plan</div>
+<p>Chapter 28 has now shown three faces of "planning is sequence generation". <a href="section-28.3.html">Section 28.3</a> generated the plan <em>autoregressively</em>, token by token, conditioning on a target return (Decision Transformer). This section generates it <em>by denoising</em>, the whole trajectory at once, steered by guidance (Diffuser, Decision Diffuser). The two share the premise that decisions are samples from a model of good behavior, and differ only in the generative model and therefore in what is easy: autoregression is fast and causal but commits early and drifts; diffusion is slow but globally coherent and composable. Both descend from the same shift this part keeps making, away from "compute a value function, act greedily" and toward "model trajectories, then condition". The next section completes the arc by bringing the architectures of Part III back as policies in their own right.</p>
+</div>
+
+<div class="callout warning">
+<div class="callout-title">Common Pitfalls in Diffusion Planning</div>
+<p>Four mistakes recur when readers first build or deploy a diffusion planner, and naming them now saves a great deal of confusion:</p>
+<ul>
+<li><strong>Cranking the guidance scale.</strong> Pushing $\alpha$ (Diffuser) or $w$ (Decision Diffuser) too high chases reward straight off the data manifold, producing trajectories the implicit dynamics never validated: high predicted return, physically impossible plan. The guidance scale is a manifold-versus-reward dial, not a free quality knob.</li>
+<li><strong>Forgetting to re-condition on the current state.</strong> If you sample a full plan and execute it open-loop, model error compounds. Diffusion planning is meant to run in an MPC loop: sample, execute the first action, observe, resample, inpainting the new $\mathbf{s}_0$ every time.</li>
+<li><strong>Diffusing raw discrete or high-frequency actions.</strong> Action sequences are often noisy or discrete and diffuse poorly. Decision Diffuser's choice to diffuse states and recover actions with an inverse-dynamics model exists for this reason; ignoring it gives jittery, low-quality action plans.</li>
+<li><strong>Ignoring the sampling-cost budget.</strong> A planner that needs hundreds of denoising steps per plan cannot run at control rate without a fast sampler (DDIM, distillation) or infrequent replanning. Treating sampling cost as an afterthought produces a planner that works in a notebook and not on a robot.</li>
+</ul>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 28.4.1: Why Posterior Sampling? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Explain, using the displaced-mean reverse step of subsection two, why guided diffusion sampling draws (approximately) from the posterior $p_\theta(\boldsymbol{\tau})\,e^{\mathcal{J}_\phi(\boldsymbol{\tau})}$ rather than from $p_\theta(\boldsymbol{\tau})$ alone. Identify which term plays the role of the prior and which the likelihood, and state in one sentence what happens to the sampled distribution as the guidance scale $\alpha \to 0$ and as $\alpha \to \infty$. Relate the $\alpha \to \infty$ limit to the manifold pitfall in the warning callout above.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 28.4.2: Compose Two Constraints in the From-Scratch Planner <span class="exercise-type coding">Coding</span></div>
+<p>Extend the <code>plan</code> function of Code 28.4.2 to accept a second guidance term: in addition to the goal-reaching score, add an avoidance score that penalizes the trajectory passing through a forbidden interval (for example, positions in $[0.0, 0.2]$ at any timestep). Sum the two gradients with separate weights $w_1, w_2$, as in the composition equation of subsection three, and verify by printing the trajectory that the plan both ends near the goal and avoids the forbidden band. Report how the two weights trade off when the goal lies on the far side of the forbidden region.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 28.4.3: Diffusion Planner Versus MPC <span class="exercise-type analysis">Analysis</span></div>
+<p>Using the box-by-box correspondence of Figure 28.4.2, write a one-page comparison of the diffusion planner of this section against the model predictive controller of <a href="../module-27-control-imitation/section-27.2.html">Section 27.2</a> on a task of your choice. Address: which method needs an explicit dynamics model and which learns it implicitly; how each represents multiple equally good plans; how each handles a constraint added at deployment time; and what each pays at run time per replanning step. Conclude with a decision rule, in two sentences, for when you would reach for a diffusion planner over MPC and when you would not, connecting your answer to the learned-planning framing of <a href="../module-29-world-models-planning/index.html">Chapter 29</a>.</p>
+</div>
+
+<p>We have now seen planning recast as conditional generation by denoising: a diffusion model over whole trajectories, steered toward high return by classifier guidance (Diffuser) or by classifier-free conditioning that composes constraints at sampling time (Decision Diffuser), slotted into a receding-horizon loop as a learned replacement for the MPC inner optimizer. The thread that ran through the section, denoising leads to diffusion leads to diffusion planning, closes the generative side of Chapter 28's story. One face of "sequence models as decision makers" remains. The autoregressive transformers and structured state-space models of Part III were built to model sequences; the closing section asks what happens when we point those same architectures directly at the policy, treating action selection itself as the sequence-modeling problem. <a href="section-28.5.html">Section 28.5</a> bridges back to Part III, recasting Transformers and SSMs as policies and tying the chapter's sequence-modeling view of decision making to the architectures that opened the deep-learning part of the book.</p>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-28.3.html"><span class="nav-label">Previous</span><span class="nav-num">Section 28.3</span><span class="nav-title">Trajectory Transformer and Decision Transformer</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 28</span><span class="nav-num">Contents</span><span class="nav-title">Sequence Models for Decision Making</span></a>
+<a class="next" href="section-28.5.html"><span class="nav-label">Next</span><span class="nav-num">Section 28.5</span><span class="nav-title">Bridge: Transformers and SSMs from Part III as Policies</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

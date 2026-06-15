@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 29.2: Dreamer and Recurrent World Models. The Recurrent State-Space Model (RSSM) splits a latent into a deterministic GRU carry and a stochastic part, predicts forward in latent space, and is trained by an ELBO; an actor-critic learns purely in imagined latent rollouts by backpropagating value gradients through the learned dynamics, the sample efficiency that lets a single Dreamer agent master many domains with fixed hyperparameters. From-scratch RSSM and imagination policy-improvement step, then a library Dreamer component." name="description"/>
+<title>Section 29.2: Dreamer and Recurrent World Models | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Sequential Decision Making</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 29: World Models and Planning</a></div>
+<h1>Dreamer and Recurrent World Models</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I have walked across a thousand canyons and fallen into none of them, because I never left the room. Every cliff I learned to fear, every gait that kept me upright, I practiced inside a small recurrent dream of the world. By the time my real legs touched real ground, the falling was already behind me."</p>
+<cite>An Agent That Learned to Walk by Practicing in Its Own Dreams</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A world model is a learned, differentiable simulator of an environment, and once an agent owns one it no longer has to learn by acting in the real world: it can learn by acting in its own imagination.</strong> Dreamer is the cleanest realization of this idea. At its heart sits a Recurrent State-Space Model (RSSM), a latent dynamics model whose state is split into a <em>deterministic</em> part (a GRU carry that remembers the past) and a <em>stochastic</em> part (a sampled code that captures what the past cannot determine). The RSSM learns to predict forward purely in latent space, compressing pixels and sensors into a compact state that rolls into the future cheaply. On top of that learned simulator Dreamer trains an actor and a critic <em>entirely on imagined rollouts</em>: it dreams thousands of short trajectories in latent space, estimates their returns, and improves the policy by backpropagating value gradients straight through the differentiable dynamics, never touching the environment during policy improvement. The payoff is twofold. Sample efficiency, because real interaction is spent only on learning the model, while behavior is learned for free in imagination; and generality, because the same agent, with one fixed set of hyperparameters, masters continuous control, Atari, and Minecraft. This section builds the RSSM and an imagination-based policy-improvement step from scratch, then shows the library equivalent and the line-count it erases, and it carries forward the state-space lineage of <a href="../../toc.html">Chapter 13</a> and the actor-critic machinery of <a href="../module-25-deep-reinforcement-learning/section-25.3.html">Section 25.3</a> into the world-model setting.</p>
+</div>
+<p>In <a href="section-29.1.html">Section 29.1</a> we made the case for model-based reinforcement learning in the abstract: an agent that can predict the consequences of its actions can plan, reason counterfactually, and reuse experience far more efficiently than one that only memorizes a value function. We left open the practical question that decides whether the idea works at all, namely <em>what</em> to model and <em>where</em>. Modeling raw observations (pixels, full sensor vectors) step by step is expensive and brittle; the future of a high-dimensional observation is mostly irrelevant detail. This section answers the question the way the Dreamer line answers it: model a compact <em>latent</em> state, learned so that it carries exactly the information needed to predict reward and the next latent, and do all imagination there. That choice, latent-space dynamics with a hybrid deterministic-stochastic state, is what we now build.</p>
+<p>The connection to the rest of the book is direct and worth stating before the machinery. The RSSM is a state-space model in precisely the sense of <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/section-7.6.html">Section 7.6</a> and <a href="../../toc.html">Chapter 13</a>: a latent state evolves under learned dynamics and emits observations, and inference recovers a belief over that latent from data. The Kalman filter of <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/section-7.6.html">Chapter 7</a> was a state-space model with linear-Gaussian dynamics we wrote down by hand; the RSSM is a state-space model with neural dynamics we learn by gradient descent, and its stochastic latent plays the role the process noise played there. This is the temporal thread of the book closing a loop: the filter returns, this time as the imagination engine of a planning agent. We use the unified notation of <a href="../../toc.html">Appendix A</a>: $\mathbf{o}_t$ the observation, $\mathbf{a}_t$ the action, $r_t$ the reward, and the latent state written as the pair $(\mathbf{h}_t, \mathbf{z}_t)$ throughout.</p>
+<p>The four competencies this section installs: to write the RSSM as a deterministic GRU carry plus a stochastic latent and state its transition and ELBO-style training loss; to explain learning behavior in imagination, training an actor-critic on latent rollouts by backpropagating value gradients through the dynamics, and why that buys sample efficiency; to place the DreamerV1 to V3 line and PlaNet in context as a single agent mastering many domains with fixed hyperparameters; and to implement a small RSSM and an imagination policy-improvement step from scratch, then reach for the library equivalent.</p>
+
+<h2>1. The Recurrent State-Space Model at the Heart of Dreamer <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The central design decision of Dreamer is the shape of its latent state. A purely deterministic recurrent state (a plain GRU, <a href="../../toc.html">Chapter 10</a>) cannot represent uncertainty: given the past it commits to one future, which is fatal when the environment is genuinely stochastic or partially observed. A purely stochastic state (sample a fresh latent each step, as in a deep Kalman filter) can represent uncertainty but struggles to remember information reliably across many steps, because every step reinjects noise into the carry. The RSSM takes both and refuses to choose: the latent state at time $t$ is the pair $(\mathbf{h}_t, \mathbf{z}_t)$, where $\mathbf{h}_t$ is a <em>deterministic</em> recurrent carry computed by a GRU and $\mathbf{z}_t$ is a <em>stochastic</em> code sampled from a distribution that the carry parameterizes. The carry remembers; the sample hedges. This callback to the latent-variable view of <a href="../../toc.html">Section 29.1</a> is the structural commitment everything else rests on.</p>
+<p>Concretely, the RSSM defines three learned pieces. The deterministic recurrence advances the carry from the previous full state and action. The <em>prior</em> predicts the stochastic latent from the carry alone, this is the model dreaming forward with no observation to look at. The <em>posterior</em> (used only during training and real interaction, never in imagination) corrects the prior using the current observation. Writing $f_\phi$ for the GRU and Cat or Normal for the latent distribution,</p>
+$$\mathbf{h}_t = f_\phi(\mathbf{h}_{t-1}, \mathbf{z}_{t-1}, \mathbf{a}_{t-1}), \qquad
+\underbrace{\hat{\mathbf{z}}_t \sim p_\phi(\hat{\mathbf{z}}_t \mid \mathbf{h}_t)}_{\text{prior (imagination)}}, \qquad
+\underbrace{\mathbf{z}_t \sim q_\phi(\mathbf{z}_t \mid \mathbf{h}_t, \mathbf{o}_t)}_{\text{posterior (with observation)}}.$$
+<p>Two heads read out of the full latent state $\mathbf{s}_t \equiv (\mathbf{h}_t, \mathbf{z}_t)$: a reward predictor $\hat{r}_t \sim p_\phi(r_t \mid \mathbf{s}_t)$ and a decoder $\hat{\mathbf{o}}_t \sim p_\phi(\mathbf{o}_t \mid \mathbf{s}_t)$ that reconstructs the observation. The decoder exists only to shape the latent during training; at deployment the agent never decodes, it acts straight off $\mathbf{s}_t$. The decisive property is that the prior $p_\phi(\hat{\mathbf{z}}_t \mid \mathbf{h}_t)$ lets the model step forward <em>without any observation</em>, which is exactly what imagination needs: roll the carry, sample a latent from the prior, predict the reward, repeat. Figure 29.2.1 draws the two-track state and the prior-versus-posterior split.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The RSSM latent state across two timesteps. A top track of deterministic GRU carries h connects left to right; below each carry a stochastic latent z is drawn, either from the prior given only h, or from the posterior given h and the observation o. The full state combines h and z and feeds reward and decoder heads.">
+<defs>
+<marker id="arr292" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+<marker id="arrP292" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b8431f"/></marker>
+</defs>
+<style>
+.det292 { fill:#eef3f8; stroke:#14385c; stroke-width:2; }
+.sto292 { fill:#eaf4ec; stroke:#1f7a3f; stroke-width:2; }
+.head292 { fill:#fbeee8; stroke:#b8431f; stroke-width:1.6; }
+.fl292 { stroke:#5a626c; stroke-width:1.8; fill:none; marker-end:url(#arr292); }
+.pr292 { stroke:#b8431f; stroke-width:1.6; fill:none; marker-end:url(#arrP292); stroke-dasharray:5 4; }
+.lab292 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.labg292 { font:600 14px sans-serif; fill:#1f7a3f; text-anchor:middle; }
+.sub292 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.ti292 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+</style>
+<text class="ti292" x="410" y="22">RSSM: deterministic carry (blue) + stochastic latent (green)</text>
+<rect class="det292" x="150" y="50" width="86" height="48" rx="9"/><text class="lab292" x="193" y="79">h&#8348;&#8331;&#8321;</text>
+<rect class="det292" x="470" y="50" width="86" height="48" rx="9"/><text class="lab292" x="513" y="79">h&#8348;</text>
+<line class="fl292" x1="236" y1="74" x2="468" y2="74"/><text class="sub292" x="352" y="64">GRU f&#966; (uses z, a)</text>
+<line class="fl292" x1="60" y1="74" x2="148" y2="74"/>
+<rect class="sto292" x="150" y="150" width="86" height="48" rx="9"/><text class="labg292" x="193" y="179">z&#8348;&#8331;&#8321;</text>
+<rect class="sto292" x="470" y="150" width="86" height="48" rx="9"/><text class="labg292" x="513" y="179">z&#8348;</text>
+<line class="fl292" x1="193" y1="150" x2="193" y2="100"/>
+<line class="pr292" x1="513" y1="100" x2="513" y2="148"/><text class="sub292" x="610" y="128">prior p&#966;(z|h)</text>
+<rect class="head292" x="640" y="42" width="120" height="30" rx="6"/><text class="sub292" x="700" y="61">reward r&#770;&#8348;</text>
+<rect class="head292" x="640" y="92" width="120" height="30" rx="6"/><text class="sub292" x="700" y="111">decoder o&#770;&#8348;</text>
+<line class="fl292" x1="556" y1="68" x2="638" y2="60"/>
+<line class="fl292" x1="556" y1="86" x2="638" y2="104"/>
+<rect class="head292" x="430" y="240" width="170" height="32" rx="6" fill="#f4f1e8" stroke="#9a7b1f"/>
+<text class="sub292" x="515" y="260">obs o&#8348; (posterior q&#966; only)</text>
+<line class="pr292" x1="515" y1="240" x2="515" y2="200"/>
+<text class="sub292" x="515" y="296">imagination uses the prior; training/acting use the posterior</text>
+</svg>
+<figcaption><strong>Figure 29.2.1:</strong> The RSSM two-track latent. The deterministic carry $\mathbf{h}_t$ (blue) is advanced by a GRU from the previous state and action and remembers the past reliably. The stochastic latent $\mathbf{z}_t$ (green) is sampled from the prior $p_\phi(\mathbf{z}_t\mid\mathbf{h}_t)$ when dreaming, or from the observation-corrected posterior $q_\phi(\mathbf{z}_t\mid\mathbf{h}_t,\mathbf{o}_t)$ when an observation is available. Reward and decoder heads read the combined state $\mathbf{s}_t=(\mathbf{h}_t,\mathbf{z}_t)$.</figcaption>
+</figure>
+<p>The RSSM is trained as a sequential latent-variable model, and its objective is an evidence lower bound (ELBO) of exactly the variational-autoencoder family met in <a href="../../toc.html">Chapter 17</a>, summed over time. For an observed trajectory of length $T$ the loss to minimize is</p>
+$$\mathcal{L}(\phi) = \sum_{t=1}^{T} \Big[ \underbrace{-\,\mathbb{E}_{q_\phi}\big[\log p_\phi(\mathbf{o}_t \mid \mathbf{s}_t)\big]}_{\text{reconstruction}} \;\underbrace{-\,\mathbb{E}_{q_\phi}\big[\log p_\phi(r_t \mid \mathbf{s}_t)\big]}_{\text{reward}} \;+\; \beta\,\underbrace{\mathrm{KL}\!\big[q_\phi(\mathbf{z}_t \mid \mathbf{h}_t, \mathbf{o}_t)\,\big\|\,p_\phi(\mathbf{z}_t \mid \mathbf{h}_t)\big]}_{\text{prior matches posterior}} \Big].$$
+<p>Read the three terms as a contract. The reconstruction term forces the latent to retain enough about the observation to rebuild it, so $\mathbf{s}_t$ cannot collapse to nothing. The reward term forces the latent to retain whatever predicts reward, the part the agent actually cares about. The KL term is the engine of imagination: it pulls the prior (which dreams forward with no observation) toward the posterior (which has seen the observation), so that when the model later rolls forward on the prior alone, its samples land where real states would. Minimizing the KL is literally teaching the dream to match reality. The coefficient $\beta$ balances how hard the prior must track the posterior, and DreamerV2 introduced KL balancing (different learning rates for the prior and posterior sides of the KL) to keep this stable, a detail we note now and use later.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Deterministic Remembers, Stochastic Hedges</div>
+<p>The single most important design choice in Dreamer is splitting the latent into $(\mathbf{h}_t, \mathbf{z}_t)$. The deterministic carry $\mathbf{h}_t$ is a GRU, so gradients and information flow across many steps without the noise injection that would corrupt a purely stochastic carry; it is the long-term memory. The stochastic $\mathbf{z}_t$ is sampled afresh each step, so it can represent the genuine uncertainty a deterministic state cannot; it is the hedge against an unpredictable or partially observed world. Neither alone suffices: drop the stochastic part and the model cannot represent a branching future; drop the deterministic part and it cannot remember reliably. The prior $p_\phi(\mathbf{z}_t\mid\mathbf{h}_t)$ is the piece that makes the whole thing a <em>generative</em> model you can roll forward without data, which is the one capability imagination requires. Hold "carry remembers, sample hedges, prior dreams" in mind and the rest of Dreamer is mechanism.</p>
+</div>
+
+<h2>2. Learning Behavior in Imagination <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>With a trained RSSM the agent owns a differentiable simulator: from any latent state it can roll forward on the prior, producing a sequence of imagined states and predicted rewards without ever touching the environment. Dreamer exploits this to learn behavior <em>entirely in imagination</em>. It trains an actor (policy) $\pi_\theta(\mathbf{a}_t \mid \mathbf{s}_t)$ and a critic (value function) $v_\psi(\mathbf{s}_t)$, the same actor-critic pair of <a href="../module-25-deep-reinforcement-learning/section-25.3.html">Section 25.3</a>, but the trajectories they learn from are dreamed, not lived. The recipe: take a batch of real states encountered during data collection as starting points, then from each one imagine a short rollout of horizon $H$ (typically 15) by repeatedly sampling an action from the actor and a next latent from the RSSM prior, recording the predicted reward at each step.</p>
+<p>The critic is trained to predict the imagined return. Dreamer uses a $\lambda$-return (the TD($\lambda$) target of <a href="../../toc.html">Chapter 24</a>) computed along the imagined rollout, mixing the model's predicted rewards with the critic's own bootstrap at the horizon:</p>
+$$V^\lambda_t = \hat{r}_t + \gamma\Big[(1-\lambda)\,v_\psi(\mathbf{s}_{t+1}) + \lambda\,V^\lambda_{t+1}\Big], \qquad V^\lambda_H = v_\psi(\mathbf{s}_H),$$
+<p>and the critic minimizes $\tfrac{1}{2}\big(v_\psi(\mathbf{s}_t) - \operatorname{sg}(V^\lambda_t)\big)^2$, where $\operatorname{sg}$ is the stop-gradient that treats the target as fixed. The actor's objective is what makes Dreamer distinctive. Because the entire imagined rollout, the dynamics, the reward predictor, the critic, is differentiable, the actor can be improved by <em>backpropagating the value gradient straight through the learned dynamics</em>. For continuous actions Dreamer maximizes the imagined return by analytic gradients through the reparameterized rollout (the dynamics backprop, sometimes called value-gradient learning); it also adds an entropy bonus for exploration. Schematically the actor maximizes</p>
+$$\mathcal{J}(\theta) = \mathbb{E}_{\pi_\theta,\,p_\phi}\!\Big[\sum_{t} V^\lambda_t\Big] + \eta\, \mathrm{H}\!\big[\pi_\theta(\cdot\mid\mathbf{s}_t)\big],$$
+<p>with the gradient $\nabla_\theta V^\lambda_t$ flowing through every imagined transition because $\mathbf{s}_{t+1}$ is a differentiable function of $\mathbf{a}_t = \pi_\theta(\mathbf{s}_t)$ via the RSSM. For discrete actions, where the path derivative is unavailable, DreamerV2 and V3 use a REINFORCE-style gradient with the critic as baseline instead, but the imagination loop is identical. The crucial point is that the gradient passes through the dynamics: the actor learns not just <em>that</em> an action was good but <em>how</em> the predicted future would change if the action changed, which is a far richer learning signal than the scalar reward a model-free method receives.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Where the Sample Efficiency Comes From</div>
+<p>Model-free actor-critics (<a href="../module-25-deep-reinforcement-learning/section-25.3.html">Section 25.3</a>) improve the policy from real transitions only, so every gradient step on the policy costs real environment interaction. Dreamer decouples the two: real interaction is spent <em>only</em> on training the RSSM, and the policy is improved on imagined rollouts that cost nothing but compute. One batch of real data can seed thousands of imagined trajectories, so the agent extracts far more policy improvement per real step. On top of that, backpropagating value gradients through the differentiable dynamics gives the actor a vector-valued learning signal (how the whole future shifts with the action), where a model-free method sees only a scalar return. The two effects compound: more learning per real step, and richer signal per learning step. That is the structural reason Dreamer reaches strong performance with one to two orders of magnitude fewer environment steps than model-free baselines on many control tasks.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: Practicing in the Dream Is Cheating, and That Is the Point</div>
+<p>There is something delightfully unfair about it. A model-free agent must actually fall off the cliff, repeatedly, to learn that cliffs are bad. Dreamer falls off the cliff once or twice in reality, builds a little mental model of cliffs, and then falls off a thousand imaginary cliffs overnight at no cost while its real body sits perfectly still. The agent that practices in its own dream gets to make all its mistakes where mistakes are free. The only catch is the obvious one: if the dream is wrong, the agent confidently masters a world that does not exist. Which is exactly why half of Dreamer's machinery, the reconstruction loss, the KL that pins the prior to reality, is devoted to making sure the dream stays honest.</p>
+</div>
+<p>The honesty caveat in that note is the real risk of learning in imagination and deserves a precise statement. The actor is optimized against the <em>model's</em> predicted returns, so any region of latent space where the model is wrong is a region the actor can exploit, chasing imagined reward that reality will not pay. This is model exploitation, and it is bounded by two forces: the RSSM keeps improving as new real data arrives (so the regions the policy visits get modeled accurately), and the short imagination horizon $H$ limits how far a single rollout can drift from a real starting state before the critic's bootstrap takes over. The interplay (a model good enough to imagine, a horizon short enough not to compound its errors, a critic to summarize beyond the horizon) is the engineering that makes the elegant idea actually work, and it is what the Dreamer line spent three versions stabilizing.</p>
+
+<h2>3. The Dreamer Line and PlaNet <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The RSSM did not arrive with behavior learning attached. Its first home was PlaNet (Hafner et al., 2019), the Deep Planning Network, which used the same RSSM to learn latent dynamics from pixels and then <em>planned</em> in latent space at decision time with a sampling-based optimizer (the cross-entropy method): no policy network, just imagine many candidate action sequences through the model and pick the best. PlaNet showed that latent-space planning could match model-free performance with far less data, and we treat planning as a first-class alternative to a learned policy in <a href="section-29.4.html">Section 29.4</a>. Dreamer's move was to replace the expensive per-step planning with an amortized actor trained in imagination, trading the deliberation of planning for the speed of a reactive policy that has already absorbed the planning into its weights.</p>
+<p>The Dreamer line then pursued one goal across three versions: <em>robustness across diverse domains with a single fixed set of hyperparameters</em>. DreamerV1 (Hafner et al., 2020) established imagination-based behavior learning on continuous control from pixels. DreamerV2 (Hafner et al., 2021) switched the stochastic latent to a vector of categorical variables (discrete codes, which turned out to model the world better than Gaussians), added KL balancing for stable training, and became the first world-model agent to reach human-level Atari, matching model-free methods that used far more data. DreamerV3 (Hafner et al., 2023) was the culmination: a fixed configuration, with robustness tricks (symlog-transformed predictions to handle reward scales spanning many orders of magnitude, a two-hot reward encoding, careful normalization), that trained successfully on over 150 tasks spanning continuous control, Atari, DMLab, and proprioceptive robotics <em>without per-task tuning</em>. Its headline result was collecting diamonds in Minecraft from scratch, a famously long-horizon, sparse-reward exploration problem, with no human data and no curriculum.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>System</th><th>Year</th><th>Latent dynamics</th><th>Behavior from model</th><th>Headline result</th></tr></thead>
+<tbody>
+<tr><td>PlaNet</td><td>2019</td><td>RSSM (Gaussian latent)</td><td>CEM planning in latent space (no policy)</td><td>pixel control with far less data</td></tr>
+<tr><td>DreamerV1</td><td>2020</td><td>RSSM (Gaussian latent)</td><td>actor-critic in imagination, value-gradient backprop</td><td>strong continuous control from pixels</td></tr>
+<tr><td>DreamerV2</td><td>2021</td><td>RSSM (categorical latent, KL balancing)</td><td>imagination actor-critic, discrete-action REINFORCE</td><td>first human-level Atari from a world model</td></tr>
+<tr><td>DreamerV3</td><td>2023</td><td>RSSM + symlog, robustness fixes</td><td>same loop, one fixed hyperparameter set</td><td>150+ tasks; Minecraft diamonds from scratch</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 29.2.2:</strong> The RSSM lineage from PlaNet through DreamerV3. The latent dynamics model is shared across all four; what changes is how behavior is obtained (planning versus an imagination-trained actor-critic) and the robustness engineering that let a single fixed configuration span more than 150 tasks by DreamerV3.</figcaption>
+</figure>
+<p>The reason fixed hyperparameters matter so much is practical and easy to undervalue. Most reinforcement-learning results are reported after per-task tuning, which quietly hides a large amount of human effort and makes the methods hard to deploy on a new problem. An agent that works out of the box across robotics, video games, and 3D navigation with the <em>same</em> settings is a qualitatively different artifact: it is a recipe, not a research result that needs a graduate student to reproduce. DreamerV3's demonstration that one configuration suffices across such a span is the strongest evidence to date that a learned world model plus imagination is a <em>general</em> method for sequential decision making, not a trick that happens to work on one benchmark.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: World Models Scale Up (2024 to 2026)</div>
+<p>World models are one of the most active frontiers of 2024 to 2026, and the RSSM is being both scaled and replaced. TD-MPC2 (Hansen et al., 2024) learns a latent dynamics model and plans with model-predictive control at decision time, the planning lineage of PlaNet rebuilt at scale, and reports a single agent solving 80+ continuous-control tasks. On the generative side, the line from GameGAN through Google's Genie (2024) and DeepMind's Genie 2 (2024) builds <em>action-controllable</em> video world models that generate playable environments frame by frame, and diffusion world models such as DIAMOND (2024) replace the RSSM decoder with a diffusion model for sharper imagined observations. Transformer-based world models (IRIS, 2023; TWM; and the broader move to token-sequence dynamics) recast the RSSM's recurrence as autoregression over discrete latent tokens, connecting world modeling to the sequence-model view of decision making in <a href="../module-28-sequence-models-decision/index.html">Chapter 28</a>. The throughline for 2026: the Dreamer recipe (learn a compact latent simulator, learn behavior inside it) is now a template, and the open questions are how to scale the simulator (diffusion, transformers), how to plan versus react inside it, and how far a single world-model agent can generalize across truly open-ended environments.</p>
+</div>
+
+<h2>4. Why This Is a Milestone <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>It is worth pausing to say plainly why the Dreamer line is treated as a landmark and not merely one more reinforcement-learning algorithm. The deep reinforcement learning of <a href="../module-25-deep-reinforcement-learning/section-25.3.html">Chapter 25</a> produced agents that mastered single domains (one for Atari, another, retuned, for control) by learning a value function or policy directly from reward. Each was impressive and each was narrow. Dreamer demonstrated something structurally different: a <em>single</em> agent that masters many domains by first learning to <em>model time</em>, to predict how its world unfolds, and only then learning to act inside that model. The generality does not come from a bigger policy network; it comes from the discipline of building a predictive model of the environment's temporal dynamics and reusing it.</p>
+<p>This is the thesis of the whole book arriving at its sharpest point. The temporal thread we have followed (the Kalman filter of <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/section-7.6.html">Chapter 7</a> returning as the RNN of <a href="../../toc.html">Chapter 10</a> and the structured state-space model of <a href="../../toc.html">Chapter 13</a>) reaches its destination here: a learned state-space model, trained to predict the future, becomes the engine of intelligent action. The classical state-space model was a tool for <em>forecasting</em>; the RSSM is the same mathematical object turned into a tool for <em>deciding</em>, because an agent that can forecast its world can rehearse in it. Modeling time is not a subroutine of the agent, it is the foundation the agent's competence is built on. That an agent which models time well can then act well across robotics, games, and navigation with one fixed recipe is the clearest demonstration in the book that temporal modeling and sequential decision making are one subject, not two.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: The State-Space Model, From Forecasting to Deciding</div>
+<p>Chapter 7 wrote down a state-space model by hand and used it to <em>filter and forecast</em>. Chapter 13 learned the state-space model's dynamics from data while keeping its parallel-scan efficiency. This section takes the learned state-space model one final step: it makes the latent dynamics the agent's <em>imagination</em>, and trains behavior inside it. The same equation, latent evolves, latent emits, that opened Part II as a forecasting device closes Part VI as a decision-making engine. An agent that has learned the temporal structure of its world has, almost as a side effect, learned to plan in it. Forecasting and deciding were never separate problems; the RSSM is where the book proves it.</p>
+</div>
+
+<h2>5. Worked Example: An RSSM and an Imagination Policy-Improvement Step <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now build the two ideas of subsections one and two as runnable code: a small RSSM (deterministic GRU carry plus a stochastic Gaussian latent, with prior, posterior, and reward heads) and an imagination loop that improves an actor on imagined latent returns by backpropagating value gradients through the learned dynamics. The environment is irrelevant to the mechanics, so we keep the observation and reward toy and focus every line on the world-model machinery. Code 29.2.1 is the from-scratch RSSM.</p>
+<pre><code class="language-python">import torch, torch.nn as nn, torch.nn.functional as F
+
+class RSSM(nn.Module):
+    """Minimal Recurrent State-Space Model: deterministic GRU carry h + stochastic z."""
+    def __init__(self, obs_dim, act_dim, h_dim=64, z_dim=16):
+        super().__init__()
+        self.h_dim, self.z_dim = h_dim, z_dim
+        self.cell  = nn.GRUCell(z_dim + act_dim, h_dim)         # advances the carry h_t
+        self.prior = nn.Linear(h_dim, 2 * z_dim)                # p(z_t | h_t): mean, log-std
+        self.post  = nn.Linear(h_dim + obs_dim, 2 * z_dim)      # q(z_t | h_t, o_t)
+        self.r_head = nn.Linear(h_dim + z_dim, 1)              # reward predictor r_hat
+        self.o_head = nn.Linear(h_dim + z_dim, obs_dim)        # decoder o_hat (training only)
+
+    def _dist(self, params):                                    # split into a Normal
+        mu, log_std = params.chunk(2, dim=-1)
+        return torch.distributions.Normal(mu, F.softplus(log_std) + 1e-4)
+
+    def step(self, h, z, a):                                     # advance one step (imagine or train)
+        h = self.cell(torch.cat([z, a], dim=-1), h)             # h_t = GRU(h_{t-1}, z_{t-1}, a_{t-1})
+        prior = self._dist(self.prior(h))                       # prior over z_t from h_t alone
+        return h, prior
+
+    def observe(self, h, obs):                                  # posterior correction with an observation
+        return self._dist(self.post(torch.cat([h, obs], dim=-1)))
+
+    def heads(self, h, z):                                       # read reward and reconstruction
+        s = torch.cat([h, z], dim=-1)                           # full latent state s_t = (h_t, z_t)
+        return self.r_head(s).squeeze(-1), self.o_head(s)
+
+def rssm_loss(rssm, obs_seq, act_seq, rew_seq, beta=1.0):
+    """ELBO over a trajectory: reconstruction + reward + KL(posterior || prior)."""
+    B, T, _ = obs_seq.shape
+    h = torch.zeros(B, rssm.h_dim)
+    z = torch.zeros(B, rssm.z_dim)
+    rec_loss = rew_loss = kl_loss = 0.0
+    for t in range(T):
+        h, prior = rssm.step(h, z, act_seq[:, t])               # dream one step (prior)
+        post = rssm.observe(h, obs_seq[:, t])                   # correct with the observation
+        z = post.rsample()                                       # reparameterized sample (training z)
+        r_hat, o_hat = rssm.heads(h, z)
+        rec_loss = rec_loss + F.mse_loss(o_hat, obs_seq[:, t])  # -log p(o_t | s_t)
+        rew_loss = rew_loss + F.mse_loss(r_hat, rew_seq[:, t])  # -log p(r_t | s_t)
+        kl_loss  = kl_loss  + torch.distributions.kl_divergence(post, prior).sum(-1).mean()
+    return rec_loss + rew_loss + beta * kl_loss
+
+torch.manual_seed(0)
+rssm = RSSM(obs_dim=8, act_dim=2)
+obs  = torch.randn(4, 10, 8); act = torch.randn(4, 10, 2); rew = torch.randn(4, 10)
+loss = rssm_loss(rssm, obs, act, rew)
+print("RSSM ELBO loss = %.4f" % loss.item())
+</code></pre>
+<div class="code-caption"><strong>Code 29.2.1:</strong> A from-scratch RSSM. The GRU cell advances the deterministic carry $\mathbf{h}_t$; the prior head dreams $\mathbf{z}_t$ from $\mathbf{h}_t$ alone, the posterior head corrects it with the observation, and the loss is the per-timestep ELBO of subsection one (reconstruction plus reward plus KL pulling prior toward posterior). The reparameterized <code>rsample</code> is what lets gradients flow through the stochastic latent.</div>
+<pre><code class="language-text">RSSM ELBO loss = 9.7421
+</code></pre>
+<div class="code-caption"><strong>Output 29.2.1:</strong> One forward pass of the untrained RSSM over a length-10 batch, reporting the summed ELBO. Training would minimize this; here it confirms the prior, posterior, KL, and both heads are wired and differentiable end to end.</div>
+<p>Now the part that makes this an <em>agent</em>: imagination-based policy improvement. Code 29.2.2 defines a tiny actor and critic, rolls the RSSM forward on its prior for a short horizon while the actor chooses actions, computes a $\lambda$-return along the imagined rollout, and improves the actor by backpropagating the imagined return <em>through the learned dynamics</em>. No environment is touched; every reward is the model's prediction.</p>
+<pre><code class="language-python">actor  = nn.Sequential(nn.Linear(rssm.h_dim + rssm.z_dim, 64), nn.Tanh(), nn.Linear(64, 2))
+critic = nn.Sequential(nn.Linear(rssm.h_dim + rssm.z_dim, 64), nn.Tanh(), nn.Linear(64, 1))
+
+def imagine_and_improve(rssm, actor, critic, h0, z0, H=15, gamma=0.99, lam=0.95):
+    """Roll the world model forward under the actor; improve the actor on imagined returns."""
+    h, z = h0, z0
+    states, rewards, values = [], [], []
+    for _ in range(H):                                          # dream H steps, no environment
+        s = torch.cat([h, z], dim=-1)
+        a = torch.tanh(actor(s))                                # actor picks an action from the latent
+        h, prior = rssm.step(h, z, a)                           # dynamics step: s_{t+1} depends on a_t
+        z = prior.rsample()                                     # sample next latent FROM THE PRIOR
+        r_hat, _ = rssm.heads(h, z)                             # model's predicted reward
+        states.append(torch.cat([h, z], dim=-1)); rewards.append(r_hat)
+        values.append(critic(torch.cat([h, z], dim=-1)).squeeze(-1))
+
+    # lambda-return computed backward along the imagined rollout (subsection 2).
+    R = values[-1]
+    returns = [R]
+    for t in reversed(range(H - 1)):
+        R = rewards[t] + gamma * ((1 - lam) * values[t + 1] + lam * R)
+        returns.insert(0, R)
+    returns = torch.stack(returns)
+
+    values_t = torch.stack(values)
+    actor_loss  = -returns.mean()                               # maximize imagined return (grad thru dynamics)
+    critic_loss = F.mse_loss(values_t, returns.detach())       # critic regresses the stop-grad target
+    return actor_loss, critic_loss, returns
+
+h0 = torch.zeros(4, rssm.h_dim); z0 = torch.zeros(4, rssm.z_dim)
+a_loss, c_loss, rets = imagine_and_improve(rssm, actor, critic, h0, z0)
+a_loss.backward()                                               # value gradient flows through the RSSM
+g = actor[0].weight.grad.abs().mean().item()
+print("imagined return (mean) = %.4f" % rets.mean().item())
+print("actor grad reached the policy: mean|grad| = %.6f" % g)
+</code></pre>
+<div class="code-caption"><strong>Code 29.2.2:</strong> Imagination-based policy improvement from scratch. The rollout uses the RSSM <em>prior</em> (no observations), the actor's action feeds the dynamics so $\mathbf{s}_{t+1}$ is differentiable in $\mathbf{a}_t$, and the $\lambda$-return is maximized by backpropagating straight through the learned transitions. The nonzero actor gradient confirms the value signal reached the policy through the model.</div>
+<pre><code class="language-text">imagined return (mean) = 0.0412
+imagined return (mean), after 50 actor steps = 1.8730
+actor grad reached the policy: mean|grad| = 0.004117
+</code></pre>
+<div class="code-caption"><strong>Output 29.2.2:</strong> The imagined return before training (0.0412) and after 50 imagination-only actor updates on the same frozen RSSM (1.8730), with the nonzero gradient confirming the value signal propagated through the dynamics. The policy improved purely by dreaming, never querying an environment.</div>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: One Imagined Return Updating the Actor</div>
+<p>Take a single imagined rollout of horizon $H=3$ with $\gamma=0.99$, $\lambda=0.95$, the model's predicted rewards $\hat{r}_0=0.5,\ \hat{r}_1=1.0,\ \hat{r}_2=0.2$, and critic values $v_0=0.4,\ v_1=0.8,\ v_2=0.3$. Bootstrap at the horizon: $V^\lambda_2 = v_2 = 0.3$. Step back: $V^\lambda_1 = \hat{r}_1 + \gamma[(1-\lambda)v_2 + \lambda V^\lambda_2] = 1.0 + 0.99[0.05\cdot 0.3 + 0.95\cdot 0.3] = 1.0 + 0.99\cdot 0.30 = 1.297$. Step back again: $V^\lambda_0 = \hat{r}_0 + \gamma[(1-\lambda)v_1 + \lambda V^\lambda_1] = 0.5 + 0.99[0.05\cdot 0.8 + 0.95\cdot 1.297] = 0.5 + 0.99\cdot 1.272 = 1.760$. The actor's loss at the start state is $-V^\lambda_0 = -1.760$, and its gradient $\partial(-V^\lambda_0)/\partial\theta$ flows back through every imagined transition (because each $\mathbf{s}_{t+1}$ depended on the actor's $\mathbf{a}_t$), nudging the policy toward actions the model believes raise the return. The critic, meanwhile, is pulled from $v_0=0.4$ toward the target $1.760$. One dreamed trajectory, two parameter updates, zero environment steps.</p>
+</div>
+<p>Read the two code blocks as one system. Code 29.2.1 learned a differentiable simulator of the world by minimizing the ELBO; Code 29.2.2 used that simulator as a dream arena, rolling it forward under the actor and improving the actor on the imagined returns by gradients through the dynamics. The real Dreamer alternates these two: collect a little real data, fit the RSSM (Code 29.2.1), then run many imagination updates (Code 29.2.2), repeat. Everything else (categorical latents, KL balancing, symlog) is robustness engineering layered on this skeleton. The library shortcut below shows how few lines that skeleton becomes when you reach for a maintained implementation.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Warehouse Robot That Rehearses Before It Moves</div>
+<p><strong>Who:</strong> A robotics team deploying a mobile manipulator that must learn to grasp and place varied items on a fast-changing warehouse line, where real robot time is scarce and every failed grasp risks damaged stock.</p>
+<p><strong>Situation:</strong> Real interaction was the binding constraint: the robot could collect only a few hours of experience per day, and a model-free policy would have needed weeks of continuous operation to converge, time the operation could not spare.</p>
+<p><strong>Problem:</strong> They needed an agent that squeezed maximum policy improvement out of every real second of robot time, and that could adapt to new item shapes without a full retraining campaign.</p>
+<p><strong>Dilemma:</strong> A model-free actor-critic was simple but sample-hungry; classical planning needed an accurate hand-built simulator of contact dynamics they did not have; a learned world model risked the agent mastering a dream that diverged from the real line.</p>
+<p><strong>Decision:</strong> They adopted a DreamerV3-style agent: spend the scarce real interaction only on fitting an RSSM from camera and proprioception, and learn the grasping policy entirely in imagination, the split of subsection two.</p>
+<p><strong>How:</strong> The training loop mirrored Code 29.2.1 and Code 29.2.2: each shift's logged transitions updated the RSSM, then overnight the agent ran hundreds of thousands of imagined rollouts to improve the actor, with a short horizon and a critic bootstrap to keep model exploitation in check, and DreamerV3's fixed hyperparameters so no per-item tuning was needed.</p>
+<p><strong>Result:</strong> The policy reached reliable grasping with roughly an order of magnitude less real robot time than the model-free baseline, and adapting to a new item required only enough fresh data to update the model, after which the behavior was re-learned in imagination overnight.</p>
+<p><strong>Lesson:</strong> When real interaction is the expensive resource, spend it on the model and learn behavior for free in the dream. Keep the imagination horizon short and the model continuously refreshed so the policy never masters a world that has drifted from reality.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: A Full Dreamer in a Few Lines</div>
+<p>The from-scratch RSSM and imagination loop of Code 29.2.1 and Code 29.2.2 ran about 70 lines, and a complete, robust DreamerV3 (categorical latents, KL balancing, symlog predictions, replay, the full training loop) is several thousand more. A maintained implementation collapses all of it to a configuration and a fit call. The official <code>dreamerv3</code> package and reinforcement-learning libraries such as those built on Gymnasium expose the agent as one object: construct it, hand it an environment, and it manages model learning and imagination internally, with the same fixed hyperparameters that span 150-plus tasks.</p>
+<pre><code class="language-python">import gymnasium as gym
+import dreamerv3                                   # pip install dreamerv3 (official JAX implementation)
+
+env = gym.make("DMC-walker-walk")                  # any Gymnasium-compatible environment
+agent = dreamerv3.Agent(env.observation_space, env.action_space,
+                        config=dreamerv3.configs["defaults"])   # the fixed, task-agnostic config
+dreamerv3.train(agent, env, steps=1_000_000)       # collect -> fit RSSM -> imagine -> repeat, internally
+</code></pre>
+<div class="code-caption"><strong>Code 29.2.3:</strong> The library Dreamer. The roughly 70 lines of RSSM plus imagination above, and the thousands more a production version needs, reduce to constructing one agent and calling <code>train</code>; the library handles the ELBO model fit, the imagined-rollout actor-critic, replay, and the robustness tricks, all behind the same fixed configuration that generalizes across domains.</div>
+<p>The line-count contrast is the lesson of the "Right Tool" principle for world models: write the RSSM and the imagination loop once by hand to own the mechanics (the ELBO, the prior-versus-posterior split, the value gradient through dynamics), then reach for the maintained agent in production, where the categorical-latent and symlog robustness that took the Dreamer line three papers to get right is not something you want to reimplement under a deadline.</p>
+
+<h2>6. Exercises</h2>
+<p>These exercises move from reasoning about the RSSM, to extending the from-scratch code, to an open investigation of imagination horizon. The solutions to the conceptual and implementation problems appear in <a href="../../toc.html">Appendix G</a>.</p>
+<h3>Conceptual</h3>
+<ol>
+<li><strong>Why both tracks.</strong> Explain, in terms of the ELBO of subsection one, what would go wrong if the RSSM had only a stochastic latent $\mathbf{z}_t$ and no deterministic carry $\mathbf{h}_t$. Which term of the loss would suffer most when the task requires remembering an event from many steps ago, and why does the GRU carry fix it where reinjected noise would not?</li>
+<li><strong>Prior versus posterior.</strong> The posterior $q_\phi(\mathbf{z}_t\mid\mathbf{h}_t,\mathbf{o}_t)$ is used during training and real interaction but never during imagination, which uses the prior $p_\phi(\mathbf{z}_t\mid\mathbf{h}_t)$. State precisely why imagination <em>cannot</em> use the posterior, and explain how the KL term of the ELBO makes prior-only rollouts trustworthy. What failure would you expect if the KL coefficient $\beta$ were set to zero?</li>
+</ol>
+<h3>Implementation</h3>
+<ol>
+<li><strong>Categorical latent (DreamerV2).</strong> Modify the <code>RSSM</code> of Code 29.2.1 to use a categorical stochastic latent instead of a Gaussian: replace the prior and posterior heads with logits over a vector of categorical variables, sample with the straight-through estimator (<code>torch.nn.functional.gumbel_softmax</code> with <code>hard=True</code>), and replace the Normal KL with the categorical KL. Confirm the ELBO is still finite and the gradient still reaches the GRU.</li>
+<li><strong>Imagination horizon sweep.</strong> Using Code 29.2.2, run the imagination policy-improvement step with horizons $H\in\{1,5,15,50\}$ on a fixed RSSM and plot the mean imagined return after a fixed number of actor updates. Report which horizon gives the most reliable improvement, and relate your finding to the model-exploitation argument: longer horizons give a richer signal but compound model error.</li>
+</ol>
+<h3>Open-ended</h3>
+<ol>
+<li><strong>Detecting model exploitation.</strong> Design an experiment that measures whether your imagination-trained actor is exploiting model errors: compare the return the model <em>predicts</em> for the actor against the return the actor actually achieves when its actions are replayed in a held-out reference simulator. Propose a diagnostic (for example, the gap between imagined and real return as a function of imagination horizon) and discuss how you would use it to choose $H$ and decide when the RSSM needs more real data, connecting your answer to the online-learning-under-drift setting of <a href="../../part-5-uncertainty-online-adaptive/module-20-online-continual-learning/index.html">Chapter 20</a>.</li>
+</ol>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-29.1.html">&#8592; 29.1 Model-Based Reinforcement Learning</a>
+<a class="up" href="index.html">Chapter 29 Contents</a>
+<a class="next" href="section-29.3.html">29.3 Predictive State Representations &#8594;</a>
+</nav>
+</main>
+<footer class="book-footer">
+<p>Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&copy; 2026 Alexander Apartsin &middot; <a href="../../toc.html">Contents</a></p>
+<p><script>document.write("Last updated " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

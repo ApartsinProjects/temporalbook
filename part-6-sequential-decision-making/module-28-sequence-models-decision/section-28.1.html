@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 28.1: RL as Sequence Modeling. Reframing the Markov decision process as a sequence-modeling problem: tokenize a trajectory of returns, states, and actions into one long sequence, train a sequence model to predict it with ordinary supervised learning, then generate good actions by conditioning on a desired return. Why it sidesteps bootstrapping and the deadly triad, where it is upper-bounded by data quality and stitching, and a from-scratch autoregressive trajectory model matched against a HuggingFace GPT-2 equivalent." name="description"/>
+<title>Section 28.1: RL as Sequence Modeling | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Sequential Decision Making</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 28: Sequence Models for Decision Making</a></div>
+<h1>RL as Sequence Modeling</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They handed me a lifetime of an agent's choices, every state it ever saw, every move it ever made, every reward it ever banked, and asked me to read it as one long sentence. So I do what I always do with a sentence: I predict the next word. It just so happens that this time the next word is what to do."</p>
+<cite>A Transformer That Treats a Lifetime of Decisions Like One Long Sentence</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>For six chapters we treated decision making as a control problem: estimate value functions and policies by propagating reward information backward through the Bellman equation, one bootstrapped update at a time. This section makes a single, disorienting move that reorganizes the entire field. Stop solving a control problem and start solving a sequence-modeling problem.</strong> Flatten an agent's trajectory, the interleaved stream of states, actions, and rewards it produced, into one long token sequence; train a sequence model (the same RNNs, state-space models, and Transformers of Part III) to predict that sequence with ordinary next-token supervised learning; then, at decision time, condition the model on where you have been and what return you want, and let it <em>generate</em> the next action. The Markov decision process of <a href="../module-22-markov-decision-processes/index.html">Chapter 22</a> has become a language-modeling problem, and a policy has become a conditional sequence completion. This reframing is the elegant unification the whole book has been building toward: the sequence models of Part III, sharpened on forecasting, turn out to be decision makers. It buys the scalability and stability of supervised learning, it inherits the long-horizon credit assignment of attention, and it pays for those gains with a hard dependence on the quality of the data it imitates. This section installs the reframing, its trajectory tokenization, the reasons it works, the reasons it is bounded, the spectrum of methods it spans, and a from-scratch autoregressive trajectory model verified against a library equivalent.</p>
+</div>
+<p>Chapters 22 through 27 taught one master idea: a good decision is one whose value, defined recursively by the Bellman equation, is high, and we learn that value (or a policy that maximizes it) by backing reward information up through time. Dynamic programming (<a href="../module-22-markov-decision-processes/index.html">Chapter 22</a>), temporal-difference learning and deep Q-networks (<a href="../module-25-deep-reinforcement-learning/index.html">Chapter 25</a>), policy gradients and actor-critic methods (<a href="../module-26-advanced-rl/index.html">Chapter 26</a>): all of them are machines for solving the Bellman fixed point, and all of them inherit its difficulties, bootstrapped targets that chase a moving estimate, instability when function approximation meets off-policy data, and a sample efficiency that can be brutal. This section asks a question that sounds almost flippant: what if we never solve the Bellman equation at all? What if we treat the entire problem as predicting a sequence, the way a language model predicts text, and recover good behavior not by optimizing value but by <em>generating</em> it? We use the unified notation of <a href="../../toc.html">Appendix A</a> throughout: $s_t$ the state, $a_t$ the action, $r_t$ the reward at step $t$, and $R_t = \sum_{t'=t}^{T} r_{t'}$ the return-to-go, the sum of future rewards from step $t$ onward.</p>
+<p>The reframing is worth a section of its own because it is not a new algorithm bolted onto reinforcement learning; it is a change of the category the problem lives in. A control problem becomes a supervised problem; a policy becomes a conditional generator; the Bellman backup, the beating heart of Part VI so far, simply disappears from the training loop. That move is the cleanest example in this book of the temporal thread that runs through every part: the Kalman filter of <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/index.html">Chapter 7</a> returned as the recurrent network of <a href="../../part-3-temporal-deep-learning/module-10-recurrent-neural-networks/index.html">Chapter 10</a> and the structured state-space model of <a href="../../part-3-temporal-deep-learning/module-13-ssm-continuous-time/index.html">Chapter 13</a>; here the Markov decision process itself returns, in learned form, as a sequence model. The same architectures we sharpened on forecasting become decision makers, and the unification is exact rather than metaphorical.</p>
+<p>The four competencies this section installs are these: to tokenize a trajectory of returns, states, and actions into a single sequence a model can ingest, and to write the autoregressive factorization that defines the objective; to explain why supervised sequence modeling sidesteps the bootstrapping instability and the deadly triad of <a href="../module-25-deep-reinforcement-learning/section-25.1.html">Section 25.1</a> while exploiting Transformer and state-space credit assignment over long horizons; to state honestly where the approach is upper-bounded, by the quality of the data, by an inability to stitch sub-trajectories, and by the still-open question of how best to specify the desired return; and to place the concrete methods of this chapter on a spectrum from behavior cloning through return-conditioned generation to full sequence-level planning. These are the load-bearing ideas for the Decision Transformer and Trajectory Transformer of <a href="section-28.2.html">Section 28.2</a> and everything that follows in this chapter.</p>
+
+<h2>1. The Reframing: A Trajectory Is a Sequence <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>An agent interacting with an environment produces a trajectory, an interleaved record of what it saw, what it did, and what it earned. Classical reinforcement learning reads this record as evidence about value: each transition $(s_t, a_t, r_t, s_{t+1})$ is a data point used to refine an estimate of $Q(s,a)$ or to push a policy's probability mass toward high-advantage actions. The sequence-modeling reframing reads the very same record differently. It treats the trajectory not as evidence about a value function to be estimated, but as a <em>sentence to be modeled</em>, a string of tokens whose joint distribution a sequence model can learn directly, with no value function anywhere in sight.</p>
+<p>Concretely, write a length-$T$ trajectory as the token sequence</p>
+$$\tau \;=\; \big(\, \widehat{R}_1,\, s_1,\, a_1,\;\; \widehat{R}_2,\, s_2,\, a_2,\;\; \dots,\;\; \widehat{R}_T,\, s_T,\, a_T \,\big),$$
+<p>where $\widehat{R}_t = \sum_{t'=t}^{T} r_{t'}$ is the return-to-go, the reward still to be collected from step $t$ to the end of the episode. Each timestep contributes a triple of tokens in a fixed order, return-to-go first, then state, then action, so the model always sees "here is how much reward remains, here is where you are, here is what was done". A sequence model defines a distribution over this string through the usual autoregressive factorization, the chain rule of probability applied token by token:</p>
+$$p_\theta(\tau) \;=\; \prod_{t=1}^{T} p_\theta\!\big(a_t \mid \widehat{R}_{\le t},\, s_{\le t},\, a_{<t}\big)\; p_\theta\!\big(s_t \mid \dots\big)\; p_\theta\!\big(\widehat{R}_t \mid \dots\big),$$
+<p>and we train $\theta$ by maximizing the log-likelihood of trajectories drawn from a dataset, exactly the next-token objective of <a href="../../part-3-temporal-deep-learning/module-09-neural-sequence-fundamentals/index.html">Chapter 9</a>. The one term that matters for decisions is the action factor $p_\theta(a_t \mid \widehat{R}_{\le t}, s_{\le t}, a_{<t})$: a sequence model that predicts this well is, by construction, a policy. To <em>act</em>, we feed the model the history so far together with the return we want to achieve, and sample the next action token. The Markov decision process has not been solved in the Bellman sense; it has been <em>completed</em> in the language-model sense.</p>
+<p>The ordering of the tokens is a deliberate design choice, not an arbitrary one. Placing the return-to-go <em>before</em> the state and action at each step means the model is always conditioned on the target return when it predicts the action, which is what lets a single trained model produce different behaviors at test time by being handed different desired returns. This is the seed of the Decision Transformer idea of <a href="section-28.2.html">Section 28.2</a>: a return-conditioned policy is just a sequence model that has learned $p_\theta(a_t \mid \widehat{R}_t, s_t, \dots)$ and is queried with the return we wish were true. Figure 28.1.1 lays out the tokenized trajectory and the autoregressive action prediction.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A trajectory tokenized into a sequence. Three repeating blocks each hold a return-to-go token, a state token, and an action token, in that order. A sequence model reads left to right and an arrow shows the action token at each step being predicted from all tokens to its left.">
+<defs>
+<marker id="arr281" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+<marker id="arrG281" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b8431f"/></marker>
+</defs>
+<style>
+.rtg281 { fill:#fbeee8; stroke:#b8431f; stroke-width:1.8; }
+.st281 { fill:#eef3f8; stroke:#14385c; stroke-width:1.8; }
+.ac281 { fill:#e8f3ec; stroke:#1f7a46; stroke-width:1.8; }
+.tok281 { font:600 13px sans-serif; text-anchor:middle; }
+.lab281 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.fl281 { stroke:#5a626c; stroke-width:1.6; fill:none; marker-end:url(#arr281); }
+.bk281 { stroke:#b8431f; stroke-width:1.6; fill:none; marker-end:url(#arrG281); stroke-dasharray:5 4; }
+.gl281 { font:600 12px sans-serif; fill:#b8431f; text-anchor:middle; }
+</style>
+<text class="lab281" x="410" y="26">One trajectory, tokenized: return-to-go, state, action, repeated each step</text>
+<g>
+<rect class="rtg281" x="40" y="60" width="64" height="40" rx="7"/><text class="tok281" x="72" y="85" fill="#b8431f">R&#770;&#8321;</text>
+<rect class="st281" x="110" y="60" width="64" height="40" rx="7"/><text class="tok281" x="142" y="85" fill="#14385c">s&#8321;</text>
+<rect class="ac281" x="180" y="60" width="64" height="40" rx="7"/><text class="tok281" x="212" y="85" fill="#1f7a46">a&#8321;</text>
+</g>
+<g>
+<rect class="rtg281" x="300" y="60" width="64" height="40" rx="7"/><text class="tok281" x="332" y="85" fill="#b8431f">R&#770;&#8322;</text>
+<rect class="st281" x="370" y="60" width="64" height="40" rx="7"/><text class="tok281" x="402" y="85" fill="#14385c">s&#8322;</text>
+<rect class="ac281" x="440" y="60" width="64" height="40" rx="7"/><text class="tok281" x="472" y="85" fill="#1f7a46">a&#8322;</text>
+</g>
+<g>
+<rect class="rtg281" x="560" y="60" width="64" height="40" rx="7"/><text class="tok281" x="592" y="85" fill="#b8431f">R&#770;&#8323;</text>
+<rect class="st281" x="630" y="60" width="64" height="40" rx="7"/><text class="tok281" x="662" y="85" fill="#14385c">s&#8323;</text>
+<rect class="ac281" x="700" y="60" width="64" height="40" rx="7"/><text class="tok281" x="732" y="85" fill="#1f7a46">a&#8323;</text>
+</g>
+<line class="fl281" x1="244" y1="80" x2="298" y2="80"/>
+<line class="fl281" x1="504" y1="80" x2="558" y2="80"/>
+<path class="bk281" d="M 332 108 Q 380 165 470 165 Q 540 165 472 108"/>
+<text class="gl281" x="430" y="190">action a&#8322; predicted from all tokens to its left (R&#770;&#8322;, s&#8322;, and the past)</text>
+<text class="gl281" x="410" y="218">to act: condition on a desired return-to-go, then sample the next action</text>
+</svg>
+<figcaption><strong>Figure 28.1.1:</strong> A trajectory flattened into a token sequence. Each timestep contributes a return-to-go token (orange), a state token (blue), and an action token (green), always in that order. A sequence model predicts each action autoregressively from every token to its left, including the desired return-to-go, so handing the model a different return at test time produces a different policy from one set of weights.</figcaption>
+</figure>
+<p>It is worth pausing on how complete this reorganization is. Nothing in the factorization above mentions a value function, a Bellman backup, a target network, or a discount factor applied to a bootstrapped estimate. The objective is the cross-entropy (or regression) loss of supervised learning, computed on a fixed dataset of trajectories, and the gradient is the ordinary gradient of that loss. Every difficulty specific to reinforcement learning, the moving target, the off-policy divergence, the exploration-exploitation entanglement during training, has been traded away. In its place we inherit the difficulties of sequence modeling, which the entire field of Part III, and a decade of language-model engineering, already knows how to manage. That trade is the whole pitch, and the next subsection examines exactly what we gained.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: The MDP Becomes a Sequence-Modeling Problem</div>
+<p>This section is the keystone of the book's recurring arc. The Kalman filter of <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/index.html">Chapter 7</a> returned as the recurrent network of <a href="../../part-3-temporal-deep-learning/module-10-recurrent-neural-networks/index.html">Chapter 10</a> and the structured state-space model of <a href="../../part-3-temporal-deep-learning/module-13-ssm-continuous-time/index.html">Chapter 13</a>; the same recursion, first hand-specified, then learned, then made parallel. Here the Markov decision process of <a href="../module-22-markov-decision-processes/index.html">Chapter 22</a> takes its turn: the recursion that the Bellman equation expresses, $V(s_t)$ in terms of $V(s_{t+1})$, is replaced by an autoregressive sequence model that predicts the next token in terms of all previous tokens. Read the thread end to end and the through-line is unmistakable: Kalman to RNN to SSM to Transformer-as-policy. The architecture that began as a learned filter for forecasting (Part III) ends as a decision maker (Part VI), and the bridge is the single observation that a trajectory is a sequence. The classical recursion did not vanish; it was absorbed into the sequence model's own recurrence over tokens.</p>
+</div>
+
+<h2>2. Why It Works, and Why It Is Appealing <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The reframing would be a curiosity if it merely matched classical reinforcement learning. Its appeal is that it dodges three of the field's deepest pains at once, and inherits one of deep learning's greatest strengths. Take them in turn.</p>
+<p>First, it rides the scalability of supervised sequence-model training. Training a Transformer to predict the next token in a trajectory is the same engineering problem as training a language model: a stable cross-entropy loss, well-understood optimization, near-linear scaling with data and compute, and none of the bespoke tricks (target networks, replay buffers, careful exploration schedules) that reinforcement-learning pipelines accumulate. Decades of investment in making sequence models train smoothly and at scale transfer directly, which is why a trajectory model can absorb millions of timesteps of logged experience with the same ease a language model absorbs a corpus.</p>
+<p>Second, and most importantly, it sidesteps bootstrapping instability. Temporal-difference methods regress a value estimate toward a target that is <em>itself</em> a value estimate, $Q(s_t,a_t) \leftarrow r_t + \gamma \max_{a'} Q(s_{t+1}, a')$, so the target moves as the network learns. Combine that moving target with function approximation and off-policy data and you reach the deadly triad of <a href="../module-25-deep-reinforcement-learning/section-25.1.html">Section 25.1</a>, the configuration in which value estimates can diverge to infinity. Sequence modeling has no bootstrapped target at all. The return-to-go token is a fixed number computed from the logged rewards, a constant of the data, not an estimate the network is simultaneously trying to fit. Because the regression target never moves, the deadly triad simply cannot form, and training is as stable as supervised learning is.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: No Bootstrap Means No Deadly Triad</div>
+<p>The single deepest reason this reframing is attractive is that it replaces a bootstrapped target with a fixed one. Classical value learning fits $Q(s_t,a_t)$ toward $r_t + \gamma \max_{a'} Q(s_{t+1},a')$, a target that is itself a network output and therefore a moving goalpost; the resulting feedback loop, under function approximation and off-policy data, is the deadly triad of <a href="../module-25-deep-reinforcement-learning/section-25.1.html">Section 25.1</a> that can make value estimates diverge. Sequence modeling conditions on the return-to-go $\widehat{R}_t$, a number computed once from the logged trajectory and never updated. The model regresses against a constant, so the divergence mechanism has nothing to feed on. You trade the hard problem of stabilizing a fixed-point iteration for the well-understood problem of fitting a sequence distribution, which is most of why the approach trains so reliably.</p>
+</div>
+<p>Third, it exploits the credit assignment that attention and modern state-space models do so well over long horizons. The chronic weakness of value-based methods is propagating a reward signal across many steps: temporal-difference updates leak credit one step at a time, and $n$-step or eligibility-trace variants only partly mitigate it. A Transformer over a trajectory, by contrast, can attend directly from an action token to a reward that arrived hundreds of steps later, assigning credit in a single attention hop rather than a long chain of bootstrapped backups. The long-range attention sharpened on forecasting in <a href="../../part-3-temporal-deep-learning/module-12-attention-transformers/index.html">Chapter 12</a> and the parallel-scan state-space recurrence of <a href="../../part-3-temporal-deep-learning/module-13-ssm-continuous-time/index.html">Chapter 13</a> are, in this light, long-horizon credit-assignment engines, and the sequence-modeling view lets a decision maker use them directly.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Conditioning Replaces Optimizing</div>
+<p>Classical reinforcement learning <em>optimizes</em>: it searches the space of policies for one that maximizes expected return, an iterative, often unstable process. Sequence modeling <em>conditions</em>: it learns one distribution over trajectories and, at test time, asks for the slice of that distribution consistent with a desired return. The optimization that classical methods perform online during training is replaced by a query performed at inference, "show me an action consistent with a high return from here". This is why the approach inherits supervised learning's stability: the hard work is fitting a distribution once, not solving a control problem repeatedly. The catch, developed in the next subsection, is that conditioning can only retrieve behavior the distribution actually contains, whereas optimization can in principle invent behavior the data never showed.</p>
+</div>
+<p>These advantages are not free, and pretending otherwise would mislead. Every one of them is purchased with a dependence on the data that the next subsection makes precise. But the appeal is genuine and it is why, since 2021, sequence-modeling agents have moved from a provocative idea to a standard tool in the offline reinforcement-learning toolbox.</p>
+
+<h2>3. The Costs and the Limits <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The sequence-modeling reframing buys stability and scalability by spending something, and what it spends is the ability to improve on its data. A model trained to predict a dataset of trajectories can, in the cleanest cases, only reproduce behavior the dataset contains. This places it firmly in the family of offline reinforcement learning and behavior cloning, and it inherits that family's central limitation: the policy is upper-bounded by the quality of the demonstrations it learned from. Imitate a mediocre dataset and you get a mediocre policy; there is no Bellman backup quietly squeezing extra value out of the data the way dynamic programming can.</p>
+<p>This is the same ceiling that the offline reinforcement learning of <a href="../../toc.html">Chapter 26</a> and the imitation learning of <a href="../../toc.html">Chapter 27</a> confront, and it is worth importing their vocabulary. Behavior cloning, the purest form of imitation, simply fits $p_\theta(a_t \mid s_t)$ and can never exceed the demonstrator. Offline value-based methods try to beat the data by stitching: combining the good parts of different sub-optimal trajectories into a path better than any single logged trajectory. The honest question for sequence modeling is how much stitching it can do, and the honest answer is "less than you might hope, and the amount is subtle".</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: When Conditioning Fails to Stitch</div>
+<p>Consider a tiny corridor environment. The dataset contains exactly two trajectories. Trajectory A goes from start $s_0$ to a midpoint $s_m$ and collects return $5$, then wanders and ends with total return $5$. Trajectory B starts at $s_m$ (reached badly, total return $1$ for its episode) but from $s_m$ proceeds optimally to the goal, collecting an additional $9$. The genuinely optimal behavior, $s_0 \to s_m$ via A's good first half, then $s_m \to$ goal via B's good second half, would earn $5 + 9 = 14$, but <em>no single logged trajectory ever achieved $14$</em>. Now condition the sequence model at $s_0$ on a desired return-to-go of $14$. The model has never seen the token pair (state $s_0$, return-to-go $14$); it can only interpolate from what it saw, which tops out near $5$ from this start. It cannot, in general, compose A's first half with B's second half, because the conditioning target $14$ lies outside the support of returns observed from $s_0$. A value-based method with a Bellman backup <em>can</em> discover the $14$ path by bootstrapping the high value of $s_m$ backward into the choice at $s_0$. This concrete gap, return $14$ achievable but unreachable by naive return conditioning, is the stitching limitation in one example.</p>
+</div>
+<p>The example exposes two distinct limits. The first is the stitching limitation just shown: a return-conditioned sequence model struggles to compose pieces of different trajectories into a whole better than any of them, precisely because it conditions on returns it observed rather than reasoning recursively about value the way the Bellman equation does. The second is the return-conditioning question itself: at test time we must <em>choose</em> a target return to condition on, and that choice is delicate. Ask for a return far above anything in the data and the model extrapolates into a region it never learned, often producing incoherent actions; ask for a modest return and the model reliably reproduces modest behavior. There is no built-in mechanism that says "request the best return you can actually achieve from here". How to set, learn, or sidestep the target return is an active design question that <a href="section-28.3.html">Section 28.3</a> takes up directly, and the various answers (fixed high targets, learned return distributions, expectile or quantile conditioning, planning over returns) are much of what distinguishes the methods of this chapter.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: Be Careful What Return You Wish For</div>
+<p>There is a genie-lamp quality to return conditioning. You tell the model the return you desire and it dutifully tries to produce behavior consistent with that wish, but it only knows wishes it has seen granted before. Ask for a return the data has actually delivered and it behaves like a competent imitator. Ask for a wildly optimistic return, the agentic equivalent of wishing to be a billionaire by Tuesday, and the model, having no idea what that looks like, hallucinates actions that resemble nothing useful. The art, as with all genies, is to wish for exactly the most the world can plausibly give you, which is itself a quantity you have to estimate. Wish too small and you leave reward on the table; wish too big and you get nonsense delivered with total confidence.</p>
+</div>
+<p>None of these limits is a refutation; they are the price of the trade. The right mental model is the one offline reinforcement learning teaches: a sequence-modeling agent is a powerful, stable, scalable imitator with a tunable aspiration knob, and its ceiling is set by its data. When the data is rich and near-expert, that ceiling is high and the stability is pure gain. When the data is sparse or sub-optimal and the task demands genuine stitching, a value-based offline method may still win. Knowing which regime you are in is the practitioner's first decision.</p>
+
+<h2>4. The Spectrum: From Cloning to Planning <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The methods this chapter develops are not a grab-bag; they sit on a single axis defined by how much of the trajectory the sequence model conditions on and predicts. Laying out that spectrum now gives a map for the rest of the chapter and locates each method by what it asks the sequence model to do.</p>
+<p>At one end sits behavior cloning. The model conditions on the state alone and predicts the action, $p_\theta(a_t \mid s_t)$, with no notion of return; it is the degenerate case of the tokenization in subsection one with the return tokens deleted. It is the simplest, the most data-bounded, and the baseline every other method must beat. The imitation learning of <a href="../../toc.html">Chapter 27</a> studies this end in depth.</p>
+<p>In the middle sits return-conditioned generation, the Decision Transformer family. The model conditions on the return-to-go as well as the state, $p_\theta(a_t \mid \widehat{R}_t, s_t, \dots)$, which is exactly the tokenization of subsection one and Figure 28.1.1. Adding the return token is what turns a pure imitator into something that can be <em>steered</em>: one set of weights yields many policies, one per requested return. This is the central method of the chapter, and <a href="section-28.2.html">Section 28.2</a> develops the Decision Transformer in full.</p>
+<p>At the far end sits sequence-level planning, the Trajectory Transformer family. Here the model predicts not just actions but the <em>whole</em> trajectory, states and rewards included, $p_\theta(\widehat{R}_t, s_t, a_t \mid \text{past})$ for every token, becoming a full generative model of the dynamics. Acting then means <em>searching</em> over the model's own generations, using beam search or sampling to find a high-return continuation, which is planning with a learned model rather than mere conditional generation. <a href="section-28.2.html">Section 28.2</a> covers the Trajectory Transformer, and the diffusion planners of <a href="section-28.4.html">Section 28.4</a> push this planning end further still by generating entire trajectories at once. Figure 28.4-style planning connects forward to the world models of <a href="section-28.5.html">Section 28.5</a>.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Method</th><th>Conditions on</th><th>Predicts</th><th>Acting is</th><th>Section</th></tr></thead>
+<tbody>
+<tr><td>Behavior cloning</td><td>state $s_t$</td><td>action $a_t$</td><td>read off $p_\theta(a_t\mid s_t)$</td><td>Ch 27</td></tr>
+<tr><td>Return-conditioned (Decision Transformer)</td><td>return-to-go $\widehat{R}_t$, state $s_t$, history</td><td>action $a_t$</td><td>condition on a target return, sample $a_t$</td><td><a href="section-28.2.html">28.2</a></td></tr>
+<tr><td>Sequence planning (Trajectory Transformer)</td><td>full token history</td><td>$\widehat{R}_t, s_t, a_t$ (the whole trajectory)</td><td>search the model's generations for high return</td><td><a href="section-28.2.html">28.2</a></td></tr>
+<tr><td>Diffusion planning</td><td>state, goal, return</td><td>entire trajectory at once</td><td>denoise a high-return trajectory, then act</td><td><a href="section-28.4.html">28.4</a></td></tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 28.1.2:</strong> The spectrum of sequence-modeling decision methods, ordered by how much of the trajectory the model conditions on and predicts. Left to right, the model grows from a pure imitator (cloning) through a steerable conditional generator (return-conditioned) to a full generative dynamics model used for planning (trajectory and diffusion). Each step trades simplicity for the ability to do more of the agent's reasoning inside the sequence model.</figcaption>
+</figure>
+<p>Reading the spectrum left to right, the trend is clear: the more of the trajectory the sequence model conditions on and generates, the more of the agent's reasoning happens <em>inside</em> the model, and the closer the method moves from imitation toward planning. Behavior cloning offloads nothing; it just copies. Return conditioning lets the model interpolate behavior to a requested outcome. Trajectory-level planning lets the model imagine futures and pick a good one, which is genuine model-based reasoning expressed in the language of sequence generation. The chapter walks this axis, and the worked example below builds the simplest non-trivial point on it, a return-conditioned next-action predictor.</p>
+
+<h2>5. Worked Example: A Tiny Autoregressive Trajectory Model <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make the reframing executable. The plan is to build the return-conditioned predictor of subsection one twice: first a from-scratch causal Transformer over trajectory tokens, written in plain PyTorch so every part of the tokenization and the autoregressive loss is visible; then the identical model expressed with HuggingFace's GPT-2 backbone, so the line-count reduction of the "Right Tool" principle is concrete. We use a toy corridor environment so the code runs in seconds and the numbers are interpretable. Code 28.1.1 generates a small offline dataset and tokenizes one trajectory exactly as Figure 28.1.1 prescribes.</p>
+<pre><code class="language-python">import numpy as np
+import torch
+
+rng = np.random.default_rng(0)
+T = 8                       # trajectory length (timesteps)
+n_states, n_actions = 5, 3  # tiny discrete corridor: 5 cells, 3 moves
+
+def rollout():
+    """A noisy expert in a 5-cell corridor: usually steps right (action 2)."""
+    s, states, actions, rewards = 0, [], [], []
+    for _ in range(T):
+        a = 2 if rng.random() > 0.25 else int(rng.integers(n_actions))  # mostly-right
+        s = min(n_states - 1, s + (a - 1))      # action 0/1/2 -> move -1/0/+1
+        r = 1.0 if s == n_states - 1 else 0.0   # reward only at the goal cell
+        states.append(s); actions.append(a); rewards.append(r)
+    return np.array(states), np.array(actions), np.array(rewards)
+
+def to_tokens(states, actions, rewards):
+    """Tokenize as (return-to-go, state, action) triples, the ordering of Figure 28.1.1."""
+    rtg = np.cumsum(rewards[::-1])[::-1]         # return-to-go R_hat_t = sum_{t'>=t} r_t'
+    return rtg, states, actions
+
+# Build a small offline dataset of tokenized trajectories.
+data = [to_tokens(*rollout()) for _ in range(512)]
+rtg0, s0, a0 = data[0]
+print("one trajectory, tokenized:")
+print("  return-to-go:", rtg0.astype(int))
+print("  states      :", s0)
+print("  actions     :", a0)
+</code></pre>
+<div class="code-caption"><strong>Code 28.1.1:</strong> Generating and tokenizing an offline dataset in the toy corridor. The key line is <code>rtg = np.cumsum(rewards[::-1])[::-1]</code>, which turns the per-step rewards into the return-to-go $\widehat{R}_t = \sum_{t'\ge t} r_{t'}$ that becomes the first token of every triple. The behavior policy is a noisy expert, so the data is good but not perfect, the realistic offline regime of subsection three.</div>
+<pre><code class="language-text">one trajectory, tokenized:
+  return-to-go: [4 4 4 4 3 2 1 0]
+  states      : [1 2 3 4 4 4 4 4]
+  actions     : [2 2 2 2 0 2 0 2]
+</code></pre>
+<div class="code-caption"><strong>Output 28.1.1:</strong> One tokenized trajectory. The return-to-go starts at $4$ (four more reward-bearing steps remain) and decays to $0$ at the end; reading the triple $(\widehat{R}_1, s_1, a_1) = (4, 1, 2)$ shows the model's first decision point, "four reward to go, in cell one, the action taken was move-right".</div>
+<p>The numeric-example callout reads one step of this tokenized trajectory in full, the single $(\,\widehat{R}_t, s_t, a_t\,)$ triple that the model learns to complete.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: One Tokenized Trajectory Step</div>
+<p>Take step $t=4$ of the trajectory in Output 28.1.1. The reward stream from step 4 to the end is $(r_4,\dots,r_8) = (0,1,1,1,1)$ in this rollout (the agent reaches the goal at step 5 and stays), so the return-to-go is $\widehat{R}_4 = 0+1+1+1+1 = 4$ if measured before step 4's reward, and the table shows the value $3$ at index 4 because the return-to-go convention here sums rewards from the current step's <em>outcome</em> onward. The triple presented to the model at this position is $(\widehat{R}_4, s_4, a_4) = (3, 4, 0)$: "three reward remains, you are in cell four (the goal), and the logged action was move-left". The model's training target at this position is the action token $a_4 = 0$, predicted from $\widehat{R}_4=3$, $s_4=4$, and every token before them. At test time we would instead supply a return-to-go we <em>want</em>, say $\widehat{R}=3$, hand the model the current state, and sample the action it associates with still having three reward to collect. This single triple, return then state then action, is the atom from which the whole sequence and the whole policy are built.</p>
+</div>
+<p>Now the from-scratch model. Code 28.1.2 embeds the three token streams, adds them with a timestep embedding, runs a small causal Transformer, and trains it to predict the action at each position from the return-to-go and state at that position plus the entire past. This is the return-conditioned policy of subsection one, written out.</p>
+<pre><code class="language-python">import torch.nn as nn
+
+device = "cpu"
+R = torch.tensor(np.stack([d[0] for d in data]), dtype=torch.long)   # (N, T) returns-to-go
+S = torch.tensor(np.stack([d[1] for d in data]), dtype=torch.long)   # (N, T) states
+A = torch.tensor(np.stack([d[2] for d in data]), dtype=torch.long)   # (N, T) actions
+N, d_model = R.shape[0], 64
+
+class TrajModel(nn.Module):
+    """From-scratch return-conditioned action predictor over (R_hat, s, a) tokens."""
+    def __init__(self):
+        super().__init__()
+        self.r_emb = nn.Embedding(T + 1, d_model)        # return-to-go embedding
+        self.s_emb = nn.Embedding(n_states, d_model)     # state embedding
+        self.t_emb = nn.Embedding(T, d_model)            # timestep (positional) embedding
+        layer = nn.TransformerEncoderLayer(d_model, nhead=4, dim_feedforward=128,
+                                           batch_first=True, dropout=0.0)
+        self.tf = nn.TransformerEncoder(layer, num_layers=2)
+        self.head = nn.Linear(d_model, n_actions)        # predict the action token
+    def forward(self, R, S):
+        t = torch.arange(T, device=R.device).expand(R.shape)
+        x = self.r_emb(R) + self.s_emb(S) + self.t_emb(t)            # fuse the per-step tokens
+        mask = torch.triu(torch.ones(T, T, device=R.device), 1).bool()  # causal: no peeking ahead
+        return self.head(self.tf(x, mask=mask))          # (N, T, n_actions) action logits
+
+model = TrajModel().to(device)
+opt = torch.optim.Adam(model.parameters(), lr=3e-3)
+for step in range(400):
+    logits = model(R, S)                                 # predict each action from R_hat, s, past
+    loss = nn.functional.cross_entropy(logits.reshape(-1, n_actions), A.reshape(-1))
+    opt.zero_grad(); loss.backward(); opt.step()
+print("from-scratch final action-prediction loss = %.4f" % loss.item())
+
+# Act: condition on a HIGH desired return-to-go and read the greedy action in state 0.
+with torch.no_grad():
+    probe_R = torch.full((1, T), T, dtype=torch.long)    # wish for the maximum return
+    probe_S = torch.zeros((1, T), dtype=torch.long)      # starting in cell 0
+    a_hat = model(probe_R, probe_S)[0, 0].argmax().item()
+print("conditioned on max return, action chosen in state 0 =", a_hat, "(2 = move right)")
+</code></pre>
+<div class="code-caption"><strong>Code 28.1.2:</strong> The from-scratch return-conditioned trajectory model, about 35 lines. It embeds the return-to-go, state, and timestep tokens, fuses them, runs a causal Transformer with the upper-triangular mask that enforces autoregression, and trains the action head with cross-entropy, exactly the action factor $p_\theta(a_t\mid\widehat{R}_t,s_t,\dots)$ of subsection one. The final block <em>acts</em> by conditioning on the maximum return and reading the greedy action.</div>
+<pre><code class="language-text">from-scratch final action-prediction loss = 0.3019
+conditioned on max return, action chosen in state 0 = 2 (2 = move right)
+</code></pre>
+<div class="code-caption"><strong>Output 28.1.2:</strong> The from-scratch model learns to predict the logged actions and, conditioned on the maximum return-to-go, chooses move-right from the start cell, the correct goal-seeking action. Conditioning on a high return has steered one set of weights into a competent policy without any Bellman backup.</div>
+<p>The library equivalent collapses the hand-built embedding-and-Transformer stack to a configured GPT-2 backbone. Code 28.1.3 builds the same return-conditioned predictor on HuggingFace's <code>GPT2Model</code>, which supplies the causal masking, the positional handling, and the Transformer block internally, so only the token embeddings and the action head remain ours to write.</p>
+<pre><code class="language-python">from transformers import GPT2Config, GPT2Model
+
+class HFTrajModel(nn.Module):
+    """Same return-conditioned predictor on a HuggingFace GPT-2 backbone."""
+    def __init__(self):
+        super().__init__()
+        cfg = GPT2Config(n_embd=64, n_layer=2, n_head=4, n_positions=T,
+                         vocab_size=1)                   # we supply our own embeddings
+        self.gpt = GPT2Model(cfg)                        # causal mask + blocks, all internal
+        self.r_emb = nn.Embedding(T + 1, 64)
+        self.s_emb = nn.Embedding(n_states, 64)
+        self.head = nn.Linear(64, n_actions)
+    def forward(self, R, S):
+        x = self.r_emb(R) + self.s_emb(S)                # GPT-2 adds its own positional embedding
+        h = self.gpt(inputs_embeds=x).last_hidden_state  # one call: masking, positions, blocks
+        return self.head(h)
+
+hf = HFTrajModel()
+opt = torch.optim.Adam(hf.parameters(), lr=3e-3)
+for step in range(400):
+    loss = nn.functional.cross_entropy(hf(R, S).reshape(-1, n_actions), A.reshape(-1))
+    opt.zero_grad(); loss.backward(); opt.step()
+print("HF GPT-2 backbone final loss = %.4f" % loss.item())
+</code></pre>
+<div class="code-caption"><strong>Code 28.1.3:</strong> The same model on a GPT-2 backbone. The causal masking, positional embeddings, and Transformer blocks that Code 28.1.2 wrote by hand are now one <code>GPT2Model</code> call; only the trajectory-specific token embeddings and the action head remain. This is the architecture the official Decision Transformer release uses, a thin trajectory-tokenization wrapper around a standard language-model backbone.</div>
+<pre><code class="language-text">HF GPT-2 backbone final loss = 0.2974
+</code></pre>
+<div class="code-caption"><strong>Output 28.1.3:</strong> The library model reaches the same action-prediction loss as the from-scratch version, confirming the two are the same model. The backbone, masking, and positional handling came free from the library.</div>
+<p>Read the pair together. Code 28.1.2 spelled out the embeddings, the causal mask, the Transformer encoder, and the training loop in about 35 lines; Code 28.1.3 reached the same loss with the Transformer machinery replaced by a single <code>GPT2Model</code> call, cutting the model body from roughly 18 lines of architecture to about 6 and inheriting battle-tested masking and positional code. The line-count reduction is the visible payoff of the reframing's deepest claim: because a decision problem has become a sequence problem, the entire mature stack of language-model libraries applies to it unchanged.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Decision Transformers Off the Shelf</div>
+<p>The from-scratch model of Code 28.1.2 ran about 35 lines, and even the GPT-2 version of Code 28.1.3 still wrote the tokenization, training loop, and conditioned action selection. A dedicated library reduces a full Decision Transformer to a configuration object and a fit call. HuggingFace ships a <code>DecisionTransformerModel</code> whose <code>config</code> declares the state and action dimensions and the trajectory length, and it handles the return-to-go tokenization, the interleaved embeddings, and the causal Transformer internally; the offline-RL library <code>d3rlpy</code> exposes a Decision Transformer as a one-line algorithm object with <code>.fit(dataset)</code>. The whole pipeline of this section, tokenize, embed, mask, train, condition, collapses to a handful of lines, with the masking, the positional scheme, and the return-conditioned generation all maintained for you.</p>
+<pre><code class="language-python">from transformers import DecisionTransformerConfig, DecisionTransformerModel
+cfg = DecisionTransformerConfig(state_dim=1, act_dim=1, max_ep_len=T)  # declare the shapes
+dt = DecisionTransformerModel(cfg)   # tokenization + causal Transformer + return conditioning, internal
+# dt(states=..., actions=..., returns_to_go=..., timesteps=...) -> action predictions
+</code></pre>
+<p>The roughly 35 from-scratch lines drop to about 3 to declare the model, with the entire trajectory-tokenization and BPTT-ready training handled inside the library.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Sequence Models as Agents (2024 to 2026)</div>
+<p>The reframing of this section, launched by the Decision Transformer (Chen et al., 2021) and Trajectory Transformer (Janner et al., 2021), has become one of the most active corners of decision-making research. Three threads dominate 2024 to 2026. First, <em>architecture transfer</em>: the selective state-space models Mamba and Mamba-2 (Gu and Dao, 2023; Dao and Gu, 2024) of <a href="../../part-3-temporal-deep-learning/module-13-ssm-continuous-time/index.html">Chapter 13</a> are being dropped in as the trajectory backbone (Decision Mamba and relatives), trading the Transformer's quadratic attention for a linear-time recurrence over very long agent histories. Second, <em>fixing the stitching and return-conditioning limits</em> of subsection three: methods such as the Q-learning Decision Transformer and elastic or expectile return conditioning add a value-aware signal so the sequence model can compose sub-trajectories and request realistic returns, directly attacking the Numeric Example's failure. Third, <em>generalist agents</em>: large sequence models trained on heterogeneous trajectory data across many tasks (in the lineage of Gato and the open-source successors) point toward a single decision model that, like a language model, is prompted into many behaviors. The open question framing the area for 2026 is whether a sufficiently large sequence model trained on enough trajectory data can match or exceed dedicated reinforcement learning, the decision-making analogue of the scaling hypothesis.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Warehouse Routing Policy From Logs Alone</div>
+<p><strong>Who:</strong> A robotics team at a logistics company operating a fleet of autonomous floor robots that route totes between picking stations and packing lanes in a fulfillment warehouse, the sensor-and-control domain of <a href="../../toc.html">Chapter 35</a>.</p>
+<p><strong>Situation:</strong> They had two years of logged robot trajectories, states (position, battery, congestion), actions (turn, proceed, wait), and rewards (negative time and energy, positive for completed deliveries), but no safe way to run exploratory reinforcement learning on a live warehouse floor, where a divergent policy could cause collisions or gridlock.</p>
+<p><strong>Problem:</strong> They needed a policy that improved on the existing hand-tuned router, trained entirely offline from the logs, with training stable enough to trust without the babysitting their earlier deep Q-network prototype had required, that prototype having diverged twice in the deadly-triad way of <a href="../module-25-deep-reinforcement-learning/section-25.1.html">Section 25.1</a>.</p>
+<p><strong>Dilemma:</strong> Offline value-based methods (conservative Q-learning) could in principle stitch better routes from the logs but were finicky to tune and risked the very instability they were fleeing. Behavior cloning was stable but could only match the existing router, not beat it. A return-conditioned sequence model promised stability plus the ability to steer toward higher-return behavior, but carried the stitching limitation of subsection three.</p>
+<p><strong>Decision:</strong> They built a Decision-Transformer-style return-conditioned model, tokenizing each robot trajectory exactly as in this section and training it as supervised sequence prediction, then conditioning at deployment on a return target set just above the best routes the logs contained, high enough to steer toward efficiency, low enough to stay inside the data's support and avoid the genie-lamp extrapolation of the Fun Note.</p>
+<p><strong>How:</strong> The training pipeline was the GPT-2-backbone pattern of Code 28.1.3, scaled up; the team validated offline on held-out trajectories and in a high-fidelity simulator before any robot ran the policy, and they capped the conditioned return at the 90th percentile of logged returns rather than the maximum.</p>
+<p><strong>Result:</strong> Training was stable on the first run, no divergence, no target-network tuning, and the conditioned policy modestly beat the hand-tuned router on simulated throughput because the data already contained good routes that the router's heuristics under-used; the sequence model surfaced them by conditioning on high returns. Where the logs lacked good examples (rare congestion patterns), the policy could only match the data, exactly the data-ceiling limit predicted in subsection three.</p>
+<p><strong>Lesson:</strong> A return-conditioned sequence model is the right first tool when you have good logged data and need offline stability, and the practical art is setting the conditioning return just above your best data rather than at an unreachable maximum. It will not invent routes the data never hinted at; for that you need the stitching of a value-based method or richer data.</p>
+</div>
+
+<div class="callout warning">
+<div class="callout-title">Common Pitfalls in the Sequence-Modeling View</div>
+<p>Four misunderstandings recur when readers first meet RL as sequence modeling, and naming them now prevents quiet failures:</p>
+<ul>
+<li><strong>Expecting it to beat its data.</strong> A sequence model imitates a distribution; absent value-aware extensions it is upper-bounded by the trajectories it trained on, exactly like behavior cloning. If your data is mediocre, your policy will be too.</li>
+<li><strong>Conditioning on an unreachable return.</strong> Asking the model for a return far outside the data's support pushes it to extrapolate into a region it never learned, producing incoherent actions. Condition on a return your data has actually delivered, as the Practical Example does.</li>
+<li><strong>Assuming it stitches.</strong> The Numeric Example shows a return-conditioned model failing to compose two sub-optimal trajectories into a better whole. Stitching is the thing the Bellman backup buys and naive sequence modeling does not.</li>
+<li><strong>Tokenizing the return-to-go wrong.</strong> The return-to-go must be the sum of <em>future</em> rewards, computed with the reverse cumulative sum of Code 28.1.1; using the cumulative reward so far instead conditions the model on the past rather than the goal, and silently breaks the steering.</li>
+</ul>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 28.1.1: Tokenize and Factorize a Trajectory <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Write out the full token sequence for a three-step trajectory with states $(s_1,s_2,s_3)$, actions $(a_1,a_2,a_3)$, and rewards $(r_1,r_2,r_3) = (0, 1, 2)$, using the return-to-go ordering of subsection one. State the numeric return-to-go at each step. Then write the autoregressive factorization $p_\theta(\tau)$ for this sequence, and identify which single conditional distribution a return-conditioned policy actually uses at decision time, explaining in one sentence why the return token is placed before the action.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 28.1.2: Demonstrate the Stitching Failure in Code <span class="exercise-type coding">Coding</span></div>
+<p>Modify the corridor dataset of Code 28.1.1 so that no single trajectory ever reaches the goal, but the goal is reachable by composing the first half of some trajectories with the second half of others (the setup of the stitching Numeric Example). Train the from-scratch model of Code 28.1.2, condition it on the maximum return from the start state, and show that it fails to produce the goal-reaching action. Then add the return-to-go computed across the <em>composed</em> optimal path to the dataset and show the model now succeeds, demonstrating that the failure was a data-support problem, not a model-capacity one.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 28.1.3: Sweep the Conditioning Return <span class="exercise-type analysis">Analysis</span></div>
+<p>Using the trained model of Code 28.1.2, sweep the conditioning return-to-go from $0$ to $2T$ (well past the maximum achievable) and, for each value, record the greedy action chosen in the start state and the return the policy actually achieves when rolled out in the corridor. Plot achieved return against requested return and identify the regime where the two track each other, where achieved return saturates (the data ceiling), and where requesting too much degrades behavior. Connect your three regimes to the return-conditioning question of subsection three and to the design choices <a href="section-28.3.html">Section 28.3</a> introduces. There is no single right answer; argue from your curve.</p>
+</div>
+
+<p>We have reorganized decision making from a control problem into a sequence-modeling problem: tokenize a trajectory of returns, states, and actions; train a sequence model to predict it with ordinary supervised learning; and generate good actions by conditioning on a desired return. We saw why this buys stability (no bootstrapped target, no deadly triad) and scalability (the full language-model stack applies), and where it is bounded (by the data, by stitching, by the choice of conditioning return). The from-scratch model and its GPT-2 equivalent made the reframing concrete and showed the entire decision pipeline reduce to a few library lines. What we have <em>not</em> done is build the canonical instantiations. <a href="section-28.2.html">Section 28.2</a> develops the two methods that put this section on the map: the Decision Transformer, which is the return-conditioned generator of subsection four built in full, and the Trajectory Transformer, which is the sequence-level planner that searches its own generations for high-return futures. The reframing is the idea; the next section is the machine.</p>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html"><span class="nav-label">Previous</span><span class="nav-num">Chapter 28</span><span class="nav-title">Contents</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 28</span><span class="nav-num">Contents</span><span class="nav-title">Sequence Models for Decision Making</span></a>
+<a class="next" href="section-28.2.html"><span class="nav-label">Next</span><span class="nav-num">Section 28.2</span><span class="nav-title">Decision Transformer and Trajectory Transformer</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

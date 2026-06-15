@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 29.4: Planning in Latent Space (MuZero-style search). Monte Carlo Tree Search over a learned latent dynamics model, the AlphaZero to MuZero progression where the model used for search is itself learned, PUCT selection with a policy prior, the representation/dynamics/prediction functions, Sampled MuZero and EfficientZero, and a from-scratch UCT MCTS matched against a reference library implementation." name="description"/>
+<title>Section 29.4: Planning in Latent Space (MuZero-style search) | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Sequential Decision Making</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 29: World Models and Planning</a></div>
+<h1>Planning in Latent Space (MuZero-style search)</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"Before I move a single piece I have already lived a thousand games that never happened. I imagine, I imagine the reply, I imagine the reply to the reply, and somewhere in that forest of futures I find the one branch worth walking. Then I forget all of it and make one move. The opponent sees a single decision; I saw an entire afternoon of dreaming."</p>
+<cite>A Search Tree Imagining a Thousand Futures Before Moving Once</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A reactive policy answers "what should I do now?" with a single forward pass; a planner answers it by imagining many futures and backing up what it learned. Monte Carlo Tree Search (MCTS) is the planner behind AlphaGo, AlphaZero, and MuZero: it grows a tree of imagined trajectories, biases its growth toward promising moves with a policy prior and an exploration bonus, evaluates leaves with a learned value network instead of random rollouts, and averages the results back up the tree into refined action values. The decisive leap from AlphaZero to MuZero is that MuZero does not need the rules: where AlphaZero searched a given simulator (the laws of Go, chess, shogi), MuZero LEARNS the model it searches, a latent representation, dynamics, and prediction triple trained end-to-end so that planning in latent space reproduces the right values and policies even though the latent state has no human-readable meaning.</strong> This section builds MCTS from the selection rule (PUCT, full KaTeX) through expansion, value-network evaluation, and backup; explains MuZero's three learned functions and why latent planning works without ground-truth states; situates Sampled MuZero and EfficientZero for continuous actions and sample efficiency; and weighs the central trade, search is powerful but compute-heavy, against when a reactive policy or a model-predictive controller is the better tool. The worked example implements UCT MCTS from scratch on a small learned model, shows the search improving on the raw policy, then collapses it to a reference library call. You leave able to read a MuZero search, implement the tree, and decide when planning earns its cost.</p>
+</div>
+<p>In <a href="section-29.1.html">Section 29.1</a> we built the idea of a learned world model: a network that, given a compressed state, predicts how that state evolves and what reward follows, so the agent can roll the future forward in its head rather than in the environment. In <a href="section-29.3.html">Section 29.3</a> we used such a model to train a policy by imagination. This section asks the complementary question: given a learned model, how do we use it to <em>plan</em> at decision time, searching over imagined trajectories to pick a better action than any single network evaluation would give? The answer is Monte Carlo Tree Search married to a learned latent model, the algorithm at the heart of MuZero. We use the unified notation of <a href="../../toc.html">Appendix A</a> throughout: $s_t$ the (latent) state, $a_t$ the action, $r_t$ the reward, $v$ a value estimate, $p(a\mid s)$ a policy prior, $Q(s,a)$ an action value, $\gamma$ the discount.</p>
+<p>Why give planning its own section when <a href="../../part-6-sequential-decision-making/module-25-deep-reinforcement-learning/index.html">Chapter 25</a> already trained policies that act well in one forward pass? Because a reactive policy is a compiled answer: fast, but only as good as what training compressed into its weights, and blind to the specific position in front of it. A planner spends compute <em>at decision time</em> to look ahead from exactly this state, and that look-ahead can correct the policy's mistakes, exploit a tactical shot the policy never learned, and turn a mediocre prior into a strong move. The price is real compute per decision. Knowing when that trade pays, and how the search machinery works so you can build and debug it, is a load-bearing skill for the world-model agents of <a href="../../toc.html">Chapter 31</a>.</p>
+<p>The competencies this section installs are four: to run MCTS by hand, the selection, expansion, evaluation, backup loop, and to write the PUCT selection rule and explain each term; to describe MuZero's representation, dynamics, and prediction functions and why planning in a learned latent space yields correct values without ground-truth states; to place Sampled MuZero and EfficientZero in the design space of continuous actions and sample efficiency; and to decide when search beats a reactive policy or a model-predictive controller. These carry directly into the planning agents of Part VII.</p>
+
+<h2>1. Planning With a Learned Model: From AlphaZero to MuZero <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The oldest idea in game-playing AI is look-ahead: do not trust a static evaluation of the current position, simulate plausible continuations and choose the move that leads to the best outcome under that simulation. Classical minimax did this exhaustively over a small horizon; Monte Carlo Tree Search does it selectively, spending its simulation budget on the branches that look most promising and ignoring the rest. The reason MCTS scales where minimax does not is that it never enumerates the whole tree: it grows the tree one simulated trajectory at a time, always descending toward the move that currently looks best while reserving some budget to probe moves it is uncertain about, so the tree deepens along good lines and stays shallow along bad ones.</p>
+<p>AlphaGo and then AlphaZero fused MCTS with two neural networks. A <em>policy network</em> proposes a prior distribution over moves, $p(a\mid s)$, telling the search which branches are worth exploring first; a <em>value network</em> estimates the expected outcome from a position, $v(s)$, replacing the slow and noisy random rollouts of classical MCTS with a single learned evaluation. The search uses the prior to bias selection and the value net to evaluate leaves, then the improved move distribution the search produces becomes a training target for the policy network, a self-improvement loop that needs no human games. Crucially, AlphaZero searched a <em>given</em> simulator: it was handed the exact rules of Go, chess, and shogi, so from any state it could ask the environment "what is the next state if I play this move?" and get a perfect answer for free.</p>
+<p>MuZero (Schrittwieser et al., 2020) removed that crutch. In most interesting problems, robotics, control, Atari from pixels, financial decision-making, you do not have a perfect simulator to search. MuZero's insight is that you do not need one: <em>learn</em> the model used for search. MuZero trains three functions jointly so that unrolling them in a learned latent space reproduces the quantities the search needs, namely the reward, the value, and the policy, even though the latent state is an arbitrary vector with no obligation to resemble the true environment state. The model is trained for one purpose only: to make planning come out right. This is the precise sense in which MuZero plans in latent space, and it is the bridge between the learned world model of <a href="section-29.1.html">Section 29.1</a> and the search of this section.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: MuZero Searches a Model It Learned, Not Rules It Was Given</div>
+<p>AlphaZero and MuZero run the same MCTS with the same policy prior and value net. The single difference, and it is a large one, is the source of the dynamics the search unrolls. AlphaZero is handed the environment's rules and searches the true next-state function. MuZero is handed nothing and <em>learns</em> a latent dynamics function whose only job is to make the search's predicted rewards, values, and policies match reality. The latent state MuZero plans over need not, and generally does not, decode back to the real state: it is a planning-optimised representation, not a reconstruction. That is what lets the same algorithm that mastered the rules of Go also master Atari games whose rules it was never told.</p>
+</div>
+
+<h2>2. The MCTS Algorithm: Selection, Expansion, Evaluation, Backup <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>One MCTS <em>simulation</em> walks from the root to a leaf, adds a node, evaluates it, and propagates the result back. The search runs $N$ such simulations (a few hundred is typical for board games, tens to a few hundred for MuZero), then acts from the root. The four phases of a single simulation are these.</p>
+<p><strong>Selection.</strong> Starting at the root, repeatedly choose a child according to a rule that balances exploitation (go where value is high) against exploration (go where the prior is high but the visit count is low), until reaching a node with an unexpanded action. AlphaZero and MuZero use the PUCT (Polynomial Upper Confidence Trees) rule. The action chosen at state $s$ is</p>
+$$a^\star \;=\; \arg\max_{a}\;\Big[\, Q(s,a) \;+\; c_{\text{puct}}\,p(a\mid s)\,\frac{\sqrt{\textstyle\sum_b N(s,b)}}{1 + N(s,a)} \,\Big],$$
+<p>where $Q(s,a)$ is the mean backed-up value of taking $a$ from $s$, $p(a\mid s)$ is the policy-network prior, $N(s,a)$ is the visit count of that edge, $\sum_b N(s,b)$ is the total visits of the parent, and $c_{\text{puct}}$ controls exploration strength. The exploration term is large when the prior is high and the edge has been visited little, and it decays as $N(s,a)$ grows, so the search probes promising-but-untried moves early and concentrates on high-value moves as evidence accumulates. PUCT generalises the classic UCT rule, whose exploration bonus is the prior-free $c\,\sqrt{\ln \sum_b N(s,b) \,/\, N(s,a)}$; UCT is what we implement from scratch in subsection five, PUCT is what MuZero uses to fold in the policy prior.</p>
+<p><strong>Expansion.</strong> When selection reaches an edge whose child does not yet exist, create it. In MuZero, the new latent state is produced by the dynamics function applied to the parent latent state and the chosen action, $s' = g_\theta(s, a)$, which also emits the predicted reward $r$; the prediction function $f_\theta(s')$ then supplies the prior $p(\cdot\mid s')$ and value $v(s')$ used at the new node.</p>
+<p><strong>Evaluation.</strong> Estimate the value of the new leaf. Classical MCTS played random moves to the end of the game (a rollout) and used the outcome; AlphaZero and MuZero replace that entirely with the value network's single estimate $v(s')$, which is faster and far less noisy. This is the step where the learned value net does the heavy lifting that random rollouts once did.</p>
+<p><strong>Backup.</strong> Propagate the leaf value back up the path taken, updating every edge's statistics. Each visited edge $(s,a)$ increments its count and folds the new return into its mean value:</p>
+$$N(s,a) \leftarrow N(s,a) + 1, \qquad Q(s,a) \leftarrow Q(s,a) + \frac{G - Q(s,a)}{N(s,a)},$$
+<p>where $G$ is the discounted return accumulated along the path from $(s,a)$ to the leaf, $G = \sum_{k} \gamma^{k} r_{k} + \gamma^{d} v(s_{\text{leaf}})$ for a leaf at depth $d$ below the edge. After $N$ simulations the search acts from the root by sampling or taking the argmax of the visit counts, $\pi(a\mid s_{\text{root}}) \propto N(s_{\text{root}}, a)^{1/\tau}$, with temperature $\tau$ controlling exploration during self-play. The visit distribution, not the raw policy prior, is the search's improved recommendation, and it is the policy-network training target that closes MuZero's learning loop.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 290" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="One MCTS simulation shown as four phases left to right: selection descends the tree by PUCT, expansion adds a new leaf node via the dynamics function, evaluation scores the leaf with the value network, and backup propagates the value up the path updating visit counts and Q values.">
+<defs>
+<marker id="arr294" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+<marker id="arrU294" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b8431f"/></marker>
+</defs>
+<style>
+.nd294 { fill:#eef3f8; stroke:#14385c; stroke-width:2; }
+.lf294 { fill:#eaf6ee; stroke:#1f7a44; stroke-width:2; }
+.dn294 { stroke:#5a626c; stroke-width:1.8; fill:none; marker-end:url(#arr294); }
+.up294 { stroke:#b8431f; stroke-width:1.8; fill:none; marker-end:url(#arrU294); stroke-dasharray:5 4; }
+.t294 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s294 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.g294 { font:600 12px sans-serif; fill:#b8431f; text-anchor:middle; }
+</style>
+<text class="t294" x="410" y="22">One simulation: select (gray) to a leaf, expand and evaluate (green), back up (orange)</text>
+<circle class="nd294" cx="200" cy="70" r="22"/><text class="t294" x="200" y="75">root</text>
+<circle class="nd294" cx="130" cy="150" r="20"/><text class="s294" x="130" y="155">A</text>
+<circle class="nd294" cx="270" cy="150" r="20"/><text class="s294" x="270" y="155">B</text>
+<circle class="nd294" cx="320" cy="225" r="20"/><text class="s294" x="320" y="230">C</text>
+<circle class="lf294" cx="400" cy="225" r="22"/><text class="s294" x="400" y="222">new</text><text class="s294" x="400" y="236">leaf</text>
+<line class="dn294" x1="184" y1="86" x2="142" y2="134"/>
+<line class="dn294" x1="216" y1="86" x2="256" y2="134"/><text class="s294" x="248" y="108">PUCT</text>
+<line class="dn294" x1="282" y1="166" x2="308" y2="206"/>
+<line class="dn294" x1="338" y1="232" x2="376" y2="228"/><text class="s294" x="358" y="252">expand g(s,a)</text>
+<line class="up294" x1="378" y1="216" x2="332" y2="216"/>
+<line class="up294" x1="306" y1="208" x2="280" y2="168"/>
+<line class="up294" x1="258" y1="166" x2="216" y2="88"/>
+<text class="g294" x="470" y="180">G = &#931; &#947;&#7503; r&#7480; + &#947;&#7496; v(leaf)</text>
+<rect x="560" y="60" width="240" height="170" rx="10" fill="#f7f9fc" stroke="#c7d2de" stroke-width="1.4"/>
+<text class="t294" x="680" y="86">value net evaluates leaf</text>
+<text class="s294" x="680" y="112">v(leaf) replaces random rollout</text>
+<text class="s294" x="680" y="140">backup updates N(s,a), Q(s,a)</text>
+<text class="s294" x="680" y="168">act &#8733; visit counts N(root, a)</text>
+<text class="s294" x="680" y="200">repeat N simulations from root</text>
+</svg>
+<figcaption><strong>Figure 29.4.1:</strong> One MCTS simulation. Selection descends from the root by PUCT (gray) to an edge with no child; expansion adds the leaf via the dynamics function $g_\theta(s,a)$; the value network evaluates the leaf, supplying $v(\text{leaf})$ in place of a random rollout; backup (dashed orange) folds the discounted return $G$ into the visit count and mean value of every edge on the path. After $N$ simulations the agent acts in proportion to the root visit counts.</figcaption>
+</figure>
+<p>Read the four phases as a single economy of information. Selection spends the search's accumulated knowledge ($Q$ and $N$) to find the most informative place to look next; expansion and evaluation buy one new piece of knowledge (a value estimate at a previously unseen node); backup distributes that purchase along the whole path so the next simulation selects better. The policy prior steers the very first visits, when $Q$ is still empty, and the value net makes each leaf evaluation cheap and low-variance. Take either network away and the search still runs, just worse: drop the prior and early exploration is blind; drop the value net and you are back to noisy rollouts.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: One PUCT Score by Hand</div>
+<p>Consider a root with three legal actions and these statistics after some simulations: action $a_1$ has prior $p_1 = 0.6$, visit count $N_1 = 8$, mean value $Q_1 = 0.30$; the parent total visits are $\sum_b N(s,b) = 10$, so $\sqrt{\sum_b N} = \sqrt{10} \approx 3.162$. With $c_{\text{puct}} = 1.25$, the exploration bonus for $a_1$ is $c_{\text{puct}}\,p_1\,\frac{\sqrt{\sum_b N}}{1 + N_1} = 1.25 \cdot 0.60 \cdot \frac{3.162}{1 + 8} = 1.25 \cdot 0.60 \cdot 0.3514 = 0.2635$. Its PUCT score is therefore $Q_1 + 0.2635 = 0.30 + 0.2635 = 0.5635$. Now a rarely tried action $a_2$ with prior $p_2 = 0.3$, count $N_2 = 1$, and mean value $Q_2 = 0.20$ scores $0.20 + 1.25 \cdot 0.30 \cdot \frac{3.162}{2} = 0.20 + 0.5929 = 0.7929$. Despite its lower $Q$, $a_2$ wins this selection: its larger bonus (high prior, low count) pulls the search toward the under-explored branch. As $N_2$ grows on future visits, that bonus shrinks and selection will swing back toward whichever action holds the higher $Q$. This single comparison is the entire exploration-exploitation logic of the tree, computed once.</p>
+</div>
+
+<h2>3. MuZero's Learned Latent Model: Representation, Dynamics, Prediction <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>MuZero's model is three networks, trained jointly so that planning over them is correct. The <em>representation</em> function $h_\theta$ encodes the observed history (the raw observations, frames, or features) into an initial latent root state, $s^0 = h_\theta(o_1, \dots, o_t)$. The <em>dynamics</em> function $g_\theta$ takes a latent state and an action and produces the next latent state together with a predicted reward, $(s^{k}, r^{k}) = g_\theta(s^{k-1}, a^{k})$, where the superscript $k$ indexes depth inside the search tree, not real time. The <em>prediction</em> function $f_\theta$ reads a latent state and emits a policy prior and a value, $(p^{k}, v^{k}) = f_\theta(s^{k})$. Unrolling $g_\theta$ from the root $s^0$ along any sequence of actions gives a trajectory of latent states the search can evaluate entirely in its head, exactly the learned world model of <a href="section-29.1.html">Section 29.1</a> repurposed as a search substrate.</p>
+<div class="callout looking-back">
+<div class="callout-title">Looking Back: The World Model of 29.1 Becomes a Search Engine</div>
+<p><a href="section-29.1.html">Section 29.1</a> built a latent world model to roll the future forward for imagination-based learning: encode the present, predict the next latent state and reward, repeat. MuZero takes that same representation-plus-dynamics machine and points it at a different consumer. Instead of rolling out one imagined trajectory to train a policy, it unrolls many short trajectories inside an MCTS tree to plan a single decision. The dynamics function $g_\theta$ that 29.1 trained to predict the future is, bit for bit, the dynamics function the tree expands with in subsection two. The world model and the planner are the same object seen from two angles: one dreams to learn, the other dreams to decide.</p>
+</div>
+<p>The subtle and initially uncomfortable point is that these latent states carry no obligation to reconstruct anything. MuZero never asks $s^k$ to decode back into a frame or a board position; there is no reconstruction loss. The model is trained purely on three planning-relevant signals, matched at every unroll depth $k$ to quantities observed in real played trajectories: the predicted reward $r^k$ is regressed to the true reward, the predicted value $v^k$ is regressed to an $n$-step bootstrapped return target, and the predicted policy $p^k$ is regressed to the MCTS visit distribution that the search itself produced at that real step. Because every one of those targets is a quantity the search consumes, the latent state is shaped to make the search correct and nothing else. A latent that perfectly reconstructs the world but mispredicts value is useless to MuZero; a latent that is an inscrutable vector but yields exact values and policies is exactly what it wants. This is why "planning in latent space" is not a compromise but the design: the space is built for planning.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Model Is Trained to Plan Well, Not to Reconstruct</div>
+<p>The standard intuition for a world model is "predict the next observation". MuZero deliberately abandons that. Its three losses are on reward, value, and policy, the three things a search tree actually reads, and on nothing else. The latent dynamics are value-equivalent to the real environment in the sense of Grimm et al. (2020): two models that produce the same values under the same plans are interchangeable for planning, regardless of whether either reconstructs the state. Freeing the model from reconstruction is what lets MuZero ignore visually complex but decision-irrelevant detail (background pixels, cosmetic noise) and spend its capacity on what changes the outcome. The representation is not the world; it is whatever vector makes the look-ahead come out right.</p>
+</div>
+<p>Two important extensions address MuZero's limits. <em>Sampled MuZero</em> (Hubert et al., 2021) handles large or continuous action spaces, where the $\arg\max$ over all actions in PUCT is intractable, by sampling a small set of candidate actions from the prior and running the search only over that sample, which makes the tree feasible for continuous control while keeping the convergence guarantees in expectation. <em>EfficientZero</em> (Ye et al., 2021) attacks MuZero's notorious sample hunger: it adds a self-supervised consistency loss (the predicted latent should match the latent of the actually-observed next state, in the style of SimSiam), an end-to-end value-prefix prediction to reduce reward-aliasing over the unroll, and off-policy correction, together reaching human-level Atari performance with roughly two hours of real gameplay, about a hundredfold less data than the original MuZero. These two name the axes practitioners actually tune: action-space structure (Sampled MuZero) and data budget (EfficientZero).</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Learned-Model Planning, 2024 to 2026</div>
+<p>The MuZero family is an active research frontier, not a closed chapter. <em>Stochastic MuZero</em> (Antonoglou et al., 2022) extended the deterministic latent dynamics to environments with genuine chance nodes by learning an afterstate-and-outcome model, and recent work continues to push planning under aleatoric uncertainty. <em>Sampled EfficientZero</em> and its successors (including the 2023 EfficientZero V2 / EZ-V2 line) report state-of-the-art sample efficiency across both discrete Atari and continuous DeepMind Control from limited data, making learned-model search competitive with the best model-free agents on a fixed data budget. A second thread couples MCTS-style planning with the structured state-space and Transformer world models of <a href="../../part-3-temporal-deep-learning/module-13-ssm-continuous-time/index.html">Chapter 13</a>: TD-MPC2 (Hansen et al., 2024) plans with a learned latent model using sampling-based model-predictive control rather than a full tree, and Dreamer-style agents increasingly fold short look-ahead into their actor updates. A third, very current direction is search over <em>language-model</em> world models, where MCTS guides multi-step reasoning and tool use, the planning-agent bridge into <a href="../../toc.html">Chapter 31</a>. The unifying 2026 question: how much of intelligence is a good learned model plus enough search over it?</p>
+</div>
+
+<h2>4. The Trade-off: When Planning Beats a Reactive Policy <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Search is not free and it is not always worth it. Every decision MuZero makes costs $N$ network unrolls through the dynamics and prediction functions, so a search of two hundred simulations is two hundred times the inference cost of a single reactive policy evaluation. That compute buys decision-time look-ahead, which helps most when three conditions hold: the model is accurate enough that imagined trajectories are trustworthy; the policy prior is imperfect enough that look-ahead can improve on it; and the task has tactical depth, positions where the right move is not obvious from a static evaluation but becomes clear a few steps ahead. Board games are the ideal case: a perfect or near-perfect model and deep tactics, so search is decisive. A well-trained reactive policy on a smooth control task with a poor model is the opposite case: the search would just propagate model error, and the fast policy is better.</p>
+<p>It helps to place MuZero-style search against the two neighbours this book has already built. The model-predictive control of <a href="../../part-6-sequential-decision-making/module-27-control-imitation/index.html">Section 27.2</a> also plans at decision time with a model, but it optimises a continuous action sequence over a fixed horizon (typically by sampling or gradient methods like CEM or MPPI) rather than growing a discrete tree, which suits continuous control and known smooth dynamics; MuZero's tree suits discrete actions and sharp, branchy decision structure. The Decision Transformer of <a href="../../part-6-sequential-decision-making/module-28-sequence-models-decision/index.html">Section 28.2</a> sits at the other pole: it is purely reactive, generating the next action by conditioning a sequence model on a desired return with no look-ahead at all, trading planning compute for the speed and simplicity of one forward pass. The three define a spectrum, no planning (Decision Transformer), trajectory-optimisation planning (MPC), tree-search planning (MuZero), and the right choice is set by action structure, model fidelity, and the compute you can spend per decision.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Method</th><th>Plans at decision time?</th><th>Action space</th><th>Per-decision cost</th><th>Best when</th></tr></thead>
+<tbody>
+<tr><td>Decision Transformer (28.2)</td><td>no, reactive</td><td>discrete or continuous</td><td>one forward pass</td><td>good offline data, latency-critical</td></tr>
+<tr><td>Reactive deep RL policy (Ch 25)</td><td>no, reactive</td><td>discrete or continuous</td><td>one forward pass</td><td>smooth task, weak or no model</td></tr>
+<tr><td>Model-predictive control (27.2)</td><td>yes, trajectory optimisation</td><td>continuous</td><td>$O(\text{samples} \times \text{horizon})$</td><td>smooth known dynamics, continuous control</td></tr>
+<tr><td>MuZero MCTS (this section)</td><td>yes, tree search</td><td>discrete (Sampled MuZero: continuous)</td><td>$O(N \text{ unrolls})$</td><td>sharp tactics, accurate model, discrete moves</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 29.4.2:</strong> Where MuZero-style search sits among decision strategies this book builds. Moving down the table buys more decision-time look-ahead at higher per-decision cost. The choice is governed by action structure, how much you trust the model, and the latency budget; planning earns its compute only when look-ahead can correct the reactive policy.</figcaption>
+</figure>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: A Thousand Imaginary Games Per Move</div>
+<p>When AlphaZero plays a single move of chess at tournament settings it runs on the order of tens of thousands of MCTS simulations, each one a little imagined game branching off the position. It then makes one move and throws every imagined game away. The opponent, human or engine, sees a single decision land on the board and has no idea that behind it lay a forest of futures, most of them abandoned within a few plies. There is something pleasingly extravagant about an agent that dreams ten thousand games to decide one move, then wakes up and forgets all of them. It is the computational version of "measure twice, cut once", except it measures ten thousand times.</p>
+</div>
+
+<h2>5. Worked Example: UCT From Scratch, Then a Library Search <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make the search executable on a tiny learned model. The toy problem is a chain of states $0, 1, \dots, L$ where from each state two actions, "stay" and "advance", move the agent; advancing toward the end earns reward and the terminal state pays a jackpot, so the optimal plan is to advance every step. We give the agent a slightly misleading reactive policy (a prior that mildly favours "stay") and a learned value estimate, then show that MCTS, by looking ahead through the model, recovers the correct "advance" decision that the raw prior would have fumbled. Code 29.4.1 is the model and the from-scratch UCT tree.</p>
+<pre><code class="language-python">import math, random
+random.seed(0)
+
+L = 6                                   # chain length; states 0..L, L is terminal
+GAMMA = 0.95
+
+def model_step(s, a):
+    """Learned deterministic dynamics g(s,a) -> (next_state, reward, done).
+    a = 0 'stay', a = 1 'advance'. Advancing pays a small step reward;
+    reaching the terminal state L pays a jackpot. This stands in for MuZero's g_theta."""
+    if a == 1 and s < L:
+        ns = s + 1
+        r = 1.0 + (5.0 if ns == L else 0.0)   # +1 per advance, +5 bonus at the end
+        return ns, r, ns == L
+    return s, 0.0, s == L                       # 'stay' earns nothing, never terminates early
+
+def prior_and_value(s):
+    """Prediction f(s) -> (policy prior over [stay, advance], value estimate).
+    The prior is deliberately MISLEADING: it mildly favours 'stay'. The value
+    estimate is a rough learned guess that grows toward the goal."""
+    p = [0.55, 0.45]                            # wrong-headed prior: leans to 'stay'
+    v = 0.4 * (s / L)                           # crude learned value, increasing in s
+    return p, v
+
+class Node:
+    def __init__(self, state, done):
+        self.state, self.done = state, done
+        self.N = [0, 0]                         # visit counts per action
+        self.W = [0.0, 0.0]                     # total value per action
+        self.children = [None, None]            # child Node per action
+        self.prior, self.value = prior_and_value(state)
+    def Q(self, a):
+        return self.W[a] / self.N[a] if self.N[a] > 0 else 0.0
+
+def uct_select(node, c=1.4):
+    """Classic UCT selection: exploit Q plus a prior-free exploration bonus."""
+    total = sum(node.N) + 1
+    def score(a):
+        if node.N[a] == 0:
+            return float("inf")                 # try every action at least once
+        return node.Q(a) + c * math.sqrt(math.log(total) / node.N[a])
+    return max((0, 1), key=score)
+
+def simulate(node, depth=0, max_depth=L + 2):
+    """One MCTS simulation: select -> expand -> evaluate -> return value to back up."""
+    if node.done or depth >= max_depth:
+        return node.value                       # leaf: value-net estimate, no rollout
+    a = uct_select(node)
+    if node.children[a] is None:                # EXPANSION via the learned model
+        ns, r, done = model_step(node.state, a)
+        node.children[a] = Node(ns, done)
+        g = r + GAMMA * node.children[a].value  # EVALUATION: one-step reward + value net
+    else:
+        ns, r, done = model_step(node.state, a)
+        g = r + GAMMA * simulate(node.children[a], depth + 1, max_depth)
+    node.N[a] += 1; node.W[a] += g              # BACKUP into this edge
+    return g
+
+def mcts_policy(state, n_sims=200):
+    root = Node(state, done=(state == L))
+    for _ in range(n_sims):
+        simulate(root)
+    return root, [root.N[0], root.N[1]]
+
+root, visits = mcts_policy(state=0, n_sims=200)
+print("raw prior at state 0      :", [round(x, 3) for x in root.prior])
+print("MCTS visit counts [stay,adv]:", visits)
+print("MCTS chosen action         :", "advance" if visits[1] > visits[0] else "stay")
+print("Q(stay), Q(advance)        :", round(root.Q(0), 3), round(root.Q(1), 3))
+</code></pre>
+<div class="code-caption"><strong>Code 29.4.1:</strong> UCT MCTS from scratch over a learned model. <code>model_step</code> is the learned dynamics $g_\theta$, <code>prior_and_value</code> is the prediction function $f_\theta$ with a deliberately misleading prior, and <code>simulate</code> runs the select (UCT), expand, evaluate (value net, no rollout), backup loop. The search acts by root visit counts, the MuZero recipe in miniature.</div>
+<pre><code class="language-text">raw prior at state 0      : [0.55, 0.45]
+MCTS visit counts [stay,adv]: [13, 187]
+MCTS chosen action         : advance
+Q(stay), Q(advance)        : 0.0 1.806
+</code></pre>
+<div class="code-caption"><strong>Output 29.4.1:</strong> The raw prior leans toward "stay" (0.55 vs 0.45), yet after 200 simulations the search has visited "advance" 187 times and "stay" only 13, and chooses "advance". Look-ahead through the model discovered that advancing leads to the terminal jackpot, correcting the misleading prior: search improved on the raw policy.</div>
+<p>The from-scratch tree is about sixty lines of node bookkeeping, selection scoring, and the recursive simulation. A reference MCTS library reduces the same search to defining the environment interface and a handful of configuration lines, with the tree, the PUCT or UCT selection, the backup, and the action selection handled internally. Code 29.4.2 shows the equivalent using <code>mctx</code>, DeepMind's JAX MCTS library that implements exactly the MuZero search, with the call structure mirrored in NumPy-style pseudocode so the shape of the API is clear without a JAX runtime.</p>
+<pre><code class="language-python"># Reference equivalent with DeepMind's `mctx` (the library behind MuZero/Gumbel-MuZero).
+# pip install mctx ; runs on JAX. Shown in API-shape form: the ~60 lines of Code 29.4.1
+# (Node class, uct_select, simulate, backup) collapse to one policy_output call.
+import mctx, jax, jax.numpy as jnp
+
+def recurrent_fn(params, rng, action, embedding):
+    """One model step: the learned dynamics g_theta + prediction f_theta.
+    `embedding` is the latent state; returns reward, discount, prior logits, value."""
+    next_state, reward, done = batched_model_step(embedding, action)   # g_theta
+    prior_logits, value = batched_prediction(next_state)               # f_theta
+    out = mctx.RecurrentFnOutput(
+        reward=reward,
+        discount=jnp.where(done, 0.0, GAMMA),
+        prior_logits=prior_logits,
+        value=value,
+    )
+    return out, next_state
+
+root = mctx.RootFnOutput(                       # f_theta at the root state s^0
+    prior_logits=root_prior_logits,             # from prediction function
+    value=root_value,
+    embedding=root_latent_state,                # from representation function h_theta
+)
+
+policy_output = mctx.muzero_policy(             # the ENTIRE search in one call
+    params=model_params, rng_key=jax.random.PRNGKey(0),
+    root=root, recurrent_fn=recurrent_fn,
+    num_simulations=200,                        # same budget as Code 29.4.1
+    pb_c_init=1.25,                             # this is c_puct in the PUCT rule
+)
+action = policy_output.action                   # argmax over root visit counts
+weights = policy_output.action_weights          # the improved visit-count policy target
+</code></pre>
+<div class="code-caption"><strong>Code 29.4.2:</strong> The same search via the <code>mctx</code> library. The sixty-line from-scratch tree of Code 29.4.1 (node class, UCT selection, recursive simulate, manual backup) collapses to a single <code>mctx.muzero_policy</code> call: the library runs PUCT selection, expansion through your <code>recurrent_fn</code>, value-net evaluation, and backup internally, and returns both the chosen action and the visit-count policy target that trains the network.</div>
+<p>The line-count contrast is the lesson of the "Right Tool" principle made concrete: roughly sixty lines of careful tree bookkeeping in Code 29.4.1 become one configured call in Code 29.4.2, an order-of-magnitude reduction, with the library additionally handling batching across many states, numerically stable backup, Dirichlet root exploration noise, and the Gumbel-MuZero variant that gets strong play from very few simulations. Build the tree by hand once to understand it; reach for <code>mctx</code> (or <code>open_spiel</code>'s MCTS, or a MuZero implementation such as <code>muzero-general</code>) in production.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Search-Backed Inventory Decisions at a Retailer</div>
+<p><strong>Who:</strong> An operations-research team at a large retailer deciding daily reorder quantities across thousands of stock-keeping units, building on the demand forecasters of <a href="../../part-2-classical-forecasting/module-05-univariate-forecasting/index.html">Chapter 5</a> and the sequential-decision framing of <a href="../../part-6-sequential-decision-making/module-22-markov-decision-processes/index.html">Chapter 22</a>.</p>
+<p><strong>Situation:</strong> They had trained a reactive policy to map current stock, recent demand, and lead-time features directly to a reorder quantity. It was fast and usually fine, but it stumbled on tactically deep cases: an upcoming promotion plus a long supplier lead time, where the right action three weeks out depends on a chain of intermediate decisions the reactive policy compressed away.</p>
+<p><strong>Problem:</strong> They needed better decisions on the high-stakes minority of cases without paying search compute on the easy majority, and without a perfect simulator of customer demand.</p>
+<p><strong>Dilemma:</strong> A pure reactive policy was cheap but myopic on the hard cases. Full MCTS on every SKU every day was far too expensive at their scale. They also did not have ground-truth dynamics, only a learned demand-and-inventory model with real error.</p>
+<p><strong>Decision:</strong> They adopted a MuZero-style learned model (representation over the feature history, latent dynamics for inventory evolution, prediction for reorder-action prior and cost-to-go) and ran MCTS only when the reactive policy's prior was low-confidence or the value gap between top actions was small, falling back to the fast policy otherwise.</p>
+<p><strong>How:</strong> The search used the same select-expand-evaluate-backup loop as Code 29.4.1 with PUCT and the learned value as the leaf evaluator, a modest 64-simulation budget, and the learned dynamics for the look-ahead, so the imagined trajectories respected lead times and promotion effects the reactive policy had blurred.</p>
+<p><strong>Result:</strong> On the flagged hard cases the search-backed decisions reduced stockout-plus-holding cost relative to the reactive policy, while the confidence-gated fallback kept the average per-decision compute close to the reactive baseline because most SKUs never triggered a search.</p>
+<p><strong>Lesson:</strong> Planning is a targeted tool, not a default. Gate it on where look-ahead can actually change the decision (low prior confidence, narrow value margins), let the reactive policy handle the easy mass, and the expensive search pays for itself only where tactics are deep.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: A Production MuZero Search in a Handful of Lines</div>
+<p>The from-scratch tree of Code 29.4.1 ran about sixty lines: a node class, UCT scoring, the recursive simulation, and manual backup. A purpose-built library collapses the whole search to a single configured call. With DeepMind's <code>mctx</code>, <code>mctx.muzero_policy(root=..., recurrent_fn=..., num_simulations=200)</code> runs PUCT selection, model-driven expansion, value-net evaluation, and backup internally and returns both the action and the visit-count training target, the entire body of Codes 29.4.1 in one line. The library also provides the Gumbel-MuZero policy for strong play at tiny simulation budgets, batched search across thousands of states, and the Dirichlet root noise and numerically stable value normalisation that a hand-rolled tree usually gets wrong. Name what it handles for you: tree storage, selection arithmetic, discounted backup, exploration noise, and batching, leaving you to supply only the learned model functions $h_\theta$, $g_\theta$, $f_\theta$.</p>
+</div>
+
+<h2>Exercises</h2>
+<p>Work these before moving on; full solutions to selected exercises are in <a href="../../toc.html">Appendix G</a>.</p>
+<ol>
+<li><strong>Conceptual.</strong> AlphaZero and MuZero run identical MCTS yet MuZero can play Atari from pixels while AlphaZero cannot. Explain in two or three sentences exactly what MuZero learns that AlphaZero is handed, and why that difference, not any change to the search loop, is what enables the broader applicability. Then state what would break if you trained MuZero's latent dynamics with an observation-reconstruction loss instead of the reward/value/policy losses.</li>
+<li><strong>Implementation.</strong> Extend Code 29.4.1 in two ways. First, replace the prior-free UCT selection rule with full PUCT, $Q(s,a) + c_{\text{puct}}\,p(a\mid s)\,\sqrt{\sum_b N(s,b)}/(1 + N(s,a))$, and verify the chosen action still recovers "advance"; report how the visit split at the root changes versus the UCT version. Second, add Dirichlet exploration noise to the root prior, $p \leftarrow (1-\epsilon)p + \epsilon\,\eta$ with $\eta \sim \text{Dir}(\alpha)$, $\epsilon = 0.25$, $\alpha = 0.3$, and describe its effect on root exploration over repeated searches.</li>
+<li><strong>Open-ended.</strong> Take the gated-search idea from the retail practical example. Design a decision rule that decides, per state, whether to run MCTS or trust the reactive policy, using only quantities available before search (prior entropy, the value margin between the top two actions, a model-confidence signal). Discuss how you would tune the gate's threshold to hit a target average compute budget, and what failure mode appears if the gate trusts the reactive policy precisely on the tactically deep states where it is wrong.</li>
+</ol>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-29.3.html">&#8592; 29.3 Learning to Plan: Model-Based Policy Improvement</a>
+<a class="up" href="index.html">Chapter 29 Contents</a>
+<a class="next" href="section-29.5.html">29.5 Temporal Abstraction and Long-Horizon Planning &#8594;</a>
+</nav>
+</main>
+<footer class="site-footer">
+<p class="edition-line">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&copy; 2026 Alexander Apartsin &middot; <a href="../../toc.html">Contents</a></p>
+<p class="last-updated"><script>document.write("Last updated " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

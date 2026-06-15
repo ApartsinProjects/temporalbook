@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 29.5: Temporal Abstraction and Long-Horizon Planning. Why flat search and single-step world models break down over long horizons (compounding model error, exponential branching), how planning over options/skills/subgoals at a coarse time scale cures both, the abstract k-step transition, recent learned-skill and goal-directed latent planners (Director, Dreamer-class), an honest synthesis of the Part VI decision-making spectrum, and a from-scratch subgoal planner beating flat planning on a long-horizon task with a library reference." name="description"/>
+<title>Section 29.5: Temporal Abstraction and Long-Horizon Planning | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Sequential Decision Making</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 29: World Models and Planning</a></div>
+<h1>Temporal Abstraction and Long-Horizon Planning</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"Ask me to cross the continent and I will not enumerate every footstep; I will say fly to Denver, then drive to the cabin, then walk the last mile. I plan in chapters and let my legs handle the footnotes. The agent that insists on reasoning one step at a time is still standing in the driveway, having computed a beautiful tree of the first nine hundred possible footsteps, none of which has left the house."</p>
+<cite>A Planner That Thinks in Chapters, Not in Footsteps</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Long-horizon planning is where both halves of a model-based agent break at once. The learned world model, accurate for a few steps, accumulates error over a long rollout until its imagined future is fiction; and flat search over primitive actions branches exponentially, so looking far enough ahead to matter is computationally hopeless. Temporal abstraction cures both with one idea: stop planning in primitive single-step actions and plan instead over <em>options</em>, skills, or subgoals that each span many steps. A plan that reaches a thousand-step goal in ten coarse decisions makes a tenfold shorter rollout (so a tenfold smaller compounded error) and an exponentially smaller search tree.</strong> This section states the long-horizon problem precisely, then builds the cure: the abstract $k$-step transition that lets a model and a search operate at a coarse time scale while low-level policies fill in the primitive actions. It surveys the recent learned-skill and goal-directed latent planners (Dreamer-class world models, Director-style subgoal planning, long-horizon model-based agents of 2023 to 2026), then closes Chapter 29 and the whole of Part VI with an honest synthesis of the decision-making spectrum, value-based to policy-gradient to model-based to sequence-model to search, and the single recurring lesson behind all of it: the right amount of structure beats brute force. A from-scratch coarse subgoal planner is shown beating flat planning on a long-horizon task, then collapsed to a library reference. You leave able to recognize when a problem needs abstraction and how to build the simplest planner that supplies it.</p>
+</div>
+<p>In <a href="section-29.4.html">Section 29.4</a> we planned <em>inside</em> a learned world model, rolling the model forward a fixed horizon and optimizing an action sequence by trajectory optimization or sampling. That worked because the horizon was short enough that the model stayed honest and the search stayed tractable. This section confronts what happens when the horizon is long: hundreds or thousands of primitive steps between the start and the goal. Both the model and the search, perfectly adequate over a short horizon, degrade in ways that no amount of tuning fixes, and the fix is structural rather than numerical. We use the unified notation of <a href="../../toc.html">Appendix A</a> throughout: $s_t$ the state, $a_t$ the primitive action, $\hat{T}$ the learned transition model, $\pi$ a policy, and $\gamma$ the discount.</p>
+<p>The thread we pick up is the one Part VI has been pulling since the start. <a href="../module-22-markov-decision-processes/index.html">Chapter 22</a> defined the MDP and value iteration over primitive actions; <a href="../module-26-advanced-rl/section-26.5.html">Section 26.5</a> introduced hierarchical reinforcement learning and the options framework, where an agent acts at two time scales; <a href="section-29.1.html">Section 29.1</a> measured how world-model error compounds over a rollout. Temporal abstraction in planning is exactly the marriage of those three: take the compounding-error problem of 29.1, take the exponential-search problem inherent in any flat MDP, and dissolve both with the multi-step options of 26.5, now used not only for acting but for <em>planning and imagining</em>. The Kalman-to-RNN, MDP-to-sequence-model arcs of this book all converge here, on the claim that the structure you build into a temporal model is what lets it reach far.</p>
+<p>The four competencies this section installs: to state precisely why long horizons break flat planning and single-step world models, separating the compounding-error failure from the branching-factor failure; to write an abstract transition that advances the world by $k$ primitive steps in one coarse decision and to see how it shrinks both the rollout length and the search depth; to place the recent learned-skill and goal-directed latent planners (Director, Dreamer-class long-horizon agents) on that map; and, closing Part VI, to choose among the whole spectrum of decision-making methods by asking how much structure the problem rewards. These are the skills that turn the eight chapters of Part VI into a single usable judgment.</p>
+
+<h2>1. The Long-Horizon Problem: Compounding Error and Exploding Search <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A model-based planner does two things: it imagines futures with a learned model, and it searches over actions to find a good one. Over a short horizon both are cheap and reliable. Over a long horizon both fail, and they fail for independent reasons, so it is worth pulling the two failures apart before reaching for a cure that addresses both.</p>
+<p>The first failure is <strong>compounding model error</strong>, the subject of <a href="section-29.1.html">Section 29.1</a>, now seen as the binding constraint on horizon. A learned transition $\hat{T}$ has some one-step error; when you roll it forward to imagine a trajectory, each step feeds the previous step's slightly-wrong output back in as input, so errors accumulate and, worse, drift the rollout off the data distribution the model was trained on, where its error is larger still. If the per-step prediction error grows by a factor $\rho > 1$ as the rollout leaves the training distribution, the error at horizon $H$ scales roughly as $\epsilon_H \approx \epsilon_1 \cdot \frac{\rho^{H} - 1}{\rho - 1}$, a sum that is benign for small $H$ and ruinous for large $H$. The practical consequence is a horizon wall: beyond some number of imagined steps the model's rollout is fiction, and optimizing an action sequence against fiction optimizes nothing. You cannot tune your way past this; a model that is excellent at one step is still useless at a thousand if $\rho > 1$.</p>
+<p>The second failure is <strong>combinatorial explosion of flat search</strong>. Searching over sequences of primitive actions, with branching factor $b$ (the number of actions worth considering per step) to depth $H$, examines on the order of $b^{H}$ trajectories. Even modest numbers are hopeless: $b = 10$ actions and a horizon of $H = 100$ steps is $10^{100}$ candidate plans, more than the atoms in the observable universe. Sampling-based planners (the CEM and MPPI methods of <a href="section-29.4.html">Section 29.4</a>) dodge the full enumeration by sampling a few thousand trajectories rather than all $b^H$, but sampling thousands of length-$H$ rollouts only relocates the cost into the first failure: each of those rollouts is a long imagination that the compounding-error wall has already corrupted. The two failures compound each other, which is why naive deep model-based planning has a horizon ceiling of a few tens of steps in practice.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Two Walls at Horizon 100</div>
+<p>Take a learned model with one-step error $\epsilon_1 = 0.01$ and a mild out-of-distribution amplification $\rho = 1.05$ per step. At horizon $H = 10$ the accumulated error is $\epsilon_1 \cdot \frac{1.05^{10}-1}{0.05} \approx 0.01 \cdot 12.6 = 0.126$, still small. At $H = 100$ it is $\epsilon_1 \cdot \frac{1.05^{100}-1}{0.05} \approx 0.01 \cdot 2610 = 26.1$, larger than the state itself: the rollout is fiction. Simultaneously, the search tree with $b = 10$ goes from $10^{10}$ candidate plans at $H = 10$ (already large but samplable) to $10^{100}$ at $H = 100$ (unsamplable by any margin). Both walls arrive at the same horizon. Now plan in coarse decisions of length $k = 10$ instead: the abstract horizon is $H/k = 10$, the model is rolled only ten coarse steps so its compounded error is back to the benign $0.126$ regime, and the search is $b^{H/k} = 10^{10}$ rather than $10^{100}$, a reduction of ninety orders of magnitude. The same horizon, made reachable by abstraction.</p>
+</div>
+<p>The diagnosis tells you the shape of the cure. Both walls are functions of the <em>number of decision points between start and goal</em>: the rollout length that compounds error is that count, and the search depth that branches is that count. Anything that reduces the number of decision points without changing where you can end up attacks both walls at once. That is exactly what temporal abstraction does: it replaces a long chain of primitive decisions with a short chain of coarse ones, each coarse decision being a multi-step behavior. Figure 29.5.1 contrasts the flat and abstract decision chains.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Top row: a long flat chain of many small primitive-action nodes from start to goal, labeled deep rollout and exponential search. Bottom row: a short chain of three large option nodes spanning the same start-to-goal distance, each option internally expanding into primitive steps, labeled shallow rollout and small search.">
+<defs>
+<marker id="arr295" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+<marker id="arrO295" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b8431f"/></marker>
+</defs>
+<style>
+.prim295 { fill:#eef3f8; stroke:#14385c; stroke-width:1.4; }
+.opt295 { fill:#fbeee8; stroke:#b8431f; stroke-width:2; }
+.fl295 { stroke:#5a626c; stroke-width:1.6; fill:none; marker-end:url(#arr295); }
+.flo295 { stroke:#b8431f; stroke-width:2; fill:none; marker-end:url(#arrO295); }
+.lab295 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub295 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.opl295 { font:600 13px sans-serif; fill:#b8431f; text-anchor:middle; }
+.tag295 { font:italic 12px sans-serif; fill:#5a626c; text-anchor:start; }
+.tago295 { font:italic 12px sans-serif; fill:#b8431f; text-anchor:start; }
+</style>
+<text class="lab295" x="410" y="24">Flat versus abstract decision chains over the same start-to-goal distance</text>
+<!-- flat row -->
+<circle class="prim295" cx="70" cy="80" r="9"/><text class="sub295" x="70" y="64">start</text>
+<g>
+<circle class="prim295" cx="110" cy="80" r="8"/><circle class="prim295" cx="150" cy="80" r="8"/>
+<circle class="prim295" cx="190" cy="80" r="8"/><circle class="prim295" cx="230" cy="80" r="8"/>
+<circle class="prim295" cx="270" cy="80" r="8"/><circle class="prim295" cx="310" cy="80" r="8"/>
+<circle class="prim295" cx="350" cy="80" r="8"/><circle class="prim295" cx="390" cy="80" r="8"/>
+<circle class="prim295" cx="430" cy="80" r="8"/><circle class="prim295" cx="470" cy="80" r="8"/>
+<circle class="prim295" cx="510" cy="80" r="8"/><circle class="prim295" cx="550" cy="80" r="8"/>
+<circle class="prim295" cx="590" cy="80" r="8"/><circle class="prim295" cx="630" cy="80" r="8"/>
+<circle class="prim295" cx="670" cy="80" r="8"/><circle class="prim295" cx="710" cy="80" r="8"/>
+</g>
+<circle class="prim295" cx="750" cy="80" r="9"/><text class="sub295" x="750" y="64">goal</text>
+<line class="fl295" x1="79" y1="80" x2="742" y2="80" stroke-dasharray="2 30"/>
+<text class="tag295" x="70" y="108">flat: many primitive steps &#8594; deep rollout (error compounds), exponential search</text>
+<!-- abstract row -->
+<circle class="prim295" cx="70" cy="210" r="9"/><text class="sub295" x="70" y="194">start</text>
+<rect class="opt295" x="180" y="192" width="120" height="36" rx="18"/><text class="opl295" x="240" y="215">option o&#8321;</text>
+<rect class="opt295" x="350" y="192" width="120" height="36" rx="18"/><text class="opl295" x="410" y="215">option o&#8322;</text>
+<rect class="opt295" x="520" y="192" width="120" height="36" rx="18"/><text class="opl295" x="580" y="215">option o&#8323;</text>
+<circle class="prim295" cx="750" cy="210" r="9"/><text class="sub295" x="750" y="194">goal</text>
+<line class="flo295" x1="79" y1="210" x2="178" y2="210"/>
+<line class="flo295" x1="300" y1="210" x2="348" y2="210"/>
+<line class="flo295" x1="470" y1="210" x2="518" y2="210"/>
+<line class="flo295" x1="640" y1="210" x2="742" y2="210"/>
+<!-- one option expanded below -->
+<line class="fl295" x1="240" y1="228" x2="240" y2="258" stroke-dasharray="3 3"/>
+<circle class="prim295" cx="210" cy="278" r="5"/><circle class="prim295" cx="230" cy="278" r="5"/>
+<circle class="prim295" cx="250" cy="278" r="5"/><circle class="prim295" cx="270" cy="278" r="5"/>
+<text class="sub295" x="330" y="282">a low-level policy fills in the primitive steps</text>
+<text class="tago295" x="70" y="305">abstract: a few options &#8594; shallow rollout (error bounded), small search</text>
+</svg>
+<figcaption><strong>Figure 29.5.1:</strong> The same distance from start to goal, planned two ways. Flat planning (top) is a long chain of primitive steps, so the model rollout is deep (error compounds, Section 29.1) and the search branches exponentially. Abstract planning (bottom) is a short chain of options, each a multi-step skill whose primitive steps are filled in by a low-level policy, so the rollout is shallow and the search small. Abstraction attacks both long-horizon walls because both are functions of the number of decision points.</figcaption>
+</figure>
+<p>It is worth saying plainly what abstraction is <em>not</em> doing. It is not making the world shorter; the agent still takes the same thousand primitive steps in the environment. It is making the <em>plan</em> shorter, by changing the unit of decision from a primitive action to a temporally extended behavior. The primitive steps still happen, but they happen <em>inside</em> an option, executed by a low-level controller that the high-level planner does not reason about step by step. The planner reasons in chapters; the low-level policy writes the footnotes. This division of labor is the entire content of the cure, and the rest of the section makes it precise and then executable.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Both Long-Horizon Walls Are Functions of the Decision Count</div>
+<p>Compounding model error scales with the rollout length; combinatorial search cost scales with the search depth; and both lengths are the same quantity, the number of decision points between start and goal. This is why a single intervention cures both. Reduce the decision count by a factor $k$ (plan in options of length $k$ instead of primitive actions) and the rollout error drops to its much smaller $H/k$-step value <em>and</em> the search tree shrinks from $b^{H}$ to $b^{H/k}$. You do not need two different fixes for the two walls, because there were never really two walls, only one (the horizon is too long for primitive reasoning) seen from two directions. Everything else in this section is a way to realize that single factor-$k$ reduction safely.</p>
+</div>
+
+<h2>2. Temporal Abstraction as the Cure: Options, Subgoals, and the Jumpy Model <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The formal device is the <em>option</em>, introduced for acting in <a href="../module-26-advanced-rl/section-26.5.html">Section 26.5</a> and now used for planning and imagining. An option $o = (I_o, \pi_o, \beta_o)$ is a temporally extended behavior: an initiation set $I_o$ of states where it can start, an internal policy $\pi_o$ that selects primitive actions while the option runs, and a termination condition $\beta_o(s)$ giving the probability the option ends in state $s$. Running an option from a state means handing control to $\pi_o$ until $\beta_o$ fires, which takes some random number of primitive steps $k$. From the high-level planner's view, the option is one decision that advances the world by $k$ steps. A subgoal is a particularly clean special case: the option is "drive the low-level policy until you reach subgoal $g$", $\pi_o$ is a goal-conditioned policy $\pi(a \mid s, g)$, and $\beta_o$ fires when $s$ is close enough to $g$.</p>
+<p>The object that lets a planner work at this coarse scale is the <strong>abstract (jumpy) transition model</strong>. Where the flat model $\hat{T}(s_{t+1} \mid s_t, a_t)$ advances one primitive step, the abstract model advances one whole option: it predicts the state $k$ steps later, where the option lands, and the cumulative discounted reward earned along the way, without imagining the intervening primitive steps at all. For an option $o$ started in state $s$, define the abstract transition</p>
+$$\hat{T}^{o}(s' \mid s) \;=\; \Pr\!\big(s_{t+k} = s' \mid s_t = s,\ \text{run } o\big), \qquad \hat{R}^{o}(s) \;=\; \mathbb{E}\!\Big[\sum_{i=0}^{k-1} \gamma^{i}\, r_{t+i} \ \Big|\ s_t = s,\ \text{run } o\Big],$$
+<p>where $k$ is the (state-dependent, random) option duration set by $\beta_o$. This is a <em>semi-Markov</em> model: transitions take variable amounts of time, and the discount enters as $\gamma^{k}$ rather than $\gamma$. Planning with $\hat{T}^{o}$ and $\hat{R}^{o}$ is ordinary planning (value iteration, search, trajectory optimization) over a much smaller, much shallower problem, because each abstract step covers $k$ primitive steps. The high-level Bellman backup over options is</p>
+$$V(s) \;=\; \max_{o \in \mathcal{O}(s)} \Big[\, \hat{R}^{o}(s) \;+\; \gamma^{\,k_o(s)}\, \mathbb{E}_{s' \sim \hat{T}^{o}(\cdot\mid s)}\, V(s') \,\Big],$$
+<p>identical in form to the primitive Bellman equation of <a href="../module-22-markov-decision-processes/index.html">Chapter 22</a> except that the action set is options, the reward is a multi-step return, and the discount is raised to the option's duration. The crucial property is that the <em>same</em> dynamic-programming and search machinery applies: temporal abstraction does not require new algorithms, only a coarser model to run them on. A learned jumpy model is trained exactly to predict these $k$-step landings and cumulative rewards, so the planner never has to roll the flat model forward through the option's interior, which is precisely where the compounding error of subsection one lived.</p>
+<p>The benefit is now quantifiable in the same terms as the problem. If options have average duration $k$, then reaching a goal $H$ primitive steps away takes $H/k$ abstract decisions. The abstract rollout that compounds model error is $H/k$ steps long, not $H$, so by the error formula of subsection one the compounded error drops from its $H$-step value to its $H/k$-step value, often a dramatic reduction because that sum grows superlinearly. The abstract search tree is $b^{H/k}$ rather than $b^{H}$, an exponential reduction in the exponent. And because the jumpy model predicts option landings directly, it can be trained to be accurate at exactly the abstract scale the planner uses, rather than being a flat model strained far past its reliable horizon. The low-level policies inside the options absorb the primitive-step detail that the high level no longer reasons about.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Plan With a Jumpy Model, Act With Low-Level Policies</div>
+<p>Temporal abstraction splits the agent cleanly in two. The high level owns a small set of options (or a subgoal generator) and a jumpy model $\hat{T}^{o}, \hat{R}^{o}$ that predicts where each option lands and what it earns, $k$ steps at a time; it plans over this coarse, shallow, semi-Markov problem with the ordinary machinery of Chapter 22. The low level owns the goal-conditioned or option policies $\pi_o$ that turn each coarse decision into the primitive actions the environment actually consumes. The high level never imagines a primitive step, so it never pays the compounding-error or branching cost of one; the low level never reasons about the distant goal, so it never plans long. Each half does the job it is good at, and the product reaches horizons neither could reach alone. This is the options framework of Section 26.5 turned from a way to <em>act</em> into a way to <em>plan and imagine</em>.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Manager Who Never Reads the Code</div>
+<p>A hierarchical agent runs its organization exactly like a competent manager who has learned never to read the code. The manager (high level) sets three milestones for the quarter and trusts the engineers (low-level policies) to write the ten thousand lines each milestone requires. If the manager tried to review every line, planning a single quarter in units of keystrokes, the quarter would end before the plan did, which is precisely the flat-planning failure of subsection one. The manager's competence is entirely in choosing good milestones and in trusting that "ship the auth service" is a unit that someone below can expand. The whole art of temporal abstraction is picking options abstract enough to plan over and concrete enough to execute, which is also, not coincidentally, the whole art of management.</p>
+</div>
+
+<h2>3. Recent Directions: Learned Skills and Goal-Directed Latent Planning <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The modern instantiations of subsection two share a recipe: learn the world model and the abstraction together, in a latent space, end to end, rather than hand-designing options. Three threads define the 2023 to 2026 landscape, and all three sit directly on the jumpy-model-plus-low-level-policy split.</p>
+<p>The first is <strong>goal-directed latent planning</strong>, whose cleanest exemplar is <em>Director</em> (Hafner et al., 2022). Director learns a latent world model (the recurrent state-space model family this chapter has been building) and then trains a high-level "manager" policy that proposes <em>subgoals in the model's latent space</em> every fixed number of steps, while a low-level "worker" policy is rewarded for reaching those latent subgoals. The manager plans in the compact latent state, abstractly and infrequently; the worker fills in primitive actions. Crucially, the subgoals are points in a learned representation, not hand-specified coordinates, so the abstraction is discovered rather than designed. Director solved long-horizon sparse-reward tasks (visual mazes, ant navigation) that flat model-based agents could not, and it is the canonical proof that latent subgoals are a workable temporal abstraction for planning.</p>
+<p>The second is <strong>long-horizon model-based agents in the Dreamer line</strong>. DreamerV3 (Hafner et al., 2023) trains a latent world model and learns behaviors by imagining rollouts inside it, and it generalized across more than 150 tasks with fixed hyperparameters, including the famously long-horizon task of collecting diamonds in Minecraft from scratch, which demands credit assignment across thousands of steps. DreamerV3 reaches long horizons less by explicit subgoals than by a high-quality latent model plus a value function that propagates reward across imagined rollouts, but the recent trend (TD-MPC2 of Hansen et al., 2024, and follow-on planning-in-latent-space agents) explicitly combines learned latent dynamics with short-horizon planning and a learned terminal value, which is itself a form of abstraction: the learned value summarizes the infinite tail beyond the short plan, so a short imagined rollout plus a value reaches an effectively long horizon. The value function is the jumpiest model of all, collapsing the entire future after the plan into one number.</p>
+<p>The third is <strong>learned skills and skill discovery</strong>. Methods that learn a library of reusable skills without reward (mutual-information skill discovery in the DIAYN line, and its successors) produce exactly the options of subsection two, discovered from interaction; a planner then composes them. The 2023 to 2026 direction couples skill discovery with a world model so that the discovered skills are the action set of a jumpy planner, and recent offline and hierarchical methods (for instance hierarchical decision transformers and goal-conditioned offline RL of <a href="../module-28-sequence-models-decision/index.html">Chapter 28</a>) learn both the skills and the high-level controller from logged data. The common thread across all three is the marriage this section has argued for from the start: a world model for imagining, an abstraction for keeping the horizon short, learned jointly.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Long-Horizon Latent Planning (2023 to 2026)</div>
+<p>The live questions all concern <em>how abstract, and how learned, the abstraction should be</em>. Director (Hafner et al., 2022) and DreamerV3 (Hafner et al., 2023) established latent subgoals and imagination-based behavior learning; TD-MPC2 (Hansen et al., 2024) showed that a single latent-dynamics-plus-value agent plans short and reaches far across many domains with shared hyperparameters; and a fast-growing body of work asks whether <em>large pretrained sequence models</em> can serve as the high-level planner, proposing subgoals or sketching coarse plans in language or latent tokens while a learned low-level policy executes, connecting Part VI to the temporal agents of <a href="../../toc.html">Chapter 31</a>. A second frontier is <em>jumpy generative models</em> that predict far-future states directly (diffusion and flow world models that sample a distant state without unrolling the interior), which would give the abstract transition $\hat{T}^{o}$ of subsection two for free. The 2026 synthesis is that long-horizon competence is coming from the <em>combination</em>, a learned latent world model, a learned temporal abstraction, and a learned value that summarizes the tail, rather than from any one of them scaled alone.</p>
+</div>
+
+<h2>4. Synthesis of Part VI: Choosing Your Structure on the Decision-Making Spectrum <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Part VI has presented sequential decision making as a spectrum of methods, and this is the moment to lay the spectrum out whole and say how to choose along it. The chapters were not a list of competing algorithms but a graded series of answers to one question: how much structure should you build into the agent, and of what kind? Each family makes a different bet, and the right bet is a property of the problem, not of fashion.</p>
+<figure class="diagram">
+<table>
+<thead><tr><th>Family (chapter)</th><th>What it learns / uses</th><th>Structure assumed</th><th>Shines when</th></tr></thead>
+<tbody>
+<tr><td>Value-based RL (<a href="../module-24-bandits-rl-foundations/index.html">Ch 24</a>, <a href="../module-25-deep-reinforcement-learning/index.html">Ch 25</a>)</td><td>a value or $Q$ function</td><td>Markov state, bootstrapping</td><td>discrete actions, dense-ish reward, plenty of interaction</td></tr>
+<tr><td>Policy-gradient (<a href="../module-25-deep-reinforcement-learning/index.html">Ch 25</a>, <a href="../module-26-advanced-rl/index.html">Ch 26</a>)</td><td>a policy directly</td><td>differentiable policy</td><td>continuous / high-dim actions, stochastic optima</td></tr>
+<tr><td>Model-based / world models (<a href="index.html">Ch 29</a>)</td><td>a transition model $\hat{T}$, then plan</td><td>learnable dynamics</td><td>expensive interaction, reusable dynamics, planning helps</td></tr>
+<tr><td>Sequence-model / offline (<a href="../module-28-sequence-models-decision/index.html">Ch 28</a>)</td><td>actions as a sequence to predict</td><td>good logged data, return conditioning</td><td>large offline datasets, no safe exploration</td></tr>
+<tr><td>Control &amp; imitation (<a href="../module-27-control-imitation/index.html">Ch 27</a>)</td><td>a known model or expert demos</td><td>known dynamics / expert</td><td>physics is known, or an expert exists to copy</td></tr>
+<tr><td>Search &amp; abstraction (<a href="section-29.4.html">29.4</a>, this section)</td><td>explicit lookahead over a model</td><td>a usable model + horizon control</td><td>long horizons, where structure earns its keep</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 29.5.2:</strong> The Part VI decision-making spectrum, ordered loosely by how much structure each family assumes, from model-free value and policy methods that assume only a Markov state, through model-based and search methods that assume a usable model, to the abstraction methods of this section that add a hierarchy of time scales. Choosing a family is choosing how much structure the problem rewards.</figcaption>
+</figure>
+<p>The choice rule that threads the table is a single question asked in three forms. First, <em>how expensive is interaction?</em> Cheap, abundant interaction (a fast simulator) favors model-free value and policy methods that simply consume samples; expensive or unsafe interaction (a real robot, a clinical system, a market) favors model-based methods that squeeze more learning from each sample, and offline sequence models that need no new interaction at all. Second, <em>how much do you already know?</em> Known dynamics call for the optimal-control methods of <a href="../module-27-control-imitation/index.html">Chapter 27</a> rather than learning a model you already have; an available expert calls for imitation; a large logged dataset calls for the offline and sequence-model methods of <a href="../module-28-sequence-models-decision/index.html">Chapter 28</a>. Third, <em>how long is the horizon?</em> Short horizons are served by any of the families directly; long horizons are where flat methods hit the walls of subsection one and where the temporal abstraction of this section becomes not an optimization but a prerequisite. These three questions, not a benchmark leaderboard, are how a practitioner actually chooses.</p>
+<p>Underneath all three questions sits the lesson that has recurred in every chapter of this book, and most insistently in Part VI: <strong>the right amount of structure beats brute force.</strong> Too little structure (pure model-free search over primitive actions on a long-horizon sparse-reward task) hits the compounding-error and branching walls and never learns. Too much structure (a hand-built model and hand-designed options that the real problem violates) is brittle and wrong in exactly the situations that matter. The methods that have moved the field forward, from the Kalman filter becoming the RNN, from the MDP becoming the sequence model, from flat planning becoming hierarchical planning, all found the structure that matched the problem's real regularities and let learning fill the rest. Temporal abstraction is the purest statement of that lesson: it is structure (a hierarchy of time scales) added exactly where the problem (a long horizon) demands it, and nowhere else.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Structure Is a Dial, Not a Switch</div>
+<p>The Part VI spectrum is not a menu of mutually exclusive philosophies but a single dial labeled "how much structure". Value and policy methods sit at the low-structure end (assume only a Markov state); model-based and search methods add a learnable model; temporal abstraction adds a hierarchy of time scales on top. Turning the dial up buys sample efficiency and reach but costs flexibility and risks a wrong assumption; turning it down buys robustness to model error but costs the ability to plan far. The expert move is to set the dial to match the problem's real structure: as much as the problem genuinely has, no more. A long-horizon, expensive-interaction problem with reusable dynamics wants the dial high (model-based, abstract, planning); a cheap-simulator, short-horizon problem wants it low (model-free, direct). Getting the setting right is the entire skill that Part VI has been teaching.</p>
+</div>
+
+<h2>5. Worked Example: A Coarse Subgoal Planner Beats Flat Planning <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We make the whole argument executable on a long-horizon navigation task: a $50 \times 50$ grid where an agent must travel from a corner to the opposite corner, a primitive horizon of about a hundred steps. We compare two planners against a learned-style jumpy model. The flat planner samples primitive action sequences and rolls a one-step model forward across the full horizon, paying both walls of subsection one. The abstract planner plans over a handful of <em>subgoals</em> (waypoints) using a jumpy model that lands on a subgoal in one coarse step, then a trivial low-level policy walks between waypoints. We show the abstract planner reaching the goal where the flat one does not, then collapse it to a library reference. Code 29.5.1 sets up the environment and the flat baseline.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(0)
+N = 50                                    # 50 x 50 grid; goal is ~100 primitive steps away
+GOAL = np.array([N - 1, N - 1])
+START = np.array([0, 0])
+ACTIONS = np.array([[1, 0], [-1, 0], [0, 1], [0, -1]])   # 4 primitive moves
+
+def step(s, a):
+    """One-step true dynamics: move and clip to the grid (the 'real' env)."""
+    return np.clip(s + a, 0, N - 1)
+
+def rollout_cost(s0, action_seq):
+    """Run a primitive action sequence; cost = remaining distance to goal."""
+    s = s0.copy()
+    for a in action_seq:
+        s = step(s, ACTIONS[a])
+    return np.abs(s - GOAL).sum(), s       # Manhattan distance left
+
+def flat_plan(s0, horizon, n_samples=4000):
+    """Flat sampling planner: sample primitive sequences of full length, keep the best."""
+    best_cost, best_seq = np.inf, None
+    for _ in range(n_samples):
+        seq = rng.integers(0, 4, size=horizon)     # a length-`horizon` primitive plan
+        c, _ = rollout_cost(s0, seq)
+        if c < best_cost:
+            best_cost, best_seq = c, seq
+    return best_cost
+
+H = 100                                   # full primitive horizon
+flat_best = flat_plan(START, H, n_samples=4000)
+print("flat planner: best remaining distance = %d (0 = reached goal)" % flat_best)
+</code></pre>
+<div class="code-caption"><strong>Code 29.5.1:</strong> The long-horizon task and the flat baseline. The flat planner samples four thousand primitive action sequences of the full length-100 horizon; the search space of $4^{100}$ plans is astronomically larger than the sample budget, so the best sampled plan barely dents the distance to the goal. This is the combinatorial wall of subsection one in code.</div>
+<pre><code class="language-text">flat planner: best remaining distance = 54 (0 = reached goal)
+</code></pre>
+<div class="code-caption"><strong>Output 29.5.1:</strong> Four thousand random length-100 primitive plans leave the agent 54 cells from the goal, more than halfway short: blind sampling over a hundred-step horizon cannot find the corner. The flat planner has hit both long-horizon walls at once.</div>
+<p>Now the abstract planner. Code 29.5.2 introduces a jumpy model that advances the world by a whole option in one coarse decision (the option is "head toward subgoal $g$", and the jumpy model predicts where it lands without simulating the interior), and plans over a short chain of subgoals instead of primitive actions. This is the cure of subsection two built from scratch.</p>
+<pre><code class="language-python">def low_level_policy(s, g):
+    """Greedy goal-conditioned policy: take the primitive move that most reduces |s - g|."""
+    best_a, best_d = None, np.inf
+    for a in ACTIONS:
+        d = np.abs(np.clip(s + a, 0, N - 1) - g).sum()
+        if d < best_d:
+            best_d, best_a = d, a
+    return best_a
+
+def jumpy_transition(s, g, max_k=N):
+    """Abstract k-step transition: run the option 'go to g' until arrival; return landing + k."""
+    k = 0
+    while not np.array_equal(s, g) and k < max_k:
+        s = np.clip(s + low_level_policy(s, g), 0, N - 1)   # low level fills in primitive steps
+        k += 1
+    return s, k                              # the high level sees only (landing, duration)
+
+def abstract_plan(s0, n_subgoals=4, n_samples=2000):
+    """Plan over a short chain of subgoals; the jumpy model jumps between them."""
+    best_cost, best_chain = np.inf, None
+    for _ in range(n_samples):
+        # propose a chain of subgoals (coarse decisions), each a grid waypoint
+        chain = rng.integers(0, N, size=(n_subgoals, 2))
+        s, total_k = s0.copy(), 0
+        for g in chain:
+            s, k = jumpy_transition(s, g)    # one coarse step covers k primitive steps
+            total_k += k
+        s, k = jumpy_transition(s, GOAL)     # final coarse step aims at the true goal
+        total_k += k
+        c = np.abs(s - GOAL).sum()
+        if c < best_cost:
+            best_cost, best_chain = c, (total_k, chain)
+    return best_cost, best_chain
+
+abs_best, (steps_used, _) = abstract_plan(START, n_subgoals=4, n_samples=2000)
+print("abstract planner: best remaining distance = %d  (used %d primitive steps)"
+      % (abs_best, steps_used))
+print("search depth: flat = %d primitive decisions, abstract = %d coarse decisions"
+      % (H, 5))
+</code></pre>
+<div class="code-caption"><strong>Code 29.5.2:</strong> The from-scratch abstract planner. The jumpy transition advances the world by a full option (run the low-level policy until it reaches a subgoal) and reports only the landing state and the duration $k$, never exposing the interior primitive steps to the high level. The planner searches over a chain of five coarse decisions (four subgoals plus the goal) instead of a hundred primitive ones, so its search depth is twenty times shallower.</div>
+<pre><code class="language-text">abstract planner: best remaining distance = 0  (used 98 primitive steps)
+search depth: flat = 100 primitive decisions, abstract = 5 coarse decisions
+</code></pre>
+<div class="code-caption"><strong>Output 29.5.2:</strong> The abstract planner reaches the goal exactly (remaining distance 0) using 98 primitive steps, planned in just 5 coarse decisions. The flat planner, searching the same task at 100-step depth, was left 54 cells short. The abstract planner wins because it searches a depth-5 tree, not a depth-100 one, and its jumpy model never rolls forward through an option's interior where error would compound.</div>
+<p>The contrast is the whole section in two numbers: 54 cells short versus 0, at search depth 100 versus 5. The abstract planner did not have a better model or more samples (it used fewer); it had a coarser decision unit, and that single change moved the horizon from unreachable to solved. Code 29.5.3 collapses the hand-built planner to its library form, where a hierarchical or goal-conditioned RL toolkit supplies the option machinery and the jumpy rollout.</p>
+<pre><code class="language-python"># Library reference: hierarchical / goal-conditioned planning with a learned world model.
+# Sketch using a Dreamer-style stack (e.g. via the `dreamerv3` or `tdmpc2` reference impls)
+# plus a goal-conditioned low level; the jumpy model and option loop are provided.
+#
+# import gymnasium as gym
+# from dreamerv3 import Agent          # learns latent world model + imagination planning
+#
+# env   = gym.make("LongHorizonNav-v0")
+# agent = Agent(env.observation_space, env.action_space,
+#               hierarchical=True,      # high-level subgoal manager + low-level worker
+#               subgoal_every=8)        # one coarse decision per 8 primitive steps (the option length k)
+# agent.train(env, steps=1_000_000)    # learns jumpy dynamics, manager, and worker jointly
+# action = agent.act(obs)              # internally: manager proposes a latent subgoal, worker executes
+print("library: subgoal manager + worker + jumpy model provided by the framework")
+</code></pre>
+<div class="code-caption"><strong>Code 29.5.3:</strong> The library reference. The roughly 45 lines of hand-built jumpy model, low-level policy, and two-level search in Code 29.5.1 and 29.5.2 collapse to a handful of configuration lines: a Dreamer-class or TD-MPC2-style hierarchical agent learns the latent world model, the high-level subgoal manager, and the low-level worker jointly, and the option loop, the jumpy rollout, and the imagination-based planning are all internal. The line-count reduction is from about 45 lines of planner logic to roughly 5 lines of agent configuration.</div>
+<pre><code class="language-text">library: subgoal manager + worker + jumpy model provided by the framework
+</code></pre>
+<div class="code-caption"><strong>Output 29.5.3:</strong> The framework supplies the hierarchy. What we built by hand to expose the mechanism, the from-scratch coarse planner of Code 29.5.2, is in production a configured agent whose manager-and-worker split and jumpy dynamics are learned end to end, exactly the Director and Dreamer-class designs of subsection three.</div>
+<p>Read the three blocks together. Code 29.5.1 hit both long-horizon walls with flat planning and fell 54 cells short. Code 29.5.2 supplied temporal abstraction from scratch, a jumpy model and a depth-5 subgoal search, and reached the goal. Code 29.5.3 collapsed that hand-built hierarchy to the few configuration lines a modern hierarchical world-model agent needs. The numeric example below puts the horizon reduction in the same terms as subsection one.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: The Horizon Reduction in the Worked Task</div>
+<p>The flat planner searched a horizon of $H = 100$ primitive decisions with branching $b = 4$: a tree of $4^{100} \approx 1.6 \times 10^{60}$ plans, against which 4000 samples is nothing, hence the 54-cell shortfall. The abstract planner searched $H/k = 5$ coarse decisions; with options of average length $k = 98/5 \approx 20$ primitive steps, the abstract tree is $b^{5}$ in the option vocabulary, vanishing next to $b^{100}$. The compounded-error side moves the same way: at $\rho = 1.05$ the flat rollout's error sum is the ruinous $H = 100$ value of subsection one's numeric example ($\approx 26\epsilon_1 \cdot 100$), while the abstract planner's jumpy model is rolled only $5$ coarse steps, landing in the benign regime. One change of decision unit, from primitive to option, bought both an exponential search reduction ($4^{100} \to 4^{5}$) and a return of the model rollout to its reliable short-horizon error.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Hierarchical Planning Off the Shelf</div>
+<p>The from-scratch jumpy model, low-level policy, and two-level subgoal search of Code 29.5.1 and 29.5.2 ran about 45 lines exposing every mechanism. A modern hierarchical world-model stack collapses all of it to a few lines of configuration: <code>dreamerv3</code> and <code>tdmpc2</code> reference implementations learn the latent jumpy dynamics and the imagination planner; goal-conditioned and hierarchical RL utilities in libraries such as <code>d3rlpy</code> (offline) and the option machinery layered on <code>Gymnasium</code> environments supply the manager-worker split, the option termination, and the semi-Markov bookkeeping internally. The reduction is from roughly 45 lines of planner logic to about 5 lines of agent configuration, with the framework handling the learned jumpy model, the subgoal proposal, the low-level execution, and the credit assignment across coarse decisions that we wrote by hand.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Warehouse Robot That Stopped Planning in Footsteps</div>
+<p><strong>Who:</strong> An autonomy team at a logistics company training a mobile manipulator to fetch items across a large warehouse, the robotics setting that threads through Part VI.</p>
+<p><strong>Situation:</strong> A fetch task spanned hundreds of primitive control steps, from the charging dock across aisles to a shelf and back. Their first agent planned model-based over primitive velocity commands.</p>
+<p><strong>Problem:</strong> Over the full horizon the learned dynamics model drifted (compounding error, subsection one), and the sampling planner's trajectories beyond about thirty steps were imagination rather than prediction, so the robot frequently committed to a plan that diverged from reality halfway down an aisle.</p>
+<p><strong>Dilemma:</strong> They could shorten the planning horizon to keep the model honest, but then the robot was greedy and got stuck behind obstacles it should have planned around; or they could keep the long horizon and accept that the far end of every plan was fiction.</p>
+<p><strong>Decision:</strong> They restructured the agent around temporal abstraction: a high-level planner that reasoned over a dozen waypoints (aisle entrances, shelf approaches, the dock) using a jumpy model that predicted arrival at a waypoint, and a learned low-level controller that drove between waypoints, exactly the manager-worker split of subsection two.</p>
+<p><strong>How:</strong> The jumpy model was trained to predict the landing pose and traversal time of "go to waypoint $g$", so the high level planned a five-to-ten-decision route while the low-level policy handled the hundreds of primitive control steps, mirroring the Code 29.5.2 structure.</p>
+<p><strong>Result:</strong> Planning became reliable because the high-level rollout was only a handful of coarse steps, well inside the jumpy model's accurate range, and the search over routes was shallow enough to replan in real time as the warehouse changed. The robot reached shelves it had previously failed to plan a route to.</p>
+<p><strong>Lesson:</strong> When a model-based agent's plans degrade past a horizon, the fix is rarely a better one-step model; it is a coarser decision unit. Plan in waypoints, not velocities, and the same model that was fiction at three hundred primitive steps is accurate at ten coarse ones.</p>
+</div>
+
+<div class="callout looking-back">
+<div class="callout-title">Looking Back: Part VI Complete, and the Road to Part VII</div>
+<p>This section closes Chapter 29 and, with it, the whole of <a href="../index.html">Part VI: Sequential Decision Making</a>. The arc was a single sustained answer to the question of how an agent should act over time. <a href="../module-22-markov-decision-processes/index.html">Chapter 22</a> and <a href="../module-23-pomdps/index.html">Chapter 23</a> built the formalism, the MDP and the POMDP, where the HMM belief state of <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/index.html">Chapter 7</a> returned as the agent's state estimate. <a href="../module-24-bandits-rl-foundations/index.html">Chapters 24</a> through <a href="../module-26-advanced-rl/index.html">26</a> learned value functions and policies from interaction; <a href="../module-27-control-imitation/index.html">Chapter 27</a> connected to optimal control and imitation; <a href="../module-28-sequence-models-decision/index.html">Chapter 28</a> reframed the MDP itself as a sequence model, the temporal thread's most striking turn, and Chapter 29 closed the loop by learning the world model and planning inside it, ending here with the temporal abstraction that lets planning reach far. The recurring lesson, stated in subsection four and earned across all eight chapters, is that the right amount of structure beats brute force: a model where dynamics are reusable, an abstraction where the horizon is long, a prior where data is scarce, and learning everywhere else. <a href="../../part-7-building-intelligent-systems/index.html">Part VII: Building Intelligent Temporal Systems</a> takes the next step. <a href="../../part-7-building-intelligent-systems/module-30-temporal-reasoning-causality/index.html">Chapter 30</a> adds temporal reasoning and causality (knowing not just what follows what, but what <em>causes</em> what); <a href="../../toc.html">Chapter 31</a> builds temporal agents that combine the perception, prediction, and planning of the previous six parts into systems that pursue goals, where the high-level planners of this section meet large pretrained models; and <a href="../../toc.html">Chapter 32</a> extends everything to space as well as time. The agent of Part VI knew how to decide; the systems of Part VII learn to reason, to act in the world, and to understand where things happen as well as when.</p>
+</div>
+
+<h2>Exercises</h2>
+<div class="callout key-insight">
+<div class="callout-title">Exercise 29.5.1 (Conceptual): The Two Walls, Separated</div>
+<p>A colleague claims their long-horizon model-based agent fails "because the search is too big" and proposes sampling more action sequences. Using subsection one, explain why more samples alone will not help if the dominant failure is compounding model error rather than search, and describe one diagnostic you would run to tell the two failures apart. Then state precisely why temporal abstraction addresses both walls with one change, referring to the decision-count argument of the Key Insight in subsection one.</p>
+</div>
+<div class="callout key-insight">
+<div class="callout-title">Exercise 29.5.2 (Implementation): Vary the Option Length</div>
+<p>Modify Code 29.5.2 so the option length is controllable: instead of running the low-level policy all the way to each subgoal, run it for a fixed number of primitive steps $k$ per coarse decision (a fixed-duration option, as in Director). Sweep $k \in \{1, 5, 10, 20, 50\}$ on the $50 \times 50$ task, holding the sample budget fixed, and plot remaining distance versus $k$. Confirm that $k = 1$ recovers (roughly) the flat planner's failure and that an intermediate $k$ is best, and explain the U-shape: why does too-small $k$ fail (subsection one) and too-large $k$ also fail (the high level loses control over where it lands)?</p>
+</div>
+<div class="callout key-insight">
+<div class="callout-title">Exercise 29.5.3 (Open-ended): Where on the Spectrum?</div>
+<p>Pick one of the three running datasets of this book (finance, healthcare, or sensor/IoT) and frame a sequential-decision task on it (for example, a trading policy, a treatment policy, or a maintenance-scheduling policy). Using the spectrum of subsection four, argue for one family of methods by answering the three choice questions explicitly (how expensive is interaction, how much do you already know, how long is the horizon), and state whether the task's horizon is long enough to require the temporal abstraction of this section. Identify the one assumption your chosen family makes that, if violated by the real problem, would most endanger it.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="nav-prev" href="section-29.4.html"><span class="nav-label">Previous</span><span class="nav-num">Section 29.4</span><span class="nav-title">Planning in Learned World Models</span></a>
+<a class="nav-up" href="index.html"><span class="nav-label">Up</span><span class="nav-num">Chapter 29</span><span class="nav-title">World Models and Planning</span></a>
+<a class="nav-next" href="../../toc.html"><span class="nav-label">Next</span><span class="nav-num">Contents</span><span class="nav-title">Table of Contents</span></a>
+</nav>
+</main>
+<footer class="site-footer">
+<p class="edition-line">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="copyright">&copy; 2026 Alexander Apartsin &middot; <a href="../../toc.html">Contents</a></p>
+<p class="last-updated"><script>document.write("Last updated: " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

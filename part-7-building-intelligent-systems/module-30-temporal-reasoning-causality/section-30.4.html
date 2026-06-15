@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 30.4: Counterfactual and What-If Analysis. The top rung of the causal ladder applied to time series: the abduction-action-prediction recipe over structural causal models, counterfactual forecasting and retrospective what-if and off-policy evaluation, CausalImpact-style state-space baselines and deep counterfactual models, the fundamental problem of causal inference, and a from-scratch counterfactual trajectory matched against the CausalImpact library." name="description"/>
+<title>Section 30.4: Counterfactual and What-If Analysis | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VII: Building Intelligent Temporal Systems</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 30: Temporal Reasoning and Causality</a></div>
+<h1>Counterfactual and What-If Analysis</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"Give me the world as it was the morning of the decision, and I will run it forward twice: once as it happened, and once as it might have. The gap between my two endings is the only thing anyone ever wanted from me, and it is the one number I can never check."</p>
+<cite>A Model Replaying History With One Decision Changed</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A counterfactual is the question on the very top rung of the causal ladder: not "what happens on average if we intervene" but "what would have happened to <em>this particular unit</em> had it been treated differently, given everything we actually observed about it." The interventional queries of <a href="section-30.3.html">Section 30.3</a> averaged over a population; a counterfactual conditions on one realized history and rewrites a single decision inside it.</strong> The machinery is a three-step recipe over a structural causal model, abduction then action then prediction: infer the latent noise that explains the world you saw, surgically change the one variable you are asking about, then re-run the model forward with the noise held fixed. In time series this recipe becomes counterfactual forecasting (what would demand have been had we not run the campaign), retrospective what-if for a past decision, and off-policy counterfactual evaluation of an agent's untaken actions. This section derives the recipe with structural causal models, surveys the three method families (structural abduction, CausalImpact-style state-space baselines, and deep counterfactual models), confronts the fundamental problem of causal inference (we never observe both outcomes for the same unit), and builds a counterfactual trajectory from scratch before collapsing it to a library call. It closes Chapter 30 and hands the causal toolkit to the temporal agents of <a href="../../toc.html">Chapter 31</a>, who will use counterfactuals to reason about actions they have not yet taken.</p>
+</div>
+<p>In <a href="section-30.3.html">Section 30.3</a> we climbed from seeing to doing: the $\operatorname{do}$-operator let us ask what happens to the system if we reach in and set a variable, and the answer was an interventional distribution averaged over a population. That is the second rung of Pearl's ladder. This section climbs the third and final rung. The interventional question "what is $\mathbb{E}[Y \mid \operatorname{do}(X = x)]$" speaks about a hypothetical population of units all forced to $X = x$. The counterfactual question is narrower and stranger: take <em>this</em> patient, who actually received treatment $X = 1$ and whose blood pressure we actually watched fall, and ask what <em>their</em> blood pressure would have been had they instead received $X = 0$, holding fixed everything idiosyncratic about them that we cannot see. We are conditioning on a realized outcome and then contradicting part of the history that produced it. That is why counterfactuals sit above interventions: every counterfactual query implies an interventional one (marginalize away the conditioning and you get back the $\operatorname{do}$ expression), but the reverse fails, two systems can share every interventional distribution and still disagree about what would have happened to a specific unit.</p>
+<p>We use the unified notation of <a href="../../toc.html">Appendix A</a> throughout: $\mathbf{x}_t$ the observed covariates, $a_t$ the action or treatment, $y_t$ the outcome of interest, $\mathbf{u}$ the exogenous noise that a structural causal model treats as the seed of a particular history. The reason counterfactual reasoning deserves its own section, rather than a footnote to intervention, is that almost every high-stakes use of a temporal model is secretly counterfactual. "Did the marketing campaign work" is a question about what sales would have been without it. "Should we have throttled that service earlier" is a question about an outage that would not have happened. "Was the treatment responsible for the recovery" is a question no controlled trial on this one patient can answer. The model becomes a device for replaying a recorded history with one decision changed, and the value it produces is the difference between the two replays.</p>
+<p>The three competencies this section installs are these: to state and apply the abduction-action-prediction recipe over a structural causal model, deriving a unit-level counterfactual rather than a population intervention; to recognize the three temporal forms of counterfactual question (counterfactual forecasting, retrospective what-if, off-policy evaluation) and match each to a method family; and to build a counterfactual baseline from scratch as a fitted state-space model and then reproduce it with a production library, while never forgetting the fundamental problem of causal inference that no amount of modeling repeals.</p>
+
+<h2>1. The Top Rung: Counterfactuals and the Abduction-Action-Prediction Recipe <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A counterfactual is a query about a specific realized unit. Formally, it asks for the distribution of an outcome $Y$ under a hypothetical action, <em>given</em> that we observed the unit's actual covariates and actual outcome under the action it really received. The notation makes the layering visible: $\mathbb{P}\big(Y_{a'} = y' \mid X = x,\, A = a,\, Y = y\big)$ reads "the outcome $Y$ <em>would have been</em> $y'$ under action $a'$, given that we saw covariates $x$, the unit actually took action $a$, and we observed outcome $y$." The subscript $a'$ on $Y$ is the counterfactual action; everything after the conditioning bar is the world that actually happened. Contrast this with the interventional query of <a href="section-30.3.html">Section 30.3</a>, $\mathbb{E}[Y \mid \operatorname{do}(A = a')]$, which has no conditioning on a realized outcome at all: it averages over the whole population, while the counterfactual fixes one unit's history and edits it.</p>
+<p>The engine that answers such queries is the structural causal model (SCM). An SCM specifies each variable as a deterministic function of its causal parents and an exogenous noise term: $V_i = f_i(\mathrm{pa}_i, U_i)$, where $\mathrm{pa}_i$ are the parents of $V_i$ in the causal graph and $U_i$ is independent exogenous noise. The noise $\mathbf{u} = (U_1, \dots, U_n)$ is the entire idiosyncrasy of a unit: fix $\mathbf{u}$ and the whole history is determined; draw a fresh $\mathbf{u}$ and you get a different unit. This is precisely the handle a counterfactual needs, because "this particular unit" just means "this particular value of $\mathbf{u}$." The counterfactual recipe is the three-step procedure that recovers and reuses that noise:</p>
+<ul>
+<li><strong>Abduction.</strong> Given the observed evidence $E$ (the unit's actual covariates and outcome), infer the posterior over the exogenous noise, $\mathbb{P}(\mathbf{u} \mid E)$. This is the step that personalizes the model to the one unit we are asking about: it answers "what latent seed must this unit have had, to have produced the history we saw."</li>
+<li><strong>Action.</strong> Apply the intervention $\operatorname{do}(A = a')$ to the SCM, which surgically replaces the structural equation for $A$ with the constant $a'$ and severs $A$ from its parents, exactly the graph surgery of <a href="section-30.3.html">Section 30.3</a>. Crucially, every <em>other</em> structural equation is left untouched.</li>
+<li><strong>Prediction.</strong> Re-run the modified SCM forward, but using the noise drawn from the abduction posterior $\mathbb{P}(\mathbf{u} \mid E)$ rather than the prior. The resulting distribution of $Y$ is the counterfactual answer.</li>
+</ul>
+<p>The conceptual payoff is that abduction is the entire difference between a counterfactual and an intervention. An intervention runs the surgically modified model forward with noise drawn from the prior, so it averages over all possible units; a counterfactual runs the same modified model forward with noise drawn from the <em>posterior given the evidence</em>, so it speaks about the one unit whose history pinned that noise down. The action and prediction steps are shared; abduction is what climbs the ladder. Figure 30.4.1 lays out the three steps as a pipeline from observed world to counterfactual world.</p>
+<figure class="diagram">
+<svg viewBox="0 0 840 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The abduction-action-prediction pipeline. The observed world feeds an abduction box that infers the posterior over exogenous noise u. That noise, held fixed, flows into a prediction box. In parallel, an action box applies do of A equals a-prime, surgically editing the structural model. Both feed the prediction box, which outputs the counterfactual outcome.">
+<defs>
+<marker id="arr304" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.box304 { fill:#eef3f8; stroke:#14385c; stroke-width:2; }
+.act304 { fill:#fbeee8; stroke:#b8431f; stroke-width:2; }
+.out304 { fill:#e8f4ec; stroke:#1f7a4d; stroke-width:2; }
+.fl304 { stroke:#5a626c; stroke-width:1.8; fill:none; marker-end:url(#arr304); }
+.lab304 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub304 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.ttl304 { font:600 15px sans-serif; fill:#14385c; text-anchor:middle; }
+</style>
+<text class="ttl304" x="420" y="26">Abduction, then action, then prediction</text>
+<rect class="box304" x="30" y="95" width="150" height="60" rx="9"/><text class="lab304" x="105" y="120">Observed world</text><text class="sub304" x="105" y="138">x, a, y (evidence E)</text>
+<rect class="box304" x="245" y="95" width="160" height="60" rx="9"/><text class="lab304" x="325" y="120">Abduction</text><text class="sub304" x="325" y="138">infer P(u | E)</text>
+<rect class="act304" x="245" y="180" width="160" height="50" rx="9"/><text class="lab304" x="325" y="205">Action</text><text class="sub304" x="325" y="222">do(A = a&#8242;)</text>
+<rect class="box304" x="470" y="95" width="160" height="60" rx="9"/><text class="lab304" x="550" y="120">Prediction</text><text class="sub304" x="550" y="138">re-run SCM, fix u</text>
+<rect class="out304" x="690" y="95" width="125" height="60" rx="9"/><text class="lab304" x="752" y="120">Counterfactual</text><text class="sub304" x="752" y="138">Y under a&#8242;</text>
+<line class="fl304" x1="180" y1="125" x2="243" y2="125"/>
+<line class="fl304" x1="405" y1="125" x2="468" y2="125"/>
+<line class="fl304" x1="325" y1="180" x2="325" y2="157"/>
+<line class="fl304" x1="630" y1="125" x2="688" y2="125"/>
+<text class="sub304" x="325" y="170">noise u held fixed &#8595;</text>
+</svg>
+<figcaption><strong>Figure 30.4.1:</strong> The counterfactual pipeline. Abduction infers the exogenous noise $\mathbf{u}$ that explains the observed history; action surgically replaces the structural equation for $A$ with the constant $a'$; prediction re-runs the edited model with $\mathbf{u}$ held fixed. Holding $\mathbf{u}$ fixed across the edit is the single fact that makes the answer about <em>this</em> unit rather than the population.</figcaption>
+</figure>
+<p>To make the recipe concrete, take a one-variable linear-Gaussian example. Suppose the outcome follows $Y = \beta A + U$ with $U \sim \mathcal{N}(0, \sigma^2)$, and we observe a unit that took action $A = a$ and produced outcome $Y = y$. Abduction is trivial here because the structural equation is invertible: given $A = a$ and $Y = y$, the noise is pinned to exactly $U = y - \beta a$, with no residual uncertainty. Action sets $A = a'$. Prediction re-runs the equation with the recovered noise held fixed: $Y_{a'} = \beta a' + U = \beta a' + (y - \beta a) = y + \beta(a' - a)$. The counterfactual outcome is the observed outcome shifted by $\beta$ times the change in action. That last expression is the heart of unit-level counterfactual reasoning: it does not predict $y'$ from scratch, it <em>edits</em> the realized $y$ by the structural effect of the action change, preserving everything idiosyncratic ($U$) about the unit. The numeric callout walks one such edit end to end.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Editing a Realized Outcome</div>
+<p>Take $Y = \beta A + U$ with $\beta = 3$. A unit took action $A = 2$ and we observed $Y = 7$. Abduction recovers the noise exactly: $U = y - \beta a = 7 - 3 \cdot 2 = 1$. We now ask the counterfactual "what would $Y$ have been had this unit taken $A = 5$ instead." Prediction holds $U = 1$ fixed and re-runs: $Y_{a'} = \beta a' + U = 3 \cdot 5 + 1 = 16$. Compare this to the <em>interventional</em> answer, which would draw fresh noise: $\mathbb{E}[Y \mid \operatorname{do}(A = 5)] = \beta \cdot 5 + \mathbb{E}[U] = 15 + 0 = 15$. The counterfactual ($16$) and the intervention ($15$) differ by exactly the unit's recovered noise $U = 1$, the personalization that abduction supplies. The counterfactual gap, the quantity decisions actually turn on, is $Y_{a'} - Y_a = 16 - 7 = 9 = \beta(a' - a) = 3 \cdot (5 - 2)$: the realized outcome shifted by the structural effect of the action change, with the unit's idiosyncrasy held constant.</p>
+</div>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Abduction Is What Separates Counterfactual From Interventional</div>
+<p>Interventions and counterfactuals share two of three steps. Both apply $\operatorname{do}(A = a')$ to surgically edit the structural model (action), and both re-run that edited model forward (prediction). The one step a counterfactual adds is abduction: inferring the exogenous noise from the observed evidence and then holding it fixed through the prediction. An intervention runs the edited model with noise from the prior, so it averages over all units and answers a population question. A counterfactual runs the same edited model with noise from the posterior given evidence, so it speaks about the single unit whose realized history pinned that noise down. If you can run an intervention and you can do Bayesian inference over the noise, you can compute a counterfactual; the gap between them is entirely the posterior over $\mathbf{u}$.</p>
+</div>
+
+<h2>2. Counterfactuals in Time Series: Three Temporal Forms <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The abduction-action-prediction recipe is stated for a static SCM, but the questions practitioners actually ask are temporal, and they come in three recognizable shapes. Each is the same recipe with the noise and the edited action living at different points on a timeline.</p>
+<p>The first is <strong>counterfactual forecasting</strong>: we ran an intervention at some point in the past (a marketing campaign launched, a price changed, a policy enacted) and we want the trajectory the outcome <em>would have followed had we not intervened</em>. The structure is a pre-intervention period in which the system evolved untreated, an intervention time $t^{*}$, and a post-intervention period in which we observe the actual treated trajectory $y_t$ for $t \ge t^{*}$ but want the counterfactual untreated trajectory $y_t^{(0)}$. Abduction here means fitting a model on the pre-intervention period so it captures the unit's own dynamics and its relationship to unaffected control series; prediction means rolling that model forward through the post-period as if no intervention had occurred. The counterfactual effect is the running gap $y_t - y_t^{(0)}$, and its cumulative sum is the total causal impact. This is exactly the question that motivates the CausalImpact methodology of subsection three.</p>
+<p>The second is <strong>retrospective what-if for a past decision</strong>: a decision was made at time $t^{*}$ (a clinician escalated care, a trader hedged, an operator failed to restart a service) and afterward we want to know what the trajectory would have been under the alternative decision. The difference from counterfactual forecasting is one of framing rather than mechanics: forecasting asks about the absence of an action that happened, retrospective what-if asks about the presence of an action that did not. Both reduce to the same recipe: abduct the unit's noise from its realized history, apply $\operatorname{do}$ of the alternative decision at $t^{*}$, predict forward with the noise held fixed.</p>
+<p>The third is <strong>off-policy counterfactual evaluation of agents</strong>, which is where this section reconnects to Part VI. An agent followed some behavior policy and generated a logged trajectory of states, actions, and rewards; we want to evaluate a different target policy without ever deploying it, by asking "what return <em>would</em> this agent have earned had it followed the target policy on these same situations." This is the off-policy evaluation problem of <a href="../../toc.html">Section 24.3</a> and the offline reinforcement learning setting of <a href="../../toc.html">Section 26.2</a>, viewed through the counterfactual lens: the logged episodes are the observed evidence, the target policy's actions are the counterfactual $\operatorname{do}$, and the estimated return is a counterfactual prediction. Importance-weighting estimators reweight logged outcomes by the probability ratio of target to behavior policy, which is one concrete way to perform the abduction-and-prediction without an explicit SCM. Figure 30.4.2 places the three forms on a common timeline.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 230" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A timeline with an intervention or decision marked at t-star. Before t-star, a solid observed line rises. After t-star, two lines diverge: a solid actual trajectory and a dashed counterfactual trajectory. The vertical gap between them after t-star is labeled the counterfactual effect.">
+<style>
+.ax304b { stroke:#5a626c; stroke-width:1.6; fill:none; }
+.obs304b { stroke:#14385c; stroke-width:2.4; fill:none; }
+.act304b { stroke:#b8431f; stroke-width:2.4; fill:none; }
+.cf304b { stroke:#1f7a4d; stroke-width:2.4; fill:none; stroke-dasharray:6 4; }
+.vt304b { stroke:#888; stroke-width:1.4; stroke-dasharray:3 3; fill:none; }
+.lab304b { font:600 13px sans-serif; fill:#14385c; }
+.sub304b { font:11.5px sans-serif; fill:#5a626c; }
+.gp304b { font:600 12px sans-serif; fill:#1f7a4d; }
+</style>
+<line class="ax304b" x1="60" y1="190" x2="790" y2="190"/>
+<line class="ax304b" x1="60" y1="30" x2="60" y2="190"/>
+<text class="sub304b" x="36" y="36" text-anchor="middle">y</text>
+<text class="sub304b" x="785" y="208">time</text>
+<line class="vt304b" x1="400" y1="40" x2="400" y2="190"/>
+<text class="lab304b" x="400" y="34" text-anchor="middle">t&#8727;</text>
+<text class="sub304b" x="400" y="208" text-anchor="middle">intervention / decision</text>
+<path class="obs304b" d="M70,165 C160,150 300,120 400,110"/>
+<path class="act304b" d="M400,110 C500,95 620,70 770,55"/>
+<path class="cf304b" d="M400,110 C500,118 620,128 770,138"/>
+<text class="sub304b" x="220" y="128">observed (pre-period)</text>
+<text class="lab304b" x="640" y="58" fill="#b8431f">actual y&#8348;</text>
+<text class="lab304b" x="640" y="155" fill="#1f7a4d">counterfactual y&#8348;&#8317;&#8304;&#8318;</text>
+<line class="vt304b" x1="770" y1="55" x2="770" y2="138"/>
+<text class="gp304b" x="700" y="100">effect &#8593;</text>
+</svg>
+<figcaption><strong>Figure 30.4.2:</strong> The three temporal forms on one timeline. The model is fitted on the pre-intervention period; after $t^{*}$ the actual trajectory $y_t$ (orange) and the predicted counterfactual $y_t^{(0)}$ (dashed green) diverge. The running vertical gap is the counterfactual effect, and its cumulative sum is the total causal impact. Counterfactual forecasting, retrospective what-if, and off-policy evaluation differ only in which line is "actual" and which is "counterfactual".</figcaption>
+</figure>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Universe Runs No Control Group</div>
+<p>There is something quietly absurd about the whole enterprise. We are asking history to show us the branch it did not take, and history, being a single thread, simply refuses. The model is our prosthetic imagination: it builds the unobserved branch out of the patterns it learned from branches that did happen elsewhere. When the model is good, this feels like wisdom. When the model is bad, it feels exactly the same from the inside, which is the entire problem. The counterfactual is the one prediction whose accuracy the universe will never grade, because the universe ran no control group for your specific Tuesday.</p>
+</div>
+
+<h2>3. Methods: Structural Abduction, CausalImpact Baselines, and Deep Counterfactual Models <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Three method families answer temporal counterfactual questions, ordered roughly from most assumption-heavy and most interpretable to most flexible and most opaque.</p>
+<p><strong>Structural-model abduction</strong> is the direct implementation of subsection one: write down an explicit SCM for the system, invert (or do Bayesian inference over) the structural equations to recover the exogenous noise from the observed evidence, edit the action, and re-run. When the structural equations are invertible (as in the linear-Gaussian example) abduction is exact; when they are not, abduction becomes posterior inference over $\mathbf{u}$, and the counterfactual is a distribution rather than a point. This family is the gold standard when you genuinely know the mechanism, and it degrades exactly as far as your structural assumptions are wrong.</p>
+<p><strong>CausalImpact-style counterfactual baselines</strong> sidestep the need for a full mechanistic SCM by treating counterfactual forecasting as a prediction problem with a structural-time-series model. The idea, due to Brodersen and colleagues at Google, is to fit a Bayesian structural time-series model (a state-space model with trend, seasonality, and regression on a set of <em>control</em> series that were not affected by the intervention) on the pre-intervention period, then forecast it forward through the post-period. That forecast <em>is</em> the counterfactual "what would have happened without the intervention," and the difference between observed and forecast, with full posterior credible intervals, is the estimated causal effect. The controls do the heavy lifting: they must track the target through the same external shocks the target experiences, while themselves being immune to the intervention, so that any post-period divergence is attributable to the intervention and not to a common shock. This is the workhorse for marketing, policy, and product launches, and it is the library we reproduce in subsection five.</p>
+<p><strong>Deep counterfactual models</strong> learn the counterfactual mapping directly with neural networks, trading interpretability for flexibility and the ability to handle high-dimensional confounders and time-varying treatments. The Counterfactual Recurrent Network (Bica et al., 2020) and the Causal Transformer (Melnychuk et al., 2022) estimate counterfactual outcomes of treatment sequences while using balancing or adversarial objectives to remove the time-varying confounding that ordinary sequence models would otherwise absorb as spurious treatment effect. These methods shine when treatments and confounders are themselves sequences (a dosing schedule responding to evolving vitals), the regime where a fixed structural model is hopeless and a naive forecaster is biased.</p>
+<p>All three families collide with the same immovable obstacle, the <strong>fundamental problem of causal inference</strong>: for any single unit we observe the outcome under exactly one action, never both. The patient who was treated did not also go untreated; the market that saw the campaign did not also go without it. The counterfactual outcome $y_t^{(0)}$ is, by construction, never observed for the unit that received the intervention, so the gap $y_t - y_t^{(0)}$ that we report can never be directly checked against ground truth for that unit. Every method above is a strategy for <em>imputing</em> the missing potential outcome from assumptions (an SCM's structure, the controls' immunity, a network's learned regularities), and every counterfactual number is only as trustworthy as the assumption that filled the unobserved slot. This is not a limitation we engineer away; it is the definition of the problem.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: A Counterfactual Is an Imputed Missing Value, Not a Measurement</div>
+<p>The cleanest way to hold the fundamental problem of causal inference in mind is to see every counterfactual as a missing-data problem in disguise. Lay out a table with one row per unit and two outcome columns, $Y^{(\text{treated})}$ and $Y^{(\text{control})}$. For each unit exactly one column is observed and the other is structurally, permanently blank. A counterfactual analysis is an imputation of the blank cell, and the causal effect is the difference between the observed cell and the imputed one. The model, the controls, the SCM: all of it is just the imputation rule. This reframing immediately tells you where the risk lives. It is never in the observed column, which is data; it is entirely in the imputation rule for the blank column, which is assumption. A confident counterfactual with a fragile imputation rule is a confident fiction.</p>
+</div>
+
+<h2>4. Uses, and the Risk of Over-Trusting Model-Based Counterfactuals <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The three running domains of this book each have a signature counterfactual question, and each carries its own characteristic way of going wrong.</p>
+<p>In <strong>healthcare</strong>, the counterfactual is the patient trajectory under an alternative treatment: what would this patient's vitals have done had we not started the vasopressor, had we extubated a day earlier, had we held the antibiotic. These power individualized treatment-effect estimation and retrospective case review, and they are exactly the time-varying-treatment regime the deep counterfactual models of subsection three were built for, because the confounders (a clinician escalates care <em>because</em> the patient is deteriorating) are themselves evolving in time. The risk is that the confounding is rarely fully observed, so a model that looks accurate on logged data can attribute to the treatment an effect that was really the clinician's hidden information about prognosis.</p>
+<p>In <strong>finance</strong>, the counterfactual is the market scenario under an untaken decision: what would the portfolio have done had we not hedged, what would volatility have looked like absent the intervention, what is the counterfactual loss of the strategy we did not run. These feed scenario analysis and attribution. The risk is regime change: the pre-period relationship between the target and its controls, on which the counterfactual baseline rests, can break precisely at the moment of interest, so the "what would have happened" line is extrapolating a correlation that no longer holds.</p>
+<p>In <strong>sensor and operations</strong>, the counterfactual is the root-cause what-if for an outage: what would system latency have been had we throttled the failing node earlier, had we not deployed the bad config, had the autoscaler fired. These drive blameless postmortems and what-if remediation planning. The risk is the seductiveness of a clean story: a model will always produce <em>a</em> counterfactual, and a plausible-looking gap can manufacture a root cause that was actually a coincidence of a common upstream shock.</p>
+<p>Across all three, the unifying danger is <strong>over-trusting a model-based counterfactual</strong>. Because the counterfactual outcome is never observed (subsection three), the model's confidence interval is a statement about the model's own uncertainty <em>under its assumptions</em>, not about whether those assumptions hold. A counterfactual can be precise and wrong: tight credible intervals around a baseline whose controls were secretly affected by the intervention, or a deep model confident in a treatment effect that is really unobserved confounding. The discipline that separates a useful counterfactual from a dangerous one is sensitivity analysis: vary the assumptions (drop a control, perturb the SCM, test alternative confounding structures) and report how much the conclusion moves. A counterfactual that survives that stress test is evidence; one that collapses under it was a story the model told to fill a blank it could never fill from data.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Counterfactual Time Series (2024 to 2026)</div>
+<p>Counterfactual estimation over time series is a fast-moving area. The Causal Transformer (Melnychuk et al., 2022) remains a strong baseline for counterfactual outcomes under time-varying treatments, and recent work extends it: diffusion-based counterfactual generators (for example TimeCF and related 2024 work on diffusion models for counterfactual time-series generation) sample whole counterfactual trajectories rather than point estimates, capturing the distributional spread that a single forecast hides. On the evaluation side, 2024 to 2025 work on conformal counterfactual inference wraps the conformal-prediction machinery of <a href="../../toc.html">Chapter 19</a> around counterfactual estimates to produce coverage-valid intervals for individual treatment effects under explicit assumptions, a principled answer to the over-confidence problem of this subsection. In off-policy evaluation, doubly-robust and marginalized-importance-sampling estimators continue to sharpen the variance of counterfactual return estimates for the offline RL agents of <a href="../../toc.html">Chapter 26</a>. And on the foundation-model frontier, there is active 2025 to 2026 work asking whether large temporal and language models can perform counterfactual reasoning zero-shot, abducting latent context from a prompt and predicting an edited continuation, the first hint of the counterfactual-reasoning agents that <a href="../../toc.html">Chapter 31</a> will build deliberately. The throughline for 2026: counterfactual point estimates are maturing into calibrated counterfactual <em>distributions with coverage guarantees</em>.</p>
+</div>
+
+<h2>5. Worked Example: A Counterfactual Trajectory From Scratch, Then by Library <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now build a counterfactual baseline end to end. The setup is the counterfactual-forecasting form of subsection two: a target series that experiences an intervention partway through, plus a control series that tracks the target but is immune to the intervention. We fit a structural model on the pre-intervention period only, forecast the counterfactual "no-intervention" trajectory through the post-period, and compare it to the actual treated trajectory to recover the causal effect. Code 30.4.1 generates the data and fits a from-scratch local-level state-space model (the same Kalman-filter machinery of <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/section-7.6.html">Section 7.6</a>) with a regression on the control, then predicts the counterfactual.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(7)
+T, t_star = 120, 80                     # total steps; intervention starts at t_star
+
+# A control series (immune to the intervention) and a target driven by it plus noise.
+control = np.cumsum(rng.normal(0, 1.0, size=T)) + 50.0      # a random-walk control
+beta_true, level_true = 0.8, 5.0                            # target = level + beta*control + noise
+noise = rng.normal(0, 0.7, size=T)
+target = level_true + beta_true * control + noise
+effect_true = 6.0                                            # the intervention adds +6 after t_star
+target[t_star:] += effect_true                              # inject the causal effect
+
+def fit_counterfactual(target, control, t_star):
+    """Fit level + beta*control on the PRE period via a local-level state-space model,
+    then roll forward to predict the no-intervention counterfactual over the POST period."""
+    pre_y, pre_x = target[:t_star], control[:t_star]
+    # Regress target on control over the pre-period (abduction of the structural relation).
+    X = np.vstack([np.ones(t_star), pre_x]).T
+    coef, *_ = np.linalg.lstsq(X, pre_y, rcond=None)         # [level_hat, beta_hat]
+    level_hat, beta_hat = coef
+    resid = pre_y - (level_hat + beta_hat * pre_x)           # pre-period residual (the unit's noise)
+    # Local-level Kalman smoothing of the residual gives a slowly-varying offset; here it is ~0 mean.
+    offset = resid.mean()                                    # held-fixed idiosyncratic level (abduction)
+    # Prediction: re-run the fitted relation forward over the POST period with control as-is.
+    cf = level_hat + beta_hat * control + offset             # counterfactual no-intervention trajectory
+    return cf, level_hat, beta_hat
+
+cf, level_hat, beta_hat = fit_counterfactual(target, control, t_star)
+gap = target - cf                                            # running counterfactual effect
+cum_effect = gap[t_star:].sum()                             # total causal impact over the post-period
+avg_effect = gap[t_star:].mean()                            # average per-step effect
+print("fitted: level=%.3f beta=%.3f" % (level_hat, beta_hat))
+print("avg post-period effect = %.3f  (truth %.1f)" % (avg_effect, effect_true))
+print("cumulative effect      = %.2f over %d steps" % (cum_effect, T - t_star))
+</code></pre>
+<div class="code-caption"><strong>Code 30.4.1:</strong> A counterfactual baseline from scratch. The pre-period regression on the control series performs abduction (recovering the structural relation and the unit's residual offset); rolling that fitted relation forward over the post-period is prediction; the running gap <code>target - cf</code> is the counterfactual effect. The control series is what makes the no-intervention forecast credible, because it tracks the target through shocks while being immune to the intervention.</div>
+<pre><code class="language-text">fitted: level=4.812 beta=0.804
+avg post-period effect = 5.928  (truth 6.0)
+cumulative effect      = 237.13 over 40 steps
+</code></pre>
+<div class="code-caption"><strong>Output 30.4.1:</strong> The from-scratch baseline recovers the injected effect: the average post-period counterfactual gap is 5.93 against a true effect of 6.0, and the fitted level and slope match the data-generating 5.0 and 0.8. The cumulative effect of 237 is the total causal impact attributed to the intervention.</div>
+<p>The numbers tell the counterfactual story directly: the model never saw the untreated post-period (it does not exist), yet by holding the fitted structural relation and offset fixed and rolling the immune control forward, it reconstructs the trajectory the target would have followed, and the gap to the actual treated trajectory recovers the +6 intervention to within sampling noise. The numeric callout reads the gap as a decision number.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Reading the Counterfactual Gap as a Decision</div>
+<p>The post-period actual target averages roughly $\bar{y} \approx 95.9$ in the units of the series, and the counterfactual no-intervention forecast averages roughly $\bar{y}^{(0)} \approx 89.9$. The counterfactual gap is $\bar{y} - \bar{y}^{(0)} \approx 6.0$ per step, and over the 40 post-period steps the cumulative impact is about $237$. If each unit of the target is, say, ten thousand dollars of weekly revenue and the intervention was a campaign that cost two hundred thousand dollars, the counterfactual says the campaign generated about $237 \times \$10{,}000 = \$2.37$M of incremental revenue, an order of magnitude above its cost. Notice what carries the decision: not the actual $95.9$, which we measured, but the counterfactual $89.9$, which we never observed and entirely imputed from the control. Move the control's immunity assumption and the $89.9$ moves with it, which is precisely why subsection four insists on sensitivity analysis before betting on the gap.</p>
+</div>
+<p>Now the library pair. The whole apparatus of Code 30.4.1, the pre-period regression, the offset bookkeeping, the forward roll, the gap and cumulative sum, is exactly what the <code>CausalImpact</code> library packages, with the added rigor of a full Bayesian structural time-series model and posterior credible intervals rather than a point estimate. Code 30.4.2 reproduces the analysis in a few lines.</p>
+<pre><code class="language-python">import pandas as pd
+from causalimpact import CausalImpact     # pip install pycausalimpact
+
+# Same target and control; CausalImpact wants the target as the first column.
+df = pd.DataFrame({"y": target, "control": control})
+pre_period  = [0, t_star - 1]             # fit the structural time-series model here
+post_period = [t_star, T - 1]             # estimate the counterfactual + effect here
+
+ci = CausalImpact(df, pre_period, post_period)   # fits a Bayesian structural time-series model
+print(ci.summary())                              # average + cumulative effect with credible intervals
+</code></pre>
+<div class="code-caption"><strong>Code 30.4.2:</strong> The same counterfactual analysis with the CausalImpact library. The roughly 25 lines of pre-period regression, abduction offset, forward prediction, and gap accounting in Code 30.4.1 collapse to three lines: <code>CausalImpact</code> fits a full Bayesian structural time-series model (trend, seasonality, and control regression), forecasts the counterfactual, and reports the average and cumulative effect with posterior credible intervals that the from-scratch version only approximated with a point estimate.</div>
+<pre><code class="language-text">Posterior inference {CausalImpact}
+
+                          Average            Cumulative
+Actual                    95.9               3835.6
+Prediction (s.d.)         89.9 (0.4)         3597.9 (15.8)
+95% CI                    [89.1, 90.7]       [3563, 3632]
+
+Absolute effect (s.d.)    6.0 (0.4)          237.7 (15.8)
+95% CI                    [5.2, 6.8]         [203, 272]
+
+Posterior prob. of a causal effect: 99.9%
+</code></pre>
+<div class="code-caption"><strong>Output 30.4.2:</strong> CausalImpact reports the same average effect (6.0) and cumulative impact (about 238) as the from-scratch model, but adds the posterior credible intervals and a 99.9% posterior probability of a causal effect that the point-estimate version could not provide. The interval [5.2, 6.8] on the average effect is the model's stated uncertainty under its assumptions, never a check against the unobserved truth.</div>
+<p>Read the three blocks together. Code 30.4.1 built abduction (pre-period fit), action (the implicit "no intervention" edit), and prediction (forward roll) by hand, recovering the +6 effect. Code 30.4.2 reproduced the same effect in three lines with full posterior intervals, the library handling the Bayesian structural time-series model, the control regression, and the credible-interval arithmetic internally. The line-count reduction from roughly 25 hand-written lines to three is the usual library dividend, but the deeper lesson is in the intervals: the from-scratch model gave a point estimate that <em>looked</em> certain, while the library makes the model's uncertainty explicit, and neither can ever cross the wall of the fundamental problem of causal inference, because the $89.9$ counterfactual was imputed, never measured.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Did the Outage Remediation Actually Help?</div>
+<p><strong>Who:</strong> A site-reliability team at a streaming platform, owners of the sensor and operations telemetry threaded through <a href="../../toc.html">Chapter 32</a> and <a href="../../toc.html">Chapter 34</a>.</p>
+<p><strong>Situation:</strong> After a latency incident, the team rolled out a config change to a fleet of edge nodes and saw p99 latency drop. Leadership wanted to credit the change and standardize it across all regions.</p>
+<p><strong>Problem:</strong> Latency was already trending down before the change because traffic was ebbing toward off-peak hours. A naive before-versus-after comparison would attribute the entire drop to the remediation, conflating the change with the daily cycle.</p>
+<p><strong>Dilemma:</strong> Standardizing a change that did nothing would waste engineering effort and obscure the real fix; dismissing a change that worked would leave the next incident unmitigated. They needed the counterfactual p99 the fleet would have shown <em>without</em> the config change, not just the before-after delta.</p>
+<p><strong>Decision:</strong> They ran a CausalImpact analysis, using a set of comparable edge nodes in regions that did <em>not</em> receive the change as controls, exactly the immune-control role of Code 30.4.1's control series.</p>
+<p><strong>How:</strong> The pre-period fit learned how the treated fleet's latency tracked the control fleets through the daily cycle; the post-period forecast gave the counterfactual no-change latency; the gap isolated the change's own effect from the ambient downtrend the controls also experienced.</p>
+<p><strong>Result:</strong> The counterfactual showed the controls dropped almost as much as the treated fleet, so the true config-change effect was small and its credible interval straddled zero. The "improvement" was mostly the daily cycle. The team did not standardize the change and instead kept investigating, avoiding a false root cause.</p>
+<p><strong>Lesson:</strong> The before-after delta answered the wrong question; the counterfactual gap against immune controls answered the right one. The controls were the entire difference between crediting a coincidence and finding the truth, which is the operational form of subsection four's warning against over-trusting a counterfactual with no honest baseline.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Counterfactual Baselines in Three Lines</div>
+<p>The from-scratch counterfactual of Code 30.4.1 ran about 25 lines of regression, abduction-offset bookkeeping, forward prediction, and gap accounting, and it produced only a point estimate. The <code>CausalImpact</code> library (Code 30.4.2) collapses all of it to three lines, <code>CausalImpact(df, pre_period, post_period)</code> plus a summary, while internally fitting a full Bayesian structural time-series model with trend, seasonality, and a spike-and-slab regression over multiple controls, and returning posterior credible intervals and a posterior probability of effect. For the deep, time-varying-treatment regime of subsection three, the same shortcut role is played by libraries such as <code>CausalTune</code> and the counterfactual estimators in <code>EconML</code> and <code>DoWhy</code> (which also automate the sensitivity analyses subsection four demands). The rule stands: hand-roll the baseline once to understand abduction-action-prediction, then reach for the library for the Bayesian rigor, multiple controls, and uncertainty quantification you would otherwise reimplement and get subtly wrong.</p>
+</div>
+
+<h2>6. Exercises</h2>
+<p>Three exercises consolidate the section: a conceptual one on the ladder, an implementation one extending the worked code, and an open-ended one on the limits.</p>
+<ol class="exercises">
+<li><strong>(Conceptual) Why abduction is the extra rung.</strong> Consider the SCM $Y = 2A + U$ with $U \sim \mathcal{N}(0, 1)$. A unit took $A = 3$ and we observed $Y = 7$. (a) Compute the interventional quantity $\mathbb{E}[Y \mid \operatorname{do}(A = 1)]$. (b) Compute the counterfactual $\mathbb{E}[Y_{A=1} \mid A = 3, Y = 7]$ using abduction-action-prediction. (c) Explain in one or two sentences why the two answers differ and what real-world question each one answers, connecting your explanation to the interventional-versus-counterfactual distinction of <a href="section-30.3.html">Section 30.3</a> and subsection one.</li>
+<li><strong>(Implementation) Sensitivity to the control.</strong> Starting from Code 30.4.1, contaminate the control series so it is <em>not</em> immune to the intervention: add a fraction $\rho \cdot \text{effect\_true}$ of the intervention into <code>control[t_star:]</code> for $\rho \in \{0, 0.25, 0.5, 1.0\}$. Re-fit and report how the estimated average post-period effect changes with $\rho$. Show that as the control absorbs more of the intervention, the estimated effect collapses toward zero, and write one sentence relating this to the over-trust risk of subsection four. (Optional: wrap the four runs in a loop and print a small table.)</li>
+<li><strong>(Open-ended) The unverifiable number.</strong> The fundamental problem of causal inference says the counterfactual trajectory $y_t^{(0)}$ is never observed for the treated unit. Design a validation strategy that gives you <em>some</em> empirical confidence in a counterfactual baseline despite this, using only data you actually have. Consider ideas such as a placebo or pre-intervention "fake intervention" test (the gap should be near zero in a period where nothing happened), backtesting the baseline on past interventions whose effects are known, or holding out control series. Discuss what each strategy does and does not certify, and connect your answer to the conformal-counterfactual coverage work referenced in the research-frontier callout.</li>
+</ol>
+
+<div class="callout looking-back">
+<div class="callout-title">Looking Back: Closing Chapter 30, and Forward to Temporal Agents</div>
+<p>This section completes Chapter 30 and with it the causal arc of the book. We began the chapter by separating temporal correlation from temporal causation, climbed Pearl's ladder from association to intervention in <a href="section-30.3.html">Section 30.3</a>, and have now reached its summit: the counterfactual, the model replaying a recorded history with one decision changed. The throughline of the chapter is that a temporal model becomes a <em>reasoning</em> device, not merely a forecasting one, when it can answer "what would have happened," and the abduction-action-prediction recipe is the small, sharp tool that makes those answers possible, bounded always by the fundamental problem of causal inference that no method repeals. The causal ideas also closed several long temporal threads: the state-space model of <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/section-7.6.html">Section 7.6</a> returned as the counterfactual baseline of this section, and the off-policy evaluation of <a href="../../toc.html">Section 24.3</a> and offline RL of <a href="../../toc.html">Section 26.2</a> reappeared as counterfactual return estimation. Chapter 31 picks up exactly here. A temporal AI agent that reasons, remembers, and acts needs all of it at once: it must remember a history (the memory of <a href="../../toc.html">Chapter 31</a>), reason counterfactually about actions it has not yet taken (this section), and then act in the world (the sequential decision making of Part VI). Counterfactual reasoning is the bridge from a model that predicts the future to an agent that deliberately chooses it. Turn the page to <a href="../../toc.html">Chapter 31: Temporal AI Agents</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="nav-prev" href="section-30.3.html"><span class="nav-label">Previous</span><span class="nav-num">Section 30.3</span><span class="nav-title">Causal Inference for Time Series</span></a>
+<a class="nav-up" href="index.html"><span class="nav-label">Up</span><span class="nav-num">Chapter 30</span><span class="nav-title">Temporal Reasoning and Causality</span></a>
+<a class="nav-next" href="../../toc.html"><span class="nav-label">Next</span><span class="nav-num">Contents</span><span class="nav-title">Table of Contents</span></a>
+</nav>
+</main>
+<footer class="book-footer">
+<p class="edition-line">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="copyright-line">&copy; 2026 Alexander Apartsin &middot; <a href="../../toc.html">Contents</a></p>
+<p class="updated-line"><script>document.write("Last updated " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>

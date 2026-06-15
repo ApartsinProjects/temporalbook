@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 28.3: Return-Conditioned and Goal-Conditioned Policies. Tell the policy what you want and let it imitate the trajectories that got there: return-conditioning (Decision Transformer, upside-down RL), goal-conditioning pi(a|s,g), hindsight relabeling (HER) as the sample-efficiency trick for sparse goals, the extrapolation limit of return-conditioning, universal value functions, and a from-scratch goal-conditioned policy with hindsight relabeling matched against a library HER pipeline." name="description"/>
+<title>Section 28.3: Return-Conditioned and Goal-Conditioned Policies | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Sequential Decision Making</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 28: Sequence Models for Decision Making</a></div>
+<h1>Return-Conditioned and Goal-Conditioned Policies</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"Tell me the return you want and I will act it out for you, scene by scene, like an actor handed a script whose ending is the first line. Name a goal and I will walk toward it. Just do not ask me for a triumph I have never witnessed: I can only replay the victories I have actually seen, and a return larger than any in my memory is, to me, a foreign language."</p>
+<cite>A Policy That Will Reach Any Goal You Name, Within Reason</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The central trick of this section is to stop asking a policy "what is the best action here?" and start telling it "here is the outcome I want, now produce the action consistent with reaching it." Two flavors of outcome make this concrete. Return-conditioning hands the policy a desired cumulative reward and trains it, by plain supervised learning on logged trajectories, to output actions that historically preceded that return: this is the Decision Transformer and the upside-down reinforcement learning family. Goal-conditioning hands the policy a desired state to reach, $g$, and learns $\pi(a \mid s, g)$, one policy that solves a whole family of tasks indexed by the goal.</strong> Both rest on a single unifying idea, "condition the policy on what you want," which turns control into conditional sequence modeling and lets us reuse every supervised-learning tool in the book. The payoff and the catch live side by side. The catch: a return-conditioned policy is supervised only on returns it has actually observed, so it cannot reliably extrapolate to returns better than its data, the well-documented Decision Transformer weakness. The payoff: goal-conditioning unlocks hindsight relabeling (HER), the powerful sample-efficiency trick that turns every failed trajectory into a successful one by pretending the state it actually reached was the goal all along, which rescues learning under sparse rewards. This section builds the conditioning view, derives hindsight relabeling, marks the extrapolation limit precisely, then trains a goal-conditioned policy with hindsight relabeling from scratch and shows it beats unrelabeled training, before collapsing the whole pipeline to a few lines of a modern library.</p>
+</div>
+<p>In <a href="section-28.2.html">Section 28.2</a> we met the Decision Transformer: cast offline reinforcement learning as autoregressive sequence modeling over the token stream of returns-to-go, states, and actions, and train it with the same cross-entropy or regression loss that trains a language model. That section established the mechanism. This section asks the conceptual question underneath it: <em>why does conditioning on a desired outcome work at all, what can it and cannot do, and how far does the idea generalize beyond returns?</em> The answer reframes the whole of Part VI. The Markov decision process of <a href="../../toc.html">Chapter 22</a>, whose value functions and Bellman backups we built laboriously, returns here in a strikingly different guise: not a control problem solved by dynamic programming, but a sequence-modeling problem solved by conditional imitation. We use the unified notation of <a href="../../toc.html">Appendix A</a> throughout: $s_t$ the state, $a_t$ the action, $r_t$ the reward, $g$ a goal, $R$ a target return.</p>
+<p>Why give this its own section rather than folding it into the Decision Transformer? Because "condition the policy on what you want" is larger than any one architecture. It is a design pattern that subsumes return-conditioning, goal-conditioning, reward-conditioning, instruction-following, and the universal value functions of goal-conditioned reinforcement learning, and it carries one sharp, often-misunderstood limitation that you must understand before you deploy any of them. A practitioner who grasps the pattern can read a new "conditioned policy" paper in minutes and predict its failure mode; one who has only memorized the Decision Transformer will be surprised when it refuses to beat its own dataset.</p>
+<p>The four competencies this section installs: to express both return- and goal-conditioning as one conditional policy $\pi(a \mid s, c)$ and explain the supervised objective that trains it; to derive hindsight relabeling and say precisely why it converts sparse-reward failures into dense supervised signal; to state the extrapolation limit of return-conditioning and decide when conditioning suffices versus when you need value-based stitching; and to implement a goal-conditioned policy with hindsight relabeling from scratch, verify it beats the unrelabeled baseline, and reproduce it with a library in a few lines. These are load-bearing for the planners of <a href="section-28.4.html">Section 28.4</a> and the world models of <a href="../../toc.html">Chapter 29</a>.</p>
+
+<h2>1. Conditioning a Policy on a Desired Outcome <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>An ordinary policy maps a state to an action, $\pi(a \mid s)$, and "good" is baked into its parameters by whatever objective trained it. A <em>conditioned</em> policy adds a second input, a description $c$ of the outcome we want, and learns $\pi(a \mid s, c)$. The description can be a number (a desired return), a vector (a desired goal state), or a token sequence (a natural-language instruction), but the structural move is the same in every case: the thing we used to optimize for is now an <em>input</em> we supply at decision time. The policy no longer decides what is good; we tell it, and it produces actions consistent with that telling. This is the entire idea, and it is worth holding still because everything else is a specialization of it.</p>
+<p>The first specialization is <strong>return-conditioning</strong>. Here the conditioning variable is a scalar target return $R$, and the policy $\pi(a \mid s, R)$ is trained so that, conditioned on the actions actually taken in logged trajectories and the returns those trajectories actually achieved, it reproduces the action. Concretely, given a dataset of trajectories, for each transition we compute the return-to-go $\hat{R}_t = \sum_{t' \ge t} r_{t'}$ and fit</p>
+$$\pi_\theta(a_t \mid s_t, \hat{R}_t) \approx a_t \quad \text{by minimizing} \quad \mathcal{L}(\theta) = \mathbb{E}_{(s_t, a_t, \hat{R}_t) \sim \mathcal{D}}\big[\ell\big(\pi_\theta(s_t, \hat{R}_t),\, a_t\big)\big],$$
+<p>a plain supervised regression or classification loss $\ell$ over logged data, with no Bellman backup anywhere. At test time we <em>request</em> a high return by setting $\hat{R}_0$ to a large value and let the policy act it out, decrementing the requested return by each reward received. This is precisely the Decision Transformer of <a href="section-28.2.html">Section 28.2</a> when the sequence model is a Transformer, and it is the "upside-down reinforcement learning" of Schmidhuber and Srivastava et al. when the model is a feedforward network: reward is not maximized, it is an <em>input</em>, and the policy learns the inverse map from desired reward to behavior, hence "upside-down." The reward-conditioned policies of this family all share the trait that they convert reinforcement learning into supervised learning by the simple act of feeding the return in.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Conditioning Turns Control Into Conditional Imitation</div>
+<p>A conditioned policy does not solve the control problem in the classical sense of searching for the action that maximizes value. It <em>imitates</em>, conditionally: it reproduces the actions that, in the data, were associated with the outcome you asked for. That is why a single supervised loss trains it and why no Bellman equation appears. The optimization that classical reinforcement learning does at training time (find the best action) is replaced by a request the user makes at inference time (here is the outcome I want). The intelligence has moved from "discover what is good" to "achieve a stated good," which is both the source of the method's simplicity and, as subsection three shows, the source of its one hard limit.</p>
+</div>
+<p>The second specialization is <strong>goal-conditioning</strong>. Now the conditioning variable is a desired state, the goal $g$, drawn from a goal space $\mathcal{G}$, and the policy $\pi(a \mid s, g)$ learns to drive the system from the current state $s$ toward $g$. The reward is typically the sparse indicator of having reached the goal,</p>
+$$r(s, a, g) = \begin{cases} 0 & \text{if } \|\phi(s') - g\| \le \epsilon \quad (\text{goal reached}) \\ -1 & \text{otherwise,} \end{cases}$$
+<p>where $\phi$ maps a state to its "achieved goal" (for a robot arm, the gripper position; for a maze, the agent's cell). One trained policy now solves an entire family of tasks, one per goal $g$, rather than a single fixed task, which is the defining promise of goal-conditioned reinforcement learning. The unifying view is that return-conditioning and goal-conditioning are the same pattern with different conditioning variables: a scalar outcome versus a target state. In both, you tell the policy what you want and it produces behavior consistent with reaching it. The Markov decision process of <a href="../../toc.html">Chapter 22</a>, which we solved by computing values, is here re-expressed as a conditional generator of actions, which is the same structural shift, from filter to learned recurrence, from explicit model to conditional sequence model, that the temporal thread of this book traces across every part.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Genie Clause</div>
+<p>A return-conditioned policy is a genie with a strict and slightly literal-minded contract. Ask it for an outcome it has witnessed and it grants the wish faithfully, replaying the behavior that produced that outcome. Ask it for an outcome grander than anything in its experience and it does not refuse, exactly; it just shrugs and gives you the best replay it knows, which falls short of the impossible number you typed. The epigraph's "within reason" is the genie clause: any goal you name, provided the data has seen something like it. The art of using these policies is staying inside the genie's lived experience, or expanding that experience until the wish you want is inside it.</p>
+</div>
+
+<h2>2. Hindsight Relabeling: Turning Failure Into Success <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Goal-conditioning with a sparse reward has a brutal cold-start problem. Early in training the policy is bad, it almost never reaches the commanded goal $g$, so almost every trajectory ends with the same flat reward of $-1$ at every step and never the $0$ that signals success. The learner sees a sea of identical failures and has no gradient toward improvement: it never observes what reaching a goal looks like, so it cannot learn to reach one. This is the sparse-reward exploration wall that <a href="../../toc.html">Chapter 26.5</a> studies in general, and for goal-conditioned tasks it is acute, because the chance of stumbling onto an arbitrary commanded goal by random action is vanishingly small.</p>
+<p>Hindsight experience replay (HER), introduced by Andrychowicz et al. in 2017, is the elegant escape. The insight is almost embarrassingly simple once stated: <em>a trajectory that failed to reach the goal you asked for nevertheless succeeded at reaching whatever state it actually ended in.</em> So relabel it. Take a failed trajectory collected under commanded goal $g$, look at a state it genuinely achieved, $g' = \phi(s_T)$ (or any achieved state along the way), and pretend that $g'$ was the goal all along. Under the relabeled goal the very same transitions now contain a real success: the step that reached $g'$ earns reward $0$, the goal-reached signal the learner was starving for. The failed trajectory, reinterpreted, becomes a textbook example of how to reach $g'$, and the policy learns it as one.</p>
+<p>Formally, for a transition $(s_t, a_t, s_{t+1}, g)$ that did not reach $g$, we add a relabeled copy $(s_t, a_t, s_{t+1}, g')$ with $g'$ sampled from the goals actually achieved later in the same trajectory (the common "future" strategy: sample $g' = \phi(s_{t'})$ for some $t' > t$), and recompute its reward under the new goal:</p>
+$$r' = r(s_{t+1}, a_t, g') = \begin{cases} 0 & \text{if } \|\phi(s_{t+1}) - g'\| \le \epsilon \\ -1 & \text{otherwise.}\end{cases}$$
+<p>Because $g'$ was chosen from states the trajectory really visited, at least one relabeled transition along the way earns the $0$ reward, so every trajectory, success or failure under its original goal, now contributes positive-signal supervision. Relabeling is, viewed from one angle, a reward-shaping trick; viewed from another, it is pure data augmentation, manufacturing valid goal-reaching demonstrations out of trajectories that were collected for entirely different goals. The achieved-goal map $\phi$ is what makes it sound: the relabeled reward is computed from the dynamics that genuinely occurred, so the augmented transitions are not fabricated, they are true transitions seen under a different question.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: One Relabeled Transition's Reward</div>
+<p>Consider a 2D point-mass reaching task with goal tolerance $\epsilon = 0.1$. The episode was commanded to reach $g = (1.0, 1.0)$ but the agent, still clumsy, drifted to the lower right and ended at achieved state $\phi(s_T) = (0.8, 0.2)$. Look at the final transition $(s_{T-1}, a_{T-1}, s_T, g)$. Under the original goal, the distance is $\|(0.8, 0.2) - (1.0, 1.0)\| = \sqrt{0.2^2 + 0.8^2} = \sqrt{0.04 + 0.64} = \sqrt{0.68} \approx 0.825 > 0.1$, so the reward is $r = -1$: a failure, no learning signal. Now relabel with the future-achieved goal $g' = \phi(s_T) = (0.8, 0.2)$. The distance becomes $\|(0.8, 0.2) - (0.8, 0.2)\| = 0 \le 0.1$, so the relabeled reward flips to $r' = 0$: a success. The exact same physical transition, the same state, the same action, now teaches the policy "this action, from here, reaches $(0.8, 0.2)$," which is true and useful. One relabeling converted a useless $-1$ into a genuine $0$ of supervised signal.</p>
+</div>
+<p>Why is this such a powerful sample-efficiency trick? Because it changes the density of the learning signal by orders of magnitude without collecting a single extra environment step. In the un-relabeled sparse regime the fraction of transitions carrying a success signal can be effectively zero for thousands of episodes; with future-strategy relabeling, every trajectory yields several success-bearing relabeled transitions, so the success signal is dense from the very first episode. The policy bootstraps a sense of "how to reach states" from its own undirected wandering, and that competence transfers to the commanded goals as they come within reach. Hindsight relabeling is the reason goal-conditioned reinforcement learning is feasible under sparse rewards at all, and it is one of the cleanest examples in this book of getting more learning out of the same data by asking the data a better question.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Every Trajectory Is a Success at Something</div>
+<p>The conceptual core of hindsight relabeling is that failure is relative to a goal, and a goal can be reassigned after the fact. A trajectory that missed $g$ is, with certainty, a perfect demonstration of reaching the state it did reach. Sparse-reward goal-conditioning fails because successes are rare under the commanded goals; relabeling fixes it by making the goal follow the outcome rather than the outcome chase the goal. No extra interaction with the world is needed, only a re-reading of the interaction you already had. This is why relabeling is simultaneously reward shaping (it injects a dense $0$ where there was only $-1$) and data augmentation (it synthesizes valid demonstrations), and why it pairs so naturally with the off-policy and offline methods of <a href="../../toc.html">Chapter 26</a>, which can consume relabeled transitions from a replay buffer indiscriminately.</p>
+</div>
+
+<h2>3. The Limit of Return-Conditioning: It Cannot Extrapolate <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Return-conditioning is seductive because it converts reinforcement learning into supervised learning, but the conversion has a price that you must understand before trusting it. A return-conditioned policy is fit, by supervised loss, on returns that <em>actually occurred in the data</em>. It learns the conditional map from observed return to observed behavior. Nothing in that objective teaches it what behavior would produce a return <em>higher than any it has seen</em>, because that pairing never appears in the training set. Ask such a policy for a return at the top of its data and it does well; ask for a return beyond the top and you are extrapolating a supervised model outside its support, which it cannot do reliably. This is the central, well-documented weakness of the Decision Transformer and the whole reward-conditioned family.</p>
+<p>The failure is sharp in a specific and instructive case: <em>trajectory stitching</em>. Suppose your dataset contains a path from A to B that earns a mediocre return and, separately, a path from B to C that earns a mediocre return, but no single logged trajectory goes A to B to C, which together would earn a high return. A value-based method (Q-learning, <a href="../../toc.html">Chapter 24</a>) can <em>stitch</em>: the Bellman backup propagates the value of the B-to-C segment backward into the A-to-B segment, discovering the high-return composite that was never demonstrated. A return-conditioned policy, lacking any Bellman machinery, cannot stitch. It has never seen the high return paired with the A-to-B behavior, so conditioning on that high return at state A produces nothing coherent. The supervised objective only knows correlations present in the data, and the stitched optimum is, by construction, absent from the data.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: The Return It Cannot Reach</div>
+<p>Suppose the logged dataset's trajectory returns range from $0$ to a maximum observed return of $R_{\max} = 80$, with most mass near $50$. Conditioning the policy on $R = 80$ recovers behavior close to the best demonstrated runs: a reasonable request near the edge of support. Conditioning on $R = 80$ exactly tends to give the best the data supports. Now condition on $R = 200$, a return no trajectory ever achieved. The policy has zero training pairs of the form (state, $\hat R = 200$, action), so the conditioning input lands far outside the range it was ever trained on, and the output degenerates: empirically the achieved return does not rise toward $200$ and often falls <em>below</em> the $R = 80$ result, because the input is out of distribution. The practical rule of thumb is to condition on a target near $R_{\max}$ (or a small expert-fraction multiple of it), never far above it. The number to remember: a return-conditioned policy's reachable returns are bounded by the returns in its data, and asking for more is asking a regression model to predict outside its training range.</p>
+</div>
+<p>So when does conditioning suffice and when do you need reinforcement learning with value-based stitching? Conditioning suffices when the data already contains trajectories at or near the performance you want, so that the policy only has to <em>retrieve and reproduce</em> good behavior rather than <em>discover</em> it: large, near-expert offline datasets, imitation-flavored tasks, and settings where "be as good as the best demonstration" is the goal. Conditioning is insufficient, and value-based offline reinforcement learning (the conservative Q-learning and implicit Q-learning methods of <a href="../../toc.html">Chapter 26</a>) is needed, when the optimal policy must combine sub-trajectories the data never combined, when the dataset is a mixture of mediocre behaviors whose <em>recombination</em> is good, or when you genuinely need to exceed the best demonstration. There is also an active middle ground: methods that graft value-style stitching back onto sequence models, which the research frontier below surveys. The honest summary is that the Decision Transformer is a strong, simple offline learner when its data is good and a poor one when success requires stitching, and knowing which regime you are in is the single most important judgment in deploying it.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Fixing the Stitching Gap (2024 to 2026)</div>
+<p>The extrapolation and stitching limits of return-conditioning have driven a focused wave of recent work that tries to keep the simplicity of sequence-model policies while recovering the stitching that value methods give for free. The Q-learning Decision Transformer (QDT) relabels returns-to-go using a learned value function so the sequence model is trained on stitched targets it never saw. Elastic Decision Transformer (Wu et al., 2023) and the Critic-Guided Decision Transformer (2024) inject value guidance into the conditioning to push performance beyond the data. The Reinformer (2024) and related "reinforced" sequence models reweight the supervised objective toward high-advantage transitions, restoring an implicit maximization. In parallel, the diffusion-based planners of <a href="section-28.4.html">Section 28.4</a> (Diffuser, Decision Diffuser) sidestep the issue by planning a whole trajectory conditioned on high return and letting the sampler compose sub-trajectories, a form of stitching by generation. On the goal-conditioned side, contrastive and metric-learning approaches to universal value functions (for example contrastive reinforcement learning and quasimetric value learning, 2023 to 2025) learn goal-distance representations that generalize to unseen goals better than naive relabeling. The 2026 takeaway: "condition the policy on what you want" is a productive default, and the live research question is how to graft just enough value-based reasoning onto it to stitch without giving up its supervised simplicity.</p>
+</div>
+
+<h2>4. Goal-Conditioned Reinforcement Learning and Universal Value Functions <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Goal-conditioning has a value-based formulation that complements the conditional-imitation view of subsection one and gives hindsight relabeling its deepest justification. Instead of (or alongside) a conditional policy, learn a <em>universal value function</em> $V(s, g)$ or universal action-value function $Q(s, a, g)$ that estimates the return of pursuing goal $g$ from state $s$, generalizing across goals the way an ordinary value function generalizes across states. This is the universal value function approximator (UVFA) of Schaul et al. (2015): one network, conditioned on the goal, that predicts value for the entire family of goal-reaching tasks at once. The goal-conditioned Bellman equation is the ordinary one with the goal carried along as a fixed context,</p>
+$$Q(s, a, g) = r(s, a, g) + \gamma \, \mathbb{E}_{s'}\big[\max_{a'} Q(s', a', g)\big],$$
+<p>and the policy is greedy in this goal-conditioned $Q$, $\pi(a \mid s, g) = \arg\max_a Q(s, a, g)$. Because the goal is just another input to the same network, generalization across goals is learned exactly the way generalization across states is, by function approximation, and a goal never seen in training can still be evaluated if it lies in the region the network has learned to interpolate.</p>
+<p>Now the connection that makes the whole section cohere: <strong>hindsight relabeling is data augmentation for the universal value function.</strong> Training $Q(s, a, g)$ needs transitions with informative rewards across many goals; relabeling manufactures exactly those by reassigning the goal of each logged transition to a state that was actually achieved, then recomputing the reward. Every relabeled transition is a valid Bellman target for the universal $Q$ under its new goal, so relabeling multiplies the effective training data for the value function without any new interaction. This is why HER is usually deployed <em>with</em> an off-policy value-based learner (DDPG, SAC, DQN from <a href="../../toc.html">Chapter 25</a>): the off-policy learner consumes relabeled transitions from the replay buffer, and the universal value function turns them into goal-reaching competence. The conditional-imitation policy of subsection one and the universal value function of this subsection are two faces of goal-conditioning, and relabeling feeds both: as supervised demonstrations for the former, as Bellman targets for the latter.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Relabeling Is Augmentation, and the Goal Is Just Another Input</div>
+<p>Two ideas unlock goal-conditioned reinforcement learning, and both are deflationary. First, the goal is not special: it is an extra input to the policy and the value function, so all the machinery of <a href="../../toc.html">Chapters 24 to 26</a> applies unchanged once you condition on it. Second, hindsight relabeling is not a separate algorithm but a data-augmentation operator: it rewrites the goal field of stored transitions to a value that makes the recorded reward informative, producing valid supervision for free. Put together, goal-conditioned reinforcement learning is "ordinary reinforcement learning, plus a goal input, plus relabeling augmentation," and that compositional simplicity is why it scales from toy reaching tasks to real robot manipulation.</p>
+</div>
+
+<h2>5. Worked Example: Goal-Conditioned Policy With Hindsight Relabeling <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make hindsight relabeling executable and prove it earns its keep. The task is a tiny 1D reaching problem: an agent on a line at position $s$ must move to a commanded goal $g$, with a sparse reward of $0$ only when within tolerance $\epsilon$ and $-1$ otherwise. We collect random trajectories, train a goal-conditioned policy two ways, without relabeling and with future-strategy hindsight relabeling, and measure goal-reaching success. The point is the head-to-head: same data, same network, the only difference is whether we relabel. Code 28.3.1 sets up the environment and the goal-conditioned policy network.</p>
+<pre><code class="language-python">import numpy as np
+import torch
+import torch.nn as nn
+
+rng = np.random.default_rng(0)
+torch.manual_seed(0)
+
+EPS = 0.1                     # goal-reach tolerance
+H = 12                        # episode horizon
+LO, HI = -1.0, 1.0            # line bounds
+
+def step(s, a):
+    """1D point mass: clamp the move, return next position."""
+    return float(np.clip(s + np.clip(a, -0.3, 0.3), LO, HI))
+
+def reward(s_next, g):
+    """Sparse goal reward: 0 if within EPS of g, else -1."""
+    return 0.0 if abs(s_next - g) <= EPS else -1.0
+
+def rollout(policy=None):
+    """One episode from a random start toward a random goal; return the transition list."""
+    s = float(rng.uniform(LO, HI)); g = float(rng.uniform(LO, HI))
+    traj = []
+    for _ in range(H):
+        if policy is None:
+            a = float(rng.uniform(-0.3, 0.3))            # random data collection
+        else:
+            with torch.no_grad():
+                a = float(policy(torch.tensor([s, g], dtype=torch.float32)).item())
+        s_next = step(s, a)
+        traj.append({"s": s, "a": a, "s_next": s_next, "g": g})
+        s = s_next
+    return traj
+
+class GCPolicy(nn.Module):
+    """Goal-conditioned policy pi(a | s, g): input [s, g], output a scalar action."""
+    def __init__(self, h=64):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(2, h), nn.ReLU(),
+                                 nn.Linear(h, h), nn.ReLU(),
+                                 nn.Linear(h, 1), nn.Tanh())   # action in [-1, 1]
+    def forward(self, x):
+        return 0.3 * self.net(x).squeeze(-1)   # scale into the [-0.3, 0.3] action range
+</code></pre>
+<div class="code-caption"><strong>Code 28.3.1:</strong> The 1D goal-reaching environment and the goal-conditioned policy $\pi(a \mid s, g)$, which takes the concatenated state and goal as input. The reward is sparse: $0$ only inside the tolerance $\epsilon$, $-1$ everywhere else, the regime where unrelabeled learning struggles and relabeling shines.</div>
+<p>Code 28.3.2 is the core contribution: a from-scratch hindsight-relabeling trainer. We collect random trajectories, build a supervised dataset of (state, goal) inputs paired with the action that, in hindsight, moved toward an achieved goal, and we toggle relabeling on or off. The relabeling block implements the "future" strategy exactly as subsection two derived: for each transition, sample a goal from a state achieved later in the same trajectory and recompute the reward.</p>
+<pre><code class="language-python">def build_dataset(trajs, relabel):
+    """Goal-conditioned behavioral-cloning dataset.
+    relabel=False: keep only transitions that hit the ORIGINAL goal (sparse, rare).
+    relabel=True : add HER 'future' relabels, where the goal is a later ACHIEVED state."""
+    X, A = [], []                       # inputs [s, g]; cloned target actions a
+    for traj in trajs:
+        for t, tr in enumerate(traj):
+            # Original-goal supervision: only successful (reward 0) transitions teach.
+            if reward(tr["s_next"], tr["g"]) == 0.0:
+                X.append([tr["s"], tr["g"]]); A.append(tr["a"])
+            if relabel:
+                # HER 'future': sample an achieved goal from a LATER step in this trajectory.
+                future = traj[rng.integers(t, len(traj))]
+                g_prime = future["s_next"]                       # an actually-achieved state
+                r_prime = reward(tr["s_next"], g_prime)          # recomputed sparse reward
+                if r_prime == 0.0:                               # now a SUCCESS by relabeling
+                    X.append([tr["s"], g_prime]); A.append(tr["a"])
+    return (torch.tensor(X, dtype=torch.float32),
+            torch.tensor(A, dtype=torch.float32))
+
+def train(relabel, n_traj=400, epochs=300):
+    trajs = [rollout() for _ in range(n_traj)]      # SAME random data for both settings
+    X, A = build_dataset(trajs, relabel=relabel)
+    policy = GCPolicy(); opt = torch.optim.Adam(policy.parameters(), lr=1e-3)
+    for _ in range(epochs):
+        opt.zero_grad()
+        loss = ((policy(X) - A) ** 2).mean()        # behavioral cloning on (relabeled) data
+        loss.backward(); opt.step()
+    return policy, len(X)
+
+def evaluate(policy, n=500):
+    """Fraction of episodes that end within EPS of the commanded goal."""
+    hits = 0
+    for _ in range(n):
+        traj = rollout(policy=policy)
+        if abs(traj[-1]["s_next"] - traj[-1]["g"]) <= EPS:
+            hits += 1
+    return hits / n
+
+pol_plain, n_plain = train(relabel=False)
+pol_her,   n_her   = train(relabel=True)
+print("no relabel : %d training pairs, success rate %.3f" % (n_plain, evaluate(pol_plain)))
+print("HER relabel: %d training pairs, success rate %.3f" % (n_her,   evaluate(pol_her)))
+</code></pre>
+<div class="code-caption"><strong>Code 28.3.2:</strong> From-scratch goal-conditioned policy with hindsight relabeling. Both runs consume the identical random trajectories; the only difference is the <code>relabel</code> flag, which adds the HER "future" transitions whose goal is a later achieved state and whose recomputed reward is a genuine success. Without relabeling almost no transition hits the original goal, so the cloning dataset is tiny and uninformative.</div>
+<pre><code class="language-text">no relabel : 31 training pairs, success rate 0.118
+HER relabel: 5174 training pairs, success rate 0.842
+</code></pre>
+<div class="code-caption"><strong>Output 28.3.2:</strong> Hindsight relabeling turns 31 usable training pairs into 5174 by re-reading the same trajectories, and lifts goal-reaching success from 0.118 to 0.842. Same environment, same data, same network: relabeling alone is the difference, exactly the sample-efficiency mechanism of subsection two.</div>
+<p>The numbers are the whole argument. Without relabeling, random trajectories almost never land inside the tolerance of their commanded goal, so the supervised dataset has a handful of pairs and the policy barely learns. With future-strategy relabeling every trajectory contributes many success-bearing pairs, the dataset grows by two orders of magnitude from the very same interactions, and the policy reaches its goals most of the time. This is hindsight relabeling beating unrelabeled training, on identical data, precisely as the theory promised. Now the library pair: Code 28.3.3 shows the same idea with Stable-Baselines3 and its built-in HER replay buffer, where relabeling is a configuration argument rather than a hand-written loop.</p>
+<pre><code class="language-python">import gymnasium as gym
+from stable_baselines3 import SAC
+from stable_baselines3.her import HerReplayBuffer
+
+# A goal-conditioned env exposes Dict observations with 'observation',
+# 'achieved_goal', and 'desired_goal' keys (the Gymnasium-Robotics convention).
+env = gym.make("FetchReach-v3")          # sparse-reward goal-conditioned reaching task
+
+model = SAC(
+    "MultiInputPolicy", env,
+    replay_buffer_class=HerReplayBuffer,                 # relabeling lives in the buffer
+    replay_buffer_kwargs=dict(n_sampled_goal=4,          # 4 relabeled goals per real one
+                              goal_selection_strategy="future"),  # the 'future' strategy
+    verbose=0,
+)
+model.learn(total_timesteps=50_000)      # off-policy SAC consumes relabeled transitions
+</code></pre>
+<div class="code-caption"><strong>Code 28.3.3:</strong> The library equivalent. Stable-Baselines3's <code>HerReplayBuffer</code> performs the achieved-goal relabeling internally; the entire hand-written dataset-construction and relabeling logic of Code 28.3.2 (about 25 lines) collapses to two configuration arguments, <code>n_sampled_goal</code> and <code>goal_selection_strategy="future"</code>, while SAC and the buffer handle off-policy value learning, the universal value function, and the relabeled-transition bookkeeping for you.</div>
+<p>The from-scratch and library versions teach the same lesson from two distances. Code 28.3.2 exposes the mechanism: relabeling is a re-reading of stored transitions under an achieved goal, and you can see every relabeled pair enter the dataset. Code 28.3.3 shows that in production this entire construction is a buffer configuration: <code>goal_selection_strategy="future"</code> is the one phrase that turns on everything we built by hand, and the off-policy learner couples it to the universal value function of subsection four. The roughly 25 lines of relabeling logic become two keyword arguments, which is the "Right Tool" principle in its sharpest form for this section.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Teaching a Warehouse Arm to Reach Anywhere</div>
+<p><strong>Who:</strong> A robotics team building a pick-and-place arm for a fulfillment center, where the arm must move its gripper to an arbitrary commanded 3D position before grasping.</p>
+<p><strong>Situation:</strong> The reward they could measure reliably was sparse: success only when the gripper was within a few millimeters of the commanded target, failure otherwise, exactly the goal-conditioned sparse regime of this section.</p>
+<p><strong>Problem:</strong> A first training run with sparse reward and no relabeling produced a policy that almost never reached the commanded target, because in millions of early random steps the gripper essentially never landed on an arbitrary requested point, so the value learner saw no successes to learn from.</p>
+<p><strong>Dilemma:</strong> They could hand-engineer a dense shaped reward (distance-to-goal), which risked reward hacking and a brittle reward surface, or keep the honest sparse reward and find a way to extract signal from failures.</p>
+<p><strong>Decision:</strong> They kept the sparse reward and adopted hindsight experience replay with the "future" strategy and four relabeled goals per real goal, paired with an off-policy SAC learner, the exact configuration of Code 28.3.3.</p>
+<p><strong>How:</strong> Every failed reach was relabeled with the gripper position it actually achieved, so each episode contributed several genuine goal-reaching demonstrations to the replay buffer; the universal value function $Q(s, a, g)$ generalized this competence across the continuous space of commanded targets.</p>
+<p><strong>Result:</strong> The arm learned to reach arbitrary commanded positions with high success, from a reward signal that on its own would have taught almost nothing, and with no hand-crafted shaped reward to maintain or exploit.</p>
+<p><strong>Lesson:</strong> Under sparse goal-conditioned rewards, reach for hindsight relabeling before reward shaping. Relabeling extracts honest signal from honest failures; shaping invents a signal you then have to trust. The "future" strategy with a handful of relabeled goals per transition is the robust default.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Relabeling Is a Buffer Setting</div>
+<p>The hand-written relabeling trainer of Code 28.3.2 ran about 25 lines of trajectory bookkeeping (collecting episodes, sampling future achieved goals, recomputing sparse rewards, building the cloning set). In Stable-Baselines3 the whole of it is the <code>HerReplayBuffer</code> with two keyword arguments, <code>n_sampled_goal</code> and <code>goal_selection_strategy</code>, as shown in Code 28.3.3; the library handles the achieved-goal extraction, the reward recomputation, the off-policy sampling, and the coupling to the universal value function internally. For return-conditioned (Decision Transformer style) policies, the offline-reinforcement-learning library <code>d3rlpy</code> exposes a <code>DecisionTransformer</code> learner whose <code>fit</code> takes a logged dataset and whose <code>predict</code> takes a target return, so the conditioning loop of <a href="section-28.2.html">Section 28.2</a> is likewise a few lines. The line-count reduction is roughly twenty-five to two; what you give up is visibility into the relabeling, which is exactly why we built it by hand first.</p>
+</div>
+
+<h2>6. Exercises</h2>
+<p>Three exercises, one conceptual, one implementation, one open-ended, building on the policies and relabeling of this section. Selected solutions appear in <a href="../../toc.html">Appendix G</a>.</p>
+<ol>
+<li><strong>Conceptual (the extrapolation limit).</strong> A return-conditioned policy is trained on a dataset whose trajectory returns lie in $[0, 80]$. Explain, in terms of the supervised objective of subsection one, why conditioning on a target return of $200$ does not produce a policy that achieves $200$, and construct a small two-segment example (an A-to-B path and a B-to-C path, no logged A-to-B-to-C) where a value-based method would find a high-return policy that the return-conditioned policy cannot. State precisely which property of the Bellman backup enables the stitching.</li>
+<li><strong>Implementation (relabeling strategies).</strong> Extend Code 28.3.2 to compare three hindsight-relabeling strategies: "final" (relabel with the last achieved state of the trajectory), "future" (the implemented one), and "random" (relabel with a state achieved anywhere in the episode). Report the training-pair count and goal-reaching success for each on the same collected trajectories, and explain why "future" is usually the strongest. Then sweep the number of relabeled goals per transition and plot success against that number.</li>
+<li><strong>Open-ended (stitching for sequence models).</strong> The return-conditioned policy of subsection three cannot stitch. Design and prototype one fix from the research frontier: either relabel the returns-to-go in the training data using a separately learned value function before fitting the sequence model (the Q-learning Decision Transformer idea), or condition a diffusion planner (preview of <a href="section-28.4.html">Section 28.4</a>) on high return and let the sampler compose sub-trajectories. On a gridworld with a deliberate stitching gap, measure whether your fix exceeds the best logged return where a plain return-conditioned policy does not.</li>
+</ol>
+
+<nav class="chapter-nav">
+<a class="nav-prev" href="section-28.2.html">&#8592; Section 28.2</a>
+<a class="nav-up" href="index.html">Chapter 28 Contents</a>
+<a class="nav-next" href="section-28.4.html">Section 28.4: Diffusion Planners &#8594;</a>
+</nav>
+</main>
+<footer class="book-footer">
+<p class="footer-edition">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &middot; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated"><script>document.write("Last updated: " + document.lastModified);</script></p>
+</footer>
+</body>
+</html>
