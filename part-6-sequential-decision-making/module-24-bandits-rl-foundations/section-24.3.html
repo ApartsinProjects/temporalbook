@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 24.3: Contextual Bandits. Adding a feature vector to each round so the best action depends on the situation, the contextual bandit as the one-step bridge between multi-armed bandits and full reinforcement learning, LinUCB with its ridge-regression confidence ellipsoid, Thompson sampling and neural contextual bandits, off-policy evaluation by inverse propensity scoring and doubly-robust estimators, and a from-scratch LinUCB matched against a library implementation on a synthetic contextual bandit." name="description"/>
+<title>Section 24.3: Contextual Bandits | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Sequential Decision Making</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 24: Bandits and Foundations of Reinforcement Learning</a></div>
+<h1>Contextual Bandits</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"For a thousand rounds I pulled the same lever because, on average, it paid best. Then someone handed me a slip of paper at the start of each round, the weather, the user's age, the time of day, and I realized: there is no single best lever. There is a best lever for this slip. I had been answering the wrong question confidently the entire time."</p>
+<cite>A Bandit That Finally Looks at the Situation Before Choosing</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A multi-armed bandit asks "which arm is best on average?" A contextual bandit asks the question that almost every real decision actually poses: "which arm is best <em>given what I can see right now</em>?" At the start of each round the learner observes a feature vector $\mathbf{x}_t$, the context, chooses an action, and receives a reward whose expectation depends on both the action and the context. That single addition, a feature vector revealed before the choice, turns the bandit from a global average-chaser into a function learner, and it is the addition that makes the bandit industrially dominant: recommendation, personalization, ad selection, and dynamic pricing are all contextual-bandit problems wearing different domain costumes.</strong> The contextual bandit also occupies a precise theoretical position: it is the bridge between the context-free bandit of <a href="section-24.2.html">Section 24.2</a> and the full Markov decision process of <a href="../module-22-markov-decision-processes/index.html">Chapter 22</a>. It has state (the context $\mathbf{x}_t$) but no transitions: your action changes the reward you collect, not the next context you see. It is, exactly, a one-step reinforcement-learning problem. This section builds the contextual reward model, derives LinUCB from ridge regression and a confidence ellipsoid, surveys Thompson sampling and neural contextual bandits, develops off-policy evaluation by inverse propensity scoring and doubly-robust estimators (the tools that let you score a new policy from logged data without running it live), and implements LinUCB from scratch on a synthetic problem before collapsing it to a library call. You leave able to recognize a contextual bandit in the wild, choose an exploration strategy, and evaluate a candidate policy offline.</p>
+</div>
+<p>In <a href="section-24.2.html">Section 24.2</a> we met the multi-armed bandit and its exploration strategies: epsilon-greedy, upper confidence bounds, and Thompson sampling, all built on the premise that each arm has one fixed reward distribution to be estimated. That premise is exactly what real applications violate. The best news article for a retiree at breakfast is not the best article for a teenager at midnight; the best price for a price-sensitive shopper is not the best price for a brand-loyal one. The context-free bandit, forced to pick one global best arm, averages across all these situations and serves everyone the bland compromise. This section gives the bandit eyes. It observes the situation first, then chooses, and the regret it competes against is no longer "the single best arm" but "the best <em>policy</em> mapping contexts to arms", a far stronger and far more useful benchmark.</p>
+<p>This matters because the contextual bandit is, by a wide margin, the most deployed form of sequential decision making in industry, more than full reinforcement learning, which it often quietly outperforms in settings without long-horizon dynamics. When your action does not change the world's next state (recommending an article does not change who arrives next), you do not need the transition machinery of an MDP, and paying for it buys you instability and sample inefficiency for nothing. The contextual bandit is the right tool precisely when the problem has rich state but trivial dynamics, and an enormous fraction of valuable decision problems have exactly that shape. We use the unified notation of <a href="../../toc.html">Appendix A</a> throughout: $\mathbf{x}_t$ the context, $a_t$ the chosen action, $r_t$ the observed reward, $\pi$ a policy mapping contexts to actions.</p>
+<p>Four competencies this section installs: to write the contextual reward model and state the regret a contextual learner minimizes; to derive and implement LinUCB, the linear reward model with a ridge-regression confidence-ellipsoid exploration bonus; to describe Thompson sampling and neural contextual bandits as alternative exploration mechanisms; and to estimate the value of a policy you have not run, from logged data alone, using inverse propensity scoring and the doubly-robust estimator. These are the load-bearing skills for the deep and offline reinforcement learning of <a href="../../toc.html">Chapter 25</a> and beyond.</p>
+
+<h2>1. Adding Context: The Situation Decides the Best Action <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The defining move of the contextual bandit is a single new object revealed at the top of each round: a feature vector $\mathbf{x}_t \in \mathbb{R}^d$ describing the situation. The interaction loop becomes: the environment reveals $\mathbf{x}_t$; the learner chooses an action $a_t \in \{1, \dots, K\}$; the environment returns a reward $r_t$ whose expected value depends on both the context and the chosen action. Nothing else carries over from one round to the next. There is no state transition, no notion that the action you took nudges the context you will see next. That absence is the whole reason the contextual bandit is simpler than the MDP of <a href="../module-22-markov-decision-processes/index.html">Chapter 22</a>, and the presence of $\mathbf{x}_t$ is the whole reason it is richer than the context-free bandit of <a href="section-24.2.html">Section 24.2</a>.</p>
+<p>Formally, we assume an expected-reward function of context and action,</p>
+$$\mathbb{E}[\,r_t \mid \mathbf{x}_t, a_t = a\,] = \mu_a(\mathbf{x}_t), \qquad r_t = \mu_{a_t}(\mathbf{x}_t) + \varepsilon_t,$$
+<p>with $\varepsilon_t$ a zero-mean noise term. The learner's goal is to choose actions so as to accumulate reward close to that of the best context-dependent policy. Writing the optimal policy as $\pi^\star(\mathbf{x}) = \arg\max_a \mu_a(\mathbf{x})$, the cumulative regret over $T$ rounds is</p>
+$$\mathrm{Regret}(T) = \sum_{t=1}^{T} \Big[\,\mu_{\pi^\star(\mathbf{x}_t)}(\mathbf{x}_t) - \mu_{a_t}(\mathbf{x}_t)\,\Big].$$
+<p>Compare this to the context-free regret of <a href="section-24.2.html">Section 24.2</a>, which subtracts the single global best arm $\mu_{a^\star}$. The contextual benchmark $\mu_{\pi^\star(\mathbf{x}_t)}(\mathbf{x}_t)$ is per-round and per-context, and it is generally much higher than any fixed arm's mean, so beating it requires actually learning the functions $\mu_a(\cdot)$, not merely their averages. This is the precise sense in which a contextual bandit is a function-learning problem: exploration must discover not "which arm pays most" but "which arm pays most in which region of context space".</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A comparison of three decision settings drawn as boxes. Left: multi-armed bandit, no context arrow in, one action out, reward back, no state transition. Middle: contextual bandit, a context x_t arrow enters before the action, action out, reward back, but still no transition arrow to the next context. Right: Markov decision process, a state s_t enters, an action out, reward back, and a transition arrow loops to the next state s_t plus one.">
+<defs>
+<marker id="arr243" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+<marker id="arrC243" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b8431f"/></marker>
+</defs>
+<style>
+.box243 { fill:#eef3f8; stroke:#14385c; stroke-width:2; }
+.fl243 { stroke:#5a626c; stroke-width:1.8; fill:none; marker-end:url(#arr243); }
+.tr243 { stroke:#b8431f; stroke-width:1.8; fill:none; marker-end:url(#arrC243); stroke-dasharray:5 4; }
+.t243 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.s243 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.c243 { font:600 12px sans-serif; fill:#b8431f; text-anchor:middle; }
+</style>
+<text class="t243" x="410" y="22">From global average to situation-aware to stateful: the bandit-to-RL bridge</text>
+<rect class="box243" x="40" y="90" width="180" height="70" rx="10"/><text class="t243" x="130" y="120">Multi-armed</text><text class="s243" x="130" y="140">no context</text>
+<rect class="box243" x="320" y="90" width="180" height="70" rx="10"/><text class="t243" x="410" y="120">Contextual</text><text class="s243" x="410" y="140">state, no transitions</text>
+<rect class="box243" x="600" y="90" width="180" height="70" rx="10"/><text class="t243" x="690" y="120">MDP</text><text class="s243" x="690" y="140">state + transitions</text>
+<line class="fl243" x1="130" y1="200" x2="130" y2="162"/><text class="s243" x="130" y="218">action &#8594; reward</text>
+<line class="fl243" x1="290" y1="125" x2="318" y2="125"/><text class="s243" x="295" y="80">x&#8348;</text>
+<line class="fl243" x1="410" y1="200" x2="410" y2="162"/><text class="s243" x="410" y="218">action &#8594; reward</text>
+<line class="fl243" x1="570" y1="125" x2="598" y2="125"/><text class="s243" x="575" y="80">s&#8348;</text>
+<line class="fl243" x1="690" y1="200" x2="690" y2="162"/><text class="s243" x="690" y="218">action &#8594; reward</text>
+<path class="tr243" d="M 740 160 q 60 50 0 -35" />
+<text class="c243" x="775" y="135">s&#8348;&#8330;&#8321;</text>
+</svg>
+<figcaption><strong>Figure 24.3.1:</strong> The contextual bandit sits exactly between the context-free bandit and the MDP. It gains the context $\mathbf{x}_t$ that the multi-armed bandit lacks (so the best action varies with the situation), but it lacks the transition arrow of the MDP (the orange dashed loop): the action affects the reward, never the next context. That one missing arrow is what makes it a one-step reinforcement-learning problem rather than a multi-step one.</figcaption>
+</figure>
+<p>The position of the contextual bandit between the two neighbors is worth stating precisely, because it dictates which algorithms apply. From the multi-armed bandit it inherits the exploration-exploitation tension: you still must occasionally try an action you are unsure about to learn its reward. From the MDP it borrows the notion of state, the context $\mathbf{x}_t$, but throws away the transition kernel $P(\mathbf{x}_{t+1} \mid \mathbf{x}_t, a_t)$ entirely. Because there are no transitions, there is no temporal credit assignment, no discounting, no value-function bootstrapping; the reward is immediate and fully attributable to the single action that earned it. That collapse to one step is liberating: it means the rich, stable supervised-learning toolbox (linear models, gradient-boosted trees, neural networks) can estimate $\mu_a(\mathbf{x})$ directly, and the only genuinely sequential subtlety left is how to explore.</p>
+<p>One distinction deserves emphasis because it separates the contextual bandit from ordinary supervised learning even though both fit a function $\mu_a(\mathbf{x})$. In supervised regression you are handed, for every training example, the label for <em>every</em> action: you see the reward you would have gotten under each choice. In the bandit you see only the reward of the action you actually took, the so-called <em>bandit feedback</em> or partial-information setting. You never observe the counterfactual: what the skipped arms would have paid. This is precisely why a contextual bandit cannot simply collect a dataset and run regression once; it must <em>choose</em> which arm to query, and a poor choice of queries leaves whole regions of the reward surface unobserved. Exploration is the mechanism that ensures the function estimate $\hat{\mu}_a(\cdot)$ is informed across the action-context space rather than only along the trajectory a greedy policy happened to walk. Hold that asymmetry, full feedback in supervised learning, partial feedback here, firmly, because it is the reason every algorithm in this section pairs a regressor with an explicit exploration rule.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: One-Step RL Is Where State Meets Supervised Learning</div>
+<p>The contextual bandit is the cleanest meeting point of two worlds. Like reinforcement learning, it has state and must explore: you only observe the reward of the action you took, never the counterfactual rewards of the actions you skipped (the "bandit feedback" that distinguishes it from supervised learning, where every label is revealed). Like supervised learning, its target is a fixed function $\mu_a(\mathbf{x})$ with no temporal coupling, so you can throw any regressor at it. This is why contextual bandits are the industrial sweet spot: they deliver the personalization that flat bandits cannot, without the instability, sample-hunger, and long-horizon credit-assignment headaches of full RL. When your action does not move the world's state, do not pay for an MDP.</p>
+</div>
+
+<h2>2. LinUCB: A Linear Reward Model With a Confidence Bonus <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The most influential contextual-bandit algorithm makes one modeling assumption, that the expected reward is linear in the context, and pairs it with one exploration idea, optimism in the face of uncertainty, the same principle that powered the UCB bandit of <a href="section-24.2.html">Section 24.2</a>. Assume each arm $a$ has an unknown parameter vector $\boldsymbol{\theta}_a \in \mathbb{R}^d$ and that</p>
+$$\mathbb{E}[\,r_t \mid \mathbf{x}_t, a_t = a\,] = \mathbf{x}_t^{\top}\boldsymbol{\theta}_a.$$
+<p>If we knew $\boldsymbol{\theta}_a$ we would just pick the arm with the largest predicted reward $\mathbf{x}_t^\top\boldsymbol{\theta}_a$. We do not, so we estimate it by <em>ridge regression</em> from the rounds where arm $a$ was played, and then we add an exploration bonus proportional to how uncertain that estimate is in the direction of the current context. Collect, for arm $a$, the design matrix accumulator $\mathbf{A}_a = \lambda\mathbf{I} + \sum \mathbf{x}\mathbf{x}^\top$ (over rounds where $a$ was chosen) and the response accumulator $\mathbf{b}_a = \sum r\,\mathbf{x}$. The ridge solution and the LinUCB action-selection score are</p>
+$$\hat{\boldsymbol{\theta}}_a = \mathbf{A}_a^{-1}\mathbf{b}_a, \qquad p_a(\mathbf{x}_t) = \underbrace{\mathbf{x}_t^{\top}\hat{\boldsymbol{\theta}}_a}_{\text{exploit: predicted reward}} + \underbrace{\alpha\,\sqrt{\mathbf{x}_t^{\top}\mathbf{A}_a^{-1}\mathbf{x}_t}}_{\text{explore: confidence width}},$$
+<p>and LinUCB plays $a_t = \arg\max_a p_a(\mathbf{x}_t)$. The first term is pure exploitation, the predicted reward under the current estimate. The second term is the radius of the confidence ellipsoid around $\hat{\boldsymbol{\theta}}_a$, measured in the direction $\mathbf{x}_t$: the matrix $\mathbf{A}_a^{-1}$ is (up to noise scale) the covariance of the parameter estimate, so $\sqrt{\mathbf{x}_t^\top \mathbf{A}_a^{-1}\mathbf{x}_t}$ is the standard deviation of the predicted reward $\mathbf{x}_t^\top\hat{\boldsymbol{\theta}}_a$. The constant $\alpha$ sets how many standard deviations of optimism to add; larger $\alpha$ explores more.</p>
+<p>The ridge-regression and confidence-ellipsoid view is exactly the online ridge of <a href="../../toc.html">Chapter 20</a> seen through a decision-making lens. There, online ridge regression maintained a running inverse covariance to update a forecast as data streamed in; here, that same inverse covariance $\mathbf{A}_a^{-1}$ does double duty, it gives both the point estimate (through $\hat{\boldsymbol{\theta}}_a = \mathbf{A}_a^{-1}\mathbf{b}_a$) and the uncertainty (through the bonus). The geometry is clean: directions of context space in which arm $a$ has been pulled many times have small $\mathbf{x}^\top\mathbf{A}_a^{-1}\mathbf{x}$ (the ellipsoid is thin there, we are confident, the bonus is small), while novel directions have large $\mathbf{x}^\top\mathbf{A}_a^{-1}\mathbf{x}$ (the ellipsoid is wide, we are uncertain, the bonus is large and pulls us to explore). Optimism thus automatically steers exploration toward context directions the arm has not yet been tested in, which is precisely where learning is still possible.</p>
+<div class="callout looking-back">
+<div class="callout-title">Looking Back: The Same Inverse Covariance, Now Driving a Decision</div>
+<p>The matrix $\mathbf{A}_a^{-1}$ at the heart of LinUCB is the very object that online ridge regression maintains in <a href="../../toc.html">Chapter 20</a>. In the forecasting setting it was the running second-moment inverse that let a linear predictor update in closed form as each new observation arrived, via the matrix-inversion-lemma rank-one update. In the bandit setting nothing about that matrix changes; what changes is what we read off it. Forecasting read the mean $\hat{\boldsymbol{\theta}}_a = \mathbf{A}_a^{-1}\mathbf{b}_a$ and stopped. A decision maker reads the mean <em>and</em> the variance $\mathbf{x}^\top\mathbf{A}_a^{-1}\mathbf{x}$, then acts optimistically on the upper end of that variance. The lesson of the temporal thread repeats: the same recursive estimator that produced a point forecast in Part V, given an exploration bonus, becomes an agent that decides what data to collect next.</p>
+</div>
+<p>Why is optimism the right exploration rule rather than a heuristic? The guarantee is that LinUCB, under the linear-reward assumption, attains cumulative regret $\tilde{O}(d\sqrt{T})$, sublinear in the horizon and graceful in the context dimension $d$. Sublinear regret means the per-round regret tends to zero: the average reward converges to that of the optimal context-dependent policy. The argument mirrors the context-free UCB bound: because the true $\boldsymbol{\theta}_a$ lies inside the confidence ellipsoid with high probability, the optimistic score $p_a$ upper-bounds the true reward, so whenever LinUCB picks a suboptimal arm it can only be because that arm's ellipsoid was wide, which means we were genuinely uncertain about it, which means we are about to learn a lot by pulling it. Exploration and information gain are aligned by construction. Code 24.3.1 in subsection five implements exactly the $\mathbf{A}_a$, $\mathbf{b}_a$ update and the score above.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: The LinUCB Score for One Arm</div>
+<p>Take a two-dimensional context, ridge $\lambda = 1$, and exploration constant $\alpha = 1$. Suppose arm $a$ has been pulled on two past rounds with contexts $(1,0)$ and $(0,1)$, both yielding reward $1$. Then $\mathbf{A}_a = \mathbf{I} + (1,0)(1,0)^\top + (0,1)(0,1)^\top = \begin{psmallmatrix}2 & 0\\ 0 & 2\end{psmallmatrix}$ and $\mathbf{b}_a = 1\cdot(1,0) + 1\cdot(0,1) = (1,1)$. The ridge estimate is $\hat{\boldsymbol{\theta}}_a = \mathbf{A}_a^{-1}\mathbf{b}_a = \begin{psmallmatrix}0.5 & 0\\ 0 & 0.5\end{psmallmatrix}(1,1) = (0.5, 0.5)$. Now a new context $\mathbf{x}_t = (1, 1)$ arrives. The exploit term is $\mathbf{x}_t^\top\hat{\boldsymbol{\theta}}_a = 1\cdot 0.5 + 1\cdot 0.5 = 1.0$. The explore term is $\alpha\sqrt{\mathbf{x}_t^\top\mathbf{A}_a^{-1}\mathbf{x}_t} = 1\cdot\sqrt{(1,1)\begin{psmallmatrix}0.5 & 0\\ 0 & 0.5\end{psmallmatrix}(1,1)^\top} = \sqrt{0.5 + 0.5} = 1.0$. So the LinUCB score is $p_a(\mathbf{x}_t) = 1.0 + 1.0 = 2.0$: a confident reward prediction of $1.0$, inflated by a full $1.0$ of optimism because $(1,1)$ is a direction (the diagonal) less well covered than the two axis directions the arm was actually pulled on. Pull the arm a few more times along the diagonal and that bonus shrinks toward zero.</p>
+</div>
+
+<h2>3. Thompson Sampling and Neural Contextual Bandits <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>LinUCB explores by adding a deterministic optimism bonus. The leading alternative explores by deliberate randomness: <em>Thompson sampling</em>, the posterior-sampling strategy we first met for the context-free bandit in <a href="section-24.2.html">Section 24.2</a>, extends to the contextual setting almost verbatim. Maintain a Bayesian posterior over each arm's parameter $\boldsymbol{\theta}_a$; under the linear-Gaussian model with ridge prior, that posterior is exactly Gaussian, $\boldsymbol{\theta}_a \sim \mathcal{N}(\hat{\boldsymbol{\theta}}_a, \sigma^2 \mathbf{A}_a^{-1})$, using the same $\mathbf{A}_a$, $\mathbf{b}_a$ accumulators as LinUCB. Each round, <em>sample</em> a parameter $\tilde{\boldsymbol{\theta}}_a$ from each arm's posterior, then act greedily with respect to the sampled parameters:</p>
+$$\tilde{\boldsymbol{\theta}}_a \sim \mathcal{N}\!\big(\hat{\boldsymbol{\theta}}_a,\, \sigma^2 \mathbf{A}_a^{-1}\big), \qquad a_t = \arg\max_a\; \mathbf{x}_t^{\top}\tilde{\boldsymbol{\theta}}_a.$$
+<p>The exploration is now stochastic: an arm whose posterior is wide will sometimes sample a high parameter and get chosen, sometimes a low one and get skipped, with frequency proportional to the posterior probability that it is actually best. This "probability matching" tends to be more robust in practice than UCB's worst-case optimism, often delivering lower empirical regret, and it parallelizes naturally because each decision needs only one posterior sample rather than a covariance-direction computation. Linear Thompson sampling enjoys the same $\tilde{O}(d\sqrt{T})$ regret order as LinUCB.</p>
+<p>Both LinUCB and linear Thompson sampling assume the reward is linear in the context, and real reward surfaces rarely are. <em>Neural contextual bandits</em> replace the linear model $\mathbf{x}^\top\boldsymbol{\theta}_a$ with a neural network $f_a(\mathbf{x}; \mathbf{w})$ that can represent arbitrary reward functions, and the only real design question becomes how to do exploration when the model is no longer linear. Three families dominate. NeuralUCB and NeuralTS (Zhou et al., 2020; Zhang et al., 2021) build the confidence bonus from the network's gradient features, treating the last-layer or neural-tangent-kernel representation as the context in a LinUCB-style ellipsoid. Neural-linear methods learn a deep representation $\phi(\mathbf{x})$ with a standard network and run exact Bayesian linear regression (LinUCB or Thompson) on top of the frozen or slowly-updated features, getting nonlinearity from the representation and calibrated uncertainty from the linear head. And bootstrapped or dropout-based ensembles approximate the posterior by training several networks and sampling among them. The trade is the usual one: more expressive reward models capture richer personalization but make the uncertainty estimate that drives exploration harder to keep honest.</p>
+<p>The choice between optimism and posterior sampling is not merely aesthetic, and it is worth knowing when each pulls ahead. LinUCB's bonus is deterministic and worst-case: it explores an arm exactly as much as its widest plausible reward justifies, which makes its behavior reproducible and its regret bound tight, but also makes it sensitive to the exploration constant $\alpha$, a value too large wastes pulls on hopeless arms and a value too small under-explores. Thompson sampling sidesteps that tuning by reading the exploration rate directly off the posterior width, so an arm is tried in proportion to the posterior probability that it is best, which adapts automatically as evidence accumulates and tends to degrade more gracefully when the reward model is slightly misspecified. The practical consequence reported across large-scale studies is that Thompson sampling is frequently the stronger default in noisy, nonstationary production systems, while LinUCB is preferred when reproducibility, an explicit confidence interval, or a provable per-round guarantee is required. Both reduce, in the linear-Gaussian case, to reading the same $\hat{\boldsymbol{\theta}}_a$ and $\mathbf{A}_a^{-1}$, so switching between them in a deployed system is often a one-line change in how the score is computed.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: Optimism Versus Gambling</div>
+<p>LinUCB and Thompson sampling are two personalities solving the same problem. LinUCB is the relentless optimist: for every arm it imagines the best case consistent with the evidence, then picks whichever best case is brightest. Thompson sampling is the cheerful gambler: it rolls the dice on each arm's plausible payoff and goes with the winner of that particular roll. Optimism is deterministic and conservative about worst cases; gambling is stochastic and matches the odds. The remarkable thing is that both, despite opposite temperaments, achieve the same regret order, and in messy real systems the gambler frequently wins on the scoreboard. Two roads to the same regret bound, one tightly wound, one rolling dice, and the dice-roller is often the one you ship.</p>
+</div>
+
+<h2>4. Off-Policy Evaluation: Scoring a Policy You Have Not Run <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>In almost every production setting you cannot freely experiment. Deploying an untested recommendation policy to live users to see whether it is better is slow, expensive, and risky; a bad policy loses revenue and trust before you can measure it. Yet you have a mountain of <em>logged</em> data: contexts, the actions your current (logging) policy took, the probabilities with which it took them, and the rewards it received. Off-policy evaluation (OPE) is the set of techniques that estimate the value of a <em>new</em> policy $\pi$ from that logged data alone, without ever running $\pi$. It is the workhorse that lets teams compare dozens of candidate policies offline and deploy only the winner.</p>
+<p>The logging policy $\pi_0$ recorded, for each round, the context $\mathbf{x}_t$, the action $a_t$ it sampled, the propensity $p_t = \pi_0(a_t \mid \mathbf{x}_t)$ (the probability it chose that action), and the reward $r_t$. The target policy's value is $V(\pi) = \mathbb{E}_{\mathbf{x}}\big[\sum_a \pi(a \mid \mathbf{x})\,\mu_a(\mathbf{x})\big]$, the expected reward if $\pi$ were deployed. The <em>inverse propensity scoring</em> (IPS) estimator reweights each logged reward by how much more (or less) likely the target policy was to take the same action than the logging policy:</p>
+$$\hat{V}_{\mathrm{IPS}}(\pi) = \frac{1}{n}\sum_{t=1}^{n} \frac{\pi(a_t \mid \mathbf{x}_t)}{\pi_0(a_t \mid \mathbf{x}_t)}\, r_t.$$
+<p>The importance weight $\pi(a_t\mid\mathbf{x}_t)/\pi_0(a_t\mid\mathbf{x}_t)$ corrects for the fact that the data was collected under $\pi_0$, not $\pi$. IPS is <em>unbiased</em> whenever the logging policy had nonzero probability of every action the target policy might take (the "full support" or overlap condition), which is exactly why production logging policies must keep exploring rather than collapse to a deterministic greedy choice: a deterministic logger leaves you blind to every action it never tried. The cost of IPS is high <em>variance</em>: when $\pi_0$ took an action rarely but $\pi$ favors it, the weight $\pi/\pi_0$ is huge, and a single such round can dominate the estimate.</p>
+<p>The <em>doubly-robust</em> (DR) estimator tames that variance by combining IPS with a learned reward model $\hat{\mu}_a(\mathbf{x})$ (a "direct method" regressor fit to the logged rewards). It uses the model as a baseline and applies the expensive importance-weighting only to the model's <em>residual</em>:</p>
+$$\hat{V}_{\mathrm{DR}}(\pi) = \frac{1}{n}\sum_{t=1}^{n}\Bigg[\underbrace{\sum_{a}\pi(a\mid\mathbf{x}_t)\,\hat{\mu}_a(\mathbf{x}_t)}_{\text{model estimate of }V(\pi)} + \frac{\pi(a_t\mid\mathbf{x}_t)}{\pi_0(a_t\mid\mathbf{x}_t)}\,\big(r_t - \hat{\mu}_{a_t}(\mathbf{x}_t)\big)\Bigg].$$
+<p>The name "doubly robust" is the payoff: the estimator is consistent if <em>either</em> the propensities $\pi_0$ are correct <em>or</em> the reward model $\hat{\mu}$ is correct, you need only one of the two to be right. When the reward model is good its residual is small, so the high-variance importance weight multiplies a tiny number and the variance collapses; when the model is bad the IPS correction term rescues unbiasedness. DR is the default OPE estimator in modern contextual-bandit pipelines for exactly this reason, and it is the same control-variate idea that appears throughout statistics: subtract a correlated estimate, importance-weight only what is left.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: IPS Versus DR on One Logged Round</div>
+<p>Suppose on a logged round the context favored action $a_2$, the logging policy took $a_2$ with propensity $\pi_0(a_2\mid\mathbf{x}) = 0.1$, and the observed reward was $r = 1$. The candidate target policy strongly prefers $a_2$ here, $\pi(a_2\mid\mathbf{x}) = 0.9$. The IPS contribution of this single round is $\frac{0.9}{0.1}\cdot 1 = 9.0$: one logged sample contributes a value of nine, an enormous spike that, averaged with hundreds of near-zero rounds, swings the estimate violently. Now suppose a reasonable reward model predicts $\hat{\mu}_{a_2}(\mathbf{x}) = 0.85$ for this action and $\sum_a\pi(a\mid\mathbf{x})\hat{\mu}_a(\mathbf{x}) = 0.8$ for the target policy's whole action distribution. The DR contribution is $0.8 + \frac{0.9}{0.1}(1 - 0.85) = 0.8 + 9\cdot 0.15 = 0.8 + 1.35 = 2.15$, far closer to the plausible true value and far less explosive, because the importance weight now multiplies the small residual $0.15$ rather than the full reward $1.0$. The same weight that made IPS spike to $9.0$ is tamed to a $1.35$ correction once the model absorbs most of the signal. That contraction, weight-times-residual instead of weight-times-reward, is the entire variance reduction of doubly robust in one round.</p>
+</div>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Logged Propensities Are the Asset, Not the Logs</div>
+<p>The one operational lesson to carry out of this subsection is that the value of all future offline experimentation is decided by a single logging choice made before any of it: did you record $\pi_0(a\mid\mathbf{x})$, the probability with which the serving policy took each action? With those propensities, IPS gives an unbiased estimate of any sufficiently-overlapping policy and DR gives a low-variance one, so a year of logs becomes a laboratory in which dozens of candidate policies are compared without touching a live user. Without them, the same logs are nearly worthless for counterfactual comparison: you can see what happened, but you cannot reweight it to what <em>would</em> have happened under a different policy. Propensity logging is cheap to add and impossible to add retroactively. It is the difference between a dataset and a decision-making asset.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Off-Policy Learning at Scale (2024 to 2026)</div>
+<p>Off-policy evaluation and learning are among the most active applied-RL research areas because they sit directly on the revenue path of every large recommender. Recent work pushes three fronts. First, <em>variance control</em>: self-normalized and switch estimators, and the doubly-robust-with-shrinkage and "DR-OS" families, adaptively trade bias for variance when importance weights blow up; the SLOPE and related bandwidth-selection methods automate that trade. The Open Bandit Pipeline and its dataset (Saito et al.) have become the standard benchmark, and the 2024 to 2025 literature increasingly studies OPE for <em>large action spaces</em> via action embeddings (the marginalized IPS / MIPS estimators), where millions of items make per-action propensities hopeless but a shared embedding makes the weights tractable. Second, <em>off-policy learning</em> proper: counterfactual risk minimization and policy-gradient-from-logs methods optimize a new policy directly against a DR objective, and offline RL methods (<a href="../../toc.html">Chapter 26</a>) generalize this when transitions reappear. Third, <em>LLM-driven decisions</em>: contextual bandits now sit underneath prompt selection, model routing, and reward-model-guided generation, where the "context" is an embedding and the "arms" are prompts or models, making OPE the tool that decides which LLM policy to ship without an expensive online A/B test. The practitioner's 2026 takeaway: log your propensities, because the value of every future offline experiment depends on having them.</p>
+</div>
+
+<h2>5. Worked Example: LinUCB From Scratch, Then a Library <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make the algorithm executable on a synthetic contextual bandit where we control the ground truth, so we can measure regret exactly. The plan is a clean three-way comparison: LinUCB (context-aware, explores), a greedy linear model (context-aware, never explores), and a context-free UCB bandit (explores, but ignores context). The synthetic environment has $K$ arms, each with a true hidden parameter $\boldsymbol{\theta}_a^\star$; each round draws a random context and the reward of arm $a$ is $\mathbf{x}_t^\top\boldsymbol{\theta}_a^\star$ plus noise. Code 24.3.1 defines the environment and the from-scratch LinUCB agent.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(0)
+K, d, T = 4, 5, 3000               # arms, context dimension, rounds
+alpha, lam = 1.0, 1.0             # exploration constant; ridge regularizer
+
+# Ground-truth: each arm has a hidden linear reward parameter theta*_a.
+theta_star = rng.normal(0, 1.0, size=(K, d))
+
+def draw_context():
+    x = rng.normal(0, 1.0, size=d)
+    return x / np.linalg.norm(x)   # unit-norm contexts keep reward scales comparable
+
+def reward(a, x):
+    return float(x @ theta_star[a] + rng.normal(0, 0.1))   # linear reward + noise
+
+class LinUCB:
+    """From-scratch LinUCB: a ridge model + confidence-ellipsoid bonus per arm."""
+    def __init__(self, K, d, alpha, lam):
+        self.alpha = alpha
+        self.A = [lam * np.eye(d) for _ in range(K)]   # A_a = lam I + sum x x^T
+        self.b = [np.zeros(d) for _ in range(K)]        # b_a = sum r x
+
+    def select(self, x):
+        scores = []
+        for a in range(K):
+            Ainv = np.linalg.inv(self.A[a])
+            theta = Ainv @ self.b[a]                     # ridge estimate theta_hat_a
+            exploit = x @ theta                          # predicted reward
+            explore = self.alpha * np.sqrt(x @ Ainv @ x) # confidence width (the bonus)
+            scores.append(exploit + explore)             # the LinUCB score p_a(x)
+        return int(np.argmax(scores))
+
+    def update(self, a, x, r):
+        self.A[a] += np.outer(x, x)                      # rank-one design update
+        self.b[a] += r * x                               # response accumulation
+</code></pre>
+<div class="code-caption"><strong>Code 24.3.1:</strong> The synthetic linear contextual bandit and the from-scratch LinUCB agent. Each arm keeps its own ridge accumulators $\mathbf{A}_a$ and $\mathbf{b}_a$; <code>select</code> computes the exploit-plus-explore score $p_a(\mathbf{x})$ of subsection two, and <code>update</code> folds the observed reward into that arm's accumulators with a rank-one update.</div>
+<p>Now the two baselines and the comparison loop. The greedy agent reuses the same ridge accumulators but drops the exploration bonus (it sets $\alpha = 0$, always trusting its current estimate), and the context-free UCB agent ignores $\mathbf{x}_t$ entirely, tracking only a scalar mean and count per arm. We run all three on the same context stream and accumulate regret against the per-round optimal arm. Code 24.3.2 is the driver.</p>
+<pre><code class="language-python">class ContextFreeUCB:
+    """Ignores context: classic UCB1 on per-arm scalar means (Section 24.2)."""
+    def __init__(self, K):
+        self.n = np.zeros(K); self.mean = np.zeros(K); self.t = 0
+    def select(self, x):
+        self.t += 1
+        if (self.n == 0).any():
+            return int(np.argmin(self.n))               # pull each arm once first
+        bonus = np.sqrt(2 * np.log(self.t) / self.n)    # UCB1 exploration bonus
+        return int(np.argmax(self.mean + bonus))
+    def update(self, a, x, r):
+        self.n[a] += 1
+        self.mean[a] += (r - self.mean[a]) / self.n[a]  # incremental mean
+
+def run(agent, contextual=True):
+    total_regret = 0.0
+    for _ in range(T):
+        x = draw_context()
+        best = max(x @ theta_star[a] for a in range(K))  # oracle: best arm THIS context
+        a = agent.select(x)
+        r = reward(a, x)
+        agent.update(a, x, r)
+        total_regret += best - (x @ theta_star[a])       # instantaneous regret
+    return total_regret
+
+linucb  = LinUCB(K, d, alpha=1.0, lam=lam)
+greedy  = LinUCB(K, d, alpha=0.0, lam=lam)               # alpha=0 => pure exploitation
+cfucb   = ContextFreeUCB(K)
+print("LinUCB        cumulative regret = %.1f" % run(linucb))
+print("Greedy linear cumulative regret = %.1f" % run(greedy))
+print("Context-free  cumulative regret = %.1f" % run(cfucb))
+</code></pre>
+<div class="code-caption"><strong>Code 24.3.2:</strong> Three agents on one synthetic stream. Greedy is LinUCB with the bonus switched off ($\alpha = 0$); context-free UCB tracks only scalar per-arm means and never sees $\mathbf{x}_t$. Regret is measured each round against the context-dependent optimal arm, so a context-blind agent pays regret on every round where the best arm depends on the situation.</div>
+<pre><code class="language-text">LinUCB        cumulative regret = 41.7
+Greedy linear cumulative regret = 188.4
+Context-free  cumulative regret = 612.9
+</code></pre>
+<div class="code-caption"><strong>Output 24.3.1:</strong> LinUCB wins decisively. The context-free bandit pays the most regret because no single arm is best across all contexts, so chasing a global average is structurally doomed. The greedy linear model sees context but never explores, so it locks onto early misestimates and pays roughly four times LinUCB's regret. Context plus calibrated exploration is what makes the difference.</div>
+<p>The ordering is the lesson of the whole section in three numbers. The context-free bandit pays by far the most regret: with four arms whose best choice flips depending on $\mathbf{x}_t$, committing to any single arm is wrong most of the time, and exploration cannot fix a model that has no place to put the context. The greedy linear model fixes the modeling gap but creates an exploration gap: by always trusting its current ridge estimate it under-explores arms it initially misjudged, never collecting the data that would correct them, and pays for it. Only LinUCB has both a context-aware model and a principled reason to gather data about under-tested arm-context directions, and only LinUCB gets sublinear regret. Now the library equivalent.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Personalizing a News Feed Without an A/B Army</div>
+<p><strong>Who:</strong> A product team at a news aggregator deciding which of dozens of article categories to surface at the top of each user's feed.</p>
+<p><strong>Situation:</strong> Each visit gives a context (user history embedding, device, time of day, recent topics) and the team must pick one category to feature; the reward is whether the user clicks and reads. The best category clearly depends on the user and moment, so a single global "most popular" choice underperforms.</p>
+<p><strong>Problem:</strong> They could not run a fresh live A/B test for every one of the hundreds of candidate ranking policies their data scientists proposed; live tests were slow and each consumed scarce traffic.</p>
+<p><strong>Dilemma:</strong> Deploy candidate policies live and risk degrading the experience while learning, or evaluate them offline and risk trusting a biased estimate that does not survive contact with real users.</p>
+<p><strong>Decision:</strong> They ran LinUCB (later a neural-linear variant) as the live serving policy, crucially <em>logging the propensity</em> $\pi_0(a\mid\mathbf{x})$ of every served action, and used doubly-robust off-policy evaluation on those logs to score every candidate policy offline before promoting only the winner to a confirmatory live test.</p>
+<p><strong>How:</strong> The serving policy kept exploring (so the logs had full support), the DR estimator combined a gradient-boosted reward model with importance weighting on its residuals (subsection four), and the offline DR scores were validated against the handful of policies that did reach live tests.</p>
+<p><strong>Result:</strong> Click-through on the featured slot rose because the policy personalized by context, and the team evaluated dozens of candidates per week offline at near-zero traffic cost, reserving live tests for the few DR-OPE winners. The offline DR estimates tracked the live results closely enough to trust.</p>
+<p><strong>Lesson:</strong> A contextual bandit personalizes; logged propensities plus a doubly-robust estimator turn its data exhaust into a cheap offline evaluation lab. The single most valuable engineering decision was logging the action probabilities, because without them no unbiased offline comparison is possible.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: LinUCB and OPE in a Handful of Lines</div>
+<p>The from-scratch agent of Code 24.3.1 plus the driver of Code 24.3.2 ran roughly 45 lines of accumulator bookkeeping and regret tracking. Mature libraries collapse both the policy and the off-policy evaluation to a few lines. The <a href="https://github.com/st-tech/zr-obp">Open Bandit Pipeline</a> (<code>obp</code>) ships LinUCB, linear and logistic Thompson sampling, and the full family of OPE estimators (IPS, DR, self-normalized, switch, DR-OS); scikit-style contextual-bandit packages such as <a href="https://github.com/david-cortes/contextualbandits">contextualbandits</a> wrap LinUCB and many baselines around any scikit-learn regressor. The whole evaluate-a-policy-from-logs task becomes:</p>
+<pre><code class="language-python"># pip install obp
+from obp.policy import LinUCB
+from obp.ope import OffPolicyEvaluation, InverseProbabilityWeighting, DoublyRobust
+
+policy = LinUCB(dim=d, n_actions=K, epsilon=0.0)        # the agent: ~1 line vs ~25
+# ... fit policy / collect logged feedback into `bandit_feedback` ...
+
+ope = OffPolicyEvaluation(                                # score a NEW policy offline
+    bandit_feedback=bandit_feedback,
+    ope_estimators=[InverseProbabilityWeighting(), DoublyRobust()],
+)
+value_estimates = ope.estimate_policy_values(            # IPS and DR in one call
+    action_dist=new_policy_action_dist,                  # pi(a|x) of the candidate
+    estimated_rewards_by_reg_model=reward_model_preds,   # mu_hat for the DR term
+)
+</code></pre>
+<p>The LinUCB agent drops from about 25 lines to one constructor, and the IPS-plus-DR off-policy evaluation of subsection four, which would be another 30 lines of importance-weight and residual bookkeeping, becomes a single <code>estimate_policy_values</code> call. The library handles the propensity weighting, the reward-model integration, the variance-reduced estimators, and confidence intervals internally. The line count drops from roughly 45 (agent plus manual OPE) to about 6, with every estimator of subsection four available by name.</p>
+</div>
+<p>Read what the three code blocks establish together. Code 24.3.1 implemented LinUCB's ridge accumulators and confidence-ellipsoid bonus exactly as derived in subsection two. Code 24.3.2 ran it against a greedy context-aware baseline and a context-blind bandit on identical data, and Output 24.3.1 showed LinUCB's regret a factor of four below greedy and fifteen below context-free, isolating the two ingredients (context and calibrated exploration) that each baseline lacks one of. The library shortcut then collapsed the agent and the entire off-policy-evaluation apparatus to a few lines. The payoff: a contextual bandit is not a black box, you can build LinUCB by hand, watch context and exploration each earn their regret reduction, and reach for a library only once you understand what it computes.</p>
+
+<div class="callout warning">
+<div class="callout-title">Common Pitfalls in Contextual Bandits</div>
+<p>Four mistakes recur when readers first deploy contextual bandits, and naming them now saves a quarter of lost revenue:</p>
+<ul>
+<li><strong>Failing to log propensities.</strong> If your serving policy does not record $\pi_0(a\mid\mathbf{x})$ for each action it took, no unbiased off-policy evaluation is possible afterward, ever. This is an irreversible data loss; instrument it before launch.</li>
+<li><strong>A deterministic logging policy.</strong> A greedy logger with no exploration violates the full-support condition of subsection four, so IPS and DR cannot estimate the value of any policy that would have chosen differently. Keep the serving policy exploring.</li>
+<li><strong>Treating it as full RL.</strong> If your action genuinely does not change the next context (recommending an article does not change who arrives next), the transition machinery of an MDP buys instability and sample-hunger for nothing. Use the bandit; reserve <a href="../../toc.html">Chapter 25</a> for problems with real dynamics.</li>
+<li><strong>Trusting IPS under weak overlap.</strong> When the target policy strongly favors actions the logger took rarely, importance weights explode and the IPS estimate becomes high-variance and unreliable. Switch to doubly-robust, self-normalized, or clipped estimators, and inspect the weight distribution before trusting any number.</li>
+</ul>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 24.3.1: Why a Sum, Not a Single Best Arm <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Explain in your own words why the contextual regret of subsection one subtracts the per-round, per-context optimum $\mu_{\pi^\star(\mathbf{x}_t)}(\mathbf{x}_t)$ rather than a single global best arm $\mu_{a^\star}$, and construct a two-arm, two-context example in which the best context-free arm achieves zero context-free regret but unbounded contextual regret. Then state, in one sentence, why this is exactly the gap that the context-free UCB baseline pays in Output 24.3.1.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 24.3.2: Add Thompson Sampling and Compare <span class="exercise-type coding">Coding</span></div>
+<p>Add a <code>LinTS</code> agent to Code 24.3.1 that, each round, samples $\tilde{\boldsymbol{\theta}}_a \sim \mathcal{N}(\hat{\boldsymbol{\theta}}_a, \sigma^2\mathbf{A}_a^{-1})$ for each arm (reusing the same $\mathbf{A}_a$, $\mathbf{b}_a$ accumulators) and acts greedily on the samples, as in subsection three. Run it on the same synthetic stream as Code 24.3.2 and compare its cumulative regret to LinUCB across several seeds. Report the mean and spread of the regret difference, and comment on whether the stochastic explorer beats the optimistic one on this problem.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 24.3.3: Build IPS and Doubly-Robust by Hand <span class="exercise-type analysis">Analysis</span></div>
+<p>Generate logged data from a softmax logging policy $\pi_0$ on the synthetic environment of Code 24.3.1 (record contexts, actions, propensities, rewards). For a fixed target policy $\pi$, implement the IPS and DR estimators of subsection four, using a ridge reward model for the DR direct-method term. Compare both estimates to the true on-policy value of $\pi$ (computable here because you know $\boldsymbol{\theta}_a^\star$), then sharpen the logging policy toward determinism (raise the softmax temperature inverse) and plot how IPS variance grows while DR stays stable. Explain the result through the overlap condition. There is no single right answer for where DR overtakes IPS; argue it from the importance-weight distribution you observe.</p>
+</div>
+
+<p>We have given the bandit eyes, a feature vector revealed before each choice, and watched that single addition lift it from a global average-chaser to a situation-aware function learner with sublinear regret. We derived LinUCB from ridge regression and a confidence ellipsoid, surveyed Thompson sampling and neural exploration, and built the off-policy evaluation machinery that scores new policies from logged data. But the contextual bandit deliberately threw away one thing the full decision problem keeps: transitions. Its action affects only the immediate reward, never the next situation. The moment the action <em>does</em> change the next state, immediate reward is no longer enough, and we must reason about long-run return through a sequence of choices. That is the leap to full reinforcement learning. <a href="section-24.4.html">Section 24.4</a> takes it, introducing Monte Carlo and temporal-difference learning, the two foundational families for estimating long-run value when actions ripple forward through time.</p>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-24.2.html"><span class="nav-label">Previous</span><span class="nav-num">Section 24.2</span><span class="nav-title">Multi-Armed Bandits and Exploration</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 24</span><span class="nav-num">Contents</span><span class="nav-title">Bandits and Foundations of Reinforcement Learning</span></a>
+<a class="next" href="section-24.4.html"><span class="nav-label">Next</span><span class="nav-num">Section 24.4</span><span class="nav-title">Monte Carlo and Temporal-Difference Learning</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>
