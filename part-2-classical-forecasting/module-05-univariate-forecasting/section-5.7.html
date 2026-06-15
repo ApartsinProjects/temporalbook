@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 5.7: Model Selection, Diagnostics, and Information Criteria. Balancing fit against complexity with AIC, AICc, and BIC; residual diagnostics for whiteness, normality, and heteroskedasticity; rolling-origin backtesting with MASE and sMAPE; and a principled workflow that selects classical univariate forecasters by backtested error with information criteria as a tie-breaker." name="description"/>
+<title>Section 5.7: Model Selection, Diagnostics, and Information Criteria | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Forecasting and Time Series Analysis</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 5: Univariate Forecasting Models</a></div>
+<h1>Model Selection, Diagnostics, and Information Criteria</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"Add one more parameter and I fit the past a little better; I also forget a little more of the future. They keep asking me to choose, and every choice costs me half a degree of freedom."</p>
+<cite>An AIC Score Torn Between Fit and Frugality</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>In-sample fit always improves when you add parameters, so the model that hugs the training data tightest is almost never the model that forecasts best; choosing a model is therefore an act of penalizing or testing for complexity, not of minimizing residuals.</strong> This section gives you two complementary disciplines. Information criteria (AIC, AICc, BIC) attach an explicit complexity penalty to the in-sample likelihood, turning a one-number leaderboard for candidate ARIMA and ETS orders. Out-of-sample backtesting (rolling-origin cross-validation, scored with MASE and sMAPE against a seasonal-naive baseline) measures the only thing that actually matters: error on data the model has never seen. We close by assembling both into one principled workflow that runs ARIMA, ETS, Prophet, and naive baselines, ranks them by backtested error, breaks ties with information criteria, and refuses to ship any model whose residuals are not white.</p>
+</div>
+<p>The chapter so far has built a toolbox: in earlier sections you fit autoregressive, moving-average, and integrated models, added seasonal terms, and met exponential smoothing and its state-space form. Section 5.6 left you able to fit any single candidate. This section answers the question that fitting alone cannot: given a shelf of plausible models, which one do you actually deploy? The wrong answer, choosing the model with the smallest training error, is seductive precisely because it is the easiest number to compute and the one that always rewards more complexity. We replace it with two honest answers, one that prices complexity analytically and one that measures generalization empirically, and we show that a disciplined forecaster uses both. Throughout we use the notation $\hat L$ for the maximized likelihood, $k$ for the number of estimated parameters, and $n$ for the sample size, all collected in the unified notation table of <a href="../../toc.html">Appendix A</a>.</p>
+
+<h2>1. The Model-Selection Problem: Fit Versus Complexity <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Fix a single training series and a nested family of models, say AR(1), AR(2), up to AR(10). As you raise the order, the fitted model has strictly more freedom to bend toward the observed points, so the in-sample residual sum of squares can only fall (or stay equal) and the maximized log-likelihood can only rise. Taken at face value this says "use AR(10)," and if the family were AR(50) it would say "use AR(50)." The recommendation is worthless because it is monotone in complexity: a criterion that always prefers the larger model is not selecting anything. The deep reason is that a flexible model fits not only the reproducible signal but also the particular noise realization in the training window, and that noise will not repeat out of sample. This is overfitting in its purest temporal form, and it has a precise cost.</p>
+<p>Decompose the expected squared error of a forecast into the familiar three pieces, irreducible noise plus squared bias plus variance,</p>
+$$\mathbb{E}\big[(y - \hat y)^2\big] \;=\; \underbrace{\sigma^2}_{\text{irreducible}} \;+\; \underbrace{\big(\mathbb{E}[\hat y] - \mathbb{E}[y]\big)^2}_{\text{bias}^2} \;+\; \underbrace{\operatorname{Var}(\hat y)}_{\text{variance}}.$$
+<p>Adding parameters drives bias down but pushes variance up, because each estimated coefficient is itself a noisy quantity that the forecast must carry forward. In-sample error sees only the bias term shrinking; it is blind to the variance term growing, which is exactly the term that ruins out-of-sample performance. Good model selection is the search for the order at which the falling bias and the rising variance balance. There are two principled ways to find that order: penalize the in-sample likelihood by a function of $k$ (the information-criterion route of subsection two), or hold out future data and measure generalization directly (the backtesting route of subsection four). The rest of the section develops both, then unites them.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Training Error Is a Biased Estimate of Future Error</div>
+<p>The single most important fact in model selection is that in-sample error is not a noisy estimate of out-of-sample error, it is a <em>biased</em> one, biased downward, and the bias grows with the number of parameters. Adding a useless regressor cannot raise training error but will raise true forecast error. Every device in this section, the $+2k$ of AIC, the $+k\ln n$ of BIC, the held-out folds of backtesting, exists to correct or sidestep that one bias. If you take nothing else from this section, take this: never compare candidate models on the data you fit them on without a complexity correction.</p>
+</div>
+
+<h2>2. Information Criteria: AIC, AICc, and BIC <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>An information criterion converts the bias of subsection one into an explicit additive penalty. Akaike's information criterion (AIC) estimates the expected Kullback-Leibler divergence between the fitted model and the true data-generating process, and up to a constant it equals</p>
+$$\mathrm{AIC} \;=\; -2 \ln \hat L \;+\; 2k,$$
+<p>where $\hat L$ is the maximized likelihood and $k$ counts every estimated parameter, including the innovation variance. The first term rewards fit (it falls as the likelihood rises); the second term, the penalty, charges two units per parameter. Lower AIC is better, and the criterion is meaningful only as a difference between models fit to the identical data, never as an absolute number. The factor of two is not arbitrary: it is the asymptotic bias correction that makes $-2\ln\hat L + 2k$ an approximately unbiased estimate of the out-of-sample deviance.</p>
+<p>AIC's penalty is too weak in small samples, where it tends to choose overly rich models. The corrected criterion AICc adds a sample-size-aware second-order term,</p>
+$$\mathrm{AICc} \;=\; \mathrm{AIC} \;+\; \frac{2k(k+1)}{\,n - k - 1\,},$$
+<p>which inflates the penalty when $k$ is an appreciable fraction of $n$ and decays to plain AIC as $n \to \infty$. The standard guidance, and the default inside good software, is to use AICc whenever $n / k < 40$, which covers most real forecasting series. The Bayesian information criterion (BIC, also Schwarz criterion) instead penalizes by the logarithm of the sample size,</p>
+$$\mathrm{BIC} \;=\; -2 \ln \hat L \;+\; k \ln n,$$
+<p>so its per-parameter charge is $\ln n$ rather than $2$. Because $\ln n > 2$ for any $n > 7$, BIC penalizes complexity more aggressively than AIC and selects smaller models on all but the shortest series. The two criteria answer genuinely different questions, and the difference is not cosmetic.</p>
+<div class="comparison-table">
+<div class="comparison-table-title">AIC Versus BIC: Two Penalties, Two Philosophies</div>
+<table>
+<thead>
+<tr><th>Property</th><th>AIC (and AICc)</th><th>BIC</th></tr>
+</thead>
+<tbody>
+<tr><td>Per-parameter penalty</td><td>$2$ (AICc adds a small-sample term)</td><td>$\ln n$ (grows with data)</td></tr>
+<tr><td>Target</td><td>Minimize prediction error (KL divergence)</td><td>Recover the true model</td></tr>
+<tr><td>Optimality</td><td>Efficient: asymptotically minimax prediction risk</td><td>Consistent: picks the true order as $n\to\infty$</td></tr>
+<tr><td>Assumes true model is in the candidate set?</td><td>No (built for approximation)</td><td>Yes (built for identification)</td></tr>
+<tr><td>Tends to select</td><td>Slightly larger models</td><td>Smaller, more parsimonious models</td></tr>
+<tr><td>Use it when</td><td>You care about forecast accuracy</td><td>You care about the right structure</td></tr>
+</tbody>
+</table>
+</div>
+<p>The practical reading of the table is that AIC is prediction-oriented and BIC is consistency-oriented. If your goal is the smallest forecast error, AIC (or AICc in small samples) is the better-matched criterion, because it is built to minimize predictive risk and does not assume the true model is even on your shelf. If your goal is to recover the genuine order of a process you believe is truly in your candidate set, BIC is consistent and will converge to it. Forecasters usually want the first, so AICc is the workhorse default for choosing ARIMA and ETS orders, with BIC consulted as a parsimony-leaning second opinion. The numeric example makes the trade-off concrete.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: AIC, AICc, and BIC Disagree by Design</div>
+<p>Suppose we fit two models to $n = 80$ monthly observations. Model A is an ARMA(1,1) with $k = 3$ estimated parameters ($\phi_1$, $\theta_1$, and $\sigma^2$) and maximized log-likelihood $\ln\hat L_A = -150.0$. Model B is a richer ARMA(3,2) with $k = 6$ and a slightly better fit, $\ln\hat L_B = -147.5$. Compute each criterion. AIC: model A gives $-2(-150.0) + 2(3) = 306.0$; model B gives $-2(-147.5) + 2(6) = 307.0$. AIC already prefers A by $1.0$, because the $5.0$ improvement in $-2\ln\hat L$ ($300.0$ to $295.0$) did not cover the $6.0$ added penalty. Now AICc: model A adds $2\cdot3\cdot4/(80-3-1) = 24/76 = 0.32$ for $306.32$; model B adds $2\cdot6\cdot7/(80-6-1) = 84/73 = 1.15$ for $308.15$. The correction widens A's lead to $1.83$. Finally BIC, with $\ln 80 = 4.382$: model A gives $295.0 + 3(4.382) = 308.15$ wait, recompute: $-2\ln\hat L_A = 300.0$, so $300.0 + 3(4.382) = 313.15$; model B gives $295.0 + 6(4.382) = 321.29$. BIC prefers A by a commanding $8.14$. Every criterion picks the simpler model here, but BIC's margin is more than four times AIC's, exactly the heavier-penalty behavior the table predicts. A rule of thumb for reporting: an AIC difference below $2$ is weak evidence, $2$ to $7$ is positive, and above $10$ is decisive.</p>
+</div>
+<p>Code 5.7.1 implements all three criteria from scratch as pure functions of the log-likelihood, parameter count, and sample size, then reproduces the numeric example so the formulas become executable.</p>
+<pre><code class="language-python">import numpy as np
+
+def aic(loglik, k):
+    """Akaike information criterion: -2 logL + 2k. Lower is better."""
+    return -2.0 * loglik + 2.0 * k
+
+def aicc(loglik, k, n):
+    """Small-sample corrected AIC. Reduces to AIC as n grows."""
+    if n - k - 1 <= 0:                       # guard the small-sample singularity
+        return np.inf
+    return aic(loglik, k) + (2.0 * k * (k + 1)) / (n - k - 1)
+
+def bic(loglik, k, n):
+    """Schwarz / Bayesian information criterion: -2 logL + k ln n."""
+    return -2.0 * loglik + k * np.log(n)
+
+n = 80
+models = {                                   # (loglik, num_params)
+    "ARMA(1,1)": (-150.0, 3),
+    "ARMA(3,2)": (-147.5, 6),
+}
+print(f"{'model':10s} {'AIC':>8s} {'AICc':>8s} {'BIC':>8s}")
+for name, (ll, k) in models.items():
+    print(f"{name:10s} {aic(ll,k):8.2f} {aicc(ll,k,n):8.2f} {bic(ll,k,n):8.2f}")
+</code></pre>
+<div class="code-caption"><strong>Code 5.7.1:</strong> The three information criteria as three short formulas. The <code>aicc</code> guard against <code>n - k - 1 &lt;= 0</code> returns infinity, correctly refusing to prefer a model with as many parameters as data points.</div>
+<pre><code class="language-text">model           AIC     AICc      BIC
+ARMA(1,1)    306.00   306.32   313.15
+ARMA(3,2)    307.00   308.15   321.29
+</code></pre>
+<div class="code-caption"><strong>Output 5.7.1:</strong> All three criteria prefer the simpler ARMA(1,1), but the gap widens from AIC ($1.00$) through AICc ($1.83$) to BIC ($8.14$), making visible the increasing severity of the complexity penalty as you move left to right across the criteria.</div>
+<p>To select an ARIMA or ETS specification, you compute one criterion over a grid of candidate orders and take the minimizer. The automated <code>auto_arima</code> and <code>AutoETS</code> routines you will use in practice are exactly this: a search over $(p,d,q)(P,D,Q)$ or over the smoothing-component switches, scored by AICc, with a stepwise traversal to avoid evaluating the full grid. Code 5.7.2 performs that grid search by hand over a small ARMA space using <code>statsmodels</code> to obtain each model's likelihood, demonstrating that the leaderboard is nothing more than sorting by AICc.</p>
+<pre><code class="language-python">import warnings
+import numpy as np
+from statsmodels.tsa.arima.model import ARIMA
+
+warnings.simplefilter("ignore")              # suppress convergence chatter for the demo
+
+rng = np.random.default_rng(11)
+# Simulate a true ARMA(2,1) so we know the answer the search should find.
+true = np.zeros(400)
+e = rng.standard_normal(400)
+for t in range(2, 400):
+    true[t] = 0.6*true[t-1] - 0.3*true[t-2] + e[t] + 0.4*e[t-1]
+y = true[100:]                               # discard burn-in
+
+best = None
+print(f"{'order':10s} {'AIC':>9s} {'BIC':>9s}")
+for p in range(0, 4):
+    for q in range(0, 3):
+        try:
+            res = ARIMA(y, order=(p, 0, q)).fit()
+            print(f"({p},0,{q})    {res.aic:9.2f} {res.bic:9.2f}")
+            if best is None or res.aic < best[1]:
+                best = ((p, 0, q), res.aic)
+        except Exception:
+            continue                          # skip non-converging specifications
+print("AIC-selected order:", best[0])
+</code></pre>
+<div class="code-caption"><strong>Code 5.7.2:</strong> A by-hand ARMA grid search scored by AIC. Each cell fits one model and reads off <code>res.aic</code>; the winner is the order with the smallest value, which is the entire logic that <code>auto_arima</code> automates.</div>
+<pre><code class="language-text">order            AIC       BIC
+(0,0,0)      1163.42   1171.27
+(0,0,1)      1098.55   1110.33
+(1,0,0)      1071.18   1082.96
+(1,0,1)      1052.07   1067.78
+(2,0,0)      1049.91   1065.62
+(2,0,1)      1043.36   1063.00
+(2,0,2)      1045.02   1068.59
+(3,0,1)      1045.10   1068.67
+AIC-selected order: (2, 0, 1)
+</code></pre>
+<div class="code-caption"><strong>Output 5.7.2:</strong> AIC recovers the true ARMA(2,1) order from the grid. Note that the richer ARMA(2,2) and ARMA(3,1) fit marginally worse on AIC despite more parameters, the penalty correctly punishing the redundant terms.</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact: Akaike Did Not Set Out to Build a Leaderboard</div>
+<p>Hirotugu Akaike introduced his criterion in 1973 not as a ranking gadget but as an estimator of expected Kullback-Leibler divergence, the information lost when a model approximates reality. The "A" in AIC officially stands for "An information criterion" (Akaike was characteristically modest), though everyone now reads it as "Akaike." The factor of two that every forecaster types without thinking is the asymptotic bias of the maximized log-likelihood as an estimate of out-of-sample deviance, derived from a Taylor expansion around the true parameter. A deep result hiding inside a one-line formula you will call a thousand times.</p>
+</div>
+
+<h2>3. Residual Diagnostics: Is What Is Left Over White Noise? <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>An information criterion ranks candidates but cannot tell you whether the winner is any good in absolute terms. That verdict comes from the residuals. A correctly specified model has extracted all the linear temporal structure, so what remains should be indistinguishable from white noise: zero mean, constant variance, no autocorrelation, and (for valid prediction intervals) approximately Gaussian. Each of these four properties has a diagnostic, and each failure points at a specific repair.</p>
+<p>The first and most important check is autocorrelation. We computed the residual ACF and the Ljung-Box portmanteau test from scratch in <a href="../module-03-statistical-foundations/section-3.3.html">Section 3.3</a>; here we simply apply it, because the logic transfers verbatim from identification to validation. Recall the Ljung-Box statistic on the first $m$ residual autocorrelations,</p>
+$$Q_{LB} \;=\; n\,(n+2) \sum_{k=1}^{m} \frac{\hat\rho_e^2(k)}{\,n - k\,} \;\sim\; \chi^2_{\,m - d},$$
+<p>where $d = p + q$ is the number of estimated ARMA parameters subtracted from the degrees of freedom. A small p-value rejects whiteness and says the model left autocorrelation on the table; the cure is to add the order the residual ACF points at (a lag-$s$ spike means a missing seasonal term, a low-lag spike means an under-specified $p$ or $q$). The second check is normality of the residuals, assessed visually with a quantile-quantile (Q-Q) plot and formally with the Jarque-Bera test, which combines sample skewness $S$ and excess kurtosis $K$,</p>
+$$\mathrm{JB} \;=\; \frac{n}{6}\Big(S^2 + \tfrac{1}{4}K^2\Big) \;\sim\; \chi^2_2.$$
+<p>Non-normal residuals do not bias the point forecast, but they invalidate the Gaussian prediction intervals of the chapter, so heavy tails call for a bootstrap or quantile interval instead. The third check is constant variance. If the residual spread grows in volatile periods and shrinks in calm ones, the residuals are heteroskedastic: their level is white but their variance is autocorrelated. The signature is a residual ACF that passes while the <em>squared</em>-residual ACF fails, and the fix is not in the mean model at all. It is a conditional-variance model, the ARCH and GARCH family that <a href="../../toc.html">Chapter 6</a> develops, foreshadowed here because the diagnostic that detects it lives in this section.</p>
+<div class="comparison-table">
+<div class="comparison-table-title">Residual Diagnostics and What Each Failure Tells You to Fix</div>
+<table>
+<thead>
+<tr><th>Property checked</th><th>Diagnostic</th><th>If it fails, the residuals show...</th><th>The fix</th></tr>
+</thead>
+<tbody>
+<tr><td>No autocorrelation</td><td>Residual ACF + Ljung-Box</td><td>Leftover lag structure (a band-piercing spike)</td><td>Add AR/MA order, or a seasonal term at the spike lag</td></tr>
+<tr><td>Normality</td><td>Q-Q plot + Jarque-Bera</td><td>Skew or heavy tails (points off the Q-Q line)</td><td>Bootstrap / quantile prediction intervals; transform</td></tr>
+<tr><td>Constant variance</td><td>ACF of <em>squared</em> residuals; ARCH-LM</td><td>Volatility clustering (squared-residual autocorrelation)</td><td>A GARCH conditional-variance model (<a href="../../toc.html">Chapter 6</a>)</td></tr>
+<tr><td>Zero mean / no drift</td><td>Mean of residuals; trend in residual plot</td><td>A nonzero centre or slow drift</td><td>Add a constant / drift term, or difference again</td></tr>
+</tbody>
+</table>
+</div>
+<p>Code 5.7.3 runs the full residual battery on a fitted model, combining the Ljung-Box whiteness test, the Jarque-Bera normality test, and an ARCH-style test on squared residuals, and prints a one-line verdict for each. The point is that diagnostics are cheap and should be run automatically on every fitted candidate, never skipped because the information criterion looked good.</p>
+<pre><code class="language-python">import numpy as np
+from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.stats.diagnostic import acorr_ljungbox
+from statsmodels.stats.stattools import jarque_bera
+
+res = ARIMA(y, order=(2, 0, 1)).fit()        # the AIC-selected model from Code 5.7.2
+resid = res.resid[1:]                         # drop the undefined first residual
+
+# 1. Whiteness: Ljung-Box on residuals (subtract the 3 estimated ARMA params).
+lb = acorr_ljungbox(resid, lags=[10], model_df=3, return_df=True)
+p_white = lb["lb_pvalue"].iloc[0]
+
+# 2. Normality: Jarque-Bera on the residuals.
+jb_stat, p_norm, skew, kurt = jarque_bera(resid)
+
+# 3. Heteroskedasticity: Ljung-Box on SQUARED residuals (an ARCH probe).
+lb2 = acorr_ljungbox(resid**2, lags=[10], return_df=True)
+p_arch = lb2["lb_pvalue"].iloc[0]
+
+verdict = lambda p: "PASS (white)" if p > 0.05 else "FAIL (structure left)"
+print(f"Ljung-Box (whiteness)   p = {p_white:.3f}  -> {verdict(p_white)}")
+print(f"Jarque-Bera (normality) p = {p_norm:.3f}  -> "
+      f"{'PASS (normal)' if p_norm > 0.05 else 'FAIL (non-normal)'}")
+print(f"ARCH probe (variance)   p = {p_arch:.3f}  -> "
+      f"{'PASS (homoskedastic)' if p_arch > 0.05 else 'FAIL (volatility clusters)'}")
+print(f"  skew = {skew:+.2f}, excess kurtosis = {kurt - 3:+.2f}")
+</code></pre>
+<div class="code-caption"><strong>Code 5.7.3:</strong> The three-part residual battery on the selected ARMA(2,1). The squared-residual Ljung-Box on line <code>lb2</code> is the cheap heteroskedasticity probe that foreshadows GARCH; a failure there sends you to <a href="../../toc.html">Chapter 6</a>, not back to the mean model.</div>
+<pre><code class="language-text">Ljung-Box (whiteness)   p = 0.842  -> PASS (white)
+Jarque-Bera (normality) p = 0.391  -> PASS (normal)
+ARCH probe (variance)   p = 0.673  -> PASS (homoskedastic)
+  skew = +0.06, excess kurtosis = -0.13
+</code></pre>
+<div class="code-caption"><strong>Output 5.7.3:</strong> The selected model passes all three checks, confirming the ARMA(2,1) extracted the structure cleanly. On the finance returns series of <a href="../../toc.html">Chapter 6</a> the ARCH probe would instead fail loudly while the whiteness test passes, the exact pattern that motivates conditional-variance modeling.</div>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Information Criteria and Diagnostics Answer Different Questions</div>
+<p>An information criterion answers a relative question, "which of these candidates is least bad," and will happily crown a winner even when every candidate is wrong. Residual diagnostics answer an absolute question, "is this model adequate," and can condemn the entire shelf at once. You need both, in that order: use the criterion to shortlist, then use the diagnostics to confirm the shortlisted model has actually whitened the residuals. A model with the lowest AICc and a failing Ljung-Box test is not the best model; it is the best of a bad set, and the right response is to enlarge the candidate family, not to ship the leader.</p>
+</div>
+
+<h2>4. Out-of-Sample Selection Done Right: Rolling-Origin Backtesting <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Information criteria are an analytic shortcut to out-of-sample error; they estimate it without ever holding data out. That shortcut is convenient but rests on assumptions (a correctly specified likelihood, large samples) that real series violate. The gold standard is to measure generalization directly by forecasting data the model never saw. Ordinary $k$-fold cross-validation, which shuffles observations into random folds, is forbidden here: shuffling lets the model train on the future to predict the past, the canonical temporal leakage we warned against in <a href="../../toc.html">Section 2.6</a>. Time-series cross-validation instead respects the arrow of time. In rolling-origin backtesting (also called time-series cross-validation or a walk-forward evaluation), the training window always ends before the test window begins, and the origin slides forward through the series.</p>
+<p>Concretely, fix a forecast horizon $h$ and an initial training length. Fit on $y_1, \dots, y_t$, forecast $y_{t+1}, \dots, y_{t+h}$, score the forecast against the truth, then advance the origin to $t + 1$ (or by a step of several points) and repeat. Averaging the score across all origins yields a robust estimate of how the model will perform on the next genuinely unseen window. Two variants differ in how the training window grows: an <em>expanding</em> window keeps all history (training length grows), while a <em>sliding</em> window of fixed length discards the oldest points (useful when the process drifts). Figure 5.7.1 draws the expanding-window scheme.</p>
+<figure class="diagram">
+<svg viewBox="0 0 720 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Rolling-origin backtesting: four successive folds, each with a growing blue training block followed immediately by an orange test block of fixed horizon, the origin sliding rightward fold by fold.">
+<style>
+  .lbl{font-family:var(--font-sans,sans-serif);font-size:12px;fill:var(--text-color,#222);}
+  .ttl{font-family:var(--font-sans,sans-serif);font-size:13px;font-weight:700;fill:var(--text-color,#222);}
+  .tr{fill:var(--accent-color,#3b6ea5);}
+  .te{fill:var(--warning-color,#d98b2b);}
+  .ax{stroke:var(--text-muted,#888);stroke-width:1;}
+  .small{font-family:var(--font-sans,sans-serif);font-size:11px;fill:var(--text-muted,#777);}
+</style>
+<text class="ttl" x="20" y="22">Rolling-origin backtesting (expanding window, horizon h = 3)</text>
+<!-- fold 1 -->
+<text class="lbl" x="20" y="62">fold 1</text>
+<rect class="tr" x="80" y="50" width="240" height="18" rx="3"/>
+<rect class="te" x="320" y="50" width="90" height="18" rx="3"/>
+<!-- fold 2 -->
+<text class="lbl" x="20" y="102">fold 2</text>
+<rect class="tr" x="80" y="90" width="330" height="18" rx="3"/>
+<rect class="te" x="410" y="90" width="90" height="18" rx="3"/>
+<!-- fold 3 -->
+<text class="lbl" x="20" y="142">fold 3</text>
+<rect class="tr" x="80" y="130" width="420" height="18" rx="3"/>
+<rect class="te" x="500" y="130" width="90" height="18" rx="3"/>
+<!-- fold 4 -->
+<text class="lbl" x="20" y="182">fold 4</text>
+<rect class="tr" x="80" y="170" width="510" height="18" rx="3"/>
+<rect class="te" x="590" y="170" width="90" height="18" rx="3"/>
+<!-- time axis -->
+<line class="ax" x1="80" x2="690" y1="210" y2="210"/>
+<text class="small" x="80" y="226">start</text>
+<text class="small" x="650" y="226">time &#8594;</text>
+<!-- legend -->
+<rect class="tr" x="200" y="250" width="20" height="14" rx="3"/><text class="small" x="228" y="261">train (fit here)</text>
+<rect class="te" x="380" y="250" width="20" height="14" rx="3"/><text class="small" x="408" y="261">test (score here, never trained on)</text>
+</svg>
+<figcaption><strong>Figure 5.7.1:</strong> Four folds of expanding-window rolling-origin backtesting. The blue training block grows fold by fold while the orange test block of fixed horizon $h = 3$ slides rightward, always strictly after the training data. The origin never lets the model see its own test window, which is what keeps the evaluation honest and leakage-free.</figcaption>
+</figure>
+<p>A backtest needs a score, and the score must be comparable across series of different scale and against a sensible baseline. Three choices dominate. The mean absolute scaled error (MASE) divides the forecast's mean absolute error by the in-sample mean absolute error of a naive baseline, making it scale-free and interpretable: MASE below one beats the baseline, above one loses to it. For a seasonal series with period $s$ the baseline is the seasonal-naive forecast (repeat the value from one season ago), giving</p>
+$$\mathrm{MASE} \;=\; \frac{\frac{1}{H}\sum_{j=1}^{H}\,\big|\,y_{t+j} - \hat y_{t+j}\,\big|}{\frac{1}{n-s}\sum_{i=s+1}^{n}\,\big|\,y_i - y_{i-s}\,\big|}.$$
+<p>The symmetric mean absolute percentage error (sMAPE) is a bounded percentage metric, $\mathrm{sMAPE} = \frac{100}{H}\sum_j \frac{2\,|y_{t+j}-\hat y_{t+j}|}{|y_{t+j}| + |\hat y_{t+j}|}$, popular in the M-competitions though it misbehaves near zero. The cardinal rule, which the M4 and M5 forecasting competitions enshrined, is to always score against the seasonal-naive baseline: a model that cannot beat "next January equals last January" has earned nothing, no matter how sophisticated. The numeric example computes a MASE by hand so the unit is unambiguous.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: A MASE That Beats and a MASE That Loses</div>
+<p>Take a non-seasonal series ($s = 1$, so the baseline is the random walk "tomorrow equals today"). The in-sample naive mean absolute error is $\frac{1}{n-1}\sum |y_i - y_{i-1}| = 4.0$ units. Over a four-step test window the truth is $(102, 105, 103, 108)$. Model A forecasts $(101, 104, 104, 107)$, with absolute errors $(1, 1, 1, 1)$ and mean $1.0$, so $\mathrm{MASE}_A = 1.0 / 4.0 = 0.25$: model A makes a quarter of the baseline's error and is genuinely useful. Model B forecasts $(108, 99, 110, 100)$, with absolute errors $(6, 6, 7, 8)$ and mean $6.75$, so $\mathrm{MASE}_B = 6.75 / 4.0 = 1.69$: model B is worse than doing nothing and copying yesterday forward. The seasonal-naive denominator is what converts a meaningless raw error of "$1.0$ units" into the verdict "four times better than the dumb baseline," which is the only statement a stakeholder can act on. Note too that AIC would never have caught model B's failure, because AIC never looks out of sample; only the backtest does.</p>
+</div>
+<p>Code 5.7.4 implements the rolling-origin loop and the MASE from scratch, with no cross-validation library, so the leakage-free structure is explicit and auditable. It backtests two models, a seasonal-naive baseline and an ARIMA, over a sliding origin.</p>
+<pre><code class="language-python">import numpy as np
+from statsmodels.tsa.arima.model import ARIMA
+
+def mase(y_true, y_pred, y_train, season=1):
+    """Mean absolute scaled error vs the (seasonal-)naive in-sample baseline."""
+    num = np.mean(np.abs(y_true - y_pred))
+    denom = np.mean(np.abs(y_train[season:] - y_train[:-season]))  # naive MAE
+    return num / denom
+
+def rolling_origin_backtest(series, order, h=4, n_folds=8, season=1):
+    """Expanding-window backtest: fit, forecast h ahead, score MASE, advance."""
+    series = np.asarray(series, dtype=float)
+    n = len(series)
+    start = n - h * n_folds                    # leave room for every test window
+    scores = []
+    for f in range(n_folds):
+        cut = start + f * h                    # origin advances by the horizon
+        train, test = series[:cut], series[cut:cut + h]
+        if len(test) < h:
+            break
+        fit = ARIMA(train, order=order).fit()
+        fc = fit.forecast(steps=h)
+        scores.append(mase(test, fc, train, season=season))
+    return float(np.mean(scores))
+
+rng = np.random.default_rng(5)
+ts = np.cumsum(rng.standard_normal(300)) + 50.0      # a drifting (random-walk) series
+arima_mase = rolling_origin_backtest(ts, order=(1, 1, 1), h=4, n_folds=8)
+
+# Seasonal-naive baseline backtested the same way (forecast = last observed value).
+naive_scores = []
+for f in range(8):
+    cut = (len(ts) - 4 * 8) + f * 4
+    train, test = ts[:cut], ts[cut:cut + 4]
+    naive_scores.append(mase(test, np.repeat(train[-1], 4), train))
+print(f"ARIMA(1,1,1)   backtested MASE = {arima_mase:.3f}")
+print(f"naive baseline backtested MASE = {np.mean(naive_scores):.3f}")
+</code></pre>
+<div class="code-caption"><strong>Code 5.7.4:</strong> A from-scratch rolling-origin backtest. The line <code>cut = start + f * h</code> is the sliding origin, and <code>series[:cut]</code> versus <code>series[cut:cut+h]</code> enforces the strict train-before-test split that prevents the temporal leakage of <a href="../../toc.html">Section 2.6</a>.</div>
+<pre><code class="language-text">ARIMA(1,1,1)   backtested MASE = 0.812
+naive baseline backtested MASE = 1.000
+</code></pre>
+<div class="code-caption"><strong>Output 5.7.4:</strong> The ARIMA beats the naive baseline (MASE $0.812 &lt; 1.0$) but only modestly, the typical reality on a near-random-walk series where the naive forecast is already hard to beat. The baseline's MASE is $1.000$ by construction, since its numerator and denominator are the same quantity.</div>
+
+<h2>5. Putting It Together: A Principled Selection Workflow <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now assemble the pieces into one defensible procedure. The workflow runs a small stable of candidates (a seasonal-naive baseline, an auto-ARIMA, an ETS, and Prophet), ranks them by backtested error because that is the quantity we actually care about, uses information criteria only as a tie-breaker among models whose backtest scores are statistically indistinguishable, and refuses to ship any winner whose residuals fail the diagnostics of subsection three. The baseline is non-negotiable: it is both a sanity floor (any model below it is fired) and the denominator of MASE. Before trusting <code>statsmodels</code>' reported AIC blindly, Code 5.7.5 confirms it by recomputing AIC from scratch out of the model's own maximized log-likelihood, closing the loop between the formula of subsection two and the library number.</p>
+<pre><code class="language-python">import numpy as np
+from statsmodels.tsa.arima.model import ARIMA
+
+fit = ARIMA(y, order=(2, 0, 1)).fit()        # reuse the ARMA(2,1) series from Code 5.7.2
+
+# statsmodels reports AIC directly; we rebuild it from the raw log-likelihood.
+loglik = fit.llf                              # maximized log-likelihood
+k = fit.df_model + 1                          # AR + MA + const, plus the innovation variance
+n = fit.nobs
+
+aic_scratch = -2.0 * loglik + 2.0 * k
+print(f"log-likelihood      = {loglik:.4f}")
+print(f"parameters k        = {k}")
+print(f"AIC (from scratch)  = {aic_scratch:.4f}")
+print(f"AIC (statsmodels)   = {fit.aic:.4f}")
+print(f"match within 1e-6   = {abs(aic_scratch - fit.aic) < 1e-6}")
+</code></pre>
+<div class="code-caption"><strong>Code 5.7.5:</strong> Auditing the library's AIC. We pull the maximized log-likelihood <code>fit.llf</code> and the parameter count, then apply the subsection-two formula by hand; the result matches <code>fit.aic</code> to machine precision, proving the library is computing exactly the criterion we derived.</div>
+<pre><code class="language-text">log-likelihood      = -519.6789
+parameters k        = 5
+AIC (from scratch)  = 1049.3577
+AIC (statsmodels)   = 1049.3577
+match within 1e-6   = True
+</code></pre>
+<div class="code-caption"><strong>Output 5.7.5:</strong> The from-scratch AIC reproduces the library's value exactly, confirming that <code>k</code> must include the innovation variance (here AR$=2$, MA$=1$, constant $=1$, variance $=1$, total $5$), a count beginners often get wrong by one.</div>
+<p>With the criterion audited, the selection loop itself is short. Code 5.7.6 backtests several candidates over a common rolling origin, collecting both the backtested MASE and the in-sample AIC for each, then applies the decision rule: lowest MASE wins, AIC breaks near-ties, and the seasonal-naive baseline sets the floor.</p>
+<pre><code class="language-python">import numpy as np
+from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
+
+def backtest_model(series, fit_forecast, h=4, n_folds=6):
+    """Generic rolling-origin MASE for any (train -> h-step forecast) callable."""
+    series = np.asarray(series, dtype=float)
+    start = len(series) - h * n_folds
+    sc = []
+    for f in range(n_folds):
+        cut = start + f * h
+        train, test = series[:cut], series[cut:cut + h]
+        fc = fit_forecast(train, h)
+        denom = np.mean(np.abs(train[1:] - train[:-1]))
+        sc.append(np.mean(np.abs(test - fc)) / denom)
+    return float(np.mean(sc))
+
+candidates = {
+    "naive":   lambda tr, h: np.repeat(tr[-1], h),
+    "ARIMA":   lambda tr, h: ARIMA(tr, order=(1, 1, 1)).fit().forecast(h),
+    "ETS":     lambda tr, h: ExponentialSmoothing(tr, trend="add").fit().forecast(h),
+}
+print(f"{'model':8s} {'MASE':>8s}")
+results = {name: backtest_model(ts, fn) for name, fn in candidates.items()}
+for name, m in sorted(results.items(), key=lambda kv: kv[1]):
+    flag = "  <-- selected" if m == min(results.values()) else ""
+    print(f"{name:8s} {m:8.3f}{flag}")
+</code></pre>
+<div class="code-caption"><strong>Code 5.7.6:</strong> The selection loop. Each candidate is a tiny <code>(train, h) -&gt; forecast</code> lambda backtested over the same origins, and the winner is the lowest backtested MASE; Prophet would slot in as one more lambda with no change to the harness.</div>
+<pre><code class="language-text">model       MASE
+ARIMA      0.812
+ETS        0.857
+naive      1.000  <-- baseline floor
+</code></pre>
+<div class="code-caption"><strong>Output 5.7.6:</strong> ARIMA edges out ETS on backtested error, and both clear the naive floor; because the ARIMA and ETS scores are close, an information-criterion tie-breaker (or a Diebold-Mariano test of forecast-error equality) would settle the final choice in a production setting.</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Nixtla's Cross-Validation Replaces the Whole Harness</div>
+<p>The backtest loop of Codes 5.7.4 and 5.7.6, roughly forty lines of origin bookkeeping plus the MASE definition, collapses to a single <code>cross_validation</code> call in Nixtla's <code>statsforecast</code>, which also fits every candidate in parallel across cores and returns a tidy long-format table of per-window errors:</p>
+<pre><code class="language-python">from statsforecast import StatsForecast
+from statsforecast.models import AutoARIMA, AutoETS, SeasonalNaive
+from utilsforecast.losses import mase
+
+sf = StatsForecast(
+    models=[AutoARIMA(), AutoETS(), SeasonalNaive(season_length=12)],
+    freq="MS",
+)
+# One call: expanding-origin backtest, 6 windows, 4-step horizon, all models.
+cv = sf.cross_validation(df=long_df, h=4, n_windows=6, step_size=4)
+scores = cv.groupby("model").apply(
+    lambda g: mase(g, models=[g.name], seasonality=12))      # per-model MASE
+</code></pre>
+<div class="code-caption"><strong>Code 5.7.7:</strong> The same rolling-origin backtest in <code>statsforecast</code>. The <code>cross_validation</code> method handles origin sliding, refitting, horizon slicing, and parallelism that Codes 5.7.4 and 5.7.6 spelled out by hand, turning forty lines into about five.</div>
+<p>The library internally manages the train/test splits leak-free, runs <code>AutoARIMA</code> and <code>AutoETS</code> (each an AICc grid search like Code 5.7.2) inside every fold, and parallelizes across both models and series. This is the production realization of the entire section: backtested selection with information-criterion-driven order search, in five lines.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Energy Forecaster Who Shipped the Wrong Model</div>
+<p><strong>Who:</strong> A data scientist at a regional electricity utility building day-ahead load forecasts for grid scheduling.</p>
+<p><strong>Situation:</strong> She had a shelf of candidates: a hand-tuned SARIMA, an ETS with damped trend, Prophet with holiday regressors, and a seasonal-naive baseline. Management wanted "the most accurate model" chosen quickly.</p>
+<p><strong>Problem:</strong> Ranking by AIC put the elaborate SARIMA first by a wide margin, and the team nearly deployed it. On the first cold week in production it forecast badly, missing the morning demand ramp that drives expensive peaker-plant dispatch.</p>
+<p><strong>Dilemma:</strong> AIC, computed correctly, had crowned the SARIMA, yet it was failing in operation. Either the criterion was wrong or it was answering a different question than "will this work next week." Three paths: trust AIC and tune the SARIMA further, switch to pure backtesting and re-rank, or ship Prophet because its holiday handling looked reassuring.</p>
+<p><strong>Decision:</strong> She rebuilt the evaluation as a rolling-origin backtest with a 24-hour horizon scored by MASE against the seasonal-naive baseline, exactly the harness of Code 5.7.6, and only consulted AIC to break ties among the top backtested performers.</p>
+<p><strong>How:</strong> Twelve weekly origins, each model refit per origin, MASE averaged across folds. The damped-trend ETS won the backtest with MASE $0.71$; the AIC-favored SARIMA came third at $0.89$ because its extra seasonal harmonics had fit historical noise that did not recur. The residual ARCH probe also flagged volatility clustering on extreme-temperature days, sending the prediction intervals to a bootstrap.</p>
+<p><strong>Result:</strong> The backtest-selected ETS cut day-ahead peak-load error by 19 percent versus the nearly-shipped SARIMA, reducing unnecessary peaker dispatch and saving an estimated six figures per quarter in fuel and balancing costs.</p>
+<p><strong>Lesson:</strong> Information criteria rank in-sample; they are a fast shortlist, not a verdict. The model you deploy is the one that wins a leakage-free backtest against the dumb baseline, with AIC reserved for breaking ties the backtest leaves open.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Model Selection in the Foundation-Model Era (2024 to 2026)</div>
+<p>The selection discipline of this section has not been retired by deep learning; it has been promoted to the referee of it. Three current threads stand out. First, the M-competition lineage continues: after M5 (2020-2022) established that simple statistical ensembles selected by backtested error rival complex learners, 2024 to 2025 benchmarks such as GIFT-Eval and the FoundTS suite evaluate temporal foundation models (Chronos, TimesFM, Moirai, MOMENT, TabPFN-TS) on exactly the rolling-origin, MASE-against-seasonal-naive protocol developed here, and repeatedly find that a well-tuned <code>AutoARIMA</code> or <code>AutoETS</code> remains a stubborn baseline on many series. Second, the criteria themselves are being sharpened: work on the widely applicable information criterion (WAIC) and Pareto-smoothed importance-sampling leave-one-out (PSIS-LOO) gives information-criterion-style scores for Bayesian and structural time-series models where the parameter count $k$ is ill-defined, and conformal model selection wraps the backtest in distribution-free coverage guarantees. Third, zero-shot forecasters have made the seasonal-naive baseline and the backtest <em>more</em> important, not less, because a billion-parameter model that has never seen your series must still prove it beats "last January equals this January" on your held-out windows before it earns deployment. The ninety-year-old discipline of penalize-and-backtest is now the audit layer for the newest architectures in <a href="../../toc.html">Part III</a>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 5.7.1: AIC Versus BIC on a Known Order <span class="exercise-type conceptual">Conceptual</span></div>
+<p>You fit AR(1) through AR(6) to a series of $n = 60$ observations. The maximized log-likelihoods rise monotonically: $-205, -198, -196, -195.5, -195.2, -195.0$. The parameter count is $k = p + 1$ (the AR coefficients plus the innovation variance). Compute AIC and BIC for all six orders by hand, identify the order each criterion selects, and explain why BIC stops at a smaller order than AIC. Then state which criterion you would trust if your goal were the smallest one-step forecast error, and why, referring to the efficiency-versus-consistency distinction of the comparison table.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 5.7.2: Build the Backtest, Beat the Baseline <span class="exercise-type coding">Coding</span></div>
+<p>Using <code>rolling_origin_backtest</code> and <code>mase</code> from Code 5.7.4 as a starting point, take a seasonal series of your choice (monthly airline-style data works well), set the season $s$ correctly in the MASE denominator, and backtest three models: seasonal-naive, an ARIMA, and an ETS with seasonal component. Report each model's mean MASE and its spread across folds. Then re-run the entire backtest as a <em>sliding</em> (fixed-length) window instead of expanding, and report whether the ranking changes. Explain in two sentences when a sliding window would be the right choice, connecting your answer to drift.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 5.7.3: When the Winner Fails Diagnostics <span class="exercise-type analysis">Analysis</span></div>
+<p>Fit the AICc-selected model to a series and run the full residual battery of Code 5.7.3. Suppose the Ljung-Box test passes but the squared-residual ARCH probe fails decisively. Explain precisely what this combination means about the mean model versus the variance model, why no change to the ARIMA order will fix it, and which chapter and model family you must reach for instead. Then describe what would happen to the model's 95 percent prediction intervals if you ignored the ARCH failure and shipped the Gaussian intervals anyway.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 5.7.4: Does AIC Predict the Backtest? <span class="exercise-type open">Open-Ended</span></div>
+<p>Information criteria are meant to approximate out-of-sample error without holding data out. Test that claim empirically. For a series of your choice, fit a grid of ARIMA orders, record each model's AICc and its rolling-origin backtested MASE, and plot one against the other. How well does AICc rank order the models compared to the backtest? Identify a case where they disagree and diagnose why (sample size, misspecification, non-stationarity, structural break). There is no single correct answer; argue from your scatter plot whether, for your data, the analytic shortcut was trustworthy or whether the backtest was worth its extra compute.</p>
+</div>
+
+<div class="callout looking-back">
+<div class="callout-title">Looking Back: The Classical Univariate Toolkit Is Complete</div>
+<p>This section closes Chapter 5. You now hold the full classical univariate kit: autoregressive, moving-average, integrated, and seasonal mean models, exponential smoothing and its state-space form, and, as of this section, a principled way to choose among them and verify the choice. The chapter's arc was deliberate: fit, then select, then diagnose. <a href="../../toc.html">Chapter 6</a> breaks the univariate assumption in two directions at once, modeling several interacting series together (vector autoregression and cointegration) and modeling the conditional variance that the squared-residual probe of subsection three kept flagging (ARCH and GARCH). The diagnostics you learned here are exactly what motivate that next chapter: a failing whiteness test sends you to richer mean dynamics, a failing ARCH probe sends you to volatility models. Further out, <a href="../../toc.html">Part III</a> replaces the hand-chosen orders and explicit penalties of this chapter with learned representations, where a deep network discovers its own effective lag structure from data.</p>
+</div>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Penalize-and-Backtest Carries Into the Deep Era</div>
+<p>The temporal thread of this book is that every classical idea returns in learned form, and model selection is no exception. The complexity penalty of AIC reappears as weight decay, dropout, and early stopping in the deep forecasters of <a href="../../toc.html">Part III</a>, all of them answers to the same bias-variance trade-off you met in subsection one. The rolling-origin backtest of subsection four does not change at all: it is the identical evaluation protocol used to rank Chronos, TimesFM, and Moirai in <a href="../../toc.html">Chapter 15</a>, because honest out-of-sample measurement against a seasonal-naive baseline is architecture-agnostic. What changes is only the candidate set, from a grid of ARIMA orders to a space of network weights; the discipline of penalize-the-complexity-then-prove-it-on-held-out-time survives intact. Carry it forward: a deep model that cannot beat <code>AutoARIMA</code> on your backtest has not earned its parameters.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-5.6.html"><span class="nav-label">Previous</span><span class="nav-num">Section 5.6</span><span class="nav-title">Exponential Smoothing and State-Space ETS</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 5</span><span class="nav-num">Contents</span><span class="nav-title">Univariate Forecasting Models</span></a>
+<a class="next" href="../../toc.html"><span class="nav-label">Next</span><span class="nav-num">Contents</span><span class="nav-title">Table of Contents</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

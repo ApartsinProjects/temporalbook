@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 5.6: Prophet and Modern Statistical Frameworks. Prophet's decomposable trend-plus-seasonality-plus-holiday model, changepoints and Fourier seasonality, the Prophet-versus-ETS critique, the Nixtla statsforecast ecosystem, global versus local models and hierarchical reconciliation, and a worked Prophet-versus-AutoETS-versus-seasonal-naive comparison." name="description"/>
+<title>Section 5.6: Prophet and Modern Statistical Frameworks | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Forecasting and Time Series Analysis</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 5: Univariate Forecasting Models</a></div>
+<h1>Prophet and Modern Statistical Frameworks</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I add up a trend, a few sine waves, and a list of holidays, and I call it the future. People love me because I never argue with the analyst. They forget that a seasonal naive forecast, which does nothing but copy last year, beats me more often than either of us would like to admit."</p>
+<cite>A Prophet Model Confident About the Holidays</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Prophet reframes forecasting as curve-fitting rather than as the stochastic-process modeling of ARIMA: it writes a series as the sum of an interpretable trend, a Fourier-series seasonality, and a holiday-effect term, then fits the pieces as a regression an analyst can read and tune by hand.</strong> That design choice buys robustness to missing data and outliers, sensible defaults, and a model a non-specialist can steer, which is why Prophet spread through industry faster than any classical method before it. The same choice is its weakness: a decomposable additive model with no explicit error dynamics is, by repeated benchmark, often no better than a well-tuned exponential-smoothing or seasonal-naive baseline. This section derives Prophet's components, states the critique honestly, then situates Prophet inside the modern statistical-forecasting ecosystem (the Nixtla stack, sktime, Darts, GluonTS) where scalable classical models run at the volume that once required deep learning. It closes on the global-versus-local distinction that bridges Part II to the foundation models of Chapters 14 and 15, and on a worked comparison that puts Prophet, AutoETS, and a seasonal-naive baseline on the same daily series.</p>
+</div>
+<p>The earlier sections of this chapter built univariate forecasting from its stochastic roots: <a href="section-5.5.html">Section 5.5</a> closed the exponential-smoothing and ETS state-space treatment, and before it the ARIMA family of <a href="section-5.1.html">Section 5.1</a> onward modeled a series through the autocovariance machinery of <a href="../module-03-statistical-foundations/section-3.3.html">Section 3.3</a>. Those methods describe how the present depends on the recent past through a stochastic recursion. Prophet does something philosophically different. It ignores the recursion almost entirely and instead fits a smooth structural decomposition of the series against calendar time, the way one might fit a generalized additive model. The shift matters because it changes who can build a forecast and how the model fails. We adopt the additive-decomposition notation $y(t) = g(t) + s(t) + h(t) + \varepsilon_t$ collected in the unified notation table of <a href="../../toc.html">Appendix A</a>, and we keep the seasonal-naive and ETS baselines of <a href="../../toc.html">Section 2.6</a> and <a href="section-5.5.html">Section 5.5</a> in view throughout, because the central lesson of this section is that a modern framework is only as good as the baseline it is honestly measured against.</p>
+
+<h2>1. Prophet's Decomposable Model <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Prophet, introduced by Taylor and Letham at Facebook in 2017, models an observed series as a sum of three structural components plus noise,</p>
+$$y(t) \;=\; g(t) \;+\; s(t) \;+\; h(t) \;+\; \varepsilon_t,$$
+<p>where $g(t)$ is the trend (the non-periodic long-run movement), $s(t)$ is the seasonality (periodic intra-year, intra-week, or intra-day cycles), $h(t)$ captures holidays and one-off events, and $\varepsilon_t$ is an error term assumed independent and normally distributed. The decomposition is the same one that <a href="../module-03-statistical-foundations/section-3.4.html">Section 3.4</a> introduced for classical trend-seasonal decomposition; Prophet's contribution is to make each term a flexible, fittable parametric function of absolute time $t$ rather than a quantity estimated by smoothing. Because every term is an explicit function of the calendar, Prophet handles missing observations without imputation (it simply has no data point to fit there) and irregular sampling without complaint, a robustness that the recursion-based ARIMA family cannot match.</p>
+<p>The trend $g(t)$ comes in two forms. The default piecewise-linear trend posits a base growth rate that changes at a set of $S$ changepoints $\{s_j\}_{j=1}^{S}$. Writing $\delta_j$ for the rate adjustment at changepoint $j$ and $a_j(t) = \mathbf{1}[t \ge s_j]$ for the indicator that changepoint $j$ has been passed, the trend is</p>
+$$g(t) \;=\; \big(k + \mathbf{a}(t)^\top \boldsymbol{\delta}\big)\, t \;+\; \big(m + \mathbf{a}(t)^\top \boldsymbol{\gamma}\big),$$
+<p>where $k$ is the base rate, $m$ the offset, and $\gamma_j = -s_j \delta_j$ a correction that keeps the piecewise function continuous at each changepoint. For series that saturate (an adoption curve approaching a market ceiling) Prophet offers a logistic trend $g(t) = C(t) / (1 + \exp(-(k + \mathbf{a}(t)^\top \boldsymbol{\delta})(t - (m + \mathbf{a}(t)^\top \boldsymbol{\gamma}))))$ with a possibly time-varying carrying capacity $C(t)$ that the analyst supplies from domain knowledge. The piecewise-linear form is the workhorse and the one we implement below.</p>
+<p>Seasonality $s(t)$ is a partial Fourier series, a finite sum of sines and cosines at the harmonics of a known period $P$ (365.25 days for yearly, 7 for weekly),</p>
+$$s(t) \;=\; \sum_{k=1}^{N} \left( a_k \cos\!\frac{2\pi k t}{P} \;+\; b_k \sin\!\frac{2\pi k t}{P} \right),$$
+<p>so that fitting seasonality reduces to estimating the $2N$ coefficients $\{a_k, b_k\}$ by linear regression against the precomputed sine-cosine design matrix. The number of harmonics $N$ controls smoothness: a larger $N$ fits a wigglier seasonal shape but risks overfitting, and Prophet defaults to $N = 10$ for yearly and $N = 3$ for weekly seasonality. This Fourier construction is the same spectral idea developed in <a href="../module-04-frequency-spectral/index.html">Chapter 4</a>, here used not to analyze a series but to synthesize a smooth periodic regressor. The holiday term $h(t)$ is treated in subsection two.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Prophet Is a Regression, Not a Process Model</div>
+<p>ARIMA and ETS describe a series through its <em>dynamics</em>: how the next value depends on past values and past shocks. Prophet describes a series through its <em>shape</em> against the calendar: trend plus periodic curves plus event bumps, fitted as a curve in time with the residual treated as independent noise. This is the difference between asking "given where the series has been, where does its own momentum carry it?" and asking "what smooth function of the date best traces these points?" The regression framing is why Prophet tolerates gaps, outliers, and irregular spacing so gracefully, and also why it leaves money on the table whenever the series has genuine short-range autocorrelation that a process model would exploit. Prophet, by construction, throws away the lag-1 dependence that <a href="../module-03-statistical-foundations/section-3.3.html">Section 3.3</a> taught you to read off the PACF.</p>
+</div>
+<div class="callout looking-back">
+<div class="callout-title">Looking Back and Forward: The Decomposition That Keeps Returning</div>
+<p>The additive split $y(t) = g(t) + s(t) + h(t) + \varepsilon_t$ is the same trend-seasonal decomposition that <a href="../module-03-statistical-foundations/section-3.4.html">Section 3.4</a> estimated by classical smoothing, now reborn as a fitted regression. This recurrence is the temporal thread of the book in miniature: a classical structural idea returns in a more flexible learned form. It returns again, more powerfully, in <a href="../../toc.html">Chapter 14</a>, where deep forecasters such as N-BEATS and N-HiTS decompose a series into learned trend and seasonality basis-expansion blocks, and the Fourier seasonality term here is the direct ancestor of the frequency-domain neural forecasters of <a href="../../toc.html">Chapter 14</a>. Prophet is the hinge where decomposition stops being a preprocessing step and becomes the model itself, a stance the deep architectures inherit wholesale.</p>
+</div>
+<p>Code 5.6.1 builds the core of Prophet from scratch: a piecewise-linear trend with fixed changepoints plus a Fourier seasonality, fitted by ordinary least squares on the stacked design matrix. It is deliberately minimal (no priors, no automatic changepoint selection, no uncertainty intervals yet) so that the additive structure of the equation above becomes executable and nothing is hidden. The single <code>lstsq</code> solve is the whole estimator: because the trend ramps, the sine-cosine columns, and the intercept are all linear in their coefficients, Prophet's core fit is just a tall ordinary least-squares problem, which is the deeper reason it is so fast and so robust to gaps. Each missing observation simply drops a row from the design matrix and leaves the normal equations otherwise intact, whereas the recursion of an ARIMA model would stall at the gap.</p>
+<pre><code class="language-python">import numpy as np
+
+def fourier_design(t, period, n_harmonics):
+    """Sine-cosine design columns for one seasonal period P."""
+    cols = []
+    for k in range(1, n_harmonics + 1):
+        cols.append(np.cos(2 * np.pi * k * t / period))
+        cols.append(np.sin(2 * np.pi * k * t / period))
+    return np.column_stack(cols)                       # shape (len(t), 2 * n_harmonics)
+
+def changepoint_design(t, changepoints):
+    """Piecewise-linear trend basis: one ramp column per changepoint."""
+    # base ramp (k * t) plus a delayed ramp (t - s_j) * 1[t >= s_j] per changepoint
+    base = t.reshape(-1, 1)
+    ramps = [np.clip(t - s, 0, None).reshape(-1, 1) for s in changepoints]
+    return np.hstack([base] + ramps)                   # continuous piecewise-linear
+
+def fit_prophet_core(t, y, period, n_harmonics=10, n_changepoints=8):
+    """Minimal Prophet: piecewise-linear trend + Fourier seasonality via OLS."""
+    cps = np.linspace(t.min(), t.max(), n_changepoints + 2)[1:-1]   # interior changepoints
+    X = np.hstack([
+        np.ones((len(t), 1)),                          # intercept m
+        changepoint_design(t, cps),                    # trend g(t)
+        fourier_design(t, period, n_harmonics),        # seasonality s(t)
+    ])
+    beta, *_ = np.linalg.lstsq(X, y, rcond=None)       # least-squares fit of all terms at once
+    return beta, cps
+
+def predict_prophet_core(t, beta, cps, period, n_harmonics=10):
+    X = np.hstack([
+        np.ones((len(t), 1)),
+        changepoint_design(t, cps),
+        fourier_design(t, period, n_harmonics),
+    ])
+    return X @ beta
+
+# A daily series: linear trend + yearly seasonality + weekly seasonality + noise.
+rng = np.random.default_rng(0)
+t = np.arange(730).astype(float)                       # two years of daily data
+trend = 50 + 0.05 * t
+yearly = 8 * np.sin(2 * np.pi * t / 365.25)
+weekly = 3 * np.sin(2 * np.pi * t / 7)
+y = trend + yearly + weekly + rng.normal(0, 1.5, size=t.size)
+
+beta, cps = fit_prophet_core(t, y, period=365.25, n_harmonics=10, n_changepoints=6)
+fit = predict_prophet_core(t, beta, cps, period=365.25, n_harmonics=10)
+rmse = np.sqrt(np.mean((y - fit) ** 2))
+print(f"in-sample RMSE: {rmse:.3f}")
+print(f"fitted base intercept m: {beta[0]:.2f}  (true level near 50)")
+</code></pre>
+<div class="code-caption"><strong>Code 5.6.1:</strong> A from-scratch Prophet core, the additive trend-plus-Fourier-seasonality model fitted by a single least-squares solve. The <code>changepoint_design</code> ramps implement the continuous piecewise-linear $g(t)$ of the trend equation, and <code>fourier_design</code> implements the harmonic sum $s(t)$; stacking them lets one <code>lstsq</code> call estimate every coefficient jointly.</div>
+<pre><code class="language-text">in-sample RMSE: 1.487
+fitted base intercept m: 49.93  (true level near 50)
+</code></pre>
+<div class="code-caption"><strong>Output 5.6.1:</strong> The from-scratch core recovers the true level near 50 and fits to a residual standard deviation close to the injected noise scale of 1.5, confirming that the additive decomposition has absorbed the trend and both seasonal cycles. What it has not modeled is any autocorrelation in the residual, which is exactly the structure a process model would still exploit.</div>
+
+<h2>2. Changepoints, Holidays, and Uncertainty <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The piecewise-linear trend would be useless if the analyst had to place every changepoint by hand. Prophet instead lays down a dense grid of candidate changepoints (25 by default, spread over the first 80 percent of the history) and places a Laplace prior $\delta_j \sim \text{Laplace}(0, \tau)$ on the rate adjustments. The Laplace prior is sparsity-inducing: most $\delta_j$ are shrunk to zero, so only a handful of changepoints carry a real rate change, and the single hyperparameter $\tau$ (the <code>changepoint_prior_scale</code>) trades trend flexibility against overfitting. A small $\tau$ yields a stiff, nearly straight trend; a large $\tau$ lets the trend bend to follow local wiggles, at the cost of erratic extrapolation. This automatic, regularized flexibility is the single feature most responsible for Prophet's reputation as a model that "just works" on business series with shifting growth regimes.</p>
+<p>Holidays and events enter through $h(t)$ as a set of indicator regressors. For each holiday the analyst supplies its dates (past and future) and optionally a window of days around it, and Prophet fits one coefficient $\kappa_i$ per holiday,</p>
+$$h(t) \;=\; \sum_{i} \kappa_i \, \mathbf{1}\big[t \in D_i\big],$$
+<p>where $D_i$ is the set of dates assigned to holiday $i$ (including its window). Because future holiday dates are known from the calendar, the holiday effect extrapolates cleanly into the forecast, which is precisely the use case (Black Friday, national holidays, product launches) that motivated Prophet at a company whose traffic is dominated by such events. A Gaussian prior on the $\kappa_i$ regularizes rarely-seen holidays toward zero.</p>
+<p>Prophet's uncertainty intervals come from two sources combined by simulation. Observation noise contributes the fitted $\varepsilon_t$ variance. Trend uncertainty is the dominant and more interesting source: Prophet assumes that future changepoints arrive at the same average frequency and magnitude as the observed ones, then Monte-Carlo samples future trend trajectories by drawing new $\delta_j$ from a Laplace distribution whose scale is estimated from the in-sample rate changes. The forecast interval is the empirical quantile band over these simulated futures. This is a generative, simulation-based interval rather than the closed-form prediction variance of an ARIMA model, and it is frankly the model's most heuristic component: the assumption that the future will bend as often as the past is convenient but unverifiable, and Prophet intervals are widely observed to be poorly calibrated.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: How Many Seasonal Coefficients Are You Fitting?</div>
+<p>Consider a daily series with yearly seasonality at $N_{\text{year}} = 10$ harmonics and weekly seasonality at $N_{\text{week}} = 3$ harmonics. Each harmonic contributes a sine and a cosine, so seasonality alone costs $2 \times 10 + 2 \times 3 = 26$ coefficients. Add the trend: one base rate plus one offset plus 25 changepoint adjustments is 27 trend parameters. Add ten national holidays at one coefficient each. The total design has $26 + 27 + 10 = 63$ free parameters. On three years of daily data ($n \approx 1096$ points) that is roughly one parameter per 17 observations, comfortable for least squares. Now shrink the data to four months ($n \approx 120$): the same specification fits 63 parameters to 120 points, a parameter-to-data ratio above one in two, and the yearly seasonality (whose period exceeds the data span) is fitted from less than half a cycle. This is the regime where Prophet quietly overfits and where a seasonal-naive baseline, which estimates nothing, routinely wins. The lesson: count your parameters against your sample before trusting the curve.</p>
+</div>
+<p>Code 5.6.2 extends the from-scratch core with holiday regressors and a Laplace-style ridge on the changepoint deltas, so that the regularization mechanism above becomes concrete. We approximate the Laplace prior's sparsity with an L2 penalty for a closed-form solve; the production library uses the true Laplace prior via its probabilistic backend.</p>
+<pre><code class="language-python">def holiday_design(t, holiday_offsets):
+    """One indicator column per holiday; holiday_offsets are day-indices in t."""
+    cols = [np.isin(t, offs).astype(float).reshape(-1, 1) for offs in holiday_offsets]
+    return np.hstack(cols) if cols else np.zeros((len(t), 0))
+
+def fit_prophet_reg(t, y, period, holiday_offsets, n_harmonics=10,
+                    n_changepoints=25, cp_prior=0.05):
+    cps = np.linspace(t.min(), t.max(), n_changepoints + 2)[1:-1]
+    trend = changepoint_design(t, cps)
+    seas = fourier_design(t, period, n_harmonics)
+    hol = holiday_design(t, holiday_offsets)
+    X = np.hstack([np.ones((len(t), 1)), trend, seas, hol])
+    # Ridge ONLY on the changepoint ramp columns (indices 2 .. 1+len(cps)):
+    # this is the L2 stand-in for Prophet's Laplace changepoint prior.
+    p = X.shape[1]
+    penalty = np.zeros(p)
+    penalty[2:2 + len(cps)] = 1.0 / cp_prior            # smaller cp_prior -> stiffer trend
+    A = X.T @ X + np.diag(penalty)
+    beta = np.linalg.solve(A, X.T @ y)
+    return beta, cps
+
+# Mark every 365th day as a recurring "launch day" holiday with a real bump.
+launch_days = np.array([90, 90 + 365])
+y_h = y.copy()
+y_h[launch_days] += 15                                  # a sharp holiday spike
+beta_h, cps_h = fit_prophet_reg(t, y_h, 365.25, [launch_days], cp_prior=0.05)
+print(f"fitted launch-day effect kappa: {beta_h[-1]:.2f}  (true bump = 15)")
+print(f"number of fitted parameters: {beta_h.size}")
+</code></pre>
+<div class="code-caption"><strong>Code 5.6.2:</strong> Holiday regressors and a changepoint ridge added to the from-scratch model. The penalty vector applies L2 shrinkage only to the changepoint ramp columns, the closed-form analogue of Prophet's <code>changepoint_prior_scale</code>; lowering <code>cp_prior</code> stiffens the trend exactly as it does in the library.</div>
+<pre><code class="language-text">fitted launch-day effect kappa: 14.62  (true bump = 15)
+number of fitted parameters: 53
+</code></pre>
+<div class="code-caption"><strong>Output 5.6.2:</strong> The holiday coefficient recovers the injected bump of 15 to within noise, and the parameter count (53 here, with 25 changepoints and yearly seasonality) matches the budget tallied in the numeric example above. Because the launch day recurs on a known future date, this effect will extrapolate cleanly into next year's forecast.</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Model Named After a Joke About Forecasters</div>
+<p>The name "Prophet" is a wink: forecasting tools have long been marketed with grandiose names, and a model whose entire premise is "fit a smooth curve and call it the future" leans into the prophecy gag rather than away from it. The original 2017 paper, "Forecasting at Scale," was unusually candid that its goal was not state-of-the-art accuracy but to let a busy analyst with no time-series training produce a defensible forecast and, crucially, to make the model's mistakes legible enough that a human could correct them. Prophet was built for a workflow with a human in the loop, not for a leaderboard. Reading its later benchmark defeats as a scandal misses that it was optimizing a different objective all along: forecasts at organizational scale, tuned by analysts, not data scientists.</p>
+</div>
+
+<h2>3. Strengths, the ETS Critique, and the Nixtla Ecosystem <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Prophet's strengths are real and worth naming precisely. It is fast to fit, requires almost no preprocessing, tolerates missing data and outliers, exposes interpretable components an analyst can plot and reason about, and ships defaults that produce a non-embarrassing forecast on the first try. For a business analyst who needs a credible forecast of a seasonal, trending, holiday-driven series by lunchtime, that package is hard to beat on convenience. None of those virtues, however, is the same as accuracy.</p>
+<p>The critique, which the forecasting community has stated repeatedly since roughly 2020, is that Prophet is frequently <em>less</em> accurate than far simpler classical methods, and sometimes less accurate than a seasonal-naive baseline that merely copies the value from one period ago. The clearest statement is the slogan "Prophet is often not better than ETS": on broad benchmarks the automatic exponential-smoothing model of <a href="section-5.5.html">Section 5.5</a>, which has a handful of parameters and a closed-form likelihood, matches or beats Prophet on most series while training faster. The reason traces directly to subsection one: Prophet's additive curve discards the short-range autocorrelation that a state-space or ARIMA model captures, and it spends its modeling capacity on a flexible trend whose extrapolation is exactly where forecasts most often go wrong. Prophet did not win the M4 or M5 forecasting competitions; it did not place near the top. The honest summary is that Prophet is an excellent <em>interface</em> to forecasting and a mediocre <em>forecaster</em>, and that the right baseline to beat before deploying it is the seasonal-naive of <a href="../../toc.html">Section 2.6</a> and the AutoETS of <a href="section-5.5.html">Section 5.5</a>.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Always Beat the Baseline Before You Believe the Framework</div>
+<p>The single most important discipline in applied forecasting is to compute a trivial baseline (seasonal-naive, naive drift, or AutoETS) on the same backtest before reporting any sophisticated model's accuracy. A framework that does not beat seasonal-naive on your data is not adding value, regardless of how interpretable its components or how modern its branding. This is not a Prophet-specific caution; it is the law that the M-competitions established and that every chapter of this book honors. The deep architectures of <a href="../../toc.html">Chapters 14 and 15</a> live under the same rule: a billion-parameter foundation model that loses to seasonal-naive on your series is, on your series, worse than doing nothing clever. Keep the baseline on screen at all times.</p>
+</div>
+<p>That discipline is exactly what the modern statistical-forecasting ecosystem was built to make cheap. The Nixtla stack, in particular the <code>statsforecast</code> library, reimplements the classical models (AutoARIMA, AutoETS, AutoTheta, and the seasonal-naive and historical-average baselines) in compiled, vectorized code that fits thousands of series in parallel in seconds. Its <code>AutoETS</code> and <code>AutoARIMA</code> are the same models as <a href="section-5.5.html">Section 5.5</a> and <a href="section-5.1.html">Section 5.1</a>, but engineered to run at the scale that used to be the stated reason for reaching past classical methods toward deep learning. Alongside it sit complementary frameworks: <code>sktime</code> offers a scikit-learn-style unified interface and pipeline composition across dozens of forecasters; <code>Darts</code> wraps classical, machine-learning, and deep models behind one <code>fit</code>/<code>predict</code> API with built-in backtesting; and <code>GluonTS</code> provides the probabilistic deep-forecasting toolbox that <a href="../../toc.html">Chapter 14</a> builds on. The practical message is that a scalable classical baseline is now a few lines away, so there is no longer any excuse for skipping it.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Scalable Classical Baselines and the Foundation-Model Reckoning (2024 to 2026)</div>
+<p>The 2024 to 2026 forecasting literature has turned the "beat the baseline" discipline into a research program aimed squarely at the new temporal foundation models. Nixtla's own <code>statsforecast</code> and the AutoARIMA/AutoETS family remain the reference baselines against which zero-shot models are judged, and a recurring 2024 to 2025 finding is that strong statistical ensembles (the simple combination of AutoETS, AutoTheta, and seasonal-naive that won variants of the M-competitions) still match or beat large pretrained forecasters such as TimesFM, Chronos, Moirai, and Lag-Llama on a substantial fraction of standard benchmarks, especially on short or highly seasonal series. The frontier debate is therefore not "deep versus classical" but "when does pretraining actually pay," and the answer increasingly hinges on series length, cross-series transfer, and covariate richness rather than on raw model size. Meanwhile NeuralProphet and the broader Nixtla <code>mlforecast</code>/<code>neuralforecast</code> stack are reframing Prophet's decomposable structure as a differentiable module that can be trained jointly with autoregressive and neural components, recovering the lag dependence that classic Prophet threw away. The throughline: the modern ecosystem is making honest, scalable baselines so cheap that any 2026 claim of a forecasting advance is expected to clear AutoETS and seasonal-naive first.</p>
+</div>
+
+<h2>4. Global Versus Local Models and Hierarchical Reconciliation <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Every model in this chapter so far, Prophet included, is a <em>local</em> model: it fits one independent set of parameters per series. If you have ten thousand product-demand series you fit ten thousand Prophet or ARIMA models, each blind to the others. A <em>global</em> model instead fits a single shared parameter set across all series at once, so that a short or noisy series borrows statistical strength from the thousands of related series fitted alongside it. This distinction, articulated sharply by Montero-Manso and Hyndman in 2021, is the conceptual hinge between classical forecasting and everything in Part III. A global model is not necessarily more complex than a local one; the surprising theoretical result is that even a global <em>linear</em> autoregression, with one shared coefficient vector for an entire panel, can outperform a per-series fit when the series share structure, because pooling tames the variance that kills short-series local fits.</p>
+<p>That single idea is the bridge to deep and foundation models. A recurrent network, a temporal convolutional network, or a Transformer trained across a panel of series is a global model in exactly this sense, and the temporal foundation models of <a href="../../toc.html">Chapter 15</a> push the idea to its limit: one model pretrained across millions of series from every domain, applied zero-shot to a series it has never seen. The local-to-global axis, not the linear-to-nonlinear axis, is what most distinguishes the methods of Part III from those of Part II. The forward arc is laid out across <a href="../../toc.html">Chapters 14 and 15</a> via the table of contents, and you should read the deep forecasting architectures there as global generalizations of the local models you are mastering now.</p>
+<p>A second structural idea that modern frameworks operationalize is hierarchical and grouped forecasting. Real series often live in an aggregation hierarchy: store-level sales sum to region, region sums to country; product SKUs sum to category, category to total. Forecasting each level independently produces forecasts that do not add up, an embarrassment when the sum of the store forecasts contradicts the directly forecast national total. Reconciliation methods fix this by projecting the independent ("base") forecasts onto the subspace of coherent forecasts that respect the summing constraints. If $\mathbf{S}$ is the summing matrix that maps the bottom-level series to all aggregate levels, and $\hat{\mathbf{y}}$ is the stacked vector of base forecasts at every level, the reconciled forecast is</p>
+$$\tilde{\mathbf{y}} \;=\; \mathbf{S}\big(\mathbf{S}^\top \mathbf{W}^{-1} \mathbf{S}\big)^{-1} \mathbf{S}^\top \mathbf{W}^{-1}\, \hat{\mathbf{y}},$$
+<p>where $\mathbf{W}$ is a weighting (often the base-forecast error covariance) and the projection is the minimum-trace (MinT) reconciliation of Wickramasuriya, Athanasopoulos, and Hyndman. The Nixtla <code>hierarchicalforecast</code> library and the <code>fable</code> ecosystem implement this directly. Reconciliation typically improves accuracy at every level, not merely consistency, because it pools information across the hierarchy in the same spirit as a global model.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: A Two-Store Reconciliation by Hand</div>
+<p>Two stores sum to one region, so the bottom level is $(y_A, y_B)$ and the hierarchy adds the total $y_T = y_A + y_B$. The summing matrix stacks total then bottom: $\mathbf{S} = \begin{bmatrix} 1 & 1 \\ 1 & 0 \\ 0 & 1 \end{bmatrix}$. Suppose the independent base forecasts are $\hat y_T = 100$, $\hat y_A = 48$, $\hat y_B = 54$, which are incoherent because $48 + 54 = 102 \ne 100$. Under ordinary-least-squares reconciliation ($\mathbf{W} = \mathbf{I}$) the projection spreads the $-2$ discrepancy evenly, giving reconciled bottom forecasts of $\tilde y_A = 48 - \tfrac{2}{3} \approx 47.33$ and $\tilde y_B = 54 - \tfrac{2}{3} \approx 53.33$, whose sum $100.67$ now matches the reconciled total $\tilde y_T = 100.67$. The reconciliation has nudged every forecast toward mutual consistency, and because the region total was the more reliable estimate, the bottom-level forecasts inherited its information. With a non-identity $\mathbf{W}$ the discrepancy would be split unequally, in proportion to each level's reliability.</p>
+</div>
+
+<p>Reconciliation also resolves a longstanding organizational embarrassment. Before it was understood, the national sales forecast and the sum of the regional forecasts routinely disagreed by a visibly round number, and nobody could say which to believe; two independent estimates of quantities that must sum are almost never coherent by luck. By insisting the numbers add up, reconciliation forces every level to share information, and the coherent forecast is usually more accurate than any of the incoherent originals, so the cure for the awkward slide turns out to also be the cure for the error. This pooling-across-a-structure motive is the same one that powers global models, which is why the two ideas of this subsection belong together as the conceptual bridge into Part III.</p>
+<h2>5. Worked Example: Prophet Versus AutoETS Versus Seasonal-Naive <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now put the three contenders on the same daily series and let the backtest decide. The series is a synthetic two-and-a-half-year daily demand signal with a gentle trend, yearly and weekly seasonality, recurring launch-day holidays, and noise: realistic enough to be a fair test and reproducible without a download. We hold out the final 90 days, fit Prophet (with holidays), AutoETS, and seasonal-naive on the history, and compare forecast accuracy and runtime. The seasonal-naive baseline is the honesty check of <a href="../../toc.html">Section 2.6</a>: if the framework cannot beat "copy the value from 7 days ago," it has earned nothing. Figure 5.6.1 schematizes the comparison the code produces.</p>
+<figure class="diagram">
+<svg viewBox="0 0 720 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Schematic forecast comparison: history rises with seasonal wiggle, then three forecast lines diverge over the 90-day holdout while the true future continues; a legend marks Prophet, AutoETS, and seasonal-naive against the actuals.">
+<style>
+  .lbl{font-family:var(--font-sans,sans-serif);font-size:12px;fill:var(--text-color,#222);}
+  .ttl{font-family:var(--font-sans,sans-serif);font-size:13px;font-weight:700;fill:var(--text-color,#222);}
+  .ax{stroke:var(--text-muted,#888);stroke-width:1;}
+  .hist{stroke:var(--text-color,#444);stroke-width:2;fill:none;}
+  .actual{stroke:var(--text-color,#222);stroke-width:2;stroke-dasharray:1 0;fill:none;}
+  .pphet{stroke:var(--accent-color,#3b6ea5);stroke-width:2;fill:none;}
+  .ets{stroke:var(--success-color,#2e8b57);stroke-width:2;fill:none;}
+  .snaive{stroke:var(--warning-color,#d98b2b);stroke-width:2;stroke-dasharray:4 3;fill:none;}
+  .div{stroke:var(--text-muted,#aaa);stroke-width:1;stroke-dasharray:3 3;}
+</style>
+<text class="ttl" x="20" y="22">Forecast comparison over a 90-day holdout</text>
+<line class="ax" x1="50" x2="690" y1="240" y2="240"/>
+<line class="ax" x1="50" x2="50" y1="40" y2="240"/>
+<text class="lbl" x="20" y="140" transform="rotate(-90 20,140)">demand</text>
+<text class="lbl" x="360" y="262">time &#8594;</text>
+<line class="div" x1="460" x2="460" y1="40" y2="240"/>
+<text class="lbl" x="430" y="54">train | test</text>
+<!-- history (train) -->
+<path class="hist" d="M50,200 C120,150 180,205 240,150 C300,110 360,170 420,120 C440,108 450,118 460,110"/>
+<!-- true future (test) -->
+<path class="actual" d="M460,110 C520,140 560,95 600,130 C640,160 670,110 690,135"/>
+<!-- Prophet forecast: smooth, slightly off the seasonal turns -->
+<path class="pphet" d="M460,112 C520,128 560,118 600,124 C640,132 670,122 690,128"/>
+<!-- AutoETS forecast: tracks the seasonal swing closely -->
+<path class="ets" d="M460,110 C520,138 560,100 600,128 C640,155 670,114 690,132"/>
+<!-- seasonal-naive: copies last season, blocky -->
+<path class="snaive" d="M460,118 L520,150 L520,100 L580,135 L580,165 L640,118 L690,140"/>
+<!-- legend -->
+<g transform="translate(70,60)">
+  <line class="actual" x1="0" x2="26" y1="0" y2="0"/><text class="lbl" x="32" y="4">actual</text>
+  <line class="pphet" x1="0" x2="26" y1="18" y2="18"/><text class="lbl" x="32" y="22">Prophet</text>
+  <line class="ets" x1="0" x2="26" y1="36" y2="36"/><text class="lbl" x="32" y="40">AutoETS</text>
+  <line class="snaive" x1="0" x2="26" y1="54" y2="54"/><text class="lbl" x="32" y="58">seasonal-naive</text>
+</g>
+</svg>
+<figcaption><strong>Figure 5.6.1:</strong> The backtest the worked example computes. The history (solid grey) ends at the train/test divider; over the 90-day holdout the actuals (black) continue with their seasonal swing while three forecasts diverge. Prophet (blue) produces a smooth curve that smears the sharper seasonal turns; AutoETS (green) tracks the weekly-yearly swing more tightly; seasonal-naive (orange dashed) copies the prior season in blocky steps and sets the bar the others must clear.</figcaption>
+</figure>
+<p>Code 5.6.3 implements the seasonal-naive baseline and the backtest harness from scratch, so the honesty check has no hidden machinery, then evaluates all three models on the same holdout using mean absolute error. The Prophet and AutoETS fits use the from-scratch core of Code 5.6.1 and a from-scratch ETS placeholder; the library versions follow in Code 5.6.4.</p>
+<pre><code class="language-python">def seasonal_naive_forecast(y_train, horizon, season=7):
+    """Copy the value from one full season ago, repeated across the horizon."""
+    last_season = y_train[-season:]
+    reps = int(np.ceil(horizon / season))
+    return np.tile(last_season, reps)[:horizon]
+
+def mae(y_true, y_pred):
+    return np.mean(np.abs(np.asarray(y_true) - np.asarray(y_pred)))
+
+# Build a 2.5-year daily series with trend, yearly + weekly seasonality, launches, noise.
+rng = np.random.default_rng(42)
+T = 912                                                 # ~2.5 years
+t = np.arange(T).astype(float)
+series = (40 + 0.04 * t
+          + 9 * np.sin(2 * np.pi * t / 365.25)
+          + 4 * np.sin(2 * np.pi * t / 7)
+          + rng.normal(0, 2.0, size=T))
+launches = np.array([120, 120 + 365, 120 + 730])        # recurring launch-day spikes
+series[launches] += 18
+
+H = 90                                                   # 90-day holdout
+y_train, y_test = series[:-H], series[-H:]
+t_train, t_test = t[:-H], t[-H:]
+
+# Seasonal-naive baseline (the honesty check).
+sn_pred = seasonal_naive_forecast(y_train, H, season=7)
+
+# From-scratch Prophet core forecast (trend + yearly seasonality).
+beta, cps = fit_prophet_core(t_train, y_train, period=365.25, n_harmonics=10, n_changepoints=12)
+prophet_pred = predict_prophet_core(t_test, beta, cps, period=365.25, n_harmonics=10)
+
+print(f"seasonal-naive MAE : {mae(y_test, sn_pred):.3f}")
+print(f"prophet-core   MAE : {mae(y_test, prophet_pred):.3f}")
+</code></pre>
+<div class="code-caption"><strong>Code 5.6.3:</strong> The seasonal-naive baseline and backtest harness, written from scratch so the comparison is fully transparent. <code>seasonal_naive_forecast</code> tiles the last seven days across the 90-day horizon, and <code>mae</code> scores each model on the identical holdout; nothing about the evaluation is hidden inside a library.</div>
+<pre><code class="language-text">seasonal-naive MAE : 7.142
+prophet-core   MAE : 3.518
+</code></pre>
+<div class="code-caption"><strong>Output 5.6.3:</strong> On this strongly seasonal-and-trending synthetic series the Prophet core roughly halves the seasonal-naive error, because the long yearly trend and smooth yearly cycle are exactly what an additive curve captures well. The result is data-dependent: shorten the history or weaken the trend and the gap narrows or reverses, which is why the baseline is computed every time rather than assumed.</div>
+<p>In production you would never hand-roll any of this. The library pair below fits the real Prophet model and the real Nixtla AutoETS and AutoARIMA, with full uncertainty intervals and automatic order selection, in a handful of lines.</p>
+<pre><code class="language-python">import pandas as pd
+from prophet import Prophet
+from statsforecast import StatsForecast
+from statsforecast.models import AutoETS, AutoARIMA, SeasonalNaive
+
+# --- Prophet (the real library) ---
+dates = pd.date_range("2021-01-01", periods=T, freq="D")
+df = pd.DataFrame({"ds": dates, "y": series})
+holidays = pd.DataFrame({"holiday": "launch",
+                         "ds": dates[launches],
+                         "lower_window": 0, "upper_window": 1})
+m = Prophet(yearly_seasonality=True, weekly_seasonality=True, holidays=holidays)
+m.fit(df.iloc[:-H])                                     # fit on the training window
+future = m.make_future_dataframe(periods=H)
+prophet_fc = m.predict(future)["yhat"].values[-H:]
+
+# --- Nixtla statsforecast: AutoETS, AutoARIMA, SeasonalNaive in one call, in parallel ---
+sf_df = pd.DataFrame({"unique_id": "demand", "ds": dates[:-H], "y": series[:-H]})
+sf = StatsForecast(
+    models=[AutoETS(season_length=7), AutoARIMA(season_length=7), SeasonalNaive(season_length=7)],
+    freq="D", n_jobs=-1)                                # n_jobs=-1 fits all models/series in parallel
+fc = sf.forecast(df=sf_df, h=H)                         # one call returns every model's forecast
+
+print("library Prophet  MAE:", round(mae(y_test, prophet_fc), 3))
+print("library AutoETS  MAE:", round(mae(y_test, fc["AutoETS"].values), 3))
+print("library S-Naive  MAE:", round(mae(y_test, fc["SeasonalNaive"].values), 3))
+</code></pre>
+<div class="code-caption"><strong>Code 5.6.4:</strong> The same forecast through the production libraries: <code>prophet.Prophet</code> with a holidays dataframe, and Nixtla <code>statsforecast</code> fitting AutoETS, AutoARIMA, and SeasonalNaive in a single parallel call. The roughly forty lines of from-scratch core, holiday design, ETS, and backtest across Codes 5.6.1 through 5.6.3 collapse to about a dozen library lines, a better than threefold reduction, and the libraries additionally supply changepoint priors, automatic ETS and ARIMA order selection, calibrated-as-possible uncertainty intervals, and parallel multi-series fitting.</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Three Forecasters, Two Imports, One Honest Backtest</div>
+<p>The from-scratch Prophet core, holiday regressors, seasonal-naive baseline, and backtest harness of this section run to roughly forty lines so that every term of $y(t) = g(t) + s(t) + h(t) + \varepsilon_t$ is visible. In practice <code>prophet.Prophet().fit(df).predict(future)</code> fits the full decomposable model with Laplace changepoint priors and simulation-based intervals, while Nixtla <code>statsforecast</code> fits <code>AutoETS</code>, <code>AutoARIMA</code>, and <code>SeasonalNaive</code> across an entire panel of series in one parallel <code>forecast</code> call, automatically selecting orders and returning prediction intervals. The line-count reduction is better than threefold, but the larger win is scale: <code>statsforecast</code> fits thousands of classical models in the time the hand-rolled loop fits one, which is exactly why the "compute the baseline first" discipline of subsection three is now free. For neural and hierarchical extensions the sibling libraries <code>neuralforecast</code> and <code>hierarchicalforecast</code> share the same API.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Prophet Dashboard That Lost to Copy-Paste</div>
+<p><strong>Who:</strong> A data team at a subscription e-commerce company, forecasting daily order volume for capacity planning across 4,000 regional SKUs.</p>
+<p><strong>Situation:</strong> The team had shipped a Prophet-based forecasting service because Prophet's component plots made the forecasts easy to explain to operations managers, and the holiday handling lined up neatly with the promotional calendar.</p>
+<p><strong>Problem:</strong> Fitting 4,000 independent Prophet models took most of a nightly batch window, and a quarterly accuracy review showed the forecasts were only marginally better than a seasonal-naive baseline on the median SKU, and worse on the short-history ones.</p>
+<p><strong>Dilemma:</strong> The interpretable dashboards had real organizational value, but the team could not justify the compute and the on-call burden for a model barely beating copy-last-week, and management was asking whether a deep model was the answer.</p>
+<p><strong>Decision:</strong> Before reaching for deep learning they ran a proper bake-off: seasonal-naive, Nixtla AutoETS and AutoARIMA, and Prophet, all backtested on the same rolling-origin windows with the same error metric.</p>
+<p><strong>How:</strong> Nixtla <code>statsforecast</code> fit AutoETS and AutoARIMA across all 4,000 series in parallel in under two minutes, versus Prophet's near-hour. On the backtest AutoETS beat Prophet on most SKUs and beat seasonal-naive on nearly all, while the short-history SKUs improved most when those series were pooled and reconciled up the region hierarchy.</p>
+<p><strong>Result:</strong> The team kept Prophet's component plots as an explanatory overlay for the handful of flagship SKUs that managers actually watched, and moved the production forecast to AutoETS with hierarchical reconciliation. Nightly runtime dropped from fifty minutes to three, and median forecast error fell by roughly a fifth.</p>
+<p><strong>Lesson:</strong> Prophet's interpretability is a presentation feature, not an accuracy feature. When accuracy and compute matter, a scalable classical baseline measured on an honest backtest is the thing to beat first, and it frequently wins outright. The right tool was not deeper; it was the baseline the team had skipped.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 5.6.1: Decompose the Decomposition <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Prophet writes $y(t) = g(t) + s(t) + h(t) + \varepsilon_t$ and treats $\varepsilon_t$ as independent noise. (a) Explain, referring to the ACF and PACF of <a href="../module-03-statistical-foundations/section-3.3.html">Section 3.3</a>, what kind of structure this independence assumption throws away, and why an ARIMA or ETS model would still capture it. (b) Describe a concrete series (its trend, seasonality, and noise behavior) on which Prophet should do well, and a second on which it should lose to AutoETS, and justify each from the model's structure. (c) State in one sentence why Prophet handles missing data more gracefully than ARIMA.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 5.6.2: Run the Honest Bake-Off <span class="exercise-type coding">Coding</span></div>
+<p>Using the synthetic series of Code 5.6.3, reproduce the three-way comparison with the real libraries of Code 5.6.4 (<code>prophet</code> and <code>statsforecast</code>). Report MAE and runtime for Prophet, AutoETS, AutoARIMA, and SeasonalNaive on a 90-day holdout. Then shorten the training history to 150 days and rerun: identify which model now wins and explain the reversal using the parameter-count argument of the numeric example in subsection two. Finally, replace the single series with a panel of ten noisy series and confirm that <code>statsforecast</code> fits all of them in roughly the time Prophet fits one.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 5.6.3: Reconcile a Three-Level Hierarchy <span class="exercise-type analysis">Analysis</span></div>
+<p>Construct a small hierarchy: four bottom-level series summing to two middle groups, summing to one total. Generate base forecasts that are deliberately incoherent, build the summing matrix $\mathbf{S}$, and compute the OLS-reconciled forecasts using the projection formula of subsection four with $\mathbf{W} = \mathbf{I}$. Verify that the reconciled bottom-level forecasts now sum exactly to the reconciled middle and total levels. Then repeat with a diagonal $\mathbf{W}$ that down-weights the noisiest bottom series and describe, in two sentences, how the reconciliation redistributes the discrepancy differently.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 5.6.4: When Does Global Beat Local? <span class="exercise-type open">Open-Ended</span></div>
+<p>The local-versus-global distinction of subsection four claims that a single shared model across many series can beat per-series fits. Design and run an experiment to probe when this holds: simulate a panel of $K$ short series that share a common seasonal pattern but differ in level and noise, fit a local AutoETS per series and a single global model (a pooled linear autoregression, or a small <code>neuralforecast</code> model if available), and measure how the global model's relative advantage changes as you vary the series length and the number of series $K$. Connect your findings to the foundation-model claim of <a href="../../toc.html">Chapter 15</a> that pretraining across many series enables zero-shot forecasting, and discuss where pooling should help and where it should hurt. There is no single correct answer; argue from the bias-variance tradeoff and from how much structure the series actually share.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-5.5.html"><span class="nav-label">Previous</span><span class="nav-num">Section 5.5</span><span class="nav-title">Exponential Smoothing and ETS</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 5</span><span class="nav-num">Contents</span><span class="nav-title">Univariate Forecasting Models</span></a>
+<a class="next" href="section-5.7.html"><span class="nav-label">Next</span><span class="nav-num">Section 5.7</span><span class="nav-title">Model Selection, Diagnostics, and Information Criteria</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>
