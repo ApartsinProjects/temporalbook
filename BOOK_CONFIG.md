@@ -205,6 +205,8 @@ chapter run strictly in sequence.
 - **Section density**: deep, target ~7 sections per chapter (~250 sections across 36 chapters). Matches the "Deeper" tier; exceeds VisionBook density.
 - **Running narrative**: rotate all three datasets by part (finance / healthcare / sensor-IoT), as detailed under "Three Running Datasets" above. No single lead domain.
 - **Deployment targets**: (1) GitHub Pages with a custom domain (e.g. `temporalbook.apartsin.com`), mirroring VisionBook; (2) Amazon KDP via `html2epub` -> `epub2kpf`. Build all HTML to satisfy both web and KDP/Kindle (P0 blockers) from the start.
+- **Depth & production strategy (locked 2026-06-15)**: DEEP FIRST-PASS plus a single END ENRICHMENT WAVE. Each section is written rich on the first pass: target ~400-550 lines, with 2-3 worked examples, a from-scratch-then-library-shortcut code pair for each major concept, fuller derivations, and more practical-example / research-frontier callouts. Intrinsic depth (theory, examples, code, math) is done first-pass because it is cheap then and expensive to retrofit. Whole-book-dependent depth is DEFERRED to one enrichment wave after all 36 chapters exist: Illustrator (gemini-imagegen, 5-8 figures/chapter), Cross-Reference Architect (wire every temporal-thread arc precisely, repoint toc-routed forward links to real chapter files), Content Update Scout (2025-2026 currency), Controller + Publication QA. Do NOT thin-then-thicken intrinsic content.
+- **Per-chapter section list**: follow BOOK_PLAN's section enumeration exactly (so toc.html stays consistent and scripts/activate_chapter.py wraps the right entries). Chapters range 3-7 sections; depth per section is the lever, not section count.
 
 ## The "Right Tool" Principle
 

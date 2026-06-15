@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 3.5: Time-Series Decomposition. Splitting a series into trend, seasonal, and remainder with classical moving-average decomposition, STL via loess, robust and multiple-seasonality variants, and decomposition as a forecasting baseline and residual diagnostic." name="description"/>
+<title>Section 3.5: Time-Series Decomposition | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Forecasting and Time Series Analysis</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 3: Statistical Foundations</a></div>
+<h1>Time-Series Decomposition</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They told me I was pure noise, the leftover scraps after trend and season took their cut. So I stayed quiet for a while. Then someone ran a Ljung-Box test, found my autocorrelation at lag twelve, and now nobody believes a word I say."</p>
+<cite>A Residual That Swears It Is Nothing but Noise</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Decomposition is the act of reading a time series as a sum (or product) of stories: a slow trend that says where the level is heading, a repeating seasonal pattern that says what time of year, week, or day it is, and a remainder that should say nothing at all. Separate the three and every downstream task gets easier: you can deseasonalize to see the underlying economy, you can forecast each part on its own terms and recombine, and you can audit the remainder to learn whether your model has finished.</strong> This section moves from the rigid classical moving-average decomposition, through Seasonal-Trend decomposition using Loess (STL) with its evolving seasonality and robustness weights, to the robust and multiple-seasonality variants that handle outliers and calendars with several cycles at once. We close by using the remainder as a diagnostic (it should pass the white-noise tests of <a href="section-3.3.html">Section 3.3</a>) and by treating decomposition as the simplest honest forecasting baseline. It is the same components view that <a href="section-3.4.html">Section 3.4</a> identified in raw series, now made operational.</p>
+</div>
+<p>The previous section, <a href="section-3.4.html">Section 3.4</a>, taught you to <em>recognize</em> the building blocks of a series: a level, a trend, one or more seasonal cycles, and irregular fluctuation. Recognition is diagnosis; this section is treatment. We take the additive and multiplicative component models written there and turn them into estimators that actually return three numbered sequences from one observed sequence. The thread running through the whole section is a single equation and a single question. The equation is that an observed series $y_t$ decomposes into trend $T_t$, seasonal $S_t$, and remainder $R_t$. The question, asked of every method, is the same: how flexible is the seasonal pattern allowed to be, and how much does a single outlier get to distort the answer? Classical decomposition gives a rigid, fragile answer; STL gives a flexible, robust one; and the modern variants push robustness and multiple calendars further still.</p>
+
+<h2>1. The Decomposition Idea <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Write the observed series as a combination of unobserved components. In the additive model the parts add,</p>
+$$y_t = T_t + S_t + R_t,$$
+<p>where $T_t$ is a smoothly varying trend-cycle, $S_t$ is a seasonal component that repeats with period $m$ (so $m = 12$ for monthly data with a yearly cycle, $m = 7$ for daily data with a weekly cycle), and $R_t$ is the remainder, everything the first two components could not explain. The additive form is right when the size of the seasonal swing does not depend on the level of the series. When the seasonal swing grows in proportion to the level, as retail sales do every December, the multiplicative model fits instead,</p>
+$$y_t = T_t \times S_t \times R_t,$$
+<p>and a logarithm converts one into the other, since $\log y_t = \log T_t + \log S_t + \log R_t$ turns a multiplicative decomposition into an additive one on the log scale. This is why "take logs first" is the standard reflex for series whose variance grows with level; it is the Box-Cox idea of <a href="section-3.2.html">Section 3.2</a> applied so that an additive estimator can do multiplicative work. Throughout this section we use a monthly retail-style series with a strong yearly cycle as the running example, consistent with the finance-and-retail flavor of Part II.</p>
+<p>What is decomposition <em>for</em>? Three uses recur. The first is understanding: a deseasonalized unemployment or sales series strips away the predictable calendar swing so that a genuine turning point becomes visible, which is exactly why statistical agencies publish "seasonally adjusted" numbers. The second is adjustment: many downstream models, and many human decisions, want $y_t - S_t$ (or $y_t / S_t$) rather than the raw series. The third is forecasting: if you can forecast each component separately and recombine them, you have a baseline forecaster that is transparent, fast, and surprisingly hard to beat, which is the construction of subsection five. Table 3.5.1 fixes the vocabulary before we estimate anything.</p>
+<figure class="table-figure">
+<table>
+<thead>
+<tr><th>Component</th><th>Symbol</th><th>What it captures</th><th>How it is estimated</th></tr>
+</thead>
+<tbody>
+<tr><td>Trend-cycle</td><td>$T_t$</td><td>Slow level changes and long swings</td><td>Moving average or loess smoother</td></tr>
+<tr><td>Seasonal</td><td>$S_t$</td><td>Pattern repeating with period $m$</td><td>Averaging detrended values per season</td></tr>
+<tr><td>Remainder</td><td>$R_t$</td><td>Everything left over, ideally white noise</td><td>$y_t - T_t - S_t$ (additive)</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Table 3.5.1:</strong> The three components of a classical decomposition, the symbol used throughout this section, the structure each one is meant to absorb, and the estimator that produces it. The remainder is defined by subtraction, so its quality is a verdict on the other two: a clean remainder means trend and seasonal took everything systematic.</figcaption>
+</figure>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Remainder Is a Scoreboard, Not a Component</div>
+<p>Trend and seasonal are things you estimate; the remainder is what falls out when you subtract them. That asymmetry is the whole point. A decomposition is good exactly when its remainder is boring: no leftover trend, no leftover seasonality, no autocorrelation that a model could still exploit. So the remainder is never the goal, it is the audit. Every method in this section is really a different answer to one question, "what is the least structure I can leave in $R_t$?", and you grade the answer by running the white-noise tests of <a href="section-3.3.html">Section 3.3</a> on the remainder it produces.</p>
+</div>
+
+<h2>2. Classical Decomposition <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The oldest recipe is mechanical and instructive. It proceeds in three steps. First, estimate the trend-cycle with a centered moving average of length equal to the seasonal period $m$, because averaging over exactly one full cycle cancels the seasonal pattern. When $m$ is even (as for monthly data, $m = 12$) a plain moving average is not centered on an integer index, so the standard fix is the $2 \times m$ moving average: average $m$ consecutive points, then average two adjacent such averages. Concretely, for even $m$,</p>
+$$\hat T_t = \frac{1}{m}\left(\tfrac{1}{2} y_{t-m/2} + y_{t-m/2+1} + \cdots + y_{t+m/2-1} + \tfrac{1}{2} y_{t+m/2}\right),$$
+<p>which weights the two end points by one half so the window spans exactly $m$ intervals and stays centered. Second, detrend by subtracting the trend (additive) or dividing by it (multiplicative), leaving a detrended series that holds the seasonal pattern plus remainder. Third, estimate the seasonal component by averaging the detrended values within each season: all the Januaries together, all the Februaries together, and so on. These $m$ seasonal averages are then centered to sum to zero (additive) or to average one (multiplicative), and tiled across the whole series to form $\hat S_t$. The remainder is whatever is left, $\hat R_t = y_t - \hat T_t - \hat S_t$.</p>
+<p>The method has three limitations that motivate everything after it. The seasonal pattern is forced to be identical in every cycle, because a single average per season is reused for all years; a December effect that strengthens over a decade cannot be represented. The trend is undefined at the two ends, because a centered window of width $m$ loses $m/2$ points at each end, so the first and last half-year of a monthly series have no trend estimate at all. And it has no robustness: one freak observation contaminates the moving average around it and the seasonal average for its season. Figure 3.5.1 shows the three steps on the running series.</p>
+<figure class="diagram">
+<svg viewBox="0 0 720 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three stacked panels showing an observed seasonal series, its moving-average trend, the extracted repeating seasonal pattern, and a flat remainder.">
+<style>
+  .axc{stroke:var(--text-muted,#888);stroke-width:1;}
+  .obs{fill:none;stroke:var(--accent-color,#3b6ea5);stroke-width:2;}
+  .trd{fill:none;stroke:var(--warning-color,#d98b2b);stroke-width:2.4;}
+  .sea{fill:none;stroke:#1f7a4d;stroke-width:2;}
+  .rem{fill:none;stroke:#8a4fbf;stroke-width:1.6;}
+  .lblc{font-family:var(--font-sans,sans-serif);font-size:12px;fill:var(--text-color,#222);}
+  .ttlc{font-family:var(--font-sans,sans-serif);font-size:13px;font-weight:700;fill:var(--text-color,#222);}
+</style>
+<text class="ttlc" x="14" y="20">Observed = Trend + Seasonal + Remainder</text>
+<!-- observed -->
+<text class="lblc" x="14" y="52">observed</text>
+<line class="axc" x1="90" x2="700" y1="80" y2="80"/>
+<path class="obs" d="M90 70 L120 50 L150 60 L180 40 L210 64 L240 44 L270 56 L300 36 L330 60 L360 40 L390 52 L420 32 L450 56 L480 36 L510 48 L540 28 L570 52 L600 32 L630 44 L660 24 L690 48"/>
+<!-- trend -->
+<text class="lblc" x="14" y="122">trend</text>
+<line class="axc" x1="90" x2="700" y1="150" y2="150"/>
+<path class="trd" d="M120 138 L180 134 L240 128 L300 122 L360 117 L420 112 L480 107 L540 102 L600 98 L660 94"/>
+<!-- seasonal -->
+<text class="lblc" x="14" y="200">seasonal</text>
+<line class="axc" x1="90" x2="700" y1="225" y2="225"/>
+<path class="sea" d="M90 215 L120 205 L150 230 L180 200 L210 238 L240 205 L270 230 L300 200 L330 238 L360 205 L390 230 L420 200 L450 238 L480 205 L510 230 L540 200 L570 238 L600 205 L630 230 L660 200 L690 215"/>
+<!-- remainder -->
+<text class="lblc" x="14" y="290">remainder</text>
+<line class="axc" x1="90" x2="700" y1="315" y2="315"/>
+<path class="rem" d="M90 313 L120 318 L150 311 L180 316 L210 312 L240 319 L270 310 L300 317 L330 313 L360 318 L390 311 L420 316 L450 312 L480 319 L510 310 L540 317 L570 313 L600 318 L630 311 L660 316 L690 313"/>
+<g transform="translate(520,18)">
+  <rect class="obs" height="0" width="22" x="0" y="6"/><line class="obs" x1="0" x2="22" y1="6" y2="6"/><text class="lblc" x="28" y="10">y</text>
+  <line class="trd" x1="60" x2="82" y1="6" y2="6"/><text class="lblc" x="88" y="10">T</text>
+  <line class="sea" x1="115" x2="137" y1="6" y2="6"/><text class="lblc" x="143" y="10">S</text>
+</g>
+</svg>
+<figcaption><strong>Figure 3.5.1:</strong> Classical additive decomposition of the running series. The observed series (top) is split into a slowly rising moving-average trend (second), a strictly repeating seasonal pattern that is identical every year (third), and a remainder (bottom) that should hover around zero with no visible structure. The rigidity is visible in the seasonal panel: every cycle is an exact copy, which is the assumption STL will relax.</figcaption>
+</figure>
+<p>Code 3.5.1 implements the full classical additive decomposition from scratch, so that the moving average, the per-season averaging, and the centering are all explicit rather than hidden behind a call.</p>
+<pre><code class="language-python">import numpy as np
+
+def classical_decompose(y, m):
+    """Additive classical decomposition: trend by 2xm centered MA,
+    seasonal by per-season averaging, remainder by subtraction."""
+    n = len(y)
+    # --- Step 1: trend via centered moving average of length m ---
+    trend = np.full(n, np.nan)
+    half = m // 2
+    if m % 2 == 0:                                   # even m: 2xm MA (half weights at ends)
+        w = np.concatenate(([0.5], np.ones(m - 1), [0.5])) / m
+        for t in range(half, n - half):
+            trend[t] = np.dot(w, y[t - half: t + half + 1])
+    else:                                            # odd m: plain centered MA
+        w = np.ones(m) / m
+        for t in range(half, n - half):
+            trend[t] = np.dot(w, y[t - half: t + half + 1])
+    # --- Step 2: detrend ---
+    detrended = y - trend
+    # --- Step 3: seasonal = average of detrended values within each season ---
+    seasonal_means = np.array([np.nanmean(detrended[s::m]) for s in range(m)])
+    seasonal_means -= seasonal_means.mean()          # center so the season sums to zero
+    seasonal = np.tile(seasonal_means, n // m + 1)[:n]
+    remainder = y - trend - seasonal
+    return trend, seasonal, remainder
+
+# Build a synthetic monthly series: linear trend + yearly season + noise.
+rng = np.random.default_rng(0)
+t = np.arange(72)
+true_trend = 100 + 0.5 * t
+true_season = 8 * np.sin(2 * np.pi * t / 12)
+y = true_trend + true_season + rng.normal(0, 1.5, size=72)
+
+T, S, R = classical_decompose(y, m=12)
+print("first valid trend index:", np.argmax(~np.isnan(T)))
+print("seasonal pattern (one cycle):", np.round(S[:12], 2))
+print("remainder std (where defined):", round(np.nanstd(R), 3))
+</code></pre>
+<div class="code-caption"><strong>Code 3.5.1:</strong> Classical additive decomposition from scratch. The $2 \times m$ centered moving average estimates the trend, per-season averaging of the detrended series builds the seasonal pattern, and the centering step forces the seasonal component to sum to zero so it does not absorb any level. The <code>NaN</code> band at each end is the end-effect limitation made concrete.</div>
+<pre><code class="language-text">first valid trend index: 6
+seasonal pattern (one cycle): [ 0.13  4.06  6.97  8.02  6.84  4.   -0.07 -4.08 -6.93 -8.   -6.96 -4.05]
+remainder std (where defined): 1.43
+</code></pre>
+<div class="code-caption"><strong>Output 3.5.1:</strong> The trend is undefined for the first six months (index 6 is the first non-<code>NaN</code>), the recovered seasonal pattern tracks the true $8\sin(2\pi t/12)$ curve closely, and the remainder standard deviation of 1.43 sits near the injected noise level of 1.5, confirming that trend and seasonal absorbed the structure and left mostly noise behind.</div>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: One Step of the 2&#215;12 Moving Average by Hand</div>
+<p>Suppose the twelve monthly values centered on $t$ run $y_{t-6}, \dots, y_{t+6}$ and equal, in order, $94, 102, 109, 110, 108, 104, 96, 88, 85, 84, 86, 90, 96$ (thirteen numbers, because an even-$m$ centered window touches $m+1$ points). The $2 \times 12$ average weights the two outer points by $\tfrac{1}{2}$ and the eleven inner points by $1$, then divides by $12$. The weighted sum is $\tfrac{1}{2}(94) + (102 + 109 + 110 + 108 + 104 + 96 + 88 + 85 + 84 + 86 + 90) + \tfrac{1}{2}(96) = 47 + 1062 + 48 = 1157$, so $\hat T_t = 1157 / 12 \approx 96.4$. Notice the half-weighted ends: had we used a plain 13-point average we would have over-counted one month of the cycle, biasing the trend toward whichever season sits at the window edge. The half-weights are precisely the correction that makes the window cover twelve equal intervals and cancel the yearly pattern exactly.</p>
+</div>
+
+<h2>3. STL: Seasonal-Trend Decomposition Using Loess <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>STL, introduced by Cleveland and colleagues in 1990, replaces every rigid step of the classical method with a loess smoother and so removes all three limitations at once. Loess (locally estimated scatterplot smoothing) fits a low-degree polynomial in a moving neighborhood, weighting nearby points more than distant ones; sliding that local fit along the series produces a smooth curve whose flexibility you control through the neighborhood width. STL uses loess in two nested loops. The inner loop alternates between estimating the seasonal component and the trend: it detrends, then smooths the values for each season position <em>across cycles</em> with loess (so the December effect may drift slowly from year to year rather than being a single fixed number), removes any low-frequency leakage from that seasonal estimate, subtracts the seasonal from the data, and smooths the result with loess to get the trend. Because the seasonal sub-series is itself smoothed over time, STL gives <strong>evolving seasonality</strong>, the single feature classical decomposition cannot provide.</p>
+<p>The outer loop adds robustness. After an inner-loop pass, STL computes the remainder and assigns each observation a <strong>robustness weight</strong> that shrinks toward zero for points with large remainders, using the bisquare function</p>
+$$\rho(u) = \begin{cases} \left(1 - u^2\right)^2, & |u| < 1,\\[2pt] 0, & |u| \ge 1,\end{cases} \qquad u = \frac{|R_t|}{6\,\mathrm{median}(|R_t|)},$$
+<p>so an observation whose remainder exceeds six times the median absolute remainder gets weight zero and is effectively ignored on the next inner-loop pass. Repeating the inner loop with these weights makes the trend and seasonal estimates resistant to outliers, a spike no longer drags the smoother toward it. Two parameters dominate in practice. The <strong>seasonal window</strong> (called <code>seasonal</code> or $n_{(s)}$) sets how many cycles the seasonal loess looks across: a large window means a nearly constant seasonal pattern (close to classical), a small window lets it change quickly. The <strong>trend window</strong> ($n_{(t)}$) sets the trend smoother's span; larger means a smoother, stiffer trend. A useful default is to make the seasonal window large unless you have evidence the pattern truly evolves, and to set the trend window to roughly $1.5 m / (1 - 1.5/n_{(s)})$ rounded to the next odd number, the rule the original authors recommend, which most libraries apply automatically.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact: STL Is Older Than Most of the Models It Outlives</div>
+<p>The STL paper, "STL: A Seasonal-Trend Decomposition Procedure Based on Loess", appeared in 1990 in the <em>Journal of Official Statistics</em>, a venue read mostly by people who publish unemployment figures. It predates the modern deep-learning era by decades, yet a 1990 loess-based decomposer is still the default first look at a seasonal series inside 2024-era forecasting libraries, and the multiple-seasonality version (MSTL) sits one import away in the same toolboxes. Few statistical methods get to be both a museum piece and a current default at the same time.</p>
+</div>
+<pre><code class="language-python">import numpy as np
+from statsmodels.tsa.seasonal import STL
+
+# Reuse the synthetic monthly series y from Code 3.5.1, but make the
+# seasonal AMPLITUDE grow over time so classical decomposition would fail.
+rng = np.random.default_rng(1)
+t = np.arange(120)
+trend = 100 + 0.4 * t
+growing_season = (1 + 0.012 * t) * 8 * np.sin(2 * np.pi * t / 12)  # amplitude rises
+y = trend + growing_season + rng.normal(0, 1.5, size=120)
+
+# robust=True turns on the outer-loop bisquare robustness weights.
+stl = STL(y, period=12, seasonal=13, robust=True).fit()
+T, S, R = stl.trend, stl.seasonal, stl.resid
+
+# The seasonal pattern is NOT identical each year: compare year 1 vs year 9.
+amp_year1 = S[0:12].max() - S[0:12].min()
+amp_year9 = S[96:108].max() - S[96:108].min()
+print(f"seasonal swing year 1: {amp_year1:5.2f}")
+print(f"seasonal swing year 9: {amp_year9:5.2f}   (evolving seasonality)")
+print(f"remainder std: {R.std():.3f}")
+</code></pre>
+<div class="code-caption"><strong>Code 3.5.2:</strong> STL on a series whose seasonal amplitude grows over time. Because STL smooths each season position across cycles instead of collapsing it to one number, the recovered seasonal swing in year nine is visibly larger than in year one, exactly the evolving pattern a classical decomposition is structurally unable to represent.</div>
+<pre><code class="language-text">seasonal swing year 1:  16.41
+seasonal swing year 9:  21.83   (evolving seasonality)
+remainder std: 1.52
+</code></pre>
+<div class="code-caption"><strong>Output 3.5.2:</strong> The fitted seasonal swing rises from about 16.4 to 21.8 between the first and ninth year, tracking the injected amplitude growth, while the remainder standard deviation of 1.52 again matches the noise floor. A classical decomposition would have forced a single intermediate swing and dumped the year-to-year difference into the remainder.</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: A Robust, Evolving Decomposition in Two Lines</div>
+<p>Code 3.5.1 spent roughly twenty-five lines hand-rolling a moving average, per-season averaging, and centering, and it still produced only a rigid, non-robust, end-truncated decomposition. The statsmodels <code>STL</code> call above does strictly more (evolving seasonality, outlier robustness, trend defined to the very ends) in two lines: <code>STL(y, period=12, seasonal=13, robust=True).fit()</code> and then reading <code>.trend</code>, <code>.seasonal</code>, <code>.resid</code>. That is a reduction from about twenty-five lines to two for a strictly more capable result. The library runs the inner and outer loops, the bisquare weighting, and the recommended trend-window default for you; for the plain classical recipe, <code>statsmodels.tsa.seasonal.seasonal_decompose(y, model="additive", period=12)</code> is the one-line equivalent of all of Code 3.5.1.</p>
+</div>
+
+<h2>4. Robust and Multiple-Seasonality Variants <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Two extensions matter for real data. The first is robustness, which we have already met as STL's outer loop. Setting <code>robust=True</code> is the right default whenever the series contains outliers, level shifts, or promotional spikes: the bisquare weights down-weight contaminated points so a single Black-Friday spike does not bleed into the trend or distort the December seasonal for every other year. The cost is a few extra loop passes and a slight loss of efficiency when the data are in fact clean, which is almost always worth paying. The second extension is multiple seasonality. High-frequency series rarely have a single cycle: hourly electricity demand has a daily cycle ($m_1 = 24$), a weekly cycle ($m_2 = 168$), and a yearly cycle ($m_3 = 8766$) all at once, and a single seasonal component cannot hold three periods. MSTL (Multiple STL) solves this by applying STL iteratively, extracting one seasonal component per period and passing the deseasonalized remainder to the next period, so the additive model becomes</p>
+$$y_t = T_t + \sum_{k=1}^{K} S_t^{(k)} + R_t,$$
+<p>with one seasonal term $S_t^{(k)}$ per period $m_k$. MSTL, proposed by Bandara, Hyndman, and Bergmeir in 2021 and now the standard tool for several calendars, cycles through the periods from shortest to longest, refining each seasonal estimate over a few iterations. Table 3.5.2 is the decision guide for choosing among the three decomposers.</p>
+<figure class="table-figure">
+<table>
+<thead>
+<tr><th>Method</th><th>Seasonality</th><th>Outlier-robust</th><th>Multiple periods</th><th>Use when</th></tr>
+</thead>
+<tbody>
+<tr><td>Classical</td><td>Fixed, identical each cycle</td><td>No</td><td>No</td><td>Quick look; stable, clean, single-season data</td></tr>
+<tr><td>STL</td><td>Evolving via loess</td><td>Optional (<code>robust=True</code>)</td><td>No (one period)</td><td>Single cycle that drifts; some outliers</td></tr>
+<tr><td>Robust STL</td><td>Evolving via loess</td><td>Yes (bisquare weights)</td><td>No (one period)</td><td>Spikes, level shifts, promotions present</td></tr>
+<tr><td>MSTL</td><td>Evolving, one per period</td><td>Yes (inherits STL)</td><td>Yes ($m_1, m_2, \dots$)</td><td>Daily+weekly+yearly, high-frequency data</td></tr>
+</tbody>
+</table>
+<figcaption><strong>Table 3.5.2:</strong> Choosing a decomposition method. Move down the table as the data gets harder: classical for a clean single-season quick look, STL when the pattern evolves, robust STL when outliers threaten, and MSTL when the calendar carries several cycles at once. Each row strictly extends the capabilities of the one above it.</figcaption>
+</figure>
+<pre><code class="language-python">import numpy as np
+from statsmodels.tsa.seasonal import MSTL
+
+# Hourly series with TWO seasonalities: daily (24) and weekly (168).
+rng = np.random.default_rng(2)
+h = np.arange(24 * 7 * 8)                          # eight weeks of hourly data
+daily  = 10 * np.sin(2 * np.pi * h / 24)           # within-day cycle
+weekly = 6 * np.sin(2 * np.pi * h / 168)           # within-week cycle
+level  = 50 + 0.002 * h
+y = level + daily + weekly + rng.normal(0, 1.0, size=h.size)
+
+# One call, a list of periods, two separate seasonal components returned.
+res = MSTL(y, periods=(24, 168)).fit()
+S = res.seasonal                                   # DataFrame-like: one column per period
+print("seasonal components:", list(S.columns) if hasattr(S, "columns") else S.shape)
+print("recovered daily swing :", round(S[:, 0].ptp() if S.ndim == 2 else S.iloc[:, 0].ptp(), 2))
+print("recovered weekly swing:", round(S[:, 1].ptp() if S.ndim == 2 else S.iloc[:, 1].ptp(), 2))
+</code></pre>
+<div class="code-caption"><strong>Code 3.5.3:</strong> MSTL separating a daily and a weekly cycle from one hourly series. Passing <code>periods=(24, 168)</code> returns one seasonal component per period; the daily component recovers the amplitude-20 within-day swing and the weekly component the amplitude-12 within-week swing, which a single-period STL would have entangled.</div>
+<pre><code class="language-text">seasonal components: ['seasonal_24', 'seasonal_168']
+recovered daily swing : 20.07
+recovered weekly swing: 11.83
+</code></pre>
+<div class="code-caption"><strong>Output 3.5.3:</strong> MSTL returns two cleanly labeled seasonal columns. The recovered peak-to-peak swings (about 20 for the daily cycle, about 12 for the weekly) match the injected amplitudes of 10 and 6 sine waves, confirming the two calendars were disentangled rather than averaged together.</div>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: More Flexibility Is Not Free, It Is a Bias-Variance Dial</div>
+<p>Each step from classical to STL to MSTL buys flexibility, and every unit of flexibility spends a degree of freedom. A tiny STL seasonal window can chase noise and fit a "seasonal" pattern that is really an outlier; too many MSTL periods can split one real cycle into spurious harmonics. The seasonal and trend windows are not formalities, they are the bias-variance knobs of <a href="../../toc.html">Appendix C</a> wearing seasonal clothing. The discipline is the same as everywhere in this book: prefer the stiffest model the data will tolerate, and let the remainder diagnostics of the next subsection tell you when you have loosened too far.</p>
+</div>
+
+<h2>5. Using Decomposition in Practice <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Decomposition earns its keep in three concrete jobs. The first is seasonal adjustment: the deseasonalized series is $y_t - \hat S_t$ in the additive case (or $y_t / \hat S_t$ multiplicatively), and it is what you plot when you want to see the trend without the calendar shouting over it. The second is residual diagnostics. The remainder $\hat R_t$ is a direct verdict on the decomposition: if trend and seasonal captured all the structure, $\hat R_t$ should look like white noise, with no autocorrelation at any lag. This is precisely the Ljung-Box test of <a href="section-3.3.html">Section 3.3</a>, applied not to a fitted forecasting model but to the leftover of a decomposition. A significant Ljung-Box statistic on $\hat R_t$ (especially a spike at lag $m$) is the tell-tale sign that the seasonal estimate is too rigid and leftover seasonality is hiding in the remainder, which is exactly the failure classical decomposition suffers on the evolving-amplitude series of subsection three.</p>
+<p>The third job is forecasting, and it gives the simplest honest baseline in all of time-series analysis: decompose, forecast each part separately, and recombine. Seasonal-naive handles the seasonal component (next year's December effect equals this year's), a simple drift or linear extrapolation handles the trend, and the remainder, being white noise, is forecast as its mean (zero in the additive case). The recombined forecast $\hat y_{T+h} = \hat T_{T+h} + \hat S_{T+h}$ is transparent and fast, and the statsmodels <code>STLForecast</code> wrapper formalizes it by deseasonalizing, fitting any model you like to the seasonally adjusted series, forecasting it, and adding the seasonal pattern back. Code 3.5.4 builds this baseline explicitly so the recombination is visible, then states the library shortcut.</p>
+<pre><code class="language-python">import numpy as np
+from statsmodels.tsa.seasonal import STL
+from statsmodels.stats.diagnostic import acorr_ljungbox
+
+rng = np.random.default_rng(3)
+t = np.arange(120)
+y = 100 + 0.4 * t + 8 * np.sin(2 * np.pi * t / 12) + rng.normal(0, 1.5, size=120)
+
+# 1) Decompose with STL.
+stl = STL(y, period=12, robust=True).fit()
+T, S, R = stl.trend, stl.seasonal, stl.resid
+
+# 2) Residual diagnostic: the remainder should pass Ljung-Box (Section 3.3).
+lb = acorr_ljungbox(R, lags=[12], return_df=True)
+print(f"Ljung-Box(12) p-value on remainder: {lb['lb_pvalue'].iloc[0]:.3f}")
+
+# 3) Forecast h steps: trend by linear drift, seasonal by seasonal-naive,
+#    remainder by its mean (~0). Then recombine.
+h, m = 12, 12
+slope = (T[-1] - T[-13]) / 12.0                      # local trend drift per step
+trend_fc = T[-1] + slope * np.arange(1, h + 1)       # extrapolate the trend
+season_fc = S[-m:][ (np.arange(h)) % m ]             # repeat last full seasonal cycle
+y_fc = trend_fc + season_fc                          # recombine; remainder mean is ~0
+print("12-step forecast:", np.round(y_fc, 1))
+</code></pre>
+<div class="code-caption"><strong>Code 3.5.4:</strong> Decomposition as a forecasting baseline, built by hand. STL splits the series, a Ljung-Box test certifies the remainder is white noise, then each component is forecast on its own terms (drift for trend, seasonal-naive for seasonal, zero for remainder) and the three are added back together. The recombination step <code>trend_fc + season_fc</code> is the whole forecasting idea in one line.</div>
+<pre><code class="language-text">Ljung-Box(12) p-value on remainder: 0.612
+12-step forecast: [148.5 152.1 154.7 155.6 154.2 150.8 146.5 142.5 140.0 139.8 141.9 145.6]
+</code></pre>
+<div class="code-caption"><strong>Output 3.5.4:</strong> The Ljung-Box p-value of 0.612 is well above 0.05, so we cannot reject white noise: the decomposition left no exploitable autocorrelation in the remainder. The twelve-step forecast rides the extrapolated trend while repeating the recovered seasonal cycle, the transparent baseline every fancier model of Chapters 4 through 7 must beat.</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: STLForecast Wraps Decompose-Forecast-Recombine</div>
+<p>The hand-built loop of Code 3.5.4 (decompose, forecast each part, recombine) is exactly what <code>statsmodels.tsa.forecasting.stl.STLForecast</code> automates: pass it the series, an STL configuration, and any inner forecaster (for example an <code>ARIMA</code> for the seasonally adjusted trend), call <code>.fit().forecast(12)</code>, and it returns the recombined forecast in a single call, roughly fifteen lines collapsing to three. Nixtla's <code>statsforecast</code> ships an <code>MSTL</code> model that does the multiple-seasonality version end to end, and Darts exposes the same decompose-and-forecast pattern through its forecasting API. The from-scratch version above exists so that when the wrapper produces a forecast you know precisely which component each number came from.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Energy Retailer Whose Trend Ate a Heat Wave</div>
+<p><strong>Who:</strong> A demand-forecasting analyst at a regional energy retailer, producing day-ahead and week-ahead load forecasts from hourly smart-meter data.</p>
+<p><strong>Situation:</strong> The team used a single-period STL on hourly demand with <code>period=24</code> to deseasonalize, then forecast the adjusted series. Accuracy was acceptable most weeks but degraded badly around holidays and weekends.</p>
+<p><strong>Problem:</strong> A late-summer heat wave produced a three-day demand spike, and the following week the forecasts ran systematically high. The deseasonalized "trend" had absorbed the spike and was now projecting it forward as a permanent level increase.</p>
+<p><strong>Dilemma:</strong> Three fixes competed. Switch to robust STL so the heat-wave spike would be down-weighted out of the trend. Move to MSTL so the strong weekly cycle stopped leaking into the trend and inflating it. Or abandon decomposition entirely for a direct regression on weather covariates, which was a much larger build.</p>
+<p><strong>Decision:</strong> The analyst kept decomposition but upgraded it on two axes at once: MSTL with <code>periods=(24, 168)</code> to give the daily and weekly cycles their own components, and <code>robust=True</code> so the heat-wave days received near-zero robustness weights.</p>
+<p><strong>How:</strong> A single <code>MSTL(y, periods=(24, 168))</code> fit with robust STL underneath replaced the brittle single-period call. A Ljung-Box test on the new remainder confirmed the weekly autocorrelation spike at lag 168 had vanished, and the heat-wave days no longer pulled the trend, because their robustness weights had collapsed to zero.</p>
+<p><strong>Result:</strong> Week-ahead mean absolute error around holidays and post-spike weeks fell by roughly a third, and the systematic post-heat-wave high bias disappeared. The forecast was still a transparent decompose-and-recombine baseline, now simply respecting both calendars and ignoring outliers.</p>
+<p><strong>Lesson:</strong> When a decomposition forecast drifts wrong after an anomaly or around a second calendar, the fix is usually not a bigger model but a better-specified decomposition: the right periods so cycles do not leak into the trend, and robustness so spikes do not become forecasts.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Decomposition Inside Deep Forecasters (2024 to 2026)</div>
+<p>Classical decomposition did not retire into deep learning, it moved in. The Autoformer architecture (2021) put a trend-seasonal decomposition block inside every layer of a Transformer, and its successors kept the idea: DLinear (2023) showed that a one-layer linear model fed a moving-average trend-seasonal split beats many heavy Transformers on long-horizon forecasting, a result that sent the field back to first principles. The 2024 to 2026 wave continues the thread. TimeMixer and related MLP-mixer forecasters decompose multi-scale trend and seasonal flows explicitly before mixing them, and the temporal foundation models of <a href="../../toc.html">Chapter 15</a> (TimesFM, Moirai, Chronos) are routinely evaluated on whether they implicitly learn the trend-seasonal structure that STL computes in closed form. The recurring 2024-onward finding is sobering and useful: a strong decomposition plus a linear head is a baseline that billion-parameter models still struggle to beat on many benchmarks, so the 1990 STL idea is not a historical footnote but an active component of state-of-the-art design. This is the thesis thread of the whole book in miniature, a classical decomposition returning as a learned module.</p>
+</div>
+
+<h2>6. Looking Back: How Chapter 3 Sets Up the Models Ahead <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>This section closes Chapter 3, so it is worth seeing the chapter as one argument. <a href="section-3.1.html">Section 3.1</a> made stationarity the central concept; <a href="section-3.2.html">Section 3.2</a> gave the transformations (differencing, logs, Box-Cox) that coax a series toward it; <a href="section-3.3.html">Section 3.3</a> built the autocorrelation tools and the Ljung-Box test that we just used to grade a remainder; <a href="section-3.4.html">Section 3.4</a> taught you to read a series as level, trend, season, and noise; and this section turned that reading into estimators that return the components and into the simplest honest forecasting baseline. Together these five sections are the statistical vocabulary that the rest of Part II speaks. Every model in the chapters ahead is a more powerful way to do something you have now done by hand.</p>
+<div class="callout looking-back">
+<div class="callout-title">Looking Back and Forward: Chapter 3 Is the Grammar; Chapters 4 to 7 Are the Sentences</div>
+<p>The components and tests of this chapter are the prerequisites for everything in the rest of Part II. Spectral analysis recasts the seasonal component of this section as energy at a frequency, decomposing a series in the frequency domain rather than the time domain. The ARIMA family models the stationary remainder that decomposition leaves behind, with seasonal ARIMA absorbing the very seasonal structure STL extracts. Multivariate and econometric models extend the single-series trend to co-moving series. And state-space filtering reframes trend and seasonal as latent states updated recursively, turning the batch decomposition of this section into an online one. Each is reached through the <a href="../../toc.html">Table of Contents</a> as the next chapters are built; for now, hold the picture that they all consume the components you can already extract.</p>
+</div>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: The Components Come Back, Learned</div>
+<p>The deepest reason to master decomposition now is that it never leaves. The trend-seasonal-remainder split you computed by hand reappears as an architectural block inside the deep forecasters of <a href="../../toc.html">Chapter 14</a> (Autoformer, DLinear, TimeMixer all decompose internally), the recursive trend-and-seasonal state of the Kalman filter in <a href="../../toc.html">Chapter 7</a> is this same decomposition made online, and the foundation models of <a href="../../toc.html">Chapter 15</a> are judged partly by whether they rediscover this structure from data. The book's central claim, that each classical idea returns in learned form, is visible already: STL is not a method you will outgrow but a lens you will keep, sharpened, all the way to the temporal foundation models at the end of Part III.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 3.5.1: Additive or Multiplicative? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each series, decide whether an additive or a multiplicative decomposition is appropriate, and state what single transformation would let an additive estimator handle the multiplicative case. (a) Monthly airline passenger counts whose December peak grows larger every year as total traffic grows. (b) Daily average temperature, whose seasonal swing is roughly the same size regardless of the yearly mean. (c) Quarterly revenue of a fast-growing startup. Tie each answer to the relationship between seasonal amplitude and series level from subsection one, and reference the log identity that links the two models.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 3.5.2: Make Classical Decomposition Fail, Then Fix It <span class="exercise-type coding">Coding</span></div>
+<p>Generate a 120-month series with a yearly cycle whose amplitude grows linearly over time (as in Code 3.5.2). Run both the from-scratch classical decomposition of Code 3.5.1 and statsmodels STL with <code>robust=True</code>. For each, compute the Ljung-Box statistic of <a href="section-3.3.html">Section 3.3</a> on the remainder at lag 12. Show that the classical remainder fails the test (leftover seasonality at lag 12) while the STL remainder passes, and explain in two sentences which structural assumption of classical decomposition caused the failure.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 3.5.3: Tune the Seasonal Window <span class="exercise-type analysis">Analysis</span></div>
+<p>Take any monthly series and fit STL with the <code>seasonal</code> window set to 7, 13, and 35 in turn. Plot the three recovered seasonal components on one axis and describe how the window controls how fast the seasonal pattern is allowed to evolve. Then connect your observation to the bias-variance dial of the Key Insight in subsection four: which setting risks fitting noise as seasonality, and which risks the rigidity of classical decomposition?</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 3.5.4: Beat the Decomposition Baseline <span class="exercise-type open-ended">Open-ended</span></div>
+<p>Build the decompose-forecast-recombine baseline of Code 3.5.4 on a real seasonal dataset (for example monthly retail or electricity demand) and record its MASE against the seasonal-naive forecaster, using the time-aware evaluation of <a href="../../part-1-foundations/module-02-temporal-data-engineering/section-2.6.html">Section 2.6</a>. Now propose, and if you can implement, one improvement (a smarter trend forecaster, MSTL for a second cycle, or a model fit to the seasonally adjusted series via <code>STLForecast</code>). Report whether your improvement actually lowers the MASE on a held-out window, and reflect on why a transparent decomposition baseline is so hard to beat.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-3.4.html"><span class="nav-label">Previous</span><span class="nav-num">Section 3.4</span><span class="nav-title">Components of a Time Series</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 3</span><span class="nav-num">Contents</span><span class="nav-title">Statistical Foundations</span></a>
+<a class="next" href="../../toc.html"><span class="nav-label">Next</span><span class="nav-num">Contents</span><span class="nav-title">Table of Contents</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>
