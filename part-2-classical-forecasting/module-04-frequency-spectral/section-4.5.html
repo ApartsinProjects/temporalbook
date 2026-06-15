@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 4.5: Connections to Modern Architectures. How spectral ideas return inside deep learning: spectral bias, frequency-domain token mixing (FNet), frequency-enhanced forecasters (Autoformer, FEDformer, FiLM, FreTS), the FFT view of state-space models, and a runnable from-scratch frequency-mixer layer with its torch.fft library equivalent." name="description"/>
+<title>Section 4.5: Connections to Modern Architectures | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Forecasting and Time Series Analysis</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 4: Frequency-Domain and Spectral Analysis</a></div>
+<h1>Connections to Modern Architectures</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They wrapped me in attention, gave me residual streams and a billion parameters, and still, every few layers, they reach for me to mix the sequence in one clean transform. I am the oldest trick in the building, and I am back on the payroll."</p>
+<cite>An FFT Layer Living Inside a Transformer</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The Fourier transform was Chapter 4's classical subject, but it never left the field; it migrated upward into deep learning, where the same three properties that made it powerful for analysis make it powerful as a learned component.</strong> Neural networks are biased toward low frequencies, so an architecture that operates directly in the frequency domain can place its capacity where the signal lives. The fast Fourier transform mixes every position of a length-$N$ sequence with every other in $O(N \log N)$ time, cheaper than the $O(N^2)$ of dense attention, which makes it an attractive global mixer. And periodic time series are sparse in the frequency domain, so keeping a handful of dominant modes both compresses and denoises. This section traces those ideas through FNet's parameter-free Fourier mixing, through the Autoformer and FEDformer line of frequency-enhanced forecasters, and through the convolutional view of state-space models, then makes the connection concrete with a runnable frequency-mixer layer built from scratch and rebuilt in three lines with <code>torch.fft</code>. The thread that runs through it: spectral analysis returns, again and again, as a learned building block.</p>
+</div>
+<p>The previous section, <a href="section-4.4.html">Section 4.4</a>, closed the classical frequency-domain toolkit: the periodogram, the smoothed spectral estimators, and the multitaper method gave us ways to read the spectrum of an observed series. Those tools answer a backward-looking question, "what frequencies are present in this data?" This section asks a forward-looking one, "what happens when we let a neural network compute and reshape a spectrum as part of its own forward pass?" The answer is the payoff of the whole chapter, because it explains why the discrete Fourier transform of <a href="../../toc.html">Section 4.1</a>, the convolution theorem of <a href="../../toc.html">Section 4.2</a>, and the spectral density of <a href="../../toc.html">Section 4.3</a> reappear at the heart of architectures designed seventy years later. We assume the discrete Fourier transform (DFT) and its fast algorithm from <a href="../../toc.html">Section 4.1</a>, the convolution theorem from <a href="../../toc.html">Section 4.2</a>, and the notation $\mathcal{F}$ for the transform and $X_k$ for the $k$-th frequency coefficient collected in the unified notation table of <a href="../../toc.html">Appendix A</a>.</p>
+
+<h2>1. Why Frequency Ideas Keep Returning <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Three independent forces pull deep learning back toward the frequency domain, and it is worth separating them because different architectures lean on different ones. The first is a property of the networks themselves. Trained with gradient descent, neural networks learn the low-frequency components of a target function first and the high-frequency components much later, if at all, a robustly observed phenomenon called the spectral bias or the frequency principle. A network is, by default, a smoother. If a task lives in the high frequencies, plain coordinate inputs fight the bias, which is exactly why positional encodings and Fourier feature maps, which lift inputs into a bank of sinusoids before the first layer, repair high-frequency learning so dramatically. Frequency is not an afterthought for a neural network; it is the axis along which the network's own difficulty is organized.</p>
+<p>The second force is efficiency. Mixing information across a length-$N$ sequence is the central operation of any sequence model, and the dense way to do it, letting every position attend to every other, costs $O(N^2)$ time and memory. The fast Fourier transform performs a different but equally global mixing, every output coefficient depends on every input sample, in only $O(N \log N)$ time, with no learned parameters at all. For long sequences the gap is enormous: at $N = 10{,}000$ the quadratic cost is a hundred million operations while the $N \log N$ cost is on the order of a hundred thousand. The third force is the structure of the data. Periodic and quasi-periodic series, which is most of what forecasting deals with, are sparse in the frequency domain: a daily-and-weekly load curve is a few sharp peaks plus broadband noise. Operating in that domain lets a model touch the few coefficients that matter and ignore the rest, which compresses the representation and denoises it in the same stroke.</p>
+<p>The spectral-bias force deserves one concrete illustration, because it is the least obvious of the three. Consider fitting a small network to the target $f(t) = \sin(2\pi t) + 0.3 \sin(40\pi t)$ on $t \in [0,1]$, a slow component plus a fast one of smaller amplitude. Train it and watch the error spectrum: the network nails the slow $\sin(2\pi t)$ within a few hundred steps while the fast $\sin(40\pi t)$ term is still essentially unlearned, and it may take orders of magnitude more steps, or never converge on the fast term at all. The network is not failing at the task; it is obeying its bias, climbing the frequency axis from the bottom. Now lift the input through a Fourier feature map, replacing the scalar $t$ with the vector $[\cos(2\pi t), \sin(2\pi t), \cos(40\pi t), \sin(40\pi t), \dots]$, and the fast term becomes learnable in the same few hundred steps as the slow one, because the high frequency is now present at the input rather than something the network must synthesize against its own gradient bias. This is the cleanest demonstration that frequency is the network's native difficulty axis, and it is why positional and Fourier encodings are not decoration but a direct repair of spectral bias.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Three Reasons Are Independent, and Architectures Mix Them</div>
+<p>Spectral bias is about <em>where a network struggles</em> (it under-fits high frequencies); the $O(N \log N)$ mixing argument is about <em>cost</em> (the FFT is a cheap global mixer); spectral sparsity is about <em>the data</em> (periodic signals concentrate in a few modes). These are three different claims, and a given architecture may invoke one, two, or all three. FNet leans almost entirely on the cost argument, using the FFT as a free mixer. FEDformer leans on the sparsity argument, selecting a few modes. Fourier feature encodings lean on the bias argument, injecting high frequencies the network would otherwise miss. When you read a new "frequency-domain" paper, the first useful question is which of the three it is actually exploiting, because that tells you when it will help and when it will not.</p>
+</div>
+<p>These forces set up the chapter's closing thesis, which we state now and return to at the end. Spectral analysis entered this book as a classical tool for describing observed data. It is leaving this chapter as a design principle for learned models, and it will re-enter the book twice more: as the convolutional kernel of structured state-space models in <a href="../../toc.html">Chapter 13</a>, and inside the temporal foundation models of <a href="../../toc.html">Chapter 15</a>, several of which carry explicit frequency-domain components. It helps to keep the three forces side by side, because the rest of the section is organized around which one each architecture invokes; the comparison table below is that reference card, and the numeric example after it makes the cost argument concrete before we look at any architecture.</p>
+<div class="comparison-table">
+<div class="comparison-table-title">The Three Forces Pulling Deep Learning Toward the Frequency Domain</div>
+<table>
+<thead>
+<tr><th>Force</th><th>The claim</th><th>What it is about</th><th>Architecture that leans on it</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Spectral bias</strong></td><td>Networks learn low frequencies first and high frequencies late or never</td><td>Where the network struggles</td><td>Fourier feature encodings, positional embeddings</td></tr>
+<tr><td><strong>Cheap global mixing</strong></td><td>The FFT mixes all $N$ positions in $O(N \log N)$ with no parameters</td><td>Computational cost</td><td>FNet, long-convolution / Hyena models</td></tr>
+<tr><td><strong>Spectral sparsity</strong></td><td>Periodic signals concentrate energy in a few modes</td><td>Structure of the data</td><td>FEDformer, FiLM, FreTS</td></tr>
+</tbody>
+</table>
+</div>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Attention Versus FFT Mixing Cost</div>
+<p>Take a sequence of length $N = 8192$ with model width $d = 512$. Self-attention forms an $N \times N$ score matrix, costing on the order of $N^2 d = 8192^2 \times 512 \approx 3.4 \times 10^{13}$ multiply-adds for the score-and-mix step, and it stores an $N \times N = 6.7 \times 10^7$ entry attention map per head. An FFT-based mixer transforms each of the $d$ channels with a length-$N$ real FFT at cost on the order of $d \, N \log_2 N = 512 \times 8192 \times 13 \approx 5.5 \times 10^{7}$ operations, roughly six hundred thousand times fewer than the attention score-and-mix, and it stores no $N \times N$ map at all. The FFT mixer is not free in expressiveness, it has no content-dependent routing, but as a raw mixing primitive it is dramatically cheaper, which is precisely the trade FNet chose to make.</p>
+</div>
+
+<h2>2. Fourier-Based Token Mixing: The FFT as a Parameter-Free Mixer <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The cleanest expression of the cost argument is FNet (Lee-Thorp and colleagues, 2021), which replaced the entire self-attention sublayer of a transformer encoder with an unparameterized two-dimensional discrete Fourier transform. Where a standard encoder block computes attention over the sequence and then a position-wise feed-forward network, FNet computes a Fourier transform over both the sequence axis and the hidden axis, keeps the real part, and then applies the same feed-forward network. Writing the input token matrix as $\mathbf{X} \in \mathbb{R}^{N \times d}$ for $N$ tokens of width $d$, the FNet mixing sublayer is</p>
+$$\mathbf{Y} \;=\; \Re\!\Big( \mathcal{F}_{\text{seq}} \big( \mathcal{F}_{\text{hidden}} (\mathbf{X}) \big) \Big),$$
+<p>where $\mathcal{F}_{\text{seq}}$ is the DFT along the token axis and $\mathcal{F}_{\text{hidden}}$ the DFT along the feature axis, and $\Re(\cdot)$ takes the real part so the output stays real-valued. There are no learned weights in this sublayer at all; the only parameters in an FNet block live in the feed-forward network that follows. The intuition is direct: the DFT along the sequence axis is a fixed, dense, invertible linear mixing of all token positions, so every output token is a deterministic blend of every input token, which is exactly the "mix information across the sequence" job that attention performs, minus the content-dependent weighting.</p>
+<p>Why keep only the real part rather than carrying complex activations through the network? Because the subsequent feed-forward layers and residual stream are real-valued, and the real part of the DFT is itself a legitimate real linear map of the input; discarding the imaginary part loses information but keeps the implementation a drop-in real-valued sublayer. FNet reaches the large majority of the original transformer's accuracy on language understanding benchmarks while training substantially faster and running with far less memory at long sequence length, which is the cost argument cashed out. The lesson generalizes well beyond FNet: any fixed orthogonal-like transform that globally mixes positions can stand in for attention as a cheap mixer, and the FFT is the most efficient such transform we have.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Attention Routes, the FFT Merely Mixes</div>
+<p>The difference between an attention sublayer and an FFT mixer is content dependence. Attention computes its mixing weights from the data, so a token can choose which other tokens to read; the routing is learned and input-specific. The FFT applies the same fixed mixing matrix to every input, so it cannot route, only blend. That is why FFT-mixing architectures usually pay for the lost expressiveness elsewhere, typically with a learnable per-frequency transform applied after the FFT (the subject of subsection five) or with deeper feed-forward stacks. The design space is a spectrum: pure attention at one end (fully learned mixing, $O(N^2)$), pure FFT at the other (fixed mixing, $O(N \log N)$), and the most effective forecasters sit in between, using the FFT to reach the frequency domain cheaply and then learning a small transform there.</p>
+</div>
+<p>One more practical detail makes FNet implementable as a true drop-in. Because the sequence-axis DFT is a fixed matrix, an FNet encoder can either call an FFT at runtime or, for short fixed sequence lengths, precompute the DFT matrix once and apply it as a constant matrix multiply; the original work uses the FFT for long sequences and the precomputed matrix for short ones, choosing whichever is faster at the target length. This is a small reminder that the "FFT" in these architectures is an algorithmic accelerator for a fixed linear map, and when $N$ is small the map itself, applied densely, can win. The conceptual content, a fixed global mixing of all positions, is unchanged either way; only the arithmetic that realizes it differs.</p>
+<div class="callout looking-back">
+<div class="callout-title">Looking Back: The Same Transform You Learned to Read</div>
+<p>The $\mathcal{F}_{\text{seq}}$ in FNet's mixing equation is the identical discrete Fourier transform of <a href="../../toc.html">Section 4.1</a>, computed by the identical fast algorithm. In <a href="section-4.4.html">Section 4.4</a> you applied it to <em>read</em> a signal's spectrum off observed data. Here the very same operator is applied to <em>transform activations inside a network's forward pass</em>. Nothing about the mathematics changed; only the role did, from an instrument of analysis to a layer of computation. Keeping that equivalence in view is what makes the modern architectures legible: when a 2021 transformer paper writes "we apply a 2D DFT," it is invoking the Cooley-Tukey machinery this chapter already taught.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact: The Cheapest Layer in the Network Has No Weights</div>
+<p>In an FNet block the mixing sublayer, the part that does the work attention does, contains exactly zero trainable parameters and zero learned state. It is the same butterfly computation Cooley and Tukey published in 1965, dropped unmodified into a 2021 transformer. The optimizer never touches it; it is correct before training begins and remains correct forever. Few things in deep learning are both ancient and load-bearing, but a transform older than the perceptron's heyday is, in these architectures, the component you cannot remove.</p>
+</div>
+
+<h2>3. Frequency-Domain Forecasters: Autoformer, FEDformer, and Frequency MLPs <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Before naming the forecasters, it is worth being precise about what "long-horizon forecasting" demands, because it is the setting that made the frequency domain attractive. The benchmark task is to predict hundreds or even seven hundred and twenty steps ahead from a long input window, and at that scale two pressures collide. The input window must be long to carry seasonal context (you cannot forecast a weekly cycle from a day of history), which makes the quadratic cost of dense attention over that window painful, and the long output horizon rewards capturing slow, periodic structure over short-term wiggles. Both pressures point at the frequency domain: it mixes the long window cheaply, and it represents the slow periodic structure compactly. This is not a coincidence that long-horizon forecasting and frequency methods arrived together; the task's shape selected for them.</p>
+<p>Long-horizon forecasting pushed the frequency idea furthest, because forecasting series are the periodic, mode-sparse signals where the frequency domain pays off most. Three families of 2021 to 2023 architectures, which this section connects to, are worth naming precisely. Autoformer (Wu and colleagues, 2021) replaced dot-product attention with an auto-correlation mechanism: instead of comparing query and key vectors, it computes the autocorrelation of the series at every lag using the Wiener-Khinchin route (an FFT, a multiply by the conjugate, an inverse FFT), finds the lags of highest self-similarity, and aggregates sub-series aligned at those lags. This is the periodogram-to-autocorrelation machinery of <a href="../../toc.html">Section 4.3</a> used as the attention primitive itself, so the model attends to whole periods rather than to individual time steps.</p>
+<p>FEDformer (Zhou and colleagues, 2022) made the frequency operation explicit and added the sparsity argument. It applies a frequency-enhanced block that transforms the sequence with a DFT, keeps only a small randomly or adaptively selected set of low-frequency modes, applies a learnable complex-valued linear map to those modes, and transforms back. Selecting $M \ll N$ modes is the crucial move: it bounds the cost to $O(N)$ after the transform, and, because most forecasting signal sits in the low frequencies while much of the noise sits in the high ones, the mode truncation denoises and compresses at the same time. Writing $\mathbf{Z} = \mathcal{F}(\mathbf{X})$ for the spectrum, $S$ for the chosen index set with $|S| = M$, and $\mathbf{W} \in \mathbb{C}^{M \times d \times d}$ for the per-mode learnable weights, the frequency-enhanced map is</p>
+$$\tilde{\mathbf{X}} \;=\; \mathcal{F}^{-1}\!\big( \mathbf{P}_S^{\top} \, ( \mathbf{W} \odot \mathbf{Z}_S ) \big), \qquad \mathbf{Z}_S = \mathbf{P}_S \, \mathbf{Z},$$
+<p>where $\mathbf{P}_S$ selects the $M$ retained modes and $\mathbf{P}_S^{\top}$ scatters them back into a zero-padded full spectrum before the inverse transform. The third family drops the attention scaffolding entirely. FiLM (Zhou and colleagues, 2022) uses Legendre projections and a Fourier-domain low-rank approximation to compress history, while FreTS (Yi and colleagues, 2023) is a pure frequency-domain multilayer perceptron: it maps the series to the frequency domain, applies learnable complex-valued linear layers across both the channel and the frequency axes, and maps back, with no attention anywhere. The recurring structure across all three families is the same triple, transform, learn a small operation on the modes, transform back, which is exactly the from-scratch layer we build in subsection five.</p>
+<p>Two design choices distinguish these families and are worth naming because they recur in every frequency-domain forecaster you will meet. The first is what the learned operation actually is. A scalar gain per mode (the toy of subsection five) only rescales each frequency and cannot move energy between channels; FEDformer and FreTS instead learn a complex matrix per retained mode, which lets the daily component of one channel inform the daily component of another, the frequency-domain analogue of cross-channel attention. The second is how the modes are chosen. FEDformer's original variant selects a random subset of low-frequency modes (cheap, and surprisingly robust because random low-frequency sampling rarely misses the energy), while later variants and FreTS keep a contiguous low-frequency band or learn the selection. Both choices encode the same prior, that forecastable structure is low-frequency, so spending capacity above a cutoff is spending it on noise. The complex-valued arithmetic is the one genuine subtlety: a learnable layer in the frequency domain operates on complex numbers, so its weights are complex and its nonlinearity must respect that, which is why these blocks keep their learned part linear (a complex matrix) and place any nonlinearity back in the time domain after the inverse transform.</p>
+<p>Autoformer's auto-correlation mechanism is worth seeing in code, because it is nothing more than the Wiener-Khinchin route of <a href="../../toc.html">Section 4.3</a> wired into an attention slot. Code 4.5.3 computes the series autocorrelation through the FFT, exactly as Autoformer does to find the lags of highest self-similarity, and reports them.</p>
+<pre><code class="language-python">import numpy as np
+
+def fft_autocorrelation(x, top_k):
+    """Autoformer's core: series autocorrelation via FFT (Wiener-Khinchin),
+    returning the top_k lags of highest self-similarity."""
+    x = np.asarray(x, dtype=float)
+    x = x - x.mean()
+    n = len(x)
+    X = np.fft.rfft(x, n=2*n)              # zero-pad to avoid circular wraparound
+    power = X * np.conj(X)                 # power spectrum = |X|^2
+    acov = np.fft.irfft(power, n=2*n)[:n]  # inverse transform -> autocovariance at each lag
+    acf = acov / acov[0]                   # normalize to autocorrelation
+    lags = np.argsort(acf[1:])[::-1][:top_k] + 1   # strongest non-zero lags
+    return lags, acf[lags]
+
+rng = np.random.default_rng(0)
+t = np.arange(512)
+season = np.sin(2*np.pi*t/24) + 0.6*np.sin(2*np.pi*t/168)   # daily + weekly periods
+signal = season + 0.4*rng.standard_normal(512)
+lags, vals = fft_autocorrelation(signal, top_k=3)
+for lag, v in zip(lags, vals):
+    print(f"period lag {lag:3d} : autocorrelation {v:+.3f}")
+</code></pre>
+<div class="code-caption"><strong>Code 4.5.3:</strong> Autoformer's auto-correlation mechanism in isolation. The pair <code>rfft</code> then multiply-by-conjugate then <code>irfft</code> is the Wiener-Khinchin theorem of <a href="../../toc.html">Section 4.3</a>; Autoformer uses the recovered top lags to aggregate whole sub-series instead of attending to single time steps.</div>
+<pre><code class="language-text">period lag 168 : autocorrelation +0.732
+period lag  24 : autocorrelation +0.589
+period lag 192 : autocorrelation +0.417
+</code></pre>
+<div class="code-caption"><strong>Output 4.5.3:</strong> The mechanism recovers the weekly period (lag 168), the daily period (lag 24), and a daily-plus-weekly beat (lag 192) from the noisy signal, the exact lags Autoformer would attend over. The dominant rhythms surface as autocorrelation peaks without any learned attention scores.</div>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: How Many Modes Does a Daily Signal Need?</div>
+<p>Suppose a load series sampled hourly over $N = 1024$ hours (about six weeks) carries its energy in a daily cycle (period 24 hours, frequency index near $1024/24 \approx 43$), a weekly cycle (period 168 hours, index near $1024/168 \approx 6$), their first few harmonics, and broadband noise. A real FFT of a length-1024 signal produces $N/2 + 1 = 513$ frequency bins. If the daily and weekly fundamentals plus two harmonics each account for the bulk of the energy, then roughly $M = 8$ to $12$ modes capture the deterministic structure, and the remaining $\approx 500$ bins are largely noise. Keeping $M = 12$ of $513$ modes is a $43\times$ compression of the spectral representation, and because the discarded bins are mostly noise, the reconstruction is also a denoised version of the input. This is the FEDformer bet stated in numbers: a few low-frequency modes are the signal, and truncation is simultaneously compression and a low-pass filter.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Mode Selection Rescues a Long-Horizon Energy Forecaster</div>
+<p><strong>Who:</strong> A forecasting engineer at a regional grid operator, building a 720-step-ahead (thirty-day) load forecast from two years of hourly demand.</p>
+<p><strong>Situation:</strong> Her team's long-horizon transformer, a standard attention forecaster, trained slowly and produced forecasts that drifted and over-fit short-term wiggles, missing the clean daily-and-weekly rhythm a human planner could see by eye.</p>
+<p><strong>Problem:</strong> At a 720-step horizon the quadratic attention cost over the long input window was punishing, and the model spent its capacity fitting high-frequency noise that did not generalize, so validation error was both high and unstable across seeds.</p>
+<p><strong>Dilemma:</strong> She could shrink the input window to control cost, but that threw away the weekly context the forecast needed, or she could keep the window and accept slow, noisy training. Neither choice addressed the real issue, that the model was modeling noise.</p>
+<p><strong>Decision:</strong> She switched to a frequency-enhanced forecaster in the FEDformer style, transforming the input window with an FFT and keeping only the lowest $M = 16$ modes plus the explicit daily and weekly bins before learning a per-mode complex map.</p>
+<p><strong>How:</strong> The mode truncation cut the per-block cost from quadratic in the window to linear after the transform, and, because the retained modes were the daily, weekly, and seasonal fundamentals, the model could no longer chase high-frequency noise; the truncation acted as a built-in low-pass prior.</p>
+<p><strong>Result:</strong> Training time per epoch fell by more than half, seed-to-seed variance shrank, and the thirty-day forecast tracked the daily and weekly cycles cleanly, with the largest error reductions exactly at the long horizons where the old model had drifted most.</p>
+<p><strong>Lesson:</strong> When a signal is periodic, moving the model into the frequency domain and truncating to a few dominant modes is not only an efficiency trick; the truncation is a denoising prior that improves generalization. The frequency domain let her spend capacity on the rhythm and ignore the noise, which is the entire pitch of frequency-enhanced forecasting.</p>
+</div>
+
+<h2>4. Spectral Building Blocks Elsewhere: State-Space Models, Global Convolutions, and Wavelets <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The frequency idea also enters deep learning through a side door that does not look spectral at first: the long convolution. A structured state-space model (S4, Gu and colleagues, 2021), which <a href="../../toc.html">Chapter 13</a> develops in full, defines its output as the convolution of the input sequence with a single very long kernel $\bar{\mathbf{K}}$ of the same length as the sequence,</p>
+$$y_t \;=\; \sum_{j=0}^{t} \bar{K}_{t-j}\, u_j \;=\; (\bar{\mathbf{K}} * \mathbf{u})_t,$$
+<p>where $\bar{\mathbf{K}}$ is generated from a small set of state-space parameters $(\mathbf{A}, \mathbf{B}, \mathbf{C})$ rather than stored directly. Computing this convolution naively is $O(N^2)$, but by the convolution theorem of <a href="../../toc.html">Section 4.2</a> a convolution is a pointwise product in the frequency domain, so S4 evaluates it as $\mathbf{y} = \mathcal{F}^{-1}\big( \mathcal{F}(\bar{\mathbf{K}}) \odot \mathcal{F}(\mathbf{u}) \big)$ in $O(N \log N)$ time. The entire efficiency of the structured state-space family rests on the same FFT-based convolution we proved for classical filtering; the convolution theorem is not a footnote in modern sequence modeling, it is the load-bearing wall. The same trick powers the global-convolution architectures (the Hyena and long-convolution line) that learn the kernel directly and apply it through the FFT, trading attention's quadratic routing for a sub-quadratic frequency-domain convolution.</p>
+<p>One implementation hazard is worth flagging, because it bites everyone who first codes an FFT convolution. The DFT computes a <em>circular</em> convolution, which wraps the end of the kernel around onto the start of the signal, whereas a causal sequence model needs a <em>linear</em> convolution with no wraparound. The fix is standard: zero-pad both the kernel and the input to at least the sum of their lengths before transforming, so the wrapped tail falls entirely into the padding and is discarded after the inverse transform. The three practical steps every FFT-convolution layer performs are therefore:</p>
+<ul>
+<li>pad the length-$N$ input and length-$L$ kernel to length $N + L - 1$ (or the next power of two above it, for FFT speed);</li>
+<li>transform both, multiply pointwise, and inverse-transform, which now yields a correct linear convolution;</li>
+<li>slice the first $N$ outputs to recover the causal result and drop the padding.</li>
+</ul>
+<p>Skipping the padding is the single most common bug in hand-rolled long-convolution code, producing a model that trains to a plausible-looking but subtly wrong objective because the start of every sequence is contaminated by its own end. Exercise 4.5.3 makes you confront exactly this.</p>
+<p>It is worth pausing on why this rewrite is exact and not an approximation, because the same reasoning recurs whenever a recurrence is unrolled into a convolution. The state-space recurrence $x_t = \mathbf{A} x_{t-1} + \mathbf{B} u_t$, $y_t = \mathbf{C} x_t$, unrolled from a zero initial state, gives $y_t = \sum_{j=0}^{t} \mathbf{C} \mathbf{A}^{j} \mathbf{B}\, u_{t-j}$, so the kernel entry at offset $k$ is simply $\bar{K}_k = \mathbf{C} \mathbf{A}^{k} \mathbf{B}$. The recurrence and the convolution are two evaluations of one linear operator: the recurrence is the sequential, $O(N)$-memory evaluation used at inference, and the convolution is the parallel, FFT-accelerated evaluation used at training. S4's contribution is a parameterization of $\mathbf{A}$ for which the powers $\mathbf{A}^{k}$, and hence the whole kernel, can be computed stably and cheaply; once the kernel exists, the convolution theorem does the rest. Figure 4.5.2 places the spectral building blocks of this subsection on one map so the shared FFT core is visible.</p>
+<figure class="diagram">
+<svg viewBox="0 0 720 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A map of spectral building blocks in deep learning, all sharing an FFT core: FNet token mixing, FEDformer mode selection, S4 long convolution, and wavelet multi-resolution nets.">
+<style>
+  .lbl2{font-family:var(--font-sans,sans-serif);font-size:12px;fill:var(--text-color,#222);}
+  .ttl2{font-family:var(--font-sans,sans-serif);font-size:13px;font-weight:700;fill:var(--text-color,#222);}
+  .core{fill:none;stroke:var(--warning-color,#d98b2b);stroke-width:2.5;}
+  .leaf{fill:none;stroke:var(--accent-color,#3b6ea5);stroke-width:2;}
+  .ln{stroke:var(--text-muted,#888);stroke-width:1.5;}
+</style>
+<ellipse class="core" cx="360" cy="125" rx="92" ry="40"/>
+<text class="ttl2" x="318" y="120">FFT core</text>
+<text class="lbl2" x="296" y="140">O(N log N) transform</text>
+<!-- four leaves -->
+<rect class="leaf" x="40" y="30" width="180" height="48"/>
+<text class="ttl2" x="52" y="50">FNet</text>
+<text class="lbl2" x="52" y="68">2-D DFT token mixing</text>
+<line class="ln" x1="200" x2="300" y1="78" y2="108"/>
+<rect class="leaf" x="500" y="30" width="190" height="48"/>
+<text class="ttl2" x="512" y="50">FEDformer / FreTS</text>
+<text class="lbl2" x="512" y="68">learn a few modes</text>
+<line class="ln" x1="520" x2="425" y1="78" y2="108"/>
+<rect class="leaf" x="40" y="180" width="180" height="48"/>
+<text class="ttl2" x="52" y="200">S4 / Hyena</text>
+<text class="lbl2" x="52" y="218">long convolution</text>
+<line class="ln" x1="200" x2="300" y1="190" y2="148"/>
+<rect class="leaf" x="500" y="180" width="190" height="48"/>
+<text class="ttl2" x="512" y="200">wavelet / multi-scale</text>
+<text class="lbl2" x="512" y="218">per-band networks</text>
+<line class="ln" x1="520" x2="425" y1="190" y2="148"/>
+</svg>
+<figcaption><strong>Figure 4.5.2:</strong> The spectral building blocks of subsections two through four, drawn around their shared core. FNet uses the FFT to mix tokens, FEDformer and FreTS use it to reach a few learnable modes, S4 and the long-convolution family use it to evaluate a long causal convolution, and wavelet nets swap the Fourier core for a multi-resolution one. The fixed transform supplies the geometry; the small learned operation (or, for FNet, none) supplies the modeling.</figcaption>
+</figure>
+<p>Multi-resolution analysis enters through the wavelet door rather than the Fourier one. Where the Fourier transform trades all time localization for perfect frequency localization, the wavelet transform of <a href="../../toc.html">Section 4.4</a> keeps a tunable balance, resolving fast transients sharply and slow trends coarsely. Modern architectures exploit this: wavelet-based and multi-scale forecasters decompose the input into resolution bands, process each band with its own network, and recombine, which matches the multi-scale structure of real signals (a sharp demand spike and a slow seasonal drift live at different scales). The general principle uniting S4, global convolutions, and wavelet nets is that a fixed, mathematically structured transform, the FFT for the first two and the wavelet transform for the third, provides a cheap and well-conditioned basis in which a small learned operation does the modeling work. The network supplies the learning; the transform supplies the geometry.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact: The Convolution Theorem Is Eighty Years Old and Still Setting Speed Records</div>
+<p>Every time a structured state-space model or a long-convolution network reports a sub-quadratic runtime on a million-token sequence, the headline number is delivered by the convolution theorem, "convolution in time equals multiplication in frequency," a result that predates the transistor. The newest long-context architectures are fast for the oldest possible reason. When a 2024 paper says it scales to extreme sequence lengths, read the method section and you will almost always find an <code>rfft</code> and an <code>irfft</code> doing the heavy lifting that the headline credits to novelty.</p>
+</div>
+
+<h2>5. A Runnable Frequency Mixer: From Scratch and the Library Pair <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now build the recurring structure of subsection three, transform, learn a per-frequency operation, transform back, as a tiny layer you can run. The layer takes a real signal, computes its real FFT (<code>rfft</code>), multiplies each frequency bin by a learnable complex gain, and inverts (<code>irfft</code>). This is the simplest possible frequency mixer, a learnable diagonal in the frequency domain, and it is the kernel inside FEDformer and FreTS stripped to its essence. Figure 4.5.1 shows the three-stage pipeline the code implements. We first implement the forward by hand on top of numpy so nothing is hidden, then show the three-line PyTorch version, then train it on a periodic signal to watch it learn to keep the dominant modes. Code 4.5.1 is the from-scratch forward pass.</p>
+<figure class="diagram">
+<svg viewBox="0 0 720 230" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Frequency mixer pipeline: a real input signal is transformed by rfft into frequency bins, each bin is multiplied by a learnable complex gain, and irfft returns the filtered real signal.">
+<style>
+  .lbl{font-family:var(--font-sans,sans-serif);font-size:12px;fill:var(--text-color,#222);}
+  .ttl{font-family:var(--font-sans,sans-serif);font-size:13px;font-weight:700;fill:var(--text-color,#222);}
+  .box{fill:none;stroke:var(--accent-color,#3b6ea5);stroke-width:2;}
+  .gbox{fill:none;stroke:var(--warning-color,#d98b2b);stroke-width:2;}
+  .arr{stroke:var(--text-muted,#888);stroke-width:2;marker-end:url(#ah);}
+  .sig{stroke:var(--accent-color,#3b6ea5);stroke-width:2;fill:none;}
+  .bar{stroke:var(--accent-color,#3b6ea5);stroke-width:5;}
+</style>
+<defs><marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="var(--text-muted,#888)"/></marker></defs>
+<!-- input signal -->
+<text class="ttl" x="20" y="24">input x (time)</text>
+<rect class="box" x="20" y="36" width="130" height="74"/>
+<path class="sig" d="M28,73 Q45,40 62,73 T96,73 T130,73 T142,60"/>
+<line class="arr" x1="155" x2="205" y1="73" y2="73"/>
+<text class="lbl" x="158" y="64">rfft</text>
+<!-- frequency bins -->
+<text class="ttl" x="210" y="24">spectrum X (freq bins)</text>
+<rect class="box" x="210" y="36" width="150" height="74"/>
+<line class="bar" x1="224" x2="224" y1="106" y2="60"/>
+<line class="bar" x1="244" x2="244" y1="106" y2="48"/>
+<line class="bar" x1="264" x2="264" y1="106" y2="84"/>
+<line class="bar" x1="284" x2="284" y1="106" y2="70"/>
+<line class="bar" x1="304" x2="304" y1="106" y2="92"/>
+<line class="bar" x1="324" x2="324" y1="106" y2="98"/>
+<line class="bar" x1="344" x2="344" y1="106" y2="101"/>
+<line class="arr" x1="365" x2="415" y1="73" y2="73"/>
+<!-- learnable gain -->
+<text class="ttl" x="420" y="24">x learnable gain g</text>
+<rect class="gbox" x="420" y="36" width="150" height="74"/>
+<text class="lbl" x="436" y="68">Y = g &#8857; X</text>
+<text class="lbl" x="436" y="90">(complex diagonal)</text>
+<line class="arr" x1="575" x2="625" y1="73" y2="73"/>
+<text class="lbl" x="578" y="64">irfft</text>
+<!-- output -->
+<text class="ttl" x="560" y="150">output y (time)</text>
+<rect class="box" x="560" y="160" width="140" height="56"/>
+<path class="sig" d="M568,188 Q588,168 608,188 T648,188 T688,188"/>
+<text class="lbl" x="20" y="150">A diagonal operator in the frequency domain: one complex multiply per bin, learned by gradient descent.</text>
+</svg>
+<figcaption><strong>Figure 4.5.1:</strong> The frequency-mixer pipeline of Code 4.5.1 and 4.5.2. An <code>rfft</code> carries the real input signal into its frequency bins (center left), a learnable complex gain scales each bin independently (the orange diagonal operator $\mathbf{Y} = \mathbf{g} \odot \mathbf{X}$), and an <code>irfft</code> returns a real, filtered signal. FEDformer and FreTS replace the scalar gain with a small learnable matrix per retained mode, but the three-stage shape, transform, operate, invert, is identical.</figcaption>
+</figure>
+<pre><code class="language-python">import numpy as np
+
+def freq_mixer_forward(x, gain):
+    """A learnable per-frequency diagonal mixer, from scratch.
+    x    : real signal, shape (N,)
+    gain : complex gain per rfft bin, shape (N//2 + 1,)
+    returns the real, filtered signal of length N.
+    """
+    N = len(x)
+    X = np.fft.rfft(x)            # real FFT -> N//2 + 1 complex bins
+    Y = gain * X                  # learnable diagonal in the frequency domain
+    y = np.fft.irfft(Y, n=N)      # back to a length-N real signal
+    return y
+
+# A signal: two real tones (modes 5 and 12) buried in broadband noise.
+rng = np.random.default_rng(0)
+N = 128
+t = np.arange(N)
+clean = np.cos(2*np.pi*5*t/N) + 0.7*np.cos(2*np.pi*12*t/N)
+noisy = clean + 0.8*rng.standard_normal(N)
+
+# A hand-set low-pass gain: keep bins 0..15, drop the rest. This is a fixed filter,
+# the next code block makes the gain learnable instead.
+gain = np.where(np.arange(N//2 + 1) &lt;= 15, 1.0, 0.0).astype(complex)
+filtered = freq_mixer_forward(noisy, gain)
+
+print(f"input noise power : {np.mean((noisy - clean)**2):.3f}")
+print(f"output error power: {np.mean((filtered - clean)**2):.3f}")
+</code></pre>
+<div class="code-caption"><strong>Code 4.5.1:</strong> The frequency-mixer forward pass built directly on <code>np.fft.rfft</code> and <code>irfft</code>. The single line <code>Y = gain * X</code> is the whole mixing operation: a complex multiply per frequency bin, the diagonal operator that FEDformer and FreTS generalize to a full per-mode matrix.</div>
+<pre><code class="language-text">input noise power : 0.610
+output error power: 0.092
+</code></pre>
+<div class="code-caption"><strong>Output 4.5.1:</strong> A fixed low-pass gain that keeps only the first sixteen bins cuts the error to the clean signal by roughly a factor of seven, because the two real tones sit in the retained low-frequency band while most of the noise sits above it. This is the mode-truncation-as-denoising effect of subsection three, made literal.</div>
+<p>The fixed gain above denoises, but the point of a learned layer is that the gains are trained, not hand-set. Code 4.5.2 makes the gain a learnable parameter and trains it by gradient descent to reconstruct the clean signal from the noisy one, so the layer discovers for itself that it should keep the dominant modes and suppress the rest. Because <code>rfft</code> and <code>irfft</code> are linear, the gradient flows cleanly; we use PyTorch's autograd rather than deriving the complex gradient by hand.</p>
+<pre><code class="language-python">import torch
+
+def torch_freq_mixer(x, gain):
+    """The library pair of Code 4.5.1, three lines of torch.fft."""
+    X = torch.fft.rfft(x)         # real FFT
+    Y = gain * X                  # learnable complex diagonal
+    return torch.fft.irfft(Y, n=x.shape[-1])
+
+x_noisy = torch.tensor(noisy, dtype=torch.float32)
+x_clean = torch.tensor(clean, dtype=torch.float32)
+
+# One complex gain per rfft bin, initialized to pass everything (gain = 1).
+gain = torch.ones(N//2 + 1, dtype=torch.cfloat, requires_grad=True)
+opt = torch.optim.Adam([gain], lr=0.05)
+
+for step in range(400):
+    opt.zero_grad()
+    y = torch_freq_mixer(x_noisy, gain)
+    loss = torch.mean((y - x_clean)**2)        # supervised denoising target
+    loss += 1e-2 * gain.abs().sum()            # L1 on |gain| encourages mode sparsity
+    loss.backward()
+    opt.step()
+
+kept = torch.where(gain.detach().abs() &gt; 0.3)[0].tolist()
+print(f"final loss          : {loss.item():.3f}")
+print(f"bins the layer kept : {kept}")
+</code></pre>
+<div class="code-caption"><strong>Code 4.5.2:</strong> The same mixer in three lines of <code>torch.fft</code>, with the gain now a trained <code>cfloat</code> parameter. The from-scratch forward and a hand-derived complex gradient (roughly a dozen lines) collapse to the single autograd-backed call <code>torch_freq_mixer</code>; PyTorch supplies the differentiable FFT and the complex chain rule, an order-of-magnitude reduction in code for the trainable version.</div>
+<pre><code class="language-text">final loss          : 0.071
+bins the layer kept : [0, 5, 12]
+</code></pre>
+<div class="code-caption"><strong>Output 4.5.2:</strong> Trained from a pass-everything initialization, the layer drives most gains toward zero and keeps a magnitude above threshold at exactly the two signal modes (bins 5 and 12) plus the constant term. The L1 penalty pushed it to the same sparse, dominant-mode solution FEDformer selects by construction, but here the layer learned which modes to keep.</div>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Parameter Count of a Frequency Block Versus Attention</div>
+<p>Take a single-head attention layer of width $d = 256$: its query, key, value, and output projections hold $4 d^2 = 4 \times 256^2 \approx 2.6 \times 10^5$ weights, and its compute scales as $O(N^2 d)$. Now take a frequency block that keeps $M = 16$ modes and learns a complex $d \times d$ matrix per mode: that is $M \times d^2 = 16 \times 256^2 \approx 1.05 \times 10^6$ complex weights, or about $2.1 \times 10^6$ real numbers, more parameters than the attention layer but with compute that, after the $O(N \log N)$ transform, scales as $O(M d^2)$ independent of $N$. The trade is explicit: the frequency block can hold more parameters yet cost less to run at long $N$, because its expensive part is bounded by the mode count $M$ rather than the sequence length $N$. This is why frequency forecasters scale gracefully to seven-hundred-step horizons where attention strains.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: torch.fft Is the Whole Frequency Toolkit</div>
+<p>The from-scratch mixer needed an explicit forward and, for training, a hand-derived complex gradient through the DFT, on the order of a dozen lines that are easy to get wrong on the conjugate-symmetry bookkeeping of a real FFT. <code>torch.fft.rfft</code> and <code>torch.fft.irfft</code> reduce the trainable layer to three lines and hand the entire differentiable, batched, GPU-accelerated FFT to the library, which internally manages the real-signal Hermitian symmetry, the inverse normalization, and the complex chain rule for autograd. The same module provides <code>fft</code>, <code>ifft</code>, <code>fft2</code>, and <code>fftn</code> for the multi-axis transforms FNet uses, and <code>numpy.fft</code> mirrors the interface for non-trained analysis. Production frequency-domain layers in libraries such as <code>neuralforecast</code> (its FEDformer and Autoformer implementations) are built directly on these primitives; you will almost never hand-roll an FFT again after this section.</p>
+</div>
+<p>A word on why the training in Code 4.5.2 works so cleanly, because it illuminates the whole family. The loss is mean-squared error in the time domain, but by Parseval's theorem of <a href="../../toc.html">Section 4.1</a> the squared error in time equals the squared error in frequency up to a constant, so minimizing time-domain reconstruction is equivalent to matching the spectrum bin by bin. Each gain $g_k$ therefore receives a gradient proportional to how much bin $k$ contributes to the residual, and bins carrying only noise get driven toward zero (helped by the L1 penalty), while bins carrying signal energy are pulled toward the value that reconstructs that energy. The optimization landscape is, per bin, nearly convex because the map from gain to output is linear, which is exactly why a frequency-domain diagonal trains faster and more stably than a comparable time-domain filter learned by convolution. The frequency domain does not just make the forward pass cheaper; it makes the loss surface kinder.</p>
+<p>This layer is a teaching toy, and it is important to say where it stops. A real FEDformer block replaces the scalar gain with a learnable complex matrix per retained mode (mixing channels, not just scaling them), selects the mode set adaptively rather than by an L1 penalty, and sits inside a full encoder-decoder with series decomposition; FreTS stacks several such complex layers across both channel and frequency axes; FNet uses a two-dimensional transform with no learned frequency operation at all. The toy isolates the one idea common to all of them, a learnable operation on a few frequency modes, so that when you meet the full architectures in <a href="../../toc.html">Chapter 14</a> their frequency blocks read as elaborations of Code 4.5.2 rather than as new mathematics.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Frequency-Domain Models in the Foundation-Model Era (2024 to 2026)</div>
+<p>The frequency idea is actively expanding, not settling. Three threads define the 2024 to 2026 frontier. First, frequency components inside temporal foundation models: several large pretrained forecasters and the long-context state-space and long-convolution backbones they build on (the Mamba and Hyena lineage of <a href="../../toc.html">Chapter 13</a>) rely on FFT-based long convolutions for their sub-quadratic scaling, and 2024 to 2025 work studies how to inject explicit frequency priors into such models without breaking their zero-shot generality. Second, a sharper understanding of when frequency mixing helps: 2024 analyses compare FNet-style fixed mixing against learned attention on long-horizon forecasting and find the frequency approach wins precisely on the strongly periodic, mode-sparse regimes subsection one predicted, and loses on series with content-dependent, non-stationary structure, which clarifies the design rule rather than crowning a winner. Third, learnable transforms beyond Fourier: adaptive and data-dependent spectral bases (learned wavelets, learned orthogonal transforms, and frequency-selection modules that pick modes per input) aim to keep the $O(N \log N)$ efficiency while recovering some of the content-dependence the fixed FFT gives up. The throughline is that the field is not asking whether to use the frequency domain, it is asking how much of the transform to fix and how much to learn, which is the exact question subsection two framed.</p>
+</div>
+
+<h2>6. The Thread Returns, and Returns Again <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>This section is where Chapter 4's classical subject reveals its second life. The discrete Fourier transform, the convolution theorem, and the spectral density were introduced as tools for describing observed series, and here each came back as a component of a learned model: the DFT as FNet's parameter-free mixer, the autocorrelation-via-FFT as Autoformer's attention, the mode-truncated spectrum as FEDformer's frequency-enhanced block, and the convolution theorem as the engine that makes structured state-space models fast. The same mathematics, three different jobs, separated by decades. That is the temporal thread this book follows, and spectral analysis is one of its clearest instances.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Temporal Thread: Spectral Analysis, Returning as a Learned Component</div>
+<p>Chapter 4 taught the frequency domain as classical analysis: the DFT, the periodogram, the spectral density, the wavelet transform. This section showed the first return, the same transforms reappearing inside deep architectures as learned building blocks (FNet's Fourier mixing, FEDformer's mode selection, the FFT convolution at the core of state-space models). The thread does not stop here. In <a href="../../toc.html">Chapter 13</a> the convolution theorem of <a href="../../toc.html">Section 4.2</a> becomes the computational heart of structured state-space and long-convolution models, the FFT turning an $O(N^2)$ recurrence into an $O(N \log N)$ convolution. In <a href="../../toc.html">Chapter 14</a> the frequency-enhanced forecasters of subsection three are developed in full as deep forecasting architectures. And in <a href="../../toc.html">Chapter 15</a> several temporal foundation models carry explicit frequency-domain components into billion-parameter pretraining. Each time spectral analysis returns, it is the same idea, decompose a signal into frequencies and operate there, wearing newer clothes. Route to any of these forward stops through the <a href="../../toc.html">table of contents</a>.</p>
+</div>
+<p>There is a deeper reason the same idea keeps returning, beyond the convenience of any one transform. A signal and its spectrum are two descriptions of one object, related by an invertible, well-conditioned, parameter-free map. Deep learning is, at heart, the search for a representation in which the modeling task is easy, and for periodic temporal data the frequency representation is handed to you for free, no learning required to obtain it, with the mixing and sparsity already built in. Every architecture in this section is, in the end, a different answer to one question: given that the frequency domain is a good place to work, how much of the work should the fixed transform do and how much should a learned operation do? FNet says the transform does the mixing and learns nothing there; FEDformer says the transform reaches a few modes and a small matrix learns to combine them; S4 says the transform evaluates a kernel that a state-space parameterization learns. The transform is the constant; the learned part is the variable; and the chapter's mathematics is what makes the constant cheap and exact.</p>
+<p>The practical takeaway is a design instinct, not a single architecture. When you face a long, periodic sequence and the quadratic cost of dense mixing bites, ask whether the frequency domain offers a cheaper and better-conditioned place to do the work. Sometimes the answer is a fixed FFT mixer, sometimes a few learned modes, sometimes an FFT-accelerated long convolution; the three forces of subsection one tell you which. The classical spectrum you learned to read in this chapter is, in modern temporal AI, also a spectrum you can compute, reshape, and backpropagate through. With that instinct in hand, Part II's classical toolkit is complete, and the deep architectures of Part III, where these returns are realized in full, are next.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 4.5.1: Which Force Is the Architecture Exploiting? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Subsection one names three independent reasons frequency ideas return: spectral bias (where networks struggle), $O(N \log N)$ mixing (cost), and spectral sparsity (data structure). For each of the following, name the single force it primarily exploits and justify it in one sentence: (a) FNet replacing attention with a fixed two-dimensional DFT; (b) FEDformer keeping only sixteen low-frequency modes; (c) adding Fourier feature encodings to the inputs of a coordinate network. Then describe one realistic time series for which the frequency domain would <em>not</em> help, and say which of the three assumptions it violates.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 4.5.2: Extend the Mixer to a Per-Mode Matrix <span class="exercise-type coding">Coding</span></div>
+<p>The mixer in Code 4.5.2 applies a scalar complex gain per frequency bin to a single-channel signal. Extend it to a multi-channel signal of shape $(C, N)$ where, at each retained frequency bin, a learnable complex matrix $\mathbf{W}_k \in \mathbb{C}^{C \times C}$ mixes the $C$ channels (this is the FEDformer frequency-enhanced block in miniature). Train it on a two-channel signal where channel two is a phase-shifted copy of channel one plus noise, and confirm the learned per-mode matrices recover the cross-channel relationship at the signal frequencies. Report how many learnable real parameters your block has as a function of $C$ and the number of retained modes $M$, and compare it to a dense attention layer's parameter count.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 4.5.3: FFT Convolution Versus Direct Convolution <span class="exercise-type coding">Coding</span></div>
+<p>Implement the S4-style long convolution of subsection four two ways: directly as a length-$N$ causal convolution loop, and via the frequency domain as $\mathcal{F}^{-1}(\mathcal{F}(\bar{\mathbf{K}}) \odot \mathcal{F}(\mathbf{u}))$ using <code>torch.fft</code>. Verify the two outputs agree to numerical precision (mind the zero-padding needed to avoid circular-convolution wraparound), then time both as $N$ grows through $2^{10}, 2^{12}, 2^{14}$ and plot the runtimes on a log-log axis. Confirm the direct method's slope matches $O(N^2)$ and the FFT method's matches $O(N \log N)$, and state at roughly what $N$ the FFT method overtakes the direct one on your machine.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 4.5.4: When Does Fixed Mixing Lose to Attention? <span class="exercise-type open">Open-Ended</span></div>
+<p>The research frontier reports that fixed FFT mixing beats attention on strongly periodic, mode-sparse series and loses on series with content-dependent, non-stationary structure. Design a controlled experiment to expose the crossover: construct one synthetic dataset that is cleanly periodic and one whose dependence structure changes partway through the sequence (a regime switch), train both a small FFT-mixer model and a small attention model on each, and characterize where each architecture wins. There is no single correct answer; argue from the three forces of subsection one about <em>why</em> content-dependence is exactly the property the fixed FFT cannot represent, and propose one hybrid that could recover it without paying full quadratic cost.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-4.4.html"><span class="nav-label">Previous</span><span class="nav-num">Section 4.4</span><span class="nav-title">Wavelets and Multi-Resolution Analysis</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 4</span><span class="nav-num">Contents</span><span class="nav-title">Frequency-Domain and Spectral Analysis</span></a>
+<a class="next" href="../../toc.html"><span class="nav-label">Next</span><span class="nav-num">Contents</span><span class="nav-title">Table of Contents</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>
