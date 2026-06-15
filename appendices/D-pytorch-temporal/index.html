@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Appendix D: PyTorch for Temporal AI. A code-heavy refresher on tensors and autograd, nn.Module and the recurrent and convolutional and attention modules used in Part III, time-series Datasets and DataLoaders without leakage, the training and evaluation loop with mixed precision and gradient clipping and checkpointing, inference and TorchScript or ONNX export with a note on stateful streaming, and JAX notes on jit, grad, vmap, flax, and optax." name="description"/>
+<title>Appendix D: PyTorch for Temporal AI | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../../toc.html">Appendices</a></div>
+<div class="chapter-label"><a href="index.html">Appendix D: PyTorch for Temporal AI (and JAX notes)</a></div>
+<h1>PyTorch for Temporal AI</h1>
+<p class="chapter-subtitle">Tensors, autograd, nn.Module, time-series data loading, the training loop, export, and a short tour of JAX.</p>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"Give me a tensor, a loss, and a gradient that flows backward through time, and I will fit anything you can shape into a batch. Forget the gradient and I will silently fit your future to your past, and call the leak an accuracy."</p>
+<cite>A Backpropagation Graph That Has Seen Your Validation Set</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>Every deep model in Part III, from the recurrent networks of <a href="../../toc.html">Chapter 10</a> to the foundation models of <a href="../../toc.html">Chapter 15</a>, is built, trained, and shipped with the same five-part PyTorch skeleton: a tensor with an autograd graph, an <code>nn.Module</code> that maps inputs to outputs, a <code>Dataset</code> and <code>DataLoader</code> that feed it batches, a training loop that computes a loss and steps an optimizer, and an export path that freezes the trained module for deployment. This appendix walks that skeleton once, end to end, with runnable code at every step. The temporal twist is that our data is sequential, so the batch always carries a time axis, the windowing must never let the future leak into the past (the discipline of <a href="../../toc.html">Chapter 2.5</a>), and inference often runs as a streaming recurrence rather than a single forward pass. Read this appendix as the toolbox the rest of the book assumes; the closing section sketches JAX for readers who will meet it in the structured state-space and foundation-model literature.</p>
+</div>
+
+<h2>1. Tensors and Autograd</h2>
+<p>A PyTorch tensor is a multidimensional array that also remembers, when asked, how it was computed, so the framework can replay that computation backward to produce gradients. Creating tensors is direct: you can build them from Python lists or NumPy arrays, or allocate them with shape constructors. Every tensor carries three properties you will check constantly: its <code>shape</code> (the size along each axis), its <code>dtype</code> (the numeric type, usually <code>float32</code> for model weights), and its <code>device</code> (CPU or a specific GPU). Getting these three right prevents the large majority of runtime errors in temporal models, where a transposed time axis or a stray <code>float64</code> is the usual culprit.</p>
+
+<pre><code class="language-python">import torch
+
+x = torch.tensor([[1.0, 2.0], [3.0, 4.0]])      # from a Python list, dtype inferred as float32
+z = torch.zeros(2, 3)                             # shape constructor: a 2x3 tensor of zeros
+r = torch.randn(4, 16, 8)                         # random normal, our (batch, time, features) shape
+
+print(x.shape, x.dtype, x.device)                # torch.Size([2, 2]) torch.float32 cpu
+print(r.shape)                                   # torch.Size([4, 16, 8]): 4 series, 16 steps, 8 features
+
+# Move to GPU when one is present; keep a single device variable for the whole program
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+r = r.to(device)                                 # tensors must share a device to interact
+</code></pre>
+<div class="code-caption">Creating tensors and inspecting the three properties that matter most in temporal code: shape, dtype, and device.</div>
+
+<p>Autograd is the engine that makes learning possible. When a tensor is created with <code>requires_grad=True</code>, PyTorch records every operation applied to it into a dynamic computation graph. Calling <code>.backward()</code> on a scalar (typically the loss) walks that graph in reverse, accumulating the partial derivative of the scalar with respect to each leaf tensor into that tensor's <code>.grad</code> field. For a scalar loss $L$ and a parameter $\theta$, autograd computes $\partial L / \partial \theta$ exactly, by the chain rule, with no manual derivation. The example below differentiates a simple quadratic so you can check the result by hand: for $y = \sum (w x)^2$ the gradient with respect to $w$ is $\sum 2 x^2 w$.</p>
+
+<pre><code class="language-python">w = torch.tensor([2.0, 3.0], requires_grad=True)  # a leaf tensor we want gradients for
+x = torch.tensor([1.0, 4.0])                       # data, no gradient tracking needed
+y = ((w * x) ** 2).sum()                           # scalar output: builds the autograd graph
+
+y.backward()                                       # reverse-mode pass: fills w.grad
+print(w.grad)                                      # tensor([4., 96.]) == 2 * x**2 * w, checked by hand
+
+w.grad.zero_()                                     # gradients accumulate, so zero them before the next step
+</code></pre>
+<div class="code-caption">Autograd in three lines: build a scalar, call backward, read the gradient, then zero it before reusing the tensor.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">The (batch, time, features) Convention</div>
+<p>Throughout this book a temporal batch is a rank-3 tensor with shape $(B, T, F)$: $B$ independent sequences, $T$ time steps each, $F$ features per step. PyTorch's recurrent modules call this <code>batch_first=True</code>, and we use it everywhere for readability. Two consequences follow. First, slicing the time axis is always the middle index: <code>x[:, -1, :]</code> is the last step of every sequence, the usual readout for a forecaster. Second, some PyTorch modules default to the older $(T, B, F)$ ordering, so you must pass <code>batch_first=True</code> explicitly or your batch and time axes will silently swap. When a temporal model produces nonsense, check this convention first.</p>
+</div>
+
+<h2>2. nn.Module: Defining Models</h2>
+<p>An <code>nn.Module</code> is the base class for every model and every layer. You subclass it, register submodules and parameters in <code>__init__</code>, and define the forward computation in <code>forward</code>. Any tensor you wrap in <code>nn.Parameter</code> (and every submodule you assign as an attribute) is tracked automatically, so <code>model.parameters()</code> returns the full set of learnable tensors for the optimizer, and <code>model.to(device)</code> moves them all at once. The minimal module below defines a linear forecaster from scratch so you can see what the framework registers; in practice you would assemble built-in layers rather than declare raw parameters.</p>
+
+<pre><code class="language-python">import torch.nn as nn
+
+class LinearForecaster(nn.Module):
+    def __init__(self, n_features, horizon):
+        super().__init__()                              # always call the base constructor first
+        self.W = nn.Parameter(torch.randn(n_features, horizon) * 0.01)  # tracked weight
+        self.b = nn.Parameter(torch.zeros(horizon))                    # tracked bias
+
+    def forward(self, x):                               # x: (batch, features) of the last step
+        return x @ self.W + self.b                      # (batch, horizon) point forecast
+
+model = LinearForecaster(n_features=8, horizon=4)
+print(sum(p.numel() for p in model.parameters()))      # 36 = 8*4 weights + 4 biases
+</code></pre>
+<div class="code-caption">A from-scratch nn.Module: parameters wrapped in nn.Parameter are discovered automatically by model.parameters().</div>
+
+<p>You will rarely write recurrences or convolutions by hand, because PyTorch ships the sequence layers that Part III studies in depth. The recurrent modules <code>nn.RNN</code>, <code>nn.LSTM</code>, and <code>nn.GRU</code> (built in detail in <a href="../../toc.html">Chapter 10</a>) consume a $(B, T, F)$ batch and return the per-step outputs plus the final hidden state. <code>nn.Conv1d</code> is the building block of the temporal convolutional networks of <a href="../../toc.html">Chapter 11</a>, and it expects channels before time, shape $(B, F, T)$, so a transpose is usually needed. <code>nn.TransformerEncoderLayer</code> and <code>nn.MultiheadAttention</code> back the architectures of <a href="../../toc.html">Chapter 12</a>. The block below instantiates each so you can see its input and output shapes side by side.</p>
+
+<pre><code class="language-python">B, T, F = 4, 16, 8
+x = torch.randn(B, T, F)                                # (batch, time, features)
+
+lstm = nn.LSTM(input_size=F, hidden_size=32, num_layers=2, batch_first=True)
+out, (h_n, c_n) = lstm(x)                               # out: (B, T, 32); h_n: (2, B, 32) per layer
+last = out[:, -1, :]                                    # (B, 32): summary at the final step
+
+conv = nn.Conv1d(in_channels=F, out_channels=32, kernel_size=3, padding=1)
+y = conv(x.transpose(1, 2))                             # Conv1d wants (B, F, T); transpose then back
+y = y.transpose(1, 2)                                   # (B, T, 32)
+
+enc_layer = nn.TransformerEncoderLayer(d_model=F, nhead=2, batch_first=True)
+encoder = nn.TransformerEncoder(enc_layer, num_layers=2)
+z = encoder(x)                                          # (B, T, F): attention over the time axis
+</code></pre>
+<div class="code-caption">The built-in sequence modules used across Part III, each shown with its input and output shapes; note Conv1d's channels-first ordering.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Right Tool: Compose, Do Not Reimplement</div>
+<p>A working LSTM forecaster is a handful of lines: <code>nn.LSTM</code> for the recurrence, <code>nn.Linear</code> for the readout, wrapped in <code>nn.Sequential</code> or a short <code>forward</code>. Writing the gated recurrence by hand (as <a href="../../toc.html">Chapter 10</a> does for teaching) is roughly fifty lines and is slower, because the built-in module dispatches to cuDNN's fused kernels. Reach for the from-scratch version to understand the mechanism, then use the library module in every model you actually train. The same rule holds for attention and convolution.</p>
+</div>
+
+<h2>3. Datasets and DataLoaders for Time Series</h2>
+<p>A <code>Dataset</code> answers two questions: how many samples exist (<code>__len__</code>) and how to fetch the $i$-th one (<code>__getitem__</code>). For time series the unit sample is a sliding window: a contiguous block of past observations as input, paired with the value or values that follow as the target. The single rule that governs this, restated from the leakage discipline of <a href="../../toc.html">Chapter 2.5</a>, is that the target window must lie strictly after the input window in time, and that any scaling statistics must be fit on training data alone. The windowing dataset below enforces the temporal gap by construction: index $i$ reads inputs from $[i, i+L)$ and the target from $[i+L, i+L+H)$, so the target is always in the future.</p>
+
+<pre><code class="language-python">from torch.utils.data import Dataset, DataLoader
+
+class WindowDataset(Dataset):
+    def __init__(self, series, lookback, horizon):
+        self.series = torch.as_tensor(series, dtype=torch.float32)  # (N, F)
+        self.L, self.H = lookback, horizon
+
+    def __len__(self):
+        return len(self.series) - self.L - self.H + 1   # number of valid windows
+
+    def __getitem__(self, i):
+        x = self.series[i : i + self.L]                 # input window: steps [i, i+L)
+        y = self.series[i + self.L : i + self.L + self.H, 0]   # target: steps [i+L, i+L+H), first feature
+        return x, y                                     # x: (L, F)   y: (H,); target strictly after input
+</code></pre>
+<div class="code-caption">A leakage-safe windowing Dataset: __getitem__ places the target strictly after the input window, so no future value reaches the input.</div>
+
+<p>The <code>DataLoader</code> wraps a dataset to produce batches, optionally shuffled, optionally across several worker processes. It stacks the per-sample $(L, F)$ inputs into a $(B, L, F)$ batch and the $(H,)$ targets into $(B, H)$, exactly the convention of Section 1. Shuffling the order of windows is fine and helps optimization; it does not break the temporal order inside each window, which is fixed. When sequences have different lengths (variable-length events, ragged clinical records), you cannot stack them directly, so PyTorch offers two tools: <code>pad_sequence</code> to pad a batch to a common length, and <code>pack_padded_sequence</code> to tell a recurrent module to skip the padding so it does not corrupt the hidden state.</p>
+
+<pre><code class="language-python">from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence
+
+train = WindowDataset(train_series, lookback=16, horizon=4)
+loader = DataLoader(train, batch_size=64, shuffle=True, num_workers=2, drop_last=True)
+xb, yb = next(iter(loader))
+print(xb.shape, yb.shape)                               # torch.Size([64, 16, F]) torch.Size([64, 4])
+
+# Variable-length sequences: pad, then pack so the LSTM ignores the padded steps
+seqs = [torch.randn(n, F) for n in (12, 7, 19)]         # three sequences of different lengths
+lengths = torch.tensor([s.size(0) for s in seqs])
+padded = pad_sequence(seqs, batch_first=True)           # (3, 19, F), shorter ones zero-padded
+packed = pack_padded_sequence(padded, lengths, batch_first=True, enforce_sorted=False)
+</code></pre>
+<div class="code-caption">A DataLoader batches fixed windows; pad_sequence and pack_padded_sequence handle ragged variable-length sequences without letting padding pollute the recurrence.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Worked Example: A Time-Aware Split</div>
+<p>Suppose a healthcare vitals series of $N = 10{,}000$ steps. The correct split is chronological, never random: train on the first 70 percent, validate on the next 15 percent, test on the final 15 percent, so every validation and test window sits in the future relative to training. Fit the scaler on the training slice only, then apply its mean and standard deviation to all three slices. A random split would scatter future windows into the training set and inflate the score, the exact leak the epigraph warns about. The single line <code>train_series, val_series, test_series = series[:7000], series[7000:8500], series[8500:]</code> does the split; the discipline is in never shuffling across that boundary.</p>
+</div>
+
+<h2>4. The Training and Evaluation Loop</h2>
+<p>Training is a loop over epochs, each epoch a loop over batches. For every batch you perform five steps in a fixed order: zero the gradients, run the forward pass, compute the loss, call <code>backward</code>, and step the optimizer. Two additions matter for temporal models. Mixed precision (via <code>torch.amp.autocast</code> and a <code>GradScaler</code>) runs the forward pass in half precision for speed and memory, which lets you fit longer sequences. Gradient clipping caps the global gradient norm before the optimizer step, which tames the exploding gradients that recurrent networks are prone to (a problem dissected in <a href="../../toc.html">Chapter 10</a>). The loop below includes both, plus checkpointing of the best model by validation loss.</p>
+
+<pre><code class="language-python">import torch.nn as nn
+
+model = model.to(device)
+opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+loss_fn = nn.MSELoss()
+scaler = torch.amp.GradScaler(device.type)             # scales the loss for stable fp16 gradients
+best_val = float("inf")
+
+for epoch in range(50):
+    model.train()                                      # enable dropout and batchnorm updates
+    for xb, yb in train_loader:
+        xb, yb = xb.to(device), yb.to(device)
+        opt.zero_grad(set_to_none=True)                # clear last step's gradients
+        with torch.amp.autocast(device.type):          # run forward in mixed precision
+            pred = model(xb)
+            loss = loss_fn(pred, yb)
+        scaler.scale(loss).backward()                  # backward on the scaled loss
+        scaler.unscale_(opt)                           # unscale before clipping
+        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)   # tame exploding gradients
+        scaler.step(opt)                               # optimizer step
+        scaler.update()                                # adjust the scale for next time
+</code></pre>
+<div class="code-caption">The core training loop with mixed precision and gradient clipping; the five-step order (zero, forward, loss, backward, step) never changes.</div>
+
+<p>Evaluation runs on the validation split with two switches flipped. Calling <code>model.eval()</code> puts dropout and batch-normalization layers into inference mode, and wrapping the pass in <code>torch.no_grad()</code> tells autograd to build no graph, which saves memory and time. The same two switches govern the test pass and all deployment inference. After each epoch we compute the validation loss under these switches and checkpoint the model whenever it improves, so the saved file always holds the best model seen rather than the last, which may have started to overfit. The time-aware split of Section 3 guarantees this validation loss is an honest estimate of future performance.</p>
+
+<pre><code class="language-python">    model.eval()                                       # inference mode for dropout and batchnorm
+    val_loss = 0.0
+    with torch.no_grad():                              # no autograd graph during evaluation
+        for xb, yb in val_loader:
+            xb, yb = xb.to(device), yb.to(device)
+            val_loss += loss_fn(model(xb), yb).item() * len(xb)
+    val_loss /= len(val_loader.dataset)
+    if val_loss &lt; best_val:                            # checkpoint only on improvement
+        best_val = val_loss
+        torch.save({"model": model.state_dict(),       # weights only, the portable format
+                    "epoch": epoch, "val_loss": val_loss}, "best.pt")
+</code></pre>
+<div class="code-caption">The evaluation half of the loop: eval mode plus no_grad for an honest validation loss, with best-by-validation checkpointing of the state_dict.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Save the state_dict, Not the Object</div>
+<p>Checkpoint <code>model.state_dict()</code>, a plain dictionary of parameter tensors, rather than pickling the whole module. The state dict is portable across code refactors and PyTorch versions; a pickled module breaks when the class definition moves. Restoring is two lines: reconstruct the module with the same architecture, then <code>model.load_state_dict(torch.load("best.pt")["model"])</code>. Store the epoch and validation loss alongside the weights so a checkpoint is self-describing.</p>
+</div>
+
+<h2>5. Inference and Export</h2>
+<p>Deployment freezes a trained module so it runs without the training stack. The first rule, repeated from Section 4, is to call <code>model.eval()</code> and wrap every prediction in <code>torch.no_grad()</code>; forgetting either inflates memory and, in the case of <code>eval</code>, silently changes the answer by leaving dropout active. For portability you then export the module to a self-contained graph. <code>torch.jit.script</code> or <code>torch.jit.trace</code> produces a TorchScript artifact that runs in a Python-free C++ runtime, and <code>torch.onnx.export</code> produces an ONNX graph that runs in cross-framework runtimes such as ONNX Runtime. Both capture the architecture and weights together, so the deployment target needs no model source code.</p>
+
+<pre><code class="language-python">model.eval()
+example = torch.randn(1, 16, 8, device=device)         # one window, the export's reference input
+
+# TorchScript: a Python-free graph for the libtorch C++ runtime
+scripted = torch.jit.trace(model, example)             # trace records ops on the example
+scripted.save("model_ts.pt")
+
+# ONNX: a cross-runtime graph; mark the batch and time axes as dynamic so any length runs
+torch.onnx.export(model, example, "model.onnx",
+                  input_names=["x"], output_names=["yhat"],
+                  dynamic_axes={"x": {0: "batch", 1: "time"}, "yhat": {0: "batch"}})
+</code></pre>
+<div class="code-caption">Two export paths from one eval-mode module: TorchScript for the libtorch runtime and ONNX for cross-framework runtimes, with dynamic batch and time axes.</div>
+
+<p>Forecasting in production is often a stream: observations arrive one step at a time and you want an updated prediction after each, without re-running the model over the whole history. A recurrent model supports this naturally, because its hidden state is a sufficient summary of the past (the filtering view of <a href="../../toc.html">Chapter 7</a>). Stateful streaming inference, the deployment pattern detailed in <a href="../../toc.html">Chapter 34.1</a>, carries the hidden state between calls and feeds only the newest step, turning an $O(T)$ recompute into an $O(1)$ update per observation. The loop below shows the pattern: the LSTM consumes one step, returns a forecast, and hands its state back for the next call.</p>
+
+<pre><code class="language-python">@torch.no_grad()
+def stream_step(lstm, head, x_t, state):
+    # x_t: (1, 1, F) one new observation; state: (h, c) carried from the previous call
+    out, state = lstm(x_t, state)                      # advance the recurrence by one step
+    yhat = head(out[:, -1, :])                         # forecast from the updated hidden state
+    return yhat, state                                 # return state so the caller carries it forward
+
+state = None                                           # the recurrence initializes its own state on the first call
+for x_t in incoming_stream:                            # each x_t is one freshly arrived step
+    yhat, state = stream_step(lstm, head, x_t, state)  # O(1) update, no recompute over history
+</code></pre>
+<div class="code-caption">Stateful streaming inference: the hidden state is carried between calls so each new observation costs one step, the deployment pattern of Chapter 34.1.</div>
+
+<h2>6. JAX Notes</h2>
+<p>JAX appears throughout the structured state-space and foundation-model literature this book draws on, so it is worth a short orientation even though our code is PyTorch. JAX is built on three function transformations that compose freely. <code>jax.jit</code> compiles a Python function to fused XLA kernels for speed; <code>jax.grad</code> returns a new function that computes the gradient of a scalar-valued function; and <code>jax.vmap</code> vectorizes a function written for one example so it runs over a whole batch with no explicit batch loop. The defining difference from PyTorch is that JAX is functional: arrays are immutable and a model's parameters are an explicit argument passed in, rather than state hidden inside a module. The snippet below differentiates and batches a loss in the JAX style.</p>
+
+<pre><code class="language-python">import jax, jax.numpy as jnp
+
+def loss(params, x, y):                                # params passed explicitly, not stored on an object
+    pred = x @ params["W"] + params["b"]
+    return jnp.mean((pred - y) ** 2)
+
+grad_fn = jax.jit(jax.grad(loss))                      # grad builds the gradient fn; jit compiles it
+params = {"W": jnp.zeros((8, 4)), "b": jnp.zeros(4)}
+g = grad_fn(params, jnp.ones((32, 8)), jnp.ones((32, 4)))   # gradients w.r.t. every leaf in params
+
+batched = jax.vmap(loss, in_axes=(None, 0, 0))         # map over axis 0 of x and y, share params
+</code></pre>
+<div class="code-caption">The three JAX transforms (jit, grad, vmap) on a functional loss whose parameters are an explicit immutable argument.</div>
+
+<p>JAX helps most when a temporal model exposes structure that XLA can exploit. The associative scan behind structured state-space models such as S4 and Mamba (<a href="../../toc.html">Chapter 13</a>) compiles to a parallel prefix sum under <code>jit</code>, and <code>vmap</code> makes per-sequence or ensemble computation trivial to express, which is why much foundation-model research ships in JAX. In practice you do not write raw JAX for a full model: <strong>Flax</strong> (or the newer Equinox) supplies the neural-network module abstraction and parameter management that <code>nn.Module</code> gives in PyTorch, while <strong>Optax</strong> supplies composable optimizers and gradient transforms (Adam, weight decay, gradient clipping) that you chain together and apply to the explicit parameter tree. The mental translation is direct: a PyTorch <code>nn.Module</code> plus <code>torch.optim</code> becomes a Flax module plus an Optax optimizer, with the parameters threaded through your functions instead of held inside the model.</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Why So Much Temporal Research Lives in JAX</div>
+<p>The 2023 to 2026 wave of long-sequence models leaned on JAX precisely because of the scan-and-vmap fit. The S4 and S5 structured state-space papers and the Mamba selective-scan line (<a href="../../toc.html">Chapter 13</a>) exploit XLA's parallel scan, and several temporal foundation models (<a href="../../toc.html">Chapter 15</a>) were trained on TPUs where JAX is native. Google's TimesFM forecaster ships JAX checkpoints, and the Flax and Optax ecosystem underpins much of this work. For practitioners the takeaway is bilingual: build and deploy in PyTorch by default, but be able to read JAX, because the reference implementation of the next structured-sequence architecture is as likely to be a Flax module as a PyTorch one.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="../C-optimization-deep-learning/index.html"><span class="nav-label">Previous Appendix</span><span class="nav-num">Appendix C</span><span class="nav-title">Optimization and Deep Learning Basics</span></a>
+<a class="up" href="../../toc.html"><span class="nav-label">Appendices</span><span class="nav-num">Contents</span><span class="nav-title">Table of Contents</span></a>
+<a class="next" href="../E-datasets-benchmarks/index.html"><span class="nav-label">Next Appendix</span><span class="nav-num">Appendix E</span><span class="nav-title">Datasets, Benchmarks, and Evaluation Protocols</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

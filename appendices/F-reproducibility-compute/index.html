@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Appendix F: Reproducibility, Compute, and Experiment Management. Determinism and seeding, environment and data versioning with point-in-time correctness, experiment tracking and config management, compute budgeting and right-sizing, and a reproducibility checklist for a temporal machine-learning result." name="description"/>
+<title>Appendix F: Reproducibility, Compute, and Experiment Management | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../../toc.html">Appendices</a></div>
+<div class="chapter-label"><a href="index.html">Appendix F: Reproducibility, Compute, and Experiment Management</a></div>
+<h1>Reproducibility, Compute, and Experiment Management</h1>
+<p class="chapter-subtitle">Seeds and determinism, environment and data versioning, experiment tracking, compute budgeting, and a checklist that makes a temporal result reproducible.</p>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They asked me to reproduce last quarter's number. I had the code. I had the model. I did not have the data as it stood that Tuesday, and so I produced a different number, defended it for a week, and learned the most expensive lesson in temporal machine learning: the result is not the code, it is the code plus the world frozen at one instant."</p>
+<cite>A Forecaster Who Forgot to Save the Vintage</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>A temporal machine-learning result is reproducible only when five things are pinned together: the data as it stood at one instant (its vintage), the random seed, the configuration, the exact code commit, and the software environment. Drop any one and a rerun drifts. This appendix is the operational counterpart to the temporal-data discipline of <a href="../../toc.html">Chapter 2</a> and the deployment practice of <a href="../../toc.html">Chapter 34</a>: it turns "it worked on my machine last month" into a result a colleague can regenerate to the digit. We treat the four levers in turn, determinism, versioning, tracking, and budgeting, then close with a single checklist you can attach to any reported number.</p>
+</div>
+
+<h2>1. Determinism and Seeds</h2>
+
+<p>A reproducible run starts with control over randomness. A temporal model touches several independent random-number generators: Python's own, NumPy's, the deep-learning framework's CPU and GPU generators, and the data loader's shuffling. Seeding one of them is not enough; an unseeded generator anywhere in the path makes the run irreproducible. The first habit is therefore a single function that seeds every generator the process can reach, called once before any data is drawn or any weight is initialized.</p>
+
+<pre><code class="language-python">import os, random
+import numpy as np
+import torch
+
+def seed_everything(seed: int = 0) -&gt; None:
+    os.environ["PYTHONHASHSEED"] = str(seed)  # stabilize hash-based ordering
+    random.seed(seed)                          # Python's stdlib generator
+    np.random.seed(seed)                       # NumPy's legacy global generator
+    torch.manual_seed(seed)                    # PyTorch CPU generator
+    torch.cuda.manual_seed_all(seed)           # all visible GPU generators
+
+seed_everything(0)
+</code></pre>
+<div class="code-caption">A single entry point that seeds every generator a temporal training run can reach; call it before constructing datasets, models, or data loaders.</div>
+
+<p>Seeding fixes the starting point, but it does not by itself make the arithmetic deterministic. Many GPU kernels accumulate partial sums in a nondeterministic order, so two runs with the same seed can still diverge in the low-order bits, and that divergence compounds across the long unrolled horizons typical of recurrent and attention models. To force bit-for-bit repeatability you ask the framework for deterministic algorithms and disable the autotuner that picks kernels by benchmarking them at runtime.</p>
+
+<pre><code class="language-python">torch.use_deterministic_algorithms(True)   # error out if a kernel has no deterministic path
+torch.backends.cudnn.benchmark = False      # disable the autotuner that varies kernel choice
+torch.backends.cudnn.deterministic = True   # pin cuDNN to deterministic convolutions
+# Some CUDA reductions also require this environment variable, set BEFORE the process starts:
+#   CUBLAS_WORKSPACE_CONFIG=:4096:8
+</code></pre>
+<div class="code-caption">Forcing deterministic GPU execution in PyTorch; the autotuner and nondeterministic reductions are the usual sources of seed-stable but run-to-run drift.</div>
+
+<p>Determinism has a price, and you should pay it knowingly. Deterministic kernels are often slower (a convolution-heavy temporal convolutional network of <a href="../../toc.html">Chapter 11</a> can lose a noticeable fraction of throughput), and some operations have no deterministic GPU implementation at all, in which case the call above raises rather than silently varying. The pragmatic policy is to run full determinism for the experiments that back a reported number and for debugging, and to relax it for exploratory sweeps where statistical reproducibility across several seeds matters more than bit-exactness of any single run. Report which regime produced each result.</p>
+
+<p>The remaining source of irreproducibility is the data loader. Parallel workers each need their own seeded generator, or their shuffling and any stochastic augmentation become a function of thread-scheduling timing. Pass a generator to the loader and a deterministic per-worker seed.</p>
+
+<pre><code class="language-python">def seed_worker(worker_id: int) -&gt; None:
+    worker_seed = torch.initial_seed() % 2**32  # derived deterministically from the base seed
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+g = torch.Generator(); g.manual_seed(0)
+loader = torch.utils.data.DataLoader(
+    dataset, batch_size=64, shuffle=True,
+    num_workers=4, worker_init_fn=seed_worker, generator=g,
+)
+</code></pre>
+<div class="code-caption">A reproducible data loader: the generator fixes the shuffle order and each worker reseeds from the base seed, so batch composition no longer depends on worker timing.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight</div>
+<p>For temporal data, "shuffle" must never mean reordering across the time axis within a window: the seed controls the order in which windows are drawn, not the order of steps inside a window. A reproducible loader that quietly broke chronology would be reproducibly wrong. Reproducibility and the leakage discipline of <a href="../../toc.html">Chapter 2</a> are separate guarantees; you need both.</p>
+</div>
+
+<h2>2. Environment and Data Versioning</h2>
+
+<p>Identical code on two machines can still produce different numbers if the libraries underneath differ, because a minor version of a linear-algebra backend or a deep-learning framework can change kernel selection, default dtypes, or summation order. The environment is therefore part of the result and must be pinned. The minimum is a fully resolved dependency lockfile, not a loose list of top-level packages: a lockfile records every transitive dependency at an exact version and hash, so the environment rebuilds identically.</p>
+
+<pre><code class="language-bash"># Loose, NOT reproducible: top-level packages, versions float
+#   torch
+#   statsmodels
+# Pinned: exact versions for every transitive dependency
+pip freeze &gt; requirements.lock     # or: uv pip compile, poetry lock, conda env export
+pip install -r requirements.lock   # rebuilds the identical environment
+</code></pre>
+<div class="code-caption">A resolved lockfile pins every transitive dependency; the loose list above it lets a backend upgrade silently change your numbers.</div>
+
+<p>A lockfile pins Python packages but not the system libraries beneath them, the CUDA toolkit, the BLAS implementation, the operating-system C library. For results that must survive a machine change or a hardware refresh, capture the whole stack in a container image and record its digest. The image digest is then a single hash that stands in for the entire software environment.</p>
+
+<pre><code class="language-dockerfile">FROM python:3.11-slim
+COPY requirements.lock /tmp/requirements.lock
+RUN pip install --no-cache-dir -r /tmp/requirements.lock
+# Pin the base CUDA image by digest when GPUs are involved, for example
+#   FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04@sha256:...
+</code></pre>
+<div class="code-caption">A container fixes the system stack the lockfile cannot reach; record the built image digest alongside the run so the environment is addressable by one hash.</div>
+
+<p>Code and environment are only two thirds of the input. The data is the third, and in temporal work it is the subtle one. Data versioning tools track large files by content hash and store them outside the code repository while keeping a small pointer file under version control, so a commit pins an exact dataset the way it pins exact source. The pattern is the same whichever tool you use: the repository holds a tiny metadata file, the bytes live in object storage, and a checkout restores the exact data that commit was built against.</p>
+
+<pre><code class="language-bash">dvc add data/vitals_2026Q1.parquet   # hashes the file, writes data/vitals_2026Q1.parquet.dvc
+git add data/vitals_2026Q1.parquet.dvc data/.gitignore
+git commit -m "Pin Q1 vitals vintage"
+# A later checkout + `dvc pull` restores the byte-identical dataset for this commit.
+</code></pre>
+<div class="code-caption">Content-addressed data versioning: git tracks the small pointer file while the bytes live in remote storage, so each commit is bound to an exact dataset.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">The Temporal Must-Have: Point-in-Time Correctness</div>
+<p>For a temporal result, pinning the dataset file is not enough; you must pin the dataset <em>vintage</em>, the state of the data as it was known at the moment the model would have acted. Many real series are revised after the fact: an economic indicator is restated, a clinical record is back-filled, a label is corrected weeks later. Training or evaluating on the revised values silently leaks the future into the past and inflates every metric. Point-in-time correctness, introduced in <a href="../../toc.html">Section 2.7</a>, means each record carries the timestamp at which its value became known, and every query reconstructs the data as of a chosen instant. Version the vintage, not just the file: store the as-of timestamp with the run, and reconstruct features from the point-in-time table rather than the latest snapshot.</p>
+</div>
+
+<pre><code class="language-python"># A point-in-time feature query: use only values KNOWN as of the decision time.
+def features_as_of(panel, entity_id, as_of):
+    rows = panel[(panel.entity_id == entity_id) &amp; (panel.known_at &lt;= as_of)]
+    return rows.sort_values("known_at").groupby("field").last()  # latest KNOWN value, not latest value
+</code></pre>
+<div class="code-caption">Reconstructing features as of a decision time: filtering on <code>known_at</code> rather than the event timestamp is what prevents revised values from leaking backward.</div>
+
+<h2>3. Experiment Management</h2>
+
+<p>With inputs pinned, the next discipline is recording what each run did. An experiment tracker logs, for every run, its configuration, its metrics over time, and the artifacts it produced (the fitted model, plots, predictions), so that months later you can answer "which config produced this number" without rerunning anything. Trackers such as MLflow and Weights &amp; Biases expose nearly the same minimal interface: open a run, log parameters and metrics, log artifacts, close the run.</p>
+
+<pre><code class="language-python">import mlflow
+
+with mlflow.start_run(run_name="tcn-vitals-h24"):
+    mlflow.log_params(cfg)                       # the full resolved configuration
+    mlflow.set_tag("git_commit", git_sha)        # bind the run to exact code
+    mlflow.set_tag("data_vintage", "2026-04-01") # bind the run to the as-of instant
+    for epoch, val_mae in train(cfg):
+        mlflow.log_metric("val_mae", val_mae, step=epoch)
+    mlflow.log_artifact("model.pt")              # the produced artifact, addressable later
+</code></pre>
+<div class="code-caption">A tracked run records config, code commit, data vintage, the metric curve, and the model artifact, so the reported number is traceable to its exact inputs.</div>
+
+<p>The configuration deserves its own discipline. Burying hyperparameters as literals in the training script makes runs impossible to compare and impossible to sweep cleanly. A config manager keeps the entire experiment definition in a structured, composable file, lets you override any field from the command line, and (the part that matters for reproducibility) saves the fully resolved config of each run. A Hydra-style layout composes a run from reusable groups, so a sweep varies one group while the rest stay fixed and recorded.</p>
+
+<pre><code class="language-python">from dataclasses import dataclass, asdict
+import json
+
+@dataclass
+class Config:
+    model: str = "tcn"
+    horizon: int = 24
+    lr: float = 1e-3
+    seed: int = 0
+    data_vintage: str = "2026-04-01"   # the as-of instant travels WITH the config
+
+cfg = Config(model="tcn", horizon=24)
+json.dump(asdict(cfg), open("run_config.json", "w"), indent=2)  # the resolved config IS an artifact
+</code></pre>
+<div class="code-caption">A typed, serializable config: every field that affects the result, including the data vintage and seed, lives in one object that is saved with the run.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">One Config, One Artifact</div>
+<p>The registry habit that keeps a long-running temporal study honest is simple: every reported number traces to one resolved config that produced one saved artifact in one pass. Construct-matched metrics (a forecast's accuracy and its calibration, say) must be co-computed in that single pass on that single config, panel, model, split, and seed, then saved as one artifact. A number-by-number audit can pass while comparing values that came from different configs, and that comparison is invalid. Save the bundle, not the loose numbers, and the audit becomes meaningful.</p>
+</div>
+
+<h2>4. Compute Budgeting</h2>
+
+<p>Reproducibility tells you whether a result is real; budgeting tells you what it cost and what the next one will cost. The two families of temporal models have very different cost shapes. Classical models (the ARIMA, ETS, and state-space fits of Part II) are CPU-bound and embarrassingly parallel across series, so the right tool is process-level parallelism over a backtest grid, not a GPU. Deep temporal models (Part III) are GPU-bound, and their cost is dominated by the sequence length, the batch size, and the number of epochs.</p>
+
+<pre><code class="language-python">from joblib import Parallel, delayed
+
+# Classical: fit one model per series across all CPU cores. No GPU needed.
+results = Parallel(n_jobs=-1)(
+    delayed(fit_and_backtest)(series) for series in panel  # one independent job per series
+)
+</code></pre>
+<div class="code-caption">Classical temporal models scale by CPU parallelism across series; a backtest over thousands of series is a parallel map, not a GPU job.</div>
+
+<p>For deep models, estimate before you launch. A rough but useful budget multiplies the per-step cost by the number of steps: the GPU-hours of a run are approximately the number of training tokens or windows seen, divided by the throughput of the hardware. Estimating this on a short pilot (a few hundred steps timed) lets you price a full sweep before committing to it, and lets you choose between local and cloud rationally. The deciding question is utilization: a single long run that saturates one local GPU is cheapest locally; a wide sweep that would queue for days locally is cheaper on rented elastic capacity that runs the configurations in parallel and is released the moment they finish.</p>
+
+<pre><code class="language-python">def gpu_hours(n_windows, epochs, throughput_windows_per_sec):
+    total_windows = n_windows * epochs
+    return total_windows / throughput_windows_per_sec / 3600  # measure throughput on a short pilot
+
+print(gpu_hours(n_windows=500_000, epochs=30, throughput_windows_per_sec=1_800))
+</code></pre>
+<div class="code-caption">A back-of-the-envelope GPU-hour estimate from a pilot-measured throughput; price the sweep before you launch it rather than after the bill arrives.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Right-Size: a Tuned Baseline Is Cheap</div>
+<p>The most common budgeting error in temporal AI is reaching for the largest model first. A well-tuned classical baseline or a small neural model often matches a far larger one on a given series at a tiny fraction of the cost, and it is the honest reference every deep result must beat. The right-size principle of <a href="../../toc.html">Section 34.4</a> says spend compute where it buys accuracy and nowhere else: tune the cheap baseline to convergence, measure the gap, and only scale up when the gap justifies the spend. A reproducible cheap baseline is also the fastest thing to rerun when you need to defend a number.</p>
+</div>
+
+<p>The last budgeting axis is batch versus online. A batch (offline) forecasting job amortizes setup over a large run and is priced by total compute. An online or streaming system of <a href="../../toc.html">Chapter 20</a> is priced by latency and by steady-state cost per prediction, because it runs continuously: a model that is cheap to train once but expensive per inference can dominate the lifetime bill of a deployed temporal service. Budget the regime you will actually operate in, and measure cost per prediction, not just cost per training run, for anything that will serve online.</p>
+
+<h2>5. A Reproducibility Checklist for a Temporal ML Result</h2>
+
+<p>The four sections above reduce to one operational artifact: a checklist you attach to every reported temporal number. A result is reproducible when a colleague, starting from your repository and storage, can regenerate it to the digit. The six items below are the inputs that, pinned together, make that possible; any one missing is a hole through which a rerun drifts.</p>
+
+<table>
+<thead>
+<tr><th>Item</th><th>What to pin</th><th>How</th></tr>
+</thead>
+<tbody>
+<tr><td>Data vintage</td><td>The data as known at the decision instant, the as-of timestamp, not just the file</td><td>Point-in-time table plus stored <code>data_vintage</code> (<a href="../../toc.html">Section 2.7</a>)</td></tr>
+<tr><td>Seed</td><td>Every generator: Python, NumPy, framework CPU and GPU, data loader</td><td><code>seed_everything</code> plus deterministic-algorithm flags</td></tr>
+<tr><td>Config</td><td>Every field that affects the result, saved as a resolved artifact</td><td>Typed config serialized with the run</td></tr>
+<tr><td>Code commit</td><td>The exact source, with no uncommitted changes</td><td><code>git_sha</code> logged as a run tag; clean working tree</td></tr>
+<tr><td>Environment</td><td>Python packages and the system stack beneath them</td><td>Resolved lockfile plus container image digest</td></tr>
+<tr><td>Eval protocol</td><td>The split, the backtest scheme, the metrics, computed in one pass</td><td>Rolling-origin protocol of <a href="../../toc.html">Appendix E</a>, metrics co-computed</td></tr>
+</tbody>
+</table>
+<div class="code-caption">The six inputs that make a temporal result reproducible; each row names what to pin and the mechanism from this appendix that pins it.</div>
+
+<p>A compact way to enforce the checklist is to have every run emit a single manifest that records all six items, written next to its artifacts. The manifest is the receipt: present it with the number, and anyone can reconstruct the run.</p>
+
+<pre><code class="language-python">import json, subprocess
+
+manifest = {
+    "data_vintage": cfg.data_vintage,                                    # item 1
+    "seed": cfg.seed,                                                    # item 2
+    "config": asdict(cfg),                                               # item 3
+    "git_commit": subprocess.check_output(["git", "rev-parse", "HEAD"]).decode().strip(),  # item 4
+    "image_digest": os.environ.get("IMAGE_DIGEST", "unset"),            # item 5
+    "eval_protocol": {"scheme": "rolling-origin", "folds": 5, "metric": "MASE"},  # item 6
+}
+json.dump(manifest, open("run_manifest.json", "w"), indent=2)
+</code></pre>
+<div class="code-caption">A run manifest capturing all six checklist items in one file; saved beside the artifacts, it is the receipt that lets any reader regenerate the number.</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier</div>
+<p>Reproducibility is now a first-class concern in the temporal-forecasting literature, not an afterthought. The foundation-model wave of <a href="../../toc.html">Chapter 15</a> (Chronos, TimesFM, Moirai, MOMENT) ships public weights, training code, and fixed evaluation harnesses precisely so that headline numbers can be re-run, and standardized backtests such as the GIFT-Eval and Monash archives exist to stop the construct-mismatched comparisons this appendix warns against. Tooling is converging too: experiment trackers now capture container digests automatically, data-versioning systems are adding native point-in-time queries, and reproducibility checklists of the kind above are becoming a submission requirement at major venues. The open problem is reproducing results that depend on nondeterministic distributed training at scale, where bit-exactness is currently traded for throughput and statistical reproducibility across seeds is the practical standard.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="../E-datasets-benchmarks/index.html"><span class="nav-label">Previous</span><span class="nav-num">Appendix E</span><span class="nav-title">Datasets, Benchmarks, and Evaluation Protocols</span></a>
+<a class="up" href="../../toc.html"><span class="nav-label">Up</span><span class="nav-num">Appendices</span><span class="nav-title">Table of Contents</span></a>
+<a class="next" href="../G-solutions/index.html"><span class="nav-label">Next</span><span class="nav-num">Appendix G</span><span class="nav-title">Solutions to Selected Exercises</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>
