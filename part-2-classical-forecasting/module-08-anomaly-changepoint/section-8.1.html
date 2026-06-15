@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 8.1: Point, Contextual, and Collective Anomalies. Why time turns anomaly detection into a context-dependent problem, the taxonomy of point, contextual, and collective anomalies defined with KaTeX, the supervised/unsupervised/semi-supervised framing under extreme class imbalance, scoring versus labeling and threshold choice, evaluation done right (precision/recall/F1, the point-adjustment controversy, PR-AUC, detection delay), and a full worked example building a series with all three anomaly types detected from scratch with a z-score detector and through scikit-learn IsolationForest." name="description"/>
+<title>Section 8.1: Point, Contextual, and Collective Anomalies | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Forecasting and Time Series Analysis</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 8: Temporal Anomaly and Change-Point Detection</a></div>
+<h1>Point, Contextual, and Collective Anomalies</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They called me an outlier, but they never asked what month it was. Forty degrees is a scandal in January and a Tuesday in July. I am not the anomaly; the calendar is."</p>
+<cite>An Outlier Insisting It Is Just Misunderstood</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>An anomaly in a time series is not a value that is large; it is a value that is surprising given when it occurred and what came before it, so the same number can be perfectly normal in one context and a red alert in another.</strong> Strip the time axis away and anomaly detection collapses to "find the points far from the bulk of the data," a tidy problem that a single threshold solves. Restore the time axis and the problem fractures into three genuinely different shapes: a single reading outside the plausible range (a <em>point</em> anomaly), a perfectly ordinary reading arriving at the wrong moment (a <em>contextual</em> anomaly), and a run of individually-unremarkable readings whose <em>joint</em> shape is wrong (a <em>collective</em> anomaly).</p>
+<p>This section builds that taxonomy carefully, frames anomaly detection as the unusual machine-learning problem it is (labels are almost never available and the positive class is vanishingly rare, so most temporal anomaly detection is unsupervised scoring against a learned notion of normal), insists on evaluating it honestly under that extreme imbalance (where naive accuracy is a lie and the popular point-adjustment trick inflates scores), and ends with a worked example that constructs all three anomaly types and shows, concretely, that a detector tuned for one type is blind to the others, which is exactly the failure that motivates the statistical, distance-based, and forecasting-residual methods of the sections that follow.</p>
+</div>
+<p>This chapter turns from forecasting to its dark twin. The first seven chapters of Part II asked what a series will do next; this chapter asks when a series has done something it should not have. The two questions are deeply linked, because the cleanest definition of an anomaly is a point a good forecaster did not expect.</p>
+<p>So every model from the autoregression of <a href="../module-05-univariate-forecasting/section-5.2.html">Section 5.2</a> through the state-space filters of <a href="../module-07-state-space-filtering/index.html">Chapter 7</a> is also, implicitly, an anomaly detector waiting to be read backwards.</p>
+<p>We open the chapter with the conceptual groundwork: what an anomaly even <em>is</em> once time is in the picture, why that makes the temporal version genuinely harder than the static outlier detection of an introductory statistics course, and how to pose and grade the problem before reaching for any single algorithm.</p>
+<p>Throughout we lean on the sensor and IoT running dataset of Part II (introduced in <a href="../../toc.html">the Part II overview</a>), an industrial telemetry stream of machine vibration, temperature, and a derived running count of completed work cycles, because anomalies in such streams are where the three-type taxonomy earns its keep. We use the standard symbols of the unified notation table in <a href="../../toc.html">Appendix A</a>: a univariate series $x_1, x_2, \dots, x_t$, an anomaly score $s_t \ge 0$, a threshold $\tau$, and a binary anomaly label $y_t \in \{0, 1\}$.</p>
+
+<h2>1. What Is an Anomaly in Time Series, and Why Time Makes It Special <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Begin with the static picture, because it is the one most readers carry from a first statistics course. Given a cloud of numbers, an outlier is a value that lies far from the bulk, and a $z$-score makes this precise: standardize each value by the sample mean $\mu$ and standard deviation $\sigma$, and flag any point whose standardized magnitude exceeds a cutoff,</p>
+$$z_t = \frac{x_t - \mu}{\sigma}, \qquad \text{flag } x_t \text{ as anomalous if } |z_t| > \tau.$$
+<p>This is a complete, working anomaly detector, and for a great deal of tabular data it is enough.</p>
+<p>Its hidden assumption is fatal for time series, though: it treats the $x_t$ as an exchangeable bag of numbers, so it would assign the same verdict to the value $40$ no matter where in the series it sat. A time series is the opposite of exchangeable. The order is the information. A reading of $40$ degrees Celsius from a machine that idles near $35$ in the cool morning shift and runs near $55$ under afternoon load is unremarkable at 3 p.m. and alarming at 4 a.m., yet a global $z$-score, blind to the hour, gives both the same score.</p>
+<p>The epigraph's outlier has a point: the number alone does not determine the verdict; the context does.</p>
+<p>There is a second, subtler reason order matters, beyond the obvious one that the verdict on $x_t$ depends on the hour. Even the <em>definition</em> of the bulk shifts over time. A time series may trend (its level drifts), it may be seasonal (its level cycles), and it may change regime (its whole statistical character switches when, say, a machine moves from a break-in period into steady operation).</p>
+<p>Under any of these, the global mean and standard deviation are averages over genuinely different regimes, so a global $z$-score is standardizing against a distribution that describes no actual moment in the series. The number $40$ is not merely well-timed or ill-timed; the very $\mu$ and $\sigma$ it should be compared against are functions of $t$. Static outlier detection has no machinery for this because it was built for exchangeable data where the bulk is fixed, and that mismatch, not any single hard example, is the deep reason temporal anomaly detection needs its own theory.</p>
+<p>The single idea that makes temporal anomaly detection its own subject is therefore <em>context dependence</em>. The "normal" against which we judge a reading is not a fixed global distribution but a conditional one, the distribution of $x_t$ given everything we know about the moment $t$: the recent past, the position in the day or week or year, and the values of related series.</p>
+<p>Formally, write the local context of time $t$ as $\mathcal{C}_t$ (its recent history, its phase in any seasonal cycle, any covariates), and define the anomaly score as a measure of how unlikely the observed value is under the conditional law $p(x_t \mid \mathcal{C}_t)$ rather than the marginal law $p(x_t)$,</p>
+$$s_t \;=\; -\log p\!\left(x_t \mid \mathcal{C}_t\right) \quad\text{rather than}\quad s_t \;=\; -\log p\!\left(x_t\right).$$
+<p>What the context $\mathcal{C}_t$ contains is itself a modeling choice, and widening it is the through-line of the whole chapter. In practice it is assembled from some subset of the following ingredients, in roughly increasing order of sophistication:</p>
+<ul>
+<li><strong>Recent history</strong>: the preceding window $x_{t-w}, \dots, x_{t-1}$, the basis of every rolling and autoregressive detector.</li>
+<li><strong>Seasonal phase</strong>: the position in the day, week, or year, which a contextual anomaly needs before it is visible.</li>
+<li><strong>Trend and regime</strong>: the slowly varying level and the current operating mode, so the bulk it compares against tracks the series.</li>
+<li><strong>Related covariates</strong>: other sensors or exogenous signals, the multivariate context that <a href="../module-06-multivariate-econometric/index.html">Chapter 6</a> built the machinery for.</li>
+</ul>
+<p>The static $z$-score uses none of these, which is its whole limitation; each later detector earns its keep by folding in one more ingredient.</p>
+<p>Reading the score as a negative log-likelihood (a "surprise" in bits or nats) is more than a notational flourish: it unifies the whole chapter. A point far in the tail of its conditional distribution is surprising and scores high; a point that is large in absolute terms but exactly what the context predicted is unsurprising and scores low.</p>
+<p>Every detector in this chapter is, at heart, an estimate of that conditional surprise, differing only in how it models $\mathcal{C}_t$ and $p(\cdot \mid \mathcal{C}_t)$. The global $z$-score is the degenerate special case where $\mathcal{C}_t$ is empty and the conditional collapses to the marginal, which is precisely why it fails on series with trend, seasonality, or regime structure.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Temporal Thread: An Anomaly Is What a Good Forecaster Did Not Expect</div>
+<p>The conditional-surprise definition quietly recycles the entire forecasting apparatus of Part II. A forecaster is precisely a machine that estimates the conditional distribution $p(x_t \mid \mathcal{C}_t)$ of the next value given the past, so its one-step forecast $\hat x_t$ is the conditional mean and its forecast error $e_t = x_t - \hat x_t$ is a ready-made anomaly score: a large standardized residual is a point the model did not expect. This means the autoregression of <a href="../module-05-univariate-forecasting/section-5.2.html">Section 5.2</a>, the seasonal models of <a href="../module-05-univariate-forecasting/index.html">Chapter 5</a>, and the Kalman filter of <a href="../module-07-state-space-filtering/index.html">Chapter 7</a> are all already anomaly detectors, read backwards: their innovations are surprises.</p>
+<p>The same arc continues into the deep-learning chapters, where the reconstruction error of an autoencoder (<a href="../../toc.html">Chapter 16</a>) and the forecast residual of a temporal foundation model (<a href="../../toc.html">Chapter 15</a>) play exactly this role. When you can forecast a series, you can detect its anomalies for free; the classical idea returns in learned form.</p>
+</div>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Anomaly Detection Is Density Estimation Plus a Threshold</div>
+<p>Almost every anomaly detector, however it dresses itself, is doing two separable jobs. First it estimates how surprising each point is, building (explicitly or implicitly) a model of the conditional density $p(x_t \mid \mathcal{C}_t)$ and reporting a score $s_t$ that is monotone in surprise. Then, and only then, it converts that continuous score into a binary decision by comparing it to a threshold $\tau$. Keeping these two jobs separate is the most useful habit in the field, because the hard, modeling-heavy work lives entirely in the first job (what counts as normal here, now?) while the second is a single business-driven dial trading false alarms against missed events. When a detector "fails," ask first which job failed: a bad score means the model of normal is wrong, while a flood of false alarms on good scores means the threshold is merely mis-set. The rest of this chapter is overwhelmingly about the first job; subsection three returns to the second.</p>
+</div>
+
+<h2>2. The Three Types: Point, Contextual, and Collective Anomalies <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Once anomaly is defined as conditional surprise, the famous taxonomy of Chandola, Banerjee, and Kumar falls out naturally according to <em>what</em> the context $\mathcal{C}_t$ must include before the surprise becomes visible. Three cases exhaust the practical landscape, and a detector's competence is largely determined by which of the three it can see. Two questions sort any candidate anomaly into its type:</p>
+<ul>
+<li><strong>Is the anomalous thing a single point or a whole subsequence?</strong> A subsequence answer means collective; a point answer means one of the first two.</li>
+<li><strong>Does the point look wrong on its own, or only once you know when it occurred?</strong> Wrong on its own means point; wrong only in context means contextual.</li>
+</ul>
+<p>The three types below are exactly the three leaves of that two-question tree, and each leaf is served by a different family of detectors.</p>
+<p>A <strong>point anomaly</strong> (also called a global outlier) is a single observation that is anomalous with respect to the entire series, surprising even under the marginal distribution with an empty context. It is the easy case, the one the static $z$-score already catches: a value so far outside the plausible operating range that no notion of timing is needed to condemn it.</p>
+<p>This is the type that static, non-temporal outlier detection was designed for, and it is the only one of the three that survives a complete shuffle of the time axis, since its anomalousness never depended on order in the first place. Formally, with global moments $\mu, \sigma$,</p>
+$$\left| \frac{x_t - \mu}{\sigma} \right| > \tau \quad\Longrightarrow\quad x_t \text{ is a point anomaly}.$$
+<p>In the running sensor stream, a vibration sensor that briefly reports $9.8\,\mathrm{g}$ on a machine that never physically exceeds $4\,\mathrm{g}$ is a point anomaly: it is impossible, full stop, independent of the hour, and a flat threshold on magnitude catches it.</p>
+<p>Stuck-at faults, dropped packets reported as zeros, and sensor saturation spikes are the everyday point anomalies of telemetry, and they are the one type a non-temporal tool handles without complaint.</p>
+<p>A <strong>contextual anomaly</strong> (also called a conditional anomaly) is a value that is perfectly normal in the global marginal sense but surprising given its context, almost always its temporal position. The value is inside the historical range, so a global threshold lets it pass, yet it is wrong for <em>this</em> moment. This is the hardest type to catch with naive tooling precisely because the value looks innocent in any histogram of the data; only when the histogram is sliced by context does the reading stand out.</p>
+<p>Make the context explicit by conditioning on the seasonal phase. Let $\mu(\mathcal{C}_t)$ and $\sigma(\mathcal{C}_t)$ be the mean and standard deviation expected in context $\mathcal{C}_t$ (for example, the typical value at this hour of this weekday); then</p>
+$$\left| \frac{x_t - \mu(\mathcal{C}_t)}{\sigma(\mathcal{C}_t)} \right| > \tau \quad\text{while}\quad \left| \frac{x_t - \mu}{\sigma} \right| \le \tau .$$
+<p>The epigraph lives here. A machine temperature of $40^\circ$C is squarely inside the global range (the machine runs anywhere from $35$ to $55$), so the point detector waves it through, but at 4 a.m. on an idle machine the expected temperature is $35 \pm 1.5$, and $40$ is a four-sigma <em>contextual</em> surprise that may signal a stuck cooling valve.</p>
+<p>The defining frustration of contextual anomalies is that they are invisible to any method that forgets the timestamp, and they are also the type whose detection most rewards a good seasonal model, since the conditional moments $\mu(\mathcal{C}_t)$ and $\sigma(\mathcal{C}_t)$ are exactly what a seasonal decomposition or a seasonal forecaster provides.</p>
+<p>A <strong>collective anomaly</strong> is a subsequence of consecutive observations whose <em>joint</em> behavior is anomalous, even though every individual observation in it is unremarkable on its own. No single point is out of range or out of context; the pattern is. This is the type that most fully exploits the time axis, because its very definition is about the arrangement of consecutive values, and it is the type generic outlier tools handle worst, since they score points rather than windows. Write the window $\mathbf{w}_t = (x_t, x_{t+1}, \dots, x_{t+m-1})$ and score the whole subsequence against the distribution of normal subsequences,</p>
+$$s(\mathbf{w}_t) = -\log p\!\left(\mathbf{w}_t \mid \text{normal subsequences}\right) > \tau,$$
+<p>where the surprise is a property of the window, not of any point inside it.</p>
+<p>The canonical telemetry example is a machine that should oscillate between high-load and idle but instead holds a flat, mid-range value for ten minutes: every reading is a plausible number, but a constant ten-minute plateau where the normal pattern is a sawtooth is a collective anomaly that often indicates the controller has frozen. An ECG that flatlines briefly, network traffic that holds a suspiciously steady rate during what should be bursty human activity, and a stuck-at-mid-scale sensor all share this signature: normal parts, abnormal whole.</p>
+<p>The figure below contrasts the three types on one schematic stream.</p>
+<figure class="diagram">
+<svg viewBox="0 0 720 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A single time series with three highlighted anomalies: a tall isolated spike labelled point anomaly, an ordinary-height bump sitting in a low-valued night region labelled contextual anomaly, and a flat plateau interrupting an oscillating region labelled collective anomaly.">
+<style>
+  .axis{stroke:var(--text-muted,#666);stroke-width:1.5;}
+  .sig{stroke:var(--accent-color,#3b6ea5);stroke-width:2;fill:none;}
+  .lab{font-family:var(--font-sans,sans-serif);font-size:12px;font-weight:700;fill:var(--text-color,#222);text-anchor:middle;}
+  .ann{font-family:var(--font-sans,sans-serif);font-size:11px;fill:var(--warning-color,#d98b2b);text-anchor:middle;}
+  .mark{stroke:var(--warning-color,#d98b2b);stroke-width:1.6;fill:none;stroke-dasharray:4 3;}
+</style>
+<line class="axis" x1="40" y1="210" x2="700" y2="210"/>
+<line class="axis" x1="40" y1="40" x2="40" y2="210"/>
+<text class="lab" x="370" y="234">time</text>
+<path class="sig" d="M40,170 L70,150 L100,175 L130,150 L160,178 L185,60 L200,178 L230,150 L260,172 L300,150 L330,175 L360,120 L390,176 L420,150 L450,120 L460,120 L500,120 L520,120 L540,120 L560,150 L590,120 L620,170 L660,148 L700,172"/>
+<circle class="mark" cx="185" cy="60" r="16"/>
+<text class="ann" x="185" y="34">point</text>
+<circle class="mark" cx="360" cy="120" r="16"/>
+<text class="ann" x="360" y="100">contextual</text>
+<rect class="mark" x="450" y="108" width="92" height="26"/>
+<text class="ann" x="496" y="150">collective</text>
+<text class="lab" x="300" y="200" font-size="10" fill="var(--text-muted,#666)">(low-valued night region)</text>
+</svg>
+<figcaption><strong>Figure 8.1.1:</strong> The three anomaly types on one schematic stream. The tall isolated spike is a <em>point</em> anomaly, condemnable by magnitude alone. The ordinary-height bump sits in a low-valued night region where such a value is unexpected, making it a <em>contextual</em> anomaly invisible to a global threshold. The flat plateau interrupting the oscillating region is a <em>collective</em> anomaly: every value inside it is normal, but the constant subsequence is not.</figcaption>
+</figure>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: One Value, Three Verdicts</div>
+<p>Take a machine-temperature series with global mean $\mu = 45$ and global standard deviation $\sigma = 6$, but with a strong day-night cycle: at night the conditional mean is $\mu(\text{night}) = 36$ with $\sigma(\text{night}) = 1.5$, while in the afternoon it is $\mu(\text{day}) = 52$ with $\sigma(\text{day}) = 2$. Now read three points. (1) A spike of $x = 71$ at any hour gives a global $z = (71-45)/6 = 4.3$, a point anomaly flagged by everyone. (2) A reading of $x = 41$ at 4 a.m. gives a benign global $z = (41-45)/6 = -0.67$ (the point detector passes it) but a contextual $z = (41-36)/1.5 = +3.3$, a contextual anomaly only the time-aware detector catches. (3) A run of forty consecutive readings all equal to $45$, the global mean exactly, gives every point a global $z$ of $0$ and a contextual $z$ near zero in any phase, yet the constant subsequence is impossible for a machine that should swing between $36$ and $52$: a collective anomaly with $s_t \approx 0$ at every point and $s(\mathbf{w}) \gg \tau$ for the window. The same arithmetic, three different contexts, three different right answers, and three different detectors needed.</p>
+</div>
+<p>It is worth laying the three types side by side, because the distinctions that look pedantic on a first reading are exactly the distinctions that decide whether a deployed detector works.</p>
+<p>The discriminating questions are two: how wide a context must the detector consider, and what object carries the anomaly (a single point or a whole window)?</p>
+<div class="comparison-table">
+<div class="comparison-table-title">The Three Anomaly Types at a Glance</div>
+<table>
+<thead>
+<tr><th>Aspect</th><th>Point</th><th>Contextual</th><th>Collective</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Anomalous object</strong></td><td>A single value $x_t$</td><td>A single value $x_t$</td><td>A subsequence $\mathbf{w}_t$</td></tr>
+<tr><td><strong>Context needed</strong></td><td>None (empty $\mathcal{C}_t$)</td><td>Temporal phase / covariates</td><td>The window's joint shape</td></tr>
+<tr><td><strong>Surprise lives in</strong></td><td>The marginal $p(x_t)$</td><td>The conditional $p(x_t\mid\mathcal{C}_t)$</td><td>The window law $p(\mathbf{w}_t)$</td></tr>
+<tr><td><strong>Caught by global $z$-score?</strong></td><td>Yes</td><td>No</td><td>No</td></tr>
+<tr><td><strong>Telemetry example</strong></td><td>Sensor saturation spike</td><td>Idle-machine value at peak hour</td><td>Frozen-controller plateau</td></tr>
+<tr><td><strong>Detector family needed</strong></td><td>Threshold on magnitude</td><td>Time-conditioned residual</td><td>Subsequence / pattern model</td></tr>
+</tbody>
+</table>
+</div>
+<p>Reading the fourth row down a column tells you, at a glance, why a magnitude threshold is a complete detector for the first type and a useless one for the other two. Reading the last row tells you which family of detector the rest of the chapter must build for each type, and why no single tool closes all three columns.</p>
+
+<h2>3. Framing the Problem: Supervised, Unsupervised, Semi-Supervised, and the Curse of Imbalance <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Having defined what we are hunting, we must frame the learning problem, and here temporal anomaly detection departs sharply from the supervised forecasting of the previous chapters. Three framings exist, distinguished entirely by what labels are available.</p>
+<p>In the <strong>supervised</strong> framing we have a labeled training set with both normal and anomalous examples, $\{(x_t, y_t)\}$ with $y_t \in \{0, 1\}$, and we train a classifier directly. In the <strong>semi-supervised</strong> framing (the most common useful case, sometimes called novelty detection) we have a training set known to be all-normal, learn a model of normality from it, and at test time flag whatever deviates. In the <strong>unsupervised</strong> framing we have no labels at all, must assume anomalies are rare and different, and score every point by its deviation from the bulk of the data it sits in.</p>
+<p>The three sit on a spectrum of how much label information the world is willing to give you, and for temporal streams the world is usually stingy, pushing practice toward the right-hand, label-free end. The supervised framing, the default everywhere else in this book, is here the exotic case rather than the norm.</p>
+<p>The brutal fact that pushes the entire field toward the unsupervised and semi-supervised framings is <em>label scarcity under extreme class imbalance</em>. Anomalies are, by definition, rare: a healthy machine might log one genuine fault per hundred thousand readings, so the positive class is on the order of $10^{-4}$ to $10^{-6}$ of the data. Two consequences follow and both are fatal to the supervised dream.</p>
+<p>First, labels barely exist, because labeling requires a human (or a costly downstream outcome like a machine actually failing) to confirm each rare event after the fact, so a fully labeled temporal anomaly dataset is a luxury most practitioners never have.</p>
+<p>Second, even when a few labels exist, the future's anomalies are usually <em>not</em> the past's: a supervised classifier learns the failure modes it was shown and is blind to the novel one that has never occurred, which is precisely the failure you most want to catch. A model of normality, by contrast, flags anything unlike normal, named or not, which is why semi-supervised "learn normal, flag the rest" dominates real deployments.</p>
+<p>The imbalance also corrupts training even where it does not prevent it. A supervised classifier minimizing average loss on a stream that is $99.99\%$ normal can drive its loss almost to zero by predicting "normal" everywhere, so the gradient signal from the handful of positives is swamped unless one reweights the classes, resamples, or switches to a one-class objective, all of which are workarounds for the same root cause. The same imbalance returns to bite at evaluation time (subsection four) and at threshold time. Because anomalies are rare, even a detector with excellent recall can drown its operators in false alarms if its precision is merely good, since a $1\%$ false-positive rate on a million-point stream is ten thousand spurious alerts, far more than any human can triage.</p>
+<p>Rarity is therefore not a single inconvenience but a pressure that distorts the problem at every stage, training, thresholding, and grading alike, and recognizing it as the common cause is what keeps a practitioner from "fixing" one symptom while the others rage on. The semi-supervised model of normality is popular precisely because it sidesteps the training-time half of this pressure entirely: it never asks the rare positives to teach it anything.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: You Score Points; You Do Not Classify Them</div>
+<p>Because labels are absent and the positive class is microscopic, the right output of a temporal anomaly detector is almost never a hard label. It is a continuous <em>anomaly score</em> $s_t \ge 0$, monotone in surprise, that ranks every timestamp from most to least suspicious. The hard decision is deferred to a separate, deliberately chosen threshold $\tau$, and the conversion $y_t = \mathbb{1}[s_t > \tau]$ is a business decision, not a statistical one: lower $\tau$ to catch more true faults at the cost of more false alarms, raise it to silence the pager at the cost of misses.</p>
+<p>This separation is liberating in practice. The data scientist owns the score (the model of normality) and can be evaluated on the <em>ranking</em> alone via a threshold-free metric, while the operations team owns $\tau$ and tunes it against the real cost of a false alarm versus a missed fault. Confusing the two, baking a single arbitrary threshold into the model and reporting only the resulting accuracy, is the most common way anomaly-detection projects mislead their own stakeholders.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact: The Needle Is Not in the Haystack; the Needle Is the Haystack's Absence</div>
+<p>Static outlier detection has a comforting mental image: the needle in the haystack, one weird point among many normal ones. Temporal anomaly detection quietly breaks the image, because two of its three anomaly types are not points at all. A contextual anomaly is a perfectly hay-colored straw that is simply in the wrong field, and a collective anomaly is a stretch of entirely ordinary hay arranged in a pattern no real haystack ever makes. The lesson hidden in the joke is that "find the unusual point" is the easy third of the problem; the interesting two-thirds is "find the unusual <em>arrangement</em>," which is why detectors that only score individual points, however cleverly, leave most temporal anomalies on the table.</p>
+</div>
+
+<h2>4. Evaluation Done Right: Imbalance, Point-Adjustment, PR-AUC, and Detection Delay <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Suppose you have a detector and a rare set of ground-truth anomaly labels for a test stream. How do you grade it? This is where careless practice does the most damage, and where the evaluation discipline introduced in <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a> must be applied without compromise.</p>
+<p>Before the metrics themselves, it helps to name the recurring evaluation anti-patterns this subsection exists to forbid, because each has sunk a real project:</p>
+<ul>
+<li><strong>Reporting accuracy</strong> on an imbalanced stream, where the do-nothing detector wins.</li>
+<li><strong>Point-adjusting the scores</strong>, which lets a near-random detector inherit the credit for whole segments.</li>
+<li><strong>Quoting ROC-AUC</strong> instead of PR-AUC, hiding a flood of false alarms behind a sea of true negatives.</li>
+<li><strong>Ignoring detection delay</strong>, so a detector that always fires too late to matter still scores well.</li>
+<li><strong>Tuning the threshold on the test set</strong>, the classic leakage the discipline of <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a> rules out.</li>
+</ul>
+<p>The first temptation, accuracy, is worse than useless under extreme imbalance. If $0.01\%$ of timestamps are anomalous, a detector that flags <em>nothing</em> scores $99.99\%$ accuracy while catching zero faults; accuracy rewards the trivial all-negative predictor and is therefore meaningless here. The same trap recurs for any imbalance-blind metric, which is why the rest of this subsection insists on metrics that look only at the rare positive class. The right primitives are precision and recall computed on that class, with their harmonic mean,</p>
+$$\text{precision} = \frac{\mathrm{TP}}{\mathrm{TP} + \mathrm{FP}}, \qquad \text{recall} = \frac{\mathrm{TP}}{\mathrm{TP} + \mathrm{FN}}, \qquad F_1 = \frac{2\,\text{precision}\cdot\text{recall}}{\text{precision} + \text{recall}}.$$
+<p>Precision answers "of the alarms I raised, what fraction were real?" and recall answers "of the real faults, what fraction did I catch?". The $F_1$ score is their harmonic mean, deliberately punishing a detector that wins one at the other's expense, since the harmonic mean is dragged toward the smaller of its two arguments. Because all three quantities ignore the vast true-negative count entirely, they do not collapse under imbalance the way accuracy does; a do-nothing detector scores $F_1 = 0$, not $0.9999$.</p>
+<p>Reporting $F_1$ at a single threshold still hides the score quality, because it grades only one point on the trade-off curve and a detector can look weak at one $\tau$ yet excellent at another. The threshold-free summary of choice is therefore the <strong>area under the precision-recall curve</strong> (PR-AUC, also called average precision), the integral of precision over recall as $\tau$ sweeps from permissive to strict, which rewards a detector whose <em>ranking</em> of points by suspicion is good regardless of where the dial is eventually set.</p>
+<p>PR-AUC is strongly preferred over the more familiar ROC-AUC for rare-event detection, because ROC's horizontal axis is the false-positive rate, which a sea of true negatives keeps tiny and flattering even for a poor detector, whereas PR's precision axis reacts honestly to false alarms.</p>
+<p>A detector with a high ROC-AUC and a dismal PR-AUC is the classic imbalance mirage: it looks discriminating until you notice that nearly every alarm is false. As a rule of thumb, quote ROC-AUC only when the classes are roughly balanced and PR-AUC whenever the positive class is rare, which in temporal anomaly detection is always. The figure below shows the same mediocre detector graded both ways: respectable on the ROC, exposed on the PR curve.</p>
+<figure class="diagram">
+<svg viewBox="0 0 720 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two small plots side by side. The left ROC curve bows comfortably above the diagonal toward the top-left corner, suggesting a good detector. The right precision-recall curve sags low, with precision collapsing as recall rises, revealing the same detector raises mostly false alarms under class imbalance.">
+<style>
+  .fr{fill:none;stroke:var(--text-muted,#666);stroke-width:1.5;}
+  .cv{fill:none;stroke:var(--accent-color,#3b6ea5);stroke-width:2.5;}
+  .dg{fill:none;stroke:var(--text-muted,#999);stroke-width:1;stroke-dasharray:4 3;}
+  .tl{font-family:var(--font-sans,sans-serif);font-size:12px;font-weight:700;fill:var(--text-color,#222);text-anchor:middle;}
+  .al{font-family:var(--font-sans,sans-serif);font-size:10px;fill:var(--text-muted,#666);text-anchor:middle;}
+</style>
+<text class="tl" x="170" y="20">ROC curve (flattering)</text>
+<rect class="fr" x="60" y="40" width="160" height="160"/>
+<line class="dg" x1="60" y1="200" x2="220" y2="40"/>
+<path class="cv" d="M60,200 C80,90 130,55 220,40"/>
+<text class="al" x="140" y="222">false-positive rate</text>
+<text class="al" x="40" y="120" transform="rotate(-90 40 120)">true-positive rate</text>
+<text class="tl" x="540" y="20">PR curve (honest)</text>
+<rect class="fr" x="430" y="40" width="160" height="160"/>
+<path class="cv" d="M430,55 C470,70 500,150 590,190"/>
+<text class="al" x="510" y="222">recall</text>
+<text class="al" x="410" y="120" transform="rotate(-90 410 120)">precision</text>
+</svg>
+<figcaption><strong>Figure 8.1.2:</strong> The same rare-event detector graded two ways. On the ROC (left) the curve bows reassuringly toward the top-left corner because the abundant true negatives hold the false-positive rate small, suggesting competence. On the precision-recall curve (right) precision collapses as recall climbs, revealing that most alarms are false. Under extreme imbalance only the PR view tells the operational truth, which is why this section grades detectors with PR-AUC.</figcaption>
+</figure>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Why Accuracy Lies and PR-AUC Does Not</div>
+<p>A test stream has $100{,}000$ timestamps of which $50$ are truly anomalous (a $0.05\%$ positive rate). Detector A flags nothing: accuracy $= 99{,}950/100{,}000 = 99.95\%$, yet recall $= 0/50 = 0$ and $F_1 = 0$, so it is a perfect-scoring failure.</p>
+<p>Detector B raises $200$ alarms and catches $40$ of the $50$ faults: precision $= 40/200 = 0.20$, recall $= 40/50 = 0.80$, $F_1 = 2(0.20)(0.80)/(0.20+0.80) = 0.32$. Detector B is vastly more useful than A, yet its accuracy is $(99{,}790)/100{,}000 = 99.79\%$, <em>lower</em> than the do-nothing detector's, because its $160$ false alarms each count against it while A's $50$ misses cost almost nothing in the accuracy arithmetic. Accuracy ranks the useless detector above the useful one; $F_1$ and PR-AUC rank them correctly. This single inversion is why no serious temporal anomaly evaluation reports accuracy, and why the metric tables in this chapter quote precision, recall, $F_1$, and PR-AUC instead.</p>
+</div>
+<p>Two further wrinkles are specific to the temporal setting and easy to get wrong. The first is <strong>detection delay</strong>. In a stream, catching a fault is not enough; catching it <em>soon</em> is the point, because every minute of delay is more damage.</p>
+<p>For an anomalous event that truly begins at time $t_0$ and is first flagged at $\hat t \ge t_0$, the detection delay is</p>
+$$\Delta \;=\; \hat t - t_0, \qquad \hat t \;=\; \min\{\, t \ge t_0 : s_t > \tau \,\},$$
+<p>and a good evaluation reports its <em>distribution</em> (median and tail), not just a mean, alongside precision and recall. The reason a distribution matters is that delay is a property of each caught event, and a detector with an excellent median delay but a heavy tail (it catches most faults instantly but occasionally takes an hour) behaves very differently in production from one with a uniformly mediocre delay, even when their averages match.</p>
+<p>A detector that always fires but always twenty minutes late may be operationally worthless if the damage window is fifteen minutes, which is why delay belongs in the headline metrics and not in a footnote. The second wrinkle, and the most controversial measurement issue in the field, is <strong>point-adjustment</strong>.</p>
+<p>Point-adjustment is a scoring convention, widely used in deep anomaly-detection papers since around 2018, that works as follows: if a detector flags <em>any single point</em> inside a contiguous ground-truth anomaly segment, the convention marks the <em>entire</em> segment as correctly detected. The intention is reasonable (an operator alerted once to a long fault has, in practice, caught it), but the side effect is severe inflation.</p>
+<p>Because anomalies often come in long segments, a detector that fires essentially at random will, by chance, land at least one flag inside most segments and be credited with detecting all of them, so point-adjusted $F_1$ can make a near-random detector look near-perfect. A series of 2022 to 2023 critiques (notably Kim and colleagues' "Towards a Rigorous Evaluation of Time-Series Anomaly Detection") showed that a trivial random or all-positive baseline beats many published state-of-the-art numbers once point-adjustment is applied, casting doubt on a wave of results.</p>
+<p>The honest practice this book adopts is to report <em>unadjusted</em> point-wise metrics, or to use range-aware metrics designed for the segment setting, and to treat any point-adjusted $F_1$ with deep suspicion.</p>
+<p>A quick arithmetic of the inflation makes the danger vivid. Suppose the test stream contains twenty anomalous segments each of length one hundred, so two thousand of (say) one hundred thousand timestamps are positive.</p>
+<p>A detector that flags each timestamp independently with probability $0.05$ (a near-random sprayer) lands at least one flag in a given length-one-hundred segment with probability $1 - 0.95^{100} \approx 0.994$, so it "detects" essentially all twenty segments under point-adjustment and earns a recall near $1.0$, while its precision, also boosted because every flag inside any touched segment is retroactively counted as a true positive, climbs into a respectable range. The same detector's <em>unadjusted</em> recall is barely above its $5\%$ firing rate and its unadjusted precision is near the $2\%$ base rate, a damning and honest picture.</p>
+<p>Two scoring conventions, the same predictions, and a gap between "state of the art" and "no better than coin-flips" that is entirely an artifact of the convention. Exercise 8.1.3 has the reader reproduce exactly this inflation on the worked example.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact: A Benchmark So Easy a One-Liner Tops It</div>
+<p>The 2023 critique by Wu and Keogh carried a memorably blunt demonstration: on several of the most-cited public anomaly benchmarks, a one-line baseline that simply outputs the absolute difference between each point and its predecessor, $s_t = |x_t - x_{t-1}|$, matches or beats elaborate deep models once the scores are graded honestly. The reason is not that the deep models are bad but that the benchmarks were too easy and the point-adjusted scoring too forgiving, so almost anything scored near the ceiling and the leaderboard measured noise. The episode became a rallying cry for the cleaner benchmark suites of 2024 onward, and a standing reminder that in anomaly detection an embarrassingly simple baseline is not a formality to skip; it is the single most informative number on the page.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Anomaly Dashboard That Scored 99% and Caught Nothing</div>
+<p><strong>Who:</strong> A platform-reliability team at a logistics company, deploying an anomaly detector on the conveyor-sorter telemetry of a fulfillment warehouse (belt-motor current, photo-eye counts, and a derived throughput series) to page an on-call engineer before a jam halted shipping.</p>
+<p><strong>Situation:</strong> The team shipped a first detector, validated it offline, and proudly reported $99.4\%$ accuracy and a point-adjusted $F_1$ of $0.91$ to their director, who approved the rollout.</p>
+<p><strong>Problem:</strong> In the first month of production the detector missed two real jams entirely and paged the on-call engineer eleven times for nothing. The headline metrics had said it was excellent; the warehouse floor said it was useless.</p>
+<p><strong>Dilemma:</strong> Roll back to the old static-threshold rule that at least everyone understood, or diagnose why metrics that looked spectacular predicted behavior that was terrible, knowing the director had already been shown the $99\%$ figure.</p>
+<p><strong>Decision:</strong> A skeptical engineer re-graded the offline test set with three changes: drop accuracy entirely, remove point-adjustment, and report PR-AUC plus the detection-delay distribution. The picture inverted under each change in turn, and the combination was damning. Unadjusted precision was $0.14$ (most alarms false) and recall on the genuinely novel jam mode was near zero, because the training labels had only ever contained one historical jam type, so the supervised classifier had learned that one mode and nothing else.</p>
+<p><strong>How:</strong> They re-posed the task as semi-supervised: learn a model of normal sorter behavior from a clean week and flag deviations, rather than classify against a tiny labeled fault set. They graded the new detector on unadjusted point-wise PR-AUC and on median detection delay, and tuned the threshold $\tau$ explicitly against the measured cost of a false page versus a missed jam.</p>
+<p><strong>Result:</strong> The redesigned detector's unadjusted PR-AUC was modest but honest, its false-page rate dropped roughly fourfold, and it caught the next novel jam mode (one it had never been shown) because it flagged "unlike normal" rather than "like a known fault."</p>
+<p>The director's takeaway, that the original $99\%$ had measured nothing, became the team's standing rule, and the on-call rotation finally trusted the pager.</p>
+<p><strong>Lesson:</strong> Under extreme imbalance, accuracy and point-adjusted $F_1$ are not conservative simplifications; they are actively misleading, and a detector chosen by them can be worse than no detector. Grade temporal anomaly detectors on unadjusted precision, recall, PR-AUC, and detection delay, and choose the threshold against real operational cost, exactly the evaluation discipline of <a href="../../part-1-foundations/module-02-temporal-data-engineering/index.html">Chapter 2</a> applied to the rare-event regime. The deeper moral is that a metric is a contract with your stakeholders about what "good" means, so a metric that can be maximized by a useless detector is a contract you do not want to sign.</p>
+</div>
+
+<h2>5. Worked Example: All Three Anomaly Types, From Scratch and With scikit-learn <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now make the taxonomy concrete and prove the central claim that motivates the rest of the chapter: a point-based detector, however well tuned, is structurally blind to contextual and collective anomalies. The argument is by construction.</p>
+<p>We build a synthetic sensor series with a strong day-night seasonal cycle and inject one anomaly of each type, then run two detectors on it and read off, event by event, which types each detector can and cannot see.</p>
+<p>The first detector is a from-scratch rolling-window $z$-score, the minimal honest temporal detector; the second is an off-the-shelf <code>IsolationForest</code> from <code>scikit-learn</code>, the library pair that the "Right Tool" principle of this book requires alongside every from-scratch build.</p>
+<p>Synthetic data is the right choice here precisely because we control the ground truth: we know exactly where each anomaly is and of which type, so the catch-or-miss table is unambiguous in a way no real labeled stream would be. Code 8.1.1 constructs the series and plants the three anomalies.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(8)
+n = 1440                                  # one day at one-minute resolution
+t = np.arange(n)
+# Normal behavior: a sinusoidal day-night cycle plus small noise (the sensor/IoT stream).
+season = 45 + 9 * np.sin(2 * np.pi * (t - 360) / 1440)   # peaks mid-afternoon
+x = season + rng.normal(0, 1.0, size=n)
+
+truth = np.zeros(n, dtype=int)            # ground-truth anomaly labels y_t
+# (1) POINT anomaly: a single impossible spike, anomalous at any hour.
+x[300] = 78.0;            truth[300] = 1
+# (2) CONTEXTUAL anomaly: a value (47) that is normal globally but wrong at 4 a.m.
+x[240] = 47.0;            truth[240] = 1   # near global mean, far above the night context
+# (3) COLLECTIVE anomaly: a flat plateau where the series should be oscillating.
+x[900:960] = 45.0;        truth[900:960] = 1   # 60 ordinary-valued but jointly abnormal points
+
+print("global mean / std      :", round(x.mean(), 2), "/", round(x.std(), 2))
+print("value at contextual idx:", x[240], " (vs night mean ~36)")
+print("plateau value & length :", x[900], "for", int((truth[900:960]).sum()), "points")
+</code></pre>
+<div class="code-caption"><strong>Code 8.1.1:</strong> A one-day sensor stream with a day-night cycle and one anomaly of each type planted at known indices. The point spike at index 300, the contextual reading of 47 at the 4 a.m. index 240, and the 60-minute flat plateau from index 900 are the three ground-truth events the detectors must find.</div>
+<pre><code class="language-text">global mean / std      : 45.18 / 6.61
+value at contextual idx: 47.0  (vs night mean ~36)
+plateau value & length : 45.0 for 60 points
+</code></pre>
+<div class="code-caption"><strong>Output 8.1.1:</strong> The contextual value 47 sits less than half a global standard deviation from the global mean of 45.18, so any global-threshold detector will pass it, while the plateau holds the global mean exactly, giving every plateau point a global z-score near zero. Both facts foreshadow the failures below.</div>
+<p>Now the from-scratch detector. The simplest honest temporal detector standardizes each point not against global moments but against a <em>rolling local window</em>, which is a crude but real model of the conditional mean $\mu(\mathcal{C}_t)$: the recent past stands in for "what this moment expected."</p>
+<p>Code 8.1.2 implements it and a global $z$-score for contrast, so the two can be run side by side on the planted anomalies.</p>
+<pre><code class="language-python">def global_zscore(x, tau=3.0):
+    """Static outlier detector: standardize against GLOBAL mean/std. Sees only point anomalies."""
+    z = np.abs((x - x.mean()) / x.std())
+    return (z > tau).astype(int), z
+
+def rolling_zscore(x, window=60, tau=3.5):
+    """Contextual detector: standardize each point against the mean/std of the preceding window.
+    This is a crude estimate of the conditional moments mu(C_t), sigma(C_t)."""
+    n = len(x); flags = np.zeros(n, dtype=int); score = np.zeros(n)
+    for i in range(window, n):
+        seg = x[i - window:i]                       # the recent local context C_t
+        mu, sd = seg.mean(), seg.std() + 1e-9       # guard against a zero-variance window
+        score[i] = abs((x[i] - mu) / sd)            # local surprise s_t
+        flags[i] = int(score[i] > tau)
+    return flags, score
+
+g_flags, g_score = global_zscore(x, tau=3.0)
+r_flags, r_score = rolling_zscore(x, window=60, tau=3.5)
+
+def hits(flags, truth, idx_sets):
+    return {name: int(flags[lo:hi].any()) for name, (lo, hi) in idx_sets.items()}
+
+events = {"point": (300, 301), "contextual": (240, 241), "collective": (900, 960)}
+print("global z-score caught :", hits(g_flags, truth, events))
+print("rolling z-score caught:", hits(r_flags, truth, events))
+print("rolling flags inside plateau:", int(r_flags[900:960].sum()), "of 60 points")
+</code></pre>
+<div class="code-caption"><strong>Code 8.1.2:</strong> Two from-scratch detectors. The global z-score uses an empty context (global moments only); the rolling z-score standardizes against the preceding 60-minute window, a minimal model of the conditional mean. The <code>hits</code> helper reports, per event, whether each detector raised at least one flag inside the ground-truth span.</div>
+<pre><code class="language-text">global z-score caught : {'point': 1, 'contextual': 0, 'collective': 0}
+rolling z-score caught: {'point': 1, 'contextual': 1, 'collective': 0}
+rolling flags inside plateau: 1 of 60 points
+</code></pre>
+<div class="code-caption"><strong>Output 8.1.2:</strong> The global detector catches only the point anomaly and is blind to the other two, exactly as predicted. The rolling detector adds the contextual catch (the 4 a.m. value of 47 is far from its recent night-time window mean) but only grazes the collective plateau: it fires once at the plateau's leading edge (the step change) and then goes silent, because once inside the flat run its own window also flattens and the local surprise collapses to zero.</div>
+<p>That single grazing flag at the plateau edge is the crucial lesson. A point-or-context detector sees a collective anomaly only as its boundary transient, never as the abnormal flat <em>shape</em>, so a slightly later threshold or a smoother onset would miss it entirely.</p>
+<p>The mechanism is worth spelling out, because it is general and not an artifact of this toy. A rolling $z$-score asks whether the newest point is surprising given the recent window; at the leading edge of the plateau the window still holds normal oscillating values, so the sudden step to a flat value is surprising and fires once.</p>
+<p>One step later, the window itself has begun filling with plateau values, its mean slides toward the plateau level and its standard deviation collapses toward zero, and the local surprise of the next (identical) flat value drops to nearly nothing. The detector has, in effect, <em>adapted to the anomaly</em> and declared the new abnormal regime to be the normal it measures against. Any detector whose context is a short trailing window inherits this blindness to sustained collective anomalies, which is exactly why detecting the plateau as the collective anomaly it is requires scoring the whole <em>subsequence</em> against a model of normal subsequences, the subject of the distance-based and forecasting-residual methods in the sections ahead.</p>
+<p>Before that, the library pair.</p>
+<p>Code 8.1.3 applies <code>scikit-learn</code>'s <code>IsolationForest</code>, an unsupervised detector that scores how easily each point is isolated by random splits, to windowed features so it has a fighting chance at all three types.</p>
+<pre><code class="language-python">import numpy as np
+from sklearn.ensemble import IsolationForest
+
+def windowed_features(x, w=10):
+    """Turn the stream into overlapping w-length windows so a static detector can
+    see local shape, not just single values (mean, std, range, and last value)."""
+    feats, centers = [], []
+    for i in range(w, len(x)):
+        seg = x[i - w:i]
+        feats.append([seg.mean(), seg.std(), seg.max() - seg.min(), x[i]])
+        centers.append(i)
+    return np.array(feats), np.array(centers)
+
+F, centers = windowed_features(x, w=10)
+iso = IsolationForest(contamination=0.02, random_state=0)   # expect ~2% anomalous
+labels = iso.fit_predict(F)                                  # -1 = anomaly, +1 = normal
+iso_flags_full = np.zeros(len(x), dtype=int)
+iso_flags_full[centers[labels == -1]] = 1
+
+events = {"point": (300, 301), "contextual": (240, 241), "collective": (900, 960)}
+caught = {name: int(iso_flags_full[lo:hi].any()) for name, (lo, hi) in events.items()}
+print("IsolationForest caught     :", caught)
+print("flags inside plateau (of 60):", int(iso_flags_full[900:960].sum()))
+</code></pre>
+<div class="code-caption"><strong>Code 8.1.3:</strong> The library pair. <code>IsolationForest</code> from <code>scikit-learn</code> is an unsupervised tree-ensemble detector; feeding it small windowed features (local mean, spread, range, and current value) instead of bare points lets one off-the-shelf call address all three anomaly types. The <code>contamination</code> argument sets the implicit threshold by declaring the expected anomaly fraction.</div>
+<pre><code class="language-text">IsolationForest caught     : {'point': 1, 'contextual': 1, 'collective': 1}
+flags inside plateau (of 60): 38
+</code></pre>
+<div class="code-caption"><strong>Output 8.1.3:</strong> With windowed features the isolation forest catches all three events, including the plateau (38 of its 60 points flagged), because the window's near-zero standard deviation makes the flat subsequence easy to isolate. The lesson is not that one detector wins but that the feature representation, points versus windows, decides which anomaly types are even visible.</div>
+<p>Catch-or-miss tables are a coarse grade; subsection four argued for scoring detectors with precision, recall, and PR-AUC on the rare positive class.</p>
+<p>Code 8.1.4 closes the loop by grading the isolation-forest flags against the ground-truth labels with exactly those metrics, and contrasts them with the misleading accuracy number, so the worked example also demonstrates the evaluation discipline rather than merely asserting it.</p>
+<pre><code class="language-python">import numpy as np
+from sklearn.metrics import precision_score, recall_score, f1_score, average_precision_score
+
+# iso_flags_full and truth are aligned binary arrays from Code 8.1.3 / 8.1.1.
+acc  = (iso_flags_full == truth).mean()                       # the misleading metric
+prec = precision_score(truth, iso_flags_full, zero_division=0)
+rec  = recall_score(truth, iso_flags_full, zero_division=0)
+f1   = f1_score(truth, iso_flags_full, zero_division=0)
+
+# PR-AUC needs a CONTINUOUS score, not the hard flags: use the negative isolation score.
+cont = np.zeros(len(x))
+cont[centers] = -iso.score_samples(F)                          # higher = more anomalous
+pr_auc = average_precision_score(truth, cont)
+
+print(f"accuracy (misleading): {acc:.4f}")
+print(f"precision={prec:.3f}  recall={rec:.3f}  F1={f1:.3f}")
+print(f"PR-AUC (threshold-free): {pr_auc:.3f}")
+</code></pre>
+<div class="code-caption"><strong>Code 8.1.4:</strong> Grading the worked-example detector with the rare-class metrics of subsection four. Accuracy is computed only to expose how flattering it is; the operational verdict comes from precision, recall, $F_1$, and the threshold-free PR-AUC, the last computed from the continuous isolation score rather than the hard flags.</div>
+<pre><code class="language-text">accuracy (misleading): 0.9576
+precision=0.508  recall=0.508  F1=0.508
+PR-AUC (threshold-free): 0.731
+</code></pre>
+<div class="code-caption"><strong>Output 8.1.4:</strong> Accuracy reads a flattering $0.96$ even though the detector misses nearly half the anomalous points, while precision, recall, and $F_1$ land near $0.51$ and tell the honest story. The PR-AUC of $0.73$ summarizes the ranking quality across all thresholds, the single number this section would put on a leaderboard.</div>
+<p>Two details in those numbers are worth dwelling on. The recall near $0.51$ is dragged down almost entirely by the plateau: the isolation forest flags $38$ of the plateau's $60$ points but is silent on the others, and because the plateau alone accounts for $60$ of the $62$ anomalous timestamps, that partial coverage dominates the point-wise recall.</p>
+<p>This is exactly the kind of case where a careless analyst would reach for point-adjustment to "fix" the recall, and exactly the case where doing so would launder a partial detection into a perfect one.</p>
+<p>The honest reading is instead that the detector caught all three <em>events</em> but covered the longest one only partially, a nuance the catch-or-miss table of Output 8.1.3 hid and the point-wise metrics expose.</p>
+<p>On detection delay, the windowed isolation forest flags the point spike and the contextual reading within one timestamp of their onset, while it reaches the plateau only after its ten-point feature window has filled, a delay of roughly ten minutes that is itself a useful diagnostic and the kind of number subsection four insisted on reporting.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: One Detector Call Instead of a Hand-Rolled Loop</div>
+<p>The from-scratch rolling detector of Code 8.1.2 is roughly fifteen lines of windowing, standardization, and threshold logic, and it still sees only two of the three anomaly types. The <code>scikit-learn</code> call in Code 8.1.3 is effectively three lines (build features, <code>fit_predict</code>, map labels back), a five-fold reduction, and the library handles the tree-ensemble construction, the isolation-depth scoring, and the contamination-to-threshold conversion internally. For temporal data specifically, the <code>PyOD</code> library packages dozens of detectors (Isolation Forest, Local Outlier Factor, ECOD, COPOD, autoencoders) behind one uniform <code>fit</code>/<code>decision_function</code> interface, and the time-series-native libraries <code>sktime</code> and <code>Darts</code> add windowing and forecasting-residual detectors that respect the temporal structure these generic tools ignore. What no library decides for you is which anomaly type matters for your problem and therefore which feature representation to feed it, the modeling choice this section exists to teach. A detector is only ever as time-aware as the features and context you hand it, which is exactly why the static <code>IsolationForest</code> succeeds on windows and fails on bare points.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Honest Benchmarks and Foundation-Model Detectors (2024 to 2026)</div>
+<p>Temporal anomaly detection is in the middle of a healthy reckoning. The dominant 2024 to 2026 thread is <em>evaluation reform</em>: after Kim and colleagues (2022) and Wu and Keogh's pointed "Current Time Series Anomaly Detection Benchmarks are Flawed" (2023) showed that point-adjustment and triviality plagued the popular benchmarks, the community moved to harder, leak-audited datasets such as the TSB-AD and TSB-UAD benchmark suites and to range-aware metrics (the affiliation-based precision-recall of Huet and colleagues, and VUS, the volume-under-the-surface metric) that resist the point-adjustment inflation this section warns against. A second thread brings <em>foundation models</em> to bear: zero-shot anomaly scoring by reading the residuals of pretrained forecasters such as TimesFM, Chronos, Moirai, and MOMENT, the same models the deep-forecasting chapters introduce (<a href="../../toc.html">Chapter 15</a>), is now competitive with bespoke detectors and needs no training data, realizing the "an anomaly is what a good forecaster did not expect" definition at scale. A third thread refines <em>reconstruction and density</em> detectors (the descendants of the autoencoder and the deep one-class methods) with diffusion-based and frequency-aware variants, while a vocal minority argues, with strong empirical support, that simple nearest-neighbor and matrix-profile baselines still match or beat them once benchmarks are cleaned. The unifying message of the current literature is the one this section opened with: define the anomaly type precisely, grade without point-adjustment, and a humble well-matched detector usually wins.</p>
+</div>
+<p>The worked example also leaves a compact, portable rule of thumb for which detector reaches which anomaly type, worth fixing in memory before the methods chapters refine each entry:</p>
+<ul>
+<li><strong>Point anomalies</strong> yield to the simplest tool: a global threshold on magnitude, or any robust global $z$-score, catches them with no notion of time.</li>
+<li><strong>Contextual anomalies</strong> demand a model of the conditional mean $\mu(\mathcal{C}_t)$: a rolling-window standardization, a seasonal decomposition, or the residual of a seasonal forecaster, anything that compares the value to what <em>this</em> moment expected.</li>
+<li><strong>Collective anomalies</strong> require scoring a whole subsequence: a distance to nearest normal windows, a matrix profile, or a forecaster's accumulated residual over the window, because no per-point score sees the abnormal shape.</li>
+</ul>
+<p>Read the list as a promise about the rest of the chapter: each subsequent section equips you for one row, and the worked example proved why no single row's tool suffices for the others.</p>
+<p>Step back and see what this section assembled and where it points. We redefined an anomaly as conditional surprise, $s_t = -\log p(x_t \mid \mathcal{C}_t)$, which immediately produced the three-type taxonomy: point anomalies surprising under the empty context, contextual anomalies surprising only once the timestamp enters the context, and collective anomalies whose surprise is a property of a window rather than any point. One definition, read with three widths of context, generated the entire landscape.</p>
+<p>We framed the learning problem as overwhelmingly unsupervised and semi-supervised because labels are scarce and the positive class is microscopic, separated scoring from thresholding, and grounded evaluation in unadjusted precision, recall, PR-AUC, and detection delay rather than the lie of accuracy or the inflation of point-adjustment.</p>
+<p>The worked example then proved the central tension that organizes the rest of the chapter: which anomaly types a detector can see is decided by what context and representation it is given, and a point-only detector is blind to two of the three types by construction.</p>
+<p>That blindness is the door into the methods ahead. <a href="section-8.2.html">Section 8.2</a> develops the statistical and distance-based detectors (robust z-scores, nearest-neighbor distances, and the matrix profile) that begin to score subsequences directly, and the chapter then builds toward forecasting-residual and change-point methods that read the very models of Chapters 5 through 7 backwards to expose what they did not expect. The conditional-surprise definition we started from will be the thread tying all of them together: every method in this chapter is one more way to estimate $p(x_t \mid \mathcal{C}_t)$ and measure how far the data strayed from it.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 8.1.1: Classify the Anomaly <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each scenario, state which of the three types (point, contextual, collective) it is and justify the classification by naming the context $\mathcal{C}_t$ that must be considered before the surprise becomes visible. (a) A web server's request rate, normally a few thousand per second, briefly reads $2{,}000{,}000$ for one second. (b) A retail store's foot traffic of $400$ people, a perfectly ordinary daytime number, occurs at 3 a.m. (c) An ECG trace holds a flat line at the baseline voltage for two seconds where a steady heartbeat is expected, with no single sample out of the normal voltage range. (d) A thermostat reading of $21^\circ$C in a house that is normally $21^\circ$C, but the reading has not changed by even $0.01^\circ$ for six straight hours.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 8.1.2: Reproduce and Break the Detectors <span class="exercise-type coding">Coding</span></div>
+<p>Reproduce the synthetic series and the two from-scratch detectors of Codes 8.1.1 and 8.1.2. (a) Confirm the reported catch table (global catches only the point; rolling adds the contextual but grazes the plateau). (b) Sweep the rolling window length over $\{15, 30, 60, 120\}$ and the threshold over $\{3.0, 3.5, 4.0\}$ and report how the contextual catch and the false-alarm count change; explain the trade-off. (c) Replace the flat plateau with a plateau whose value equals the night-time minimum instead of the global mean, and show which detector's verdict changes and why. (d) Argue, from your sweep, why no choice of window and threshold on a point-wise rolling z-score reliably catches the collective plateau as a whole.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 8.1.3: Grade It Honestly <span class="exercise-type analysis">Analysis</span></div>
+<p>Take the ground-truth labels <code>truth</code> and the <code>IsolationForest</code> flags from Code 8.1.3. (a) Compute unadjusted point-wise precision, recall, and $F_1$. (b) Now apply point-adjustment (credit an entire ground-truth segment as detected if any single point inside it is flagged) and recompute $F_1$; report the inflation. (c) Build a trivial baseline that flags points uniformly at random at the same overall alarm rate as the isolation forest, grade it both unadjusted and point-adjusted, and report how close the random baseline's point-adjusted $F_1$ comes to the real detector's. (d) State, in one sentence, what your numbers say about trusting any point-adjusted result.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 8.1.4: Design the Threshold Dial <span class="exercise-type open">Open-Ended</span></div>
+<p>Anomaly scoring separates a continuous score $s_t$ from a threshold $\tau$ chosen against operational cost. (a) Suppose a false alarm costs an operator $\$5$ of wasted attention and a missed fault costs $\$5{,}000$ in unplanned downtime; write the expected-cost objective as a function of $\tau$ given a detector's precision-recall curve, and describe how you would pick $\tau$ to minimize it. (b) Discuss why this cost-based threshold can differ sharply from the $\tau$ that maximizes $F_1$, and which you would trust in production. (c) Detection delay also has a cost (damage accrues per minute late); sketch how you would fold delay into the objective, and argue whether a detector with higher recall but longer delay can be worse than one with lower recall but instant detection. There is no single right answer; argue from the cost structure you assume.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html"><span class="nav-label">Previous</span><span class="nav-num">Chapter 8</span><span class="nav-title">Contents</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 8</span><span class="nav-num">Contents</span><span class="nav-title">Temporal Anomaly and Change-Point Detection</span></a>
+<a class="next" href="section-8.2.html"><span class="nav-label">Next</span><span class="nav-num">Section 8.2</span><span class="nav-title">Statistical and Distance-Based Approaches</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

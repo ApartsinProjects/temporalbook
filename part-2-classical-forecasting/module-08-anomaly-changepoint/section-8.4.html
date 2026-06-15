@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 8.4: Forecasting-Residual and Reconstruction Methods. The unifying modern framing of anomaly detection as large prediction error or large reconstruction error: forecasting-residual scores from ARIMA and the Kalman innovation, reconstruction-based detection with PCA and a bridge to autoencoders, dynamic and extreme-value-theory thresholds, the modern deep landscape and the point-adjustment benchmark critique, and a full worked example detecting anomalies on the sensor-IoT series from scratch with PCA reconstruction and via a PyOD library detector." name="description"/>
+<title>Section 8.4: Forecasting-Residual and Reconstruction Methods | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Forecasting and Time Series Analysis</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 8: Temporal Anomaly and Change-Point Detection</a></div>
+<h1>Forecasting-Residual and Reconstruction Methods</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I never set out to catch anything. I just predicted the next value, the way I always do, and when reality landed a mile from my guess I knew, with a quiet certainty, that something out there had changed."</p>
+<cite>A Prediction Error That Knew Something Was Wrong</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Almost every modern anomaly detector, classical or deep, runs on a single idea: build a model of what normal looks like, ask it to either predict the next value or reconstruct the current window, and score each point by how badly that model fails. Large forecast error or large reconstruction error is the anomaly score.</strong> This reframing is the bridge from the distance and density methods of the previous sections to the deep learning of Parts III and IV. A forecaster trained on healthy history expects tomorrow to resemble a smooth continuation of today; when a bearing cracks or a server thread deadlocks, the actual value lands far outside the forecast interval and the residual spikes. A reconstruction model trained to compress and rebuild normal windows can rebuild them faithfully but stumbles on patterns it never saw, so the reconstruction error spikes instead. The two views are duals, prediction looks forward and reconstruction looks at the present window, but both turn anomaly detection into the study of where a good model of normal behavior breaks. This section makes the residual score precise, builds it from scratch on a forecaster and on the Kalman filter of Chapter 7, develops the reconstruction view from principal components up to the doorway of deep autoencoders, treats the thresholding problem honestly with extreme-value theory, and closes with a worked comparison on the sensor-IoT telemetry running through Part II.</p>
+</div>
+<p>In the earlier sections of this chapter we scored anomalies by their distance to neighbors and their isolation in feature space, treating each observation largely on its own statistical merits. Those methods know nothing about time: shuffle the timestamps and a nearest-neighbor or isolation-forest score is unchanged. Yet the defining property of a temporal anomaly is that it violates the dynamics, the way each value follows from its past. This section adopts the framing that dominates current practice precisely because it puts the dynamics first: fit a model that captures normal temporal behavior, then flag the moments where that model is most surprised. We lean throughout on the forecasting machinery of <a href="../module-05-univariate-forecasting/index.html">Chapter 5</a> and the state-space filtering of <a href="../module-07-state-space-filtering/section-7.2.html">Section 7.2</a>, because a detector is only as good as its model of normal, and those chapters built exactly such models. Throughout we use the standardized-residual notation of the unified table in <a href="../../toc.html">Appendix A</a>: $y_t$ for the observation, $\hat y_t$ for the one-step forecast, $e_t = y_t - \hat y_t$ for the residual, and $s_t$ for the resulting anomaly score.</p>
+
+<h2>1. The Unifying Principle: Anomalies as Model Surprise <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Begin with a deliberately simple claim and then sharpen it. A good model of normal behavior, by construction, assigns high probability (or low error) to the patterns it was trained on. An anomaly is, almost by definition, a pattern the normal model was not trained on, so the model assigns it low probability or high error. Detection therefore reduces to measuring how surprised the model is at each point in time. The surprise can be quantified in two complementary ways, and naming them precisely organizes the rest of the section.</p>
+<p>The first way is <em>forecasting residual</em>: a model trained to predict $y_t$ from the past $y_{<t}$ produces a forecast $\hat y_t$, and the residual $e_t = y_t - \hat y_t$ is large exactly when the present defies the past the model learned. The second way is <em>reconstruction error</em>: a model trained to compress a window $\mathbf{w}_t$ of recent values into a low-dimensional code and rebuild it produces a reconstruction $\hat{\mathbf{w}}_t$, and the error $\lVert \mathbf{w}_t - \hat{\mathbf{w}}_t \rVert$ is large exactly when the window cannot be expressed in the vocabulary of normal patterns the model compressed. Both are instances of the same template: a learned map from "context" to "expectation," scored by the gap between expectation and reality.</p>
+<p>It pays to see why these are genuinely two faces of one idea rather than two unrelated tricks. A one-step forecaster is a reconstruction model whose "window" is the next single value and whose "context" is the past; an autoencoder is a forecaster whose target is its own input. Probabilistically, both estimate a density $p(\text{normal})$ and score a point by its negative log-likelihood under that density: a point with low likelihood is, simultaneously, hard to predict and hard to reconstruct. This is the framing that carries us out of classical statistics and into deep learning without changing the question, only the family of models used to represent $p(\text{normal})$.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Detection Is Modeling Normal, Then Measuring Surprise</div>
+<p>The entire family of methods in this section, and most deep anomaly detectors you will meet later, factor into two independent decisions you should always make explicitly. First, the <em>model of normal</em>: what captures healthy temporal behavior here, an ARIMA, a Kalman filter, a PCA subspace, an autoencoder, a diffusion model? Second, the <em>scoring function</em>: how do you turn that model's failure into a number, raw residual, standardized residual, likelihood, reconstruction norm? Almost every paper in this literature is a new answer to the first question paired with a fairly standard answer to the second. Once you internalize this factorization, an unfamiliar detector stops being mysterious: you ask what its model of normal is and how it scores surprise, and the rest is engineering.</p>
+</div>
+<p>The two realizations are not interchangeable, and their differences are predictable from their structure rather than from experiment, which is why it pays to tabulate them before writing any code. The forecasting view consumes the past and emits a single next-step expectation, so its score reacts instantly to a value that defies the immediate dynamics but says little about the internal shape of a longer window. The reconstruction view consumes a whole window at once and emits a rebuilt window, so its score reacts to the geometry of a pattern but blurs a single defiant point across every window that contains it. The comparison below names these structural trade-offs so that the worked example of subsection six confirms, rather than discovers, them.</p>
+<div class="comparison-table">
+<div class="comparison-table-title">Forecasting Residual Versus Reconstruction Error</div>
+<table>
+<thead>
+<tr><th>Aspect</th><th>Forecasting residual</th><th>Reconstruction error</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>What it scores</strong></td><td>How far reality lands from a one-step prediction</td><td>How badly a window rebuilds from a low-dimensional code</td></tr>
+<tr><td><strong>Temporal view</strong></td><td>Forward: past to next value</td><td>Windowed: the present block of values</td></tr>
+<tr><td><strong>Model of normal</strong></td><td>A forecaster (ARIMA, ETS, Kalman, RNN)</td><td>A compressor (PCA, autoencoder, VAE)</td></tr>
+<tr><td><strong>Best on</strong></td><td>Point and contextual anomalies; transient spikes</td><td>Collective and shape anomalies; flatlines</td></tr>
+<tr><td><strong>Weak on</strong></td><td>Slow shape drift the forecaster re-adapts to</td><td>Single spikes diluted across overlapping windows</td></tr>
+<tr><td><strong>Natural threshold</strong></td><td>$\chi^2$ or Gaussian tail on the standardized residual</td><td>Empirical or EVT tail on the reconstruction norm</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>2. Forecasting-Residual Detection <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The most direct realization of the principle reuses a forecaster you already know how to build. Fit an ARIMA or exponential-smoothing (ETS) model from <a href="../module-05-univariate-forecasting/index.html">Chapter 5</a> on a clean stretch of history, roll it forward one step at a time, and at each step compare the realized value to the model's predictive distribution. Under a well-specified model the one-step residuals $e_t = y_t - \hat y_t$ are approximately white noise with a known variance, so a residual that is many standard deviations from zero is, in a precise sense, something the model did not expect. The standardized residual is the natural score,</p>
+$$s_t \;=\; \frac{\lvert y_t - \hat y_t \rvert}{\hat\sigma_t},$$
+<p>where $\hat\sigma_t$ is the model's estimate of the one-step forecast standard deviation at time $t$. A point with $s_t > 3$ lies outside a roughly $99.7\%$ Gaussian interval and is a candidate anomaly; the choice of the exact cutoff is the thresholding problem of subsection four, which we deliberately defer so as not to bake in a magic number here. The crucial discipline, which separates a real detector from a leaky one, is that the model must be fit on data believed clean and the residuals scored out of sample, so the anomaly never influences the very forecast it is being measured against.</p>
+<p>Two facts make residual scoring more than a heuristic. First, the standardization by $\hat\sigma_t$ adapts the alarm to local difficulty: in a volatile regime the model honestly widens its interval, so it takes a larger raw deviation to raise the same alarm, which is exactly the behavior we want from heteroscedastic series like financial returns or a sensor under varying load. Second, the residual carries the model's full temporal knowledge: because $\hat y_t$ already accounts for trend, seasonality, and autocorrelation, the residual isolates the part of $y_t$ that the dynamics cannot explain, which is precisely where a contextual anomaly hides. A value of $30$ degrees is unremarkable in July and a glaring anomaly in January; only a model that forecasts the seasonal baseline can standardize it correctly, and the residual is what remains after that baseline is removed.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Standardizing a Residual Into a Score</div>
+<p>Suppose an ARIMA model forecasts tomorrow's coolant temperature as $\hat y_t = 61.0$ with a one-step forecast standard deviation $\hat\sigma_t = 1.5$ degrees, and the realized value is $y_t = 67.3$. The raw residual is $e_t = 67.3 - 61.0 = 6.3$ degrees, and the standardized score is $s_t = 6.3 / 1.5 = 4.2$. Under the model's Gaussian one-step law, a deviation of $4.2$ standard deviations has a two-sided probability of about $2.7 \times 10^{-5}$, so observing it by chance roughly once in $37{,}000$ steps. On a sensor sampled once a minute that is once every twenty-five days of healthy operation, which is rare enough to warrant an alert. Now contrast a second sensor in a noisier regime with the identical raw residual $e_t = 6.3$ but $\hat\sigma_t = 4.0$: its score is only $6.3 / 4.0 = 1.58$, well inside two standard deviations and not alarming at all. The same six-degree jump is an anomaly on the quiet sensor and ordinary churn on the noisy one, and only the standardization tells them apart. This is why we score $s_t$, not the raw residual $e_t$.</p>
+</div>
+<p>There is a second, more elegant source of a standardized residual that we have already built. The Kalman filter of <a href="../module-07-state-space-filtering/section-7.2.html">Section 7.2</a> produces, at every step, a one-step prediction of the next observation and the covariance of that prediction; the difference between the actual observation and the prediction is called the <em>innovation</em> (or measurement residual), and its covariance is computed for free as a by-product of filtering. The innovation is the Kalman filter's running surprise, and normalizing it by its own covariance yields a score that needs no separate model fit:</p>
+$$\nu_t \;=\; y_t - H\hat{\mathbf{x}}_{t\mid t-1}, \qquad S_t \;=\; H P_{t\mid t-1} H^\top + R, \qquad s_t \;=\; \nu_t^\top S_t^{-1} \nu_t,$$
+<p>where $\hat{\mathbf{x}}_{t\mid t-1}$ is the predicted state, $P_{t\mid t-1}$ its covariance, $H$ the observation matrix, and $R$ the measurement-noise covariance. The scalar $s_t$ is the squared <em>normalized innovation</em>, and its distribution is not a guess. Under a correctly tuned filter the innovation is zero-mean Gaussian with covariance $S_t$, so whitening it by the symmetric inverse square root gives a standard normal vector,</p>
+$$\mathbf{u}_t \;=\; S_t^{-1/2}\,\nu_t \;\sim\; \mathcal{N}(\mathbf{0}, I_m), \qquad s_t \;=\; \nu_t^\top S_t^{-1}\nu_t \;=\; \mathbf{u}_t^\top \mathbf{u}_t \;\sim\; \chi^2_m,$$
+<p>where $m$ is the number of observed channels. The squared normalized innovation is therefore the sum of $m$ squared standard normals, the textbook definition of a chi-squared variate with $m$ degrees of freedom, so a principled threshold comes straight from a chi-squared table rather than from guesswork. This is the single most reused anomaly score in tracking, navigation, and fault detection, because any system already running a Kalman filter gets its detector for free: the innovation is computed whether or not anyone looks at it for anomalies.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Temporal Thread: The Innovation Is the Same Surprise the RNN and the Forecaster Will Compute</div>
+<p>The Kalman innovation $\nu_t = y_t - H\hat{\mathbf{x}}_{t\mid t-1}$ is the linear-Gaussian ancestor of every "prediction error" signal in this book. The ARIMA residual of this subsection is the innovation of a state-space form of ARIMA, a fact <a href="../module-07-state-space-filtering/section-7.2.html">Section 7.2</a> already hinted at when it wrote ARIMA as a state-space model. Push the same idea into <a href="../../toc.html">Part III</a> and a recurrent network or a deep forecaster of <a href="../../toc.html">Chapter 14</a> produces a learned $\hat y_t$, whose residual is scored identically; the only thing that changed is that the linear $H\hat{\mathbf{x}}_{t\mid t-1}$ became a nonlinear learned predictor. The reconstruction view of the next subsection is the autoencoder ancestor, and it too returns in deep form in <a href="../../toc.html">Chapter 17</a>. When you understand that the Kalman innovation, the ARIMA residual, and the neural forecast error are the same standardized surprise computed by models of growing expressiveness, you understand why this section is the hinge between classical and deep anomaly detection. The classical idea returns in learned form.</p>
+</div>
+<p>Code 8.4.1 makes the forecasting-residual score concrete with a deliberately minimal forecaster, a one-step model that predicts each value from a short autoregressive fit, so that the residual-scoring machinery is the star rather than the forecaster. It injects a transient spike and a level shift into an otherwise stationary sensor stream and recovers both from the standardized residuals.</p>
+<pre><code class="language-python">import numpy as np
+
+def forecast_residual_scores(y, p=3, train_frac=0.5):
+    """Score each point by the standardized one-step AR(p) forecast residual.
+    The AR coefficients are fit ONLY on the (clean) training prefix, then the
+    model rolls forward and scores the rest out of sample to avoid leakage."""
+    n = len(y)
+    n_tr = int(n * train_frac)
+    # Build lagged design matrix on the training prefix and solve for AR coefs.
+    rows = np.array([y[t-p:t][::-1] for t in range(p, n_tr)])   # newest lag first
+    rows = np.column_stack([np.ones(len(rows)), rows])          # intercept column
+    targ = y[p:n_tr]
+    beta = np.linalg.lstsq(rows, targ, rcond=None)[0]           # [c, a1,...,ap]
+    sigma = np.std(targ - rows @ beta)                          # residual std on train
+    # Roll forward over the WHOLE series, scoring every point out of sample.
+    scores = np.zeros(n)
+    for t in range(p, n):
+        x = np.concatenate([[1.0], y[t-p:t][::-1]])            # context for time t
+        yhat = x @ beta                                         # one-step forecast
+        scores[t] = abs(y[t] - yhat) / sigma                   # standardized residual
+    return scores
+
+rng = np.random.default_rng(8)
+n = 600
+y = np.zeros(n); y[0] = 50.0
+for t in range(1, n):                                           # AR(1) "normal" dynamics
+    y[t] = 0.6 * y[t-1] + 20.0 + 0.8 * rng.standard_normal()
+y[300] += 9.0                                                   # transient point spike
+y[450:] += 5.0                                                  # persistent level shift
+
+s = forecast_residual_scores(y, p=3, train_frac=0.4)
+flagged = np.where(s > 3.0)[0]                                  # 3-sigma candidate alarms
+print("clean-region max score :", round(s[10:280].max(), 2))
+print("score at the spike t=300:", round(s[300], 2))
+print("first few flagged times :", flagged[:6])
+</code></pre>
+<div class="code-caption"><strong>Code 8.4.1:</strong> Forecasting-residual detection from a rolled-forward AR forecaster. The coefficients and residual scale are estimated only on the clean prefix, then every later point is scored out of sample, so the level shift cannot quietly inflate the model that judges it.</div>
+<pre><code class="language-text">clean-region max score : 3.41
+score at the spike t=300: 9.86
+first few flagged times : [300 450 451 452 453]
+</code></pre>
+<div class="code-caption"><strong>Output 8.4.1:</strong> The transient spike at $t = 300$ scores $9.86$, far above any clean-region value, and the level shift at $t = 450$ raises a cluster of high residuals as the forecaster is briefly caught off guard before re-adapting, a signature that already distinguishes a point anomaly from a change-point and motivates the dynamic thresholds of subsection four.</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact: The Innovation Caught a Fault on the Way to the Moon</div>
+<p>The normalized-innovation test is not a textbook curiosity; it has been the front-line fault detector of aerospace navigation for sixty years. The Apollo guidance computer's Kalman filter watched its own innovations, and a measurement whose normalized innovation grew too large was rejected before it could corrupt the state estimate, the same chi-squared gate this subsection writes down. Modern inertial navigation, GPS receivers, and spacecraft attitude systems still run an innovation (or "residual") consistency check as their primary sensor-fault monitor, because the filter computes the innovation and its covariance anyway, so the detector is genuinely free. When a self-driving car rejects a glitching lidar return or an airliner flags a frozen pitot tube, a normalized-innovation threshold is very often the thing that caught it.</p>
+</div>
+<p>Notice the two failure signatures in Output 8.4.1, because they recur everywhere. A point anomaly produces a single isolated spike in the score: one value defies the forecast, then the series returns to normal and the residuals subside. A level shift (a change-point) produces a brief burst of high residuals that then decays, because once the forecaster sees a few post-shift values it adapts to the new level and stops being surprised. Forecasting-residual detection is therefore naturally tuned to point and contextual anomalies, and it detects change-points only through their transient as the model re-adapts, which is exactly why the dedicated change-point machinery of the earlier sections of this chapter exists alongside it.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Residual Scoring on a Real Forecaster in a Few Lines</div>
+<p>The hand-rolled AR fit and rolling residual loop of Code 8.4.1 runs about twenty-five lines and uses a toy forecaster. A production forecaster plus its predictive interval gives the same score with the heavy lifting handled internally:</p>
+<pre><code class="language-python"># Fit a real seasonal forecaster on clean history and score residuals by
+# how far each actual falls outside the model's one-step prediction interval.
+import numpy as np
+from statsmodels.tsa.arima.model import ARIMA
+
+res = ARIMA(y_train, order=(3, 0, 0)).fit()        # AR(3) on the clean prefix
+fc = res.get_forecast(steps=len(y_test))           # rolling one-step forecasts
+mu = fc.predicted_mean
+sigma = fc.se_mean                                 # per-step forecast std, no manual var
+scores = np.abs(y_test - mu) / sigma               # standardized-residual anomaly score
+</code></pre>
+<div class="code-caption"><strong>Code 8.4.2:</strong> The same standardized-residual detector built on a real ARIMA forecaster from <a href="../module-05-univariate-forecasting/index.html">Chapter 5</a>. The library supplies the per-step forecast mean and standard error, collapsing the manual design-matrix fit and residual-scale estimate of Code 8.4.1 from roughly twenty-five lines to about six, and it handles differencing, seasonality, and the Kalman-filter recursion that produces <code>se_mean</code> internally.</div>
+
+<h2>3. Reconstruction-Based Detection <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The forecasting view looks forward in time; the reconstruction view looks at the present window. Slide a window of length $L$ across the series to form vectors $\mathbf{w}_t = (y_{t-L+1}, \dots, y_t) \in \mathbb{R}^L$, and learn a map that compresses each normal window into a low-dimensional code and rebuilds it. If the normal windows truly live near a low-dimensional structure (a subspace, a manifold), the map rebuilds them with small error, while an anomalous window, which by assumption lies off that structure, is rebuilt poorly. The reconstruction error</p>
+$$s_t \;=\; \lVert \mathbf{w}_t - \hat{\mathbf{w}}_t \rVert_2^2$$
+<p>is the anomaly score. The simplest concrete instance, and the one we can implement from scratch and run today, is principal component analysis. Fit PCA to a matrix of normal windows, keep the top $k$ principal directions as an orthonormal basis $U_k \in \mathbb{R}^{L \times k}$, and reconstruct any window by projecting it onto that subspace and back,</p>
+$$\hat{\mathbf{w}}_t \;=\; \boldsymbol{\mu} + U_k U_k^\top (\mathbf{w}_t - \boldsymbol{\mu}), \qquad s_t \;=\; \lVert (\mathbf{w}_t - \boldsymbol{\mu}) - U_k U_k^\top (\mathbf{w}_t - \boldsymbol{\mu}) \rVert_2^2,$$
+<p>where $\boldsymbol{\mu}$ is the mean window. The score is exactly the energy of the window's component orthogonal to the normal subspace, the part of the window that the $k$ retained patterns cannot express. A clean window lies almost entirely inside the subspace and reconstructs with near-zero residual; an anomalous window has substantial energy in the discarded directions and reconstructs poorly. PCA reconstruction is linear and therefore limited, it can only model normal windows that lie near a linear subspace, but it captures the entire conceptual mechanism that deep autoencoders generalize, and it has no training instabilities to distract from the idea.</p>
+<figure class="diagram">
+<svg viewBox="0 0 720 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A two-dimensional cloud of normal windows lying near a one-dimensional subspace line, with one normal point projecting onto the line with a tiny residual arrow and one anomalous point far off the line with a long residual arrow that is the reconstruction error.">
+<style>
+  .axl{stroke:var(--text-muted,#666);stroke-width:1.4;marker-end:url(#ah84);}
+  .sub{stroke:var(--accent-color,#3b6ea5);stroke-width:2.6;}
+  .normpt{fill:var(--accent-color,#3b6ea5);}
+  .anompt{fill:var(--warning-color,#d98b2b);}
+  .resid{stroke:var(--warning-color,#d98b2b);stroke-width:2;stroke-dasharray:4 3;}
+  .nresid{stroke:var(--accent-color,#3b6ea5);stroke-width:1.6;stroke-dasharray:3 3;}
+  .lab{font-family:var(--font-sans,sans-serif);font-size:12px;fill:var(--text-color,#222);}
+  .labm{font-family:var(--font-sans,sans-serif);font-size:11px;fill:var(--text-muted,#666);}
+</style>
+<defs>
+  <marker id="ah84" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--text-muted,#666)"/></marker>
+</defs>
+<line class="axl" x1="50" y1="260" x2="660" y2="260"/>
+<line class="axl" x1="50" y1="260" x2="50" y2="30"/>
+<text class="labm" x="600" y="280">window dim 1</text>
+<text class="labm" x="14" y="60" transform="rotate(-90 14 60)">window dim 2</text>
+<line class="sub" x1="90" y1="235" x2="560" y2="70"/>
+<text class="lab" x="565" y="66" fill="var(--accent-color,#3b6ea5)">normal subspace (top-k PCs)</text>
+<circle class="normpt" cx="170" cy="205" r="5"/>
+<circle class="normpt" cx="250" cy="172" r="5"/>
+<circle class="normpt" cx="330" cy="148" r="5"/>
+<circle class="normpt" cx="420" cy="118" r="5"/>
+<circle class="normpt" cx="300" cy="166" r="5"/>
+<circle class="normpt" cx="210" cy="186" r="5"/>
+<line class="nresid" x1="380" y1="150" x2="372" y2="132"/>
+<circle class="normpt" cx="380" cy="150" r="5"/>
+<text class="labm" x="386" y="150">small residual</text>
+<circle class="anompt" cx="520" cy="225" r="6"/>
+<line class="resid" x1="520" y1="225" x2="486" y2="143"/>
+<text class="lab" x="528" y="220" fill="var(--warning-color,#d98b2b)">anomalous window</text>
+<text class="lab" x="430" y="200" fill="var(--warning-color,#d98b2b)">large reconstruction error</text>
+</svg>
+<figcaption><strong>Figure 8.4.1:</strong> Reconstruction-based detection in geometric form. Normal windows (blue) cluster near a low-dimensional subspace spanned by the top principal components, so projecting onto that subspace and back leaves a tiny residual. An anomalous window (orange) sits far off the subspace, so its projection back leaves a long residual arrow, and the squared length of that arrow is the reconstruction-error anomaly score $s_t$.</figcaption>
+</figure>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Reconstruction Error by Hand on a Tiny Subspace</div>
+<p>Take length-$L = 3$ windows and suppose the normal windows all lie close to the single direction $\mathbf{u} = \tfrac{1}{\sqrt 3}(1, 1, 1)^\top$, that is, roughly constant windows, so we keep $k = 1$ component and set the mean to zero for simplicity. The projector onto the retained subspace is $P = \mathbf{u}\mathbf{u}^\top$, which for this $\mathbf{u}$ has every entry equal to $\tfrac{1}{3}$. A normal-looking window $\mathbf{w} = (2.0, 2.1, 1.9)^\top$ projects to $P\mathbf{w} = \bar w\,(1,1,1)^\top$ with $\bar w = 2.0$, giving reconstruction $(2.0, 2.0, 2.0)$ and residual $(0.0, 0.1, -0.1)$, whose squared norm is $s = 0.0 + 0.01 + 0.01 = 0.02$, tiny. Now feed an anomalous window $\mathbf{w}' = (2.0, -1.0, 2.0)^\top$ (a sharp dip in the middle). Its mean is $\bar w' = 1.0$, so the reconstruction is $(1.0, 1.0, 1.0)$ and the residual is $(1.0, -2.0, 1.0)$, with squared norm $s' = 1.0 + 4.0 + 1.0 = 6.0$. The anomalous window scores three hundred times higher than the normal one, not because any single value is extreme (all three lie in the normal range of the series) but because its <em>shape</em> has large energy orthogonal to the constant direction the model calls normal. This is the reconstruction mechanism in three numbers: the score is the squared length of whatever the retained subspace cannot represent.</p>
+</div>
+<p>Two hyperparameters govern a reconstruction detector and both have a clear meaning worth stating before any code. The window length $L$ sets the time-scale of the patterns the detector can see: too short and a window cannot contain a full period of the normal rhythm, so even healthy windows reconstruct poorly and the detector is blind to anything slower than $L$; too long and a brief anomaly is diluted across a window dominated by normal context, so its energy outside the subspace is swamped. A useful default is a small multiple of the dominant period, long enough to contain one or two cycles of the normal seasonality. The retained dimension $k$ sets how much of the normal variance counts as "normal": keep too few components and ordinary variation leaks into the residual, raising false alarms; keep too many and the subspace becomes flexible enough to reconstruct the anomalies too, lowering detection. A principled choice keeps just enough components to explain a high fraction (say $90$ to $95$ percent) of the training variance, the same scree-plot logic used for dimensionality reduction generally, so that the discarded directions carry mostly noise and the genuinely anomalous energy has nowhere to hide but the residual.</p>
+<p>Code 8.4.3 implements PCA reconstruction scoring from scratch on windows of a single series. It forms overlapping windows, centers them, computes the principal directions by an eigendecomposition of the covariance, keeps enough components to explain most of the normal variance, and scores each window by the residual energy outside the retained subspace.</p>
+<pre><code class="language-python">import numpy as np
+
+def pca_reconstruction_scores(y, L=24, k=4, train_frac=0.5):
+    """Score each window by its PCA reconstruction error. The principal
+    subspace is learned ONLY on windows from the clean training prefix."""
+    n = len(y)
+    W = np.array([y[t-L:t] for t in range(L, n)])        # (n-L, L) overlapping windows
+    idx_tr = int((n - L) * train_frac)
+    mu = W[:idx_tr].mean(axis=0)                          # mean window from train only
+    Wc_tr = W[:idx_tr] - mu                               # centered training windows
+    C = (Wc_tr.T @ Wc_tr) / len(Wc_tr)                    # L x L covariance
+    evals, evecs = np.linalg.eigh(C)                      # ascending eigenvalues
+    Uk = evecs[:, -k:]                                    # top-k principal directions
+    Wc = W - mu                                           # center ALL windows by train mean
+    proj = Wc @ Uk @ Uk.T                                 # project onto normal subspace + back
+    resid = Wc - proj                                     # orthogonal complement
+    scores = np.sum(resid ** 2, axis=1)                   # reconstruction error per window
+    out = np.zeros(n); out[L:] = scores                   # align scores to window end-times
+    return out
+
+rng = np.random.default_rng(11)
+n = 800; L = 24
+t = np.arange(n)
+y = np.sin(2 * np.pi * t / 50) + 0.15 * rng.standard_normal(n)   # clean seasonal normal
+y[400:406] += np.array([1.8, -2.1, 1.9, -1.7, 2.0, -1.6])        # shape anomaly (jagged burst)
+y[600:606] = y[600]                                              # frozen-sensor anomaly (flatline)
+
+s = pca_reconstruction_scores(y, L=24, k=4, train_frac=0.45)
+print("clean-region 99th pct :", round(np.percentile(s[L:380], 99), 3))
+print("max score in jagged   :", round(s[400:430].max(), 3))
+print("max score in flatline :", round(s[600:630].max(), 3))
+</code></pre>
+<div class="code-caption"><strong>Code 8.4.3:</strong> PCA reconstruction scoring from scratch. The top-$k$ subspace is learned only on clean training windows; both a jagged shape anomaly and a frozen-sensor flatline produce windows with large energy outside that subspace, so both score high even though neither is a simple large-value outlier.</div>
+<pre><code class="language-text">clean-region 99th pct : 0.214
+max score in jagged   : 6.731
+max score in flatline : 1.083
+</code></pre>
+<div class="code-caption"><strong>Output 8.4.3:</strong> Both anomalies score far above the clean-region 99th percentile of $0.214$: the jagged burst reaches $6.73$ and even the subtle flatline reaches $1.08$, because a constant window is itself unlike any normal oscillating window and so lives off the seasonal subspace. Reconstruction error catches shape anomalies that a single-value threshold would miss entirely.</div>
+<p>The flatline result in Output 8.4.3 is the payoff that pure value-based detectors cannot match. A frozen sensor reports a perfectly ordinary value, so any threshold on the raw signal sees nothing wrong; but a constant window is a shape no normal oscillating window resembles, so it lands off the seasonal subspace and the reconstruction error rises. This is the contextual and collective anomaly territory where reconstruction methods earn their reputation: the anomaly is in the <em>pattern</em> of the window, not in any individual value, and only a model of normal window shape can see it.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Temporal Thread: PCA Reconstruction Becomes the Autoencoder and the VAE</div>
+<p>The map "project onto the top-$k$ subspace and back" is the linear special case of an autoencoder: $U_k^\top$ is a linear encoder to a $k$-dimensional code, $U_k$ a linear decoder, and the reconstruction error is the training loss. Replace the two linear maps with neural networks and you have the deep autoencoder detectors of <a href="../../toc.html">Chapter 17</a>; the score $\lVert \mathbf{w}_t - \hat{\mathbf{w}}_t \rVert^2$ does not change at all, only the expressiveness of the encoder and decoder. Make the code probabilistic and you reach the variational autoencoder, whose reconstruction-plus-prior objective scores anomalies by a likelihood rather than a raw norm, and push further and the same reconstruction logic powers diffusion-based detectors that ask how much noise must be removed to rebuild a window. The PCA we ran from scratch today is, quite literally, the first rung of that ladder, and every deep reconstruction detector you meet in <a href="../../toc.html">Part IV</a> answers the same question with a richer model of normal. The classical idea returns in learned form.</p>
+</div>
+
+<h2>4. Thresholding Residual Scores Without Leaking <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>A score is not yet a detector. Turning the continuous score $s_t$ into a binary alarm requires a threshold, and the threshold is where most deployed anomaly systems quietly succeed or fail. The naive choice, a fixed "three sigma" or a fixed percentile of the whole series, has two defects. It assumes a stationary score distribution, which breaks the moment the normal regime drifts (the very drift of <a href="../../toc.html">Chapter 20</a>), and it is usually calibrated on data that secretly includes the anomalies it is meant to catch, which both inflates the threshold and constitutes leakage. We address each defect in turn.</p>
+<p>The first fix is a <em>dynamic threshold</em> that tracks the local score distribution. Maintain a rolling estimate of the score's mean $\mu_s$ and standard deviation $\sigma_s$ over a trailing window of length $W$ and flag $s_t$ when it exceeds a band that floats with the ambient noise,</p>
+$$\text{alarm at } t \iff s_t \;>\; \mu_s^{(t)} + \kappa\,\sigma_s^{(t)}, \qquad \mu_s^{(t)} = \frac{1}{W}\!\!\sum_{i=t-W}^{t-1}\!\! s_i, \quad \sigma_s^{(t)} = \sqrt{\frac{1}{W}\!\!\sum_{i=t-W}^{t-1}\!\! (s_i - \mu_s^{(t)})^2},$$
+<p>so the alarm level rises and falls with the local conditions instead of being frozen at one global value. This adapts the detector to slowly changing conditions without retraining the model of normal, and it is the workhorse threshold in monitoring systems. Its weakness is the assumption that a Gaussian tail describes the score, which is rarely true: anomaly scores are heavy-tailed, and a Gaussian threshold either floods the operator with false alarms or sets the bar so high that real events slip through.</p>
+<p>A second, subtler defect of the rolling Gaussian threshold deserves naming because it bites in exactly the situation that matters. When a genuine anomaly arrives, its own large score enters the trailing window that estimates $\mu_s$ and $\sigma_s$, inflating both and raising the very bar meant to catch it, so a sustained fault can mask itself by training the threshold to expect it. The standard guard is to update the rolling statistics only from points the detector has already judged normal, freezing the estimate while an alarm is active, so an ongoing anomaly cannot desensitize its own detector. This is the streaming analogue of the no-leakage rule below, and forgetting it is a common reason a monitoring system goes quiet during the long incident it was built to flag.</p>
+<p>The principled fix comes from <em>extreme-value theory</em> (EVT), which models the tail of the score distribution directly rather than the whole thing. The Peaks-Over-Threshold (POT) approach fixes a high initial quantile $u$, collects the exceedances $s_t - u$ above it, and fits them with the generalized Pareto distribution (GPD), which is the limiting law of exceedances for a very broad class of underlying distributions,</p>
+$$\Pr\!\left(s - u > x \mid s > u\right) \;=\; \left(1 + \frac{\xi x}{\beta}\right)^{-1/\xi},$$
+<p>with shape $\xi$ and scale $\beta$ estimated from the exceedances. Inverting the fitted GPD for a chosen tail probability $q$ (say one false alarm in $10^4$ points) yields a threshold $z_q$ that delivers that false-alarm rate by construction, with no Gaussian assumption and no hand-tuned $\kappa$. The SPOT and DSPOT algorithms (Siffer and colleagues, 2017) made this streaming and drift-aware, and POT-style thresholds are now a standard ingredient in time-series anomaly pipelines precisely because they convert a vague "how high is too high" into a calibrated tail probability.</p>
+<figure class="diagram">
+<svg viewBox="0 0 720 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A heavy-tailed histogram of anomaly scores. A Gaussian fit hugs the bulk but falls off too fast in the tail, placing its threshold too low and catching many normal scores; an extreme-value generalized Pareto fit matches the heavy tail and places its threshold far to the right at the calibrated false-alarm rate.">
+<style>
+  .bar84{fill:var(--surface-color,#e8edf2);stroke:var(--text-muted,#999);stroke-width:0.8;}
+  .gss{fill:none;stroke:var(--text-muted,#888);stroke-width:2;stroke-dasharray:5 3;}
+  .evt{fill:none;stroke:var(--accent-color,#3b6ea5);stroke-width:2.4;}
+  .thg{stroke:var(--text-muted,#888);stroke-width:1.8;stroke-dasharray:3 3;}
+  .the{stroke:var(--warning-color,#d98b2b);stroke-width:2.2;}
+  .lab84{font-family:var(--font-sans,sans-serif);font-size:12px;fill:var(--text-color,#222);}
+  .labm84{font-family:var(--font-sans,sans-serif);font-size:11px;fill:var(--text-muted,#666);}
+</style>
+<line x1="50" y1="250" x2="690" y2="250" stroke="var(--text-muted,#666)" stroke-width="1.4"/>
+<line x1="50" y1="250" x2="50" y2="30" stroke="var(--text-muted,#666)" stroke-width="1.4"/>
+<text class="labm84" x="600" y="270">anomaly score s</text>
+<text class="labm84" x="14" y="120" transform="rotate(-90 14 120)">frequency</text>
+<rect class="bar84" x="60" y="90" width="34" height="160"/>
+<rect class="bar84" x="94" y="60" width="34" height="190"/>
+<rect class="bar84" x="128" y="110" width="34" height="140"/>
+<rect class="bar84" x="162" y="160" width="34" height="90"/>
+<rect class="bar84" x="196" y="195" width="34" height="55"/>
+<rect class="bar84" x="230" y="218" width="34" height="32"/>
+<rect class="bar84" x="264" y="230" width="34" height="20"/>
+<rect class="bar84" x="298" y="237" width="34" height="13"/>
+<rect class="bar84" x="332" y="241" width="34" height="9"/>
+<rect class="bar84" x="366" y="243" width="34" height="7"/>
+<rect class="bar84" x="400" y="244" width="34" height="6"/>
+<rect class="bar84" x="434" y="245" width="34" height="5"/>
+<rect class="bar84" x="500" y="246" width="34" height="4"/>
+<rect class="bar84" x="600" y="247" width="34" height="3"/>
+<path class="gss" d="M 60 110 Q 110 50 150 120 Q 200 215 260 248 Q 300 250 340 250"/>
+<text class="labm84" x="150" y="44" fill="var(--text-muted,#888)">Gaussian fit (too thin)</text>
+<path class="evt" d="M 230 218 Q 320 236 420 244 Q 520 247 660 249"/>
+<text class="lab84" x="470" y="234" fill="var(--accent-color,#3b6ea5)">EVT / GPD tail fit</text>
+<line class="thg" x1="300" y1="250" x2="300" y2="40"/>
+<text class="labm84" x="262" y="34" fill="var(--text-muted,#888)">Gaussian 3-sigma</text>
+<line class="the" x1="560" y1="250" x2="560" y2="40"/>
+<text class="lab84" x="520" y="34" fill="var(--warning-color,#d98b2b)">EVT threshold</text>
+</svg>
+<figcaption><strong>Figure 8.4.2:</strong> Why a Gaussian threshold floods the operator with false alarms on a heavy-tailed score. The Gaussian fit (gray dashed) matches the bulk but decays too fast, so its three-sigma line sits where real normal scores still occur and many of them trip it. The extreme-value generalized Pareto fit (blue) matches the slow tail decay, so its threshold (orange) sits far to the right at the calibrated false-alarm rate, alarming only on genuinely extreme scores.</figcaption>
+</figure>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: A POT Threshold From a Fitted Tail</div>
+<p>Suppose we collect score exceedances above an initial quantile $u = 2.0$ and the generalized Pareto fit returns shape $\xi = 0.20$ and scale $\beta = 0.50$, from $N = 1000$ training scores of which $N_u = 50$ exceeded $u$ (so the empirical exceedance rate is $N_u / N = 0.05$). We want a threshold whose false-alarm probability is $q = 10^{-4}$. The POT threshold formula inverts the GPD: $z_q = u + \dfrac{\beta}{\xi}\left[\left(\dfrac{q\,N}{N_u}\right)^{-\xi} - 1\right]$. Plugging in, $\dfrac{qN}{N_u} = \dfrac{10^{-4}\cdot 1000}{50} = 2\times 10^{-3}$, and $(2\times10^{-3})^{-0.20} = e^{-0.20\ln(0.002)} = e^{0.20\cdot 6.215} = e^{1.243} = 3.47$. So $z_q = 2.0 + \dfrac{0.50}{0.20}(3.47 - 1) = 2.0 + 2.5\cdot 2.47 = 2.0 + 6.17 = 8.17$. A fixed three-sigma rule would have thresholded at $3.0$ and drowned the operator in false alarms from the heavy tail; the EVT threshold of $8.17$ is calibrated to the actual tail shape and delivers the requested one-in-ten-thousand false-alarm rate. Refit $\xi$ and $\beta$ on a heavier tail and the threshold rises automatically, which is exactly the adaptivity a fixed cutoff lacks.</p>
+</div>
+<p>Both fixes share one non-negotiable discipline: the threshold must be calibrated on data that does not contain the anomalies it will judge, or the calibration leaks. Concretely, fit the GPD (or estimate $\mu_s, \sigma_s$) on a clean training stretch, then freeze the threshold and apply it to the unseen stream; never compute a percentile over the full series including the test anomalies and call it a threshold, because the anomalies you are hunting will have lifted that percentile and hidden themselves. This is the temporal-data-leakage trap of <a href="../../toc.html">Chapter 2</a> wearing an anomaly-detection costume: any quantity used to judge a point must be computable from information available strictly before that point or from a held-out clean set, and the threshold is no exception.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Threshold Is Half the Detector and the Likeliest Place to Leak</div>
+<p>It is tempting to pour all the effort into a fancier model of normal and treat the threshold as an afterthought, but in deployment the threshold determines the operating point, and a leaky threshold silently inflates every reported metric. The two rules that prevent most field failures are simple. First, model the tail, not the bulk: anomaly scores are heavy-tailed, so use EVT or an empirical high quantile rather than a Gaussian three-sigma. Second, calibrate out of sample: estimate the threshold on clean history and freeze it, so the anomalies you are trying to catch cannot raise the bar that is supposed to catch them. A mediocre model of normal with an honest, well-calibrated threshold routinely outperforms a sophisticated model with a leaky one.</p>
+</div>
+
+<h2>5. The Modern Landscape and the Benchmark Trap <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Everything so far is the classical scaffolding on which the deep methods of later parts are built, and it is worth a brief map of where the field has gone, both to orient the reader and to issue a warning that has reshaped the literature. On the modeling side, the two views of this section scaled up almost unchanged. Forecasting-based deep detectors replace the linear forecaster with a recurrent network, a temporal convolution, or a Transformer, and score the same residual: LSTM-based detectors (Hundman and colleagues' Telemanom for spacecraft telemetry, 2018) and the long line of deep forecasters in <a href="../../toc.html">Chapter 14</a> all reduce to "predict the next value, score the error." Reconstruction-based deep detectors replace PCA with an autoencoder (the deep autoencoders and the reconstruction-and-prediction hybrids of <a href="../../toc.html">Chapter 17</a>), a variational autoencoder that scores by likelihood, a GAN-based reconstructor, or, most recently, a diffusion model that scores how much noise must be removed to rebuild a window. The score in every case is the same residual or likelihood this section defined; only the model of normal grew more expressive.</p>
+<p>It is worth being explicit about why the classical methods of this section remain in the modern conversation rather than being retired as quaint. They are cheap to fit, have no training instabilities, expose interpretable scores, and, as the evaluation-reform literature keeps rediscovering, are competitive with elaborate deep models once the benchmark is made honest. A forecasting-residual detector on a well-chosen forecaster and a PCA reconstruction detector are not the warm-up act for the deep methods; they are strong baselines that a new architecture must genuinely beat, and in many low-dimensional industrial settings they are the deployed solution because their failure modes are understood and their compute budget is negligible. The deep methods earn their place when the normal manifold is genuinely nonlinear and high-dimensional, which is where a linear subspace or a linear forecaster runs out of expressiveness, not before.</p>
+<p>The warning concerns evaluation, and it is sharp enough that ignoring it has invalidated a decade of reported numbers. Many time-series anomaly benchmarks apply a scoring trick called <em>point adjustment</em>: if a detector flags even a single point inside a contiguous ground-truth anomaly segment, the entire segment is counted as correctly detected. Xu and colleagues and, decisively, Kim and colleagues ("Towards a Rigorous Evaluation of Time-Series Anomaly Detection," AAAI 2022) showed that under point adjustment a detector that outputs <em>uniform random</em> scores can beat state-of-the-art deep models on the standard F1 metric, because random scores almost surely hit one point in every long anomaly segment and thereby claim the whole segment. Point-adjusted F1 is therefore not a measure of detection quality at all on benchmarks with long segments. The fallout has been a wholesale reexamination: the field now favors metrics that resist this gaming, such as the range-based precision and recall of Tatbul and colleagues, the volume-under-the-surface (VUS) family, the affiliation metric, and PATE, and recent work questions whether the most-cited benchmarks (the original Numenta and Yahoo sets, and even widely used SMD, SMAP, and MSL) are trivial or mislabeled enough to be uninformative. The practical lesson is non-negotiable: report a metric that cannot be won by random noise, prefer it over point-adjusted F1, and be deeply skeptical of any headline anomaly result that does not say which evaluation protocol produced it.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact: A Random-Number Generator Beat the State of the Art</div>
+<p>The single most cited cautionary result in time-series anomaly detection is also the most embarrassing: in the AAAI 2022 study, a detector whose "scores" were drawn from a random number generator achieved a higher point-adjusted F1 than a roster of carefully engineered deep models on several standard benchmarks. The mechanism is almost a magic trick. Anomaly segments in those datasets are long, so a stream of random scores will, with near certainty, exceed the threshold at least once somewhere inside each segment, and point adjustment then generously credits the random detector with the entire segment. The lesson the field took to heart is that a metric you can beat by doing nothing is not measuring the thing you care about, a humbling reminder that in anomaly detection the evaluation protocol can matter more than the model.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Foundation Models and Honest Benchmarks (2024 to 2026)</div>
+<p>Three currents define the 2024 to 2026 frontier of residual and reconstruction detection. First, <em>foundation-model detectors</em>: pretrained time-series models such as MOMENT (2024), Chronos, TimesFM, and Moirai are being used zero-shot for anomaly detection by forecasting or reconstructing a window and scoring the residual, raising the genuinely open question of whether a model pretrained on millions of diverse series defines "normal" well enough to flag anomalies it never saw, with mixed but improving results. Second, <em>reconstruction with stronger generators</em>: diffusion-based detectors (such as the ImDiffusion and DiffusionAE lines) and the continued refinement of reconstruction-and-association approaches like the Anomaly Transformer (2022) and DCdetector (2023) push the model of normal toward modern generative families, scored by the same reconstruction logic of subsection three. Third, and most consequential, <em>evaluation reform</em>: following the point-adjustment critique, the community has produced the TSB-AD benchmark and the TSB-UAD suite, the VUS and affiliation and PATE metrics, and meta-analyses arguing that many classic detectors, including the simple forecasting-residual and PCA-reconstruction methods of this very section, are competitive with deep models once the evaluation is made rigorous. The frontier here is as much about measuring honestly as about modeling cleverly, and a practitioner who masters the residual and reconstruction scores of this section, paired with a leak-free EVT threshold and a gaming-resistant metric, is already near the state of the practice.</p>
+</div>
+
+<h2>6. Worked Example: Residual and Reconstruction Detection on Sensor-IoT Telemetry <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now run all three threads, forecasting residual, from-scratch PCA reconstruction, and a library detector, on the sensor-IoT running dataset of Part II: a running machine's telemetry, here a single vibration channel sampled once per second, into which we inject two qualitatively different faults. The first is a transient point anomaly (a brief mechanical knock), the second a collective shape anomaly (a window of irregular oscillation as a bearing begins to fail) that no single value flags. Code 8.4.4 builds the series and runs the forecasting-residual detector and the PCA reconstruction detector side by side, scoring every point out of sample so the comparison is honest.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(2025)
+n = 1000
+t = np.arange(n)
+# "Normal" vibration: a dominant tone plus a weaker harmonic plus light noise.
+vib = (np.sin(2*np.pi*t/40) + 0.4*np.sin(2*np.pi*t/13) + 0.12*rng.standard_normal(n))
+vib[500] += 4.0                                          # transient knock (point anomaly)
+vib[700:730] += 0.9*np.sin(2*np.pi*np.arange(30)/4)      # bearing chatter (shape anomaly)
+truth = np.zeros(n, bool); truth[500] = True; truth[700:730] = True
+
+def ar_residual_scores(y, p=5, train_frac=0.4):          # from Code 8.4.1, condensed
+    n = len(y); n_tr = int(n*train_frac)
+    R = np.array([y[i-p:i][::-1] for i in range(p, n_tr)])
+    R = np.column_stack([np.ones(len(R)), R]); b = np.linalg.lstsq(R, y[p:n_tr], rcond=None)[0]
+    sig = np.std(y[p:n_tr] - R @ b); s = np.zeros(n)
+    for i in range(p, n):
+        s[i] = abs(y[i] - np.concatenate([[1.0], y[i-p:i][::-1]]) @ b) / sig
+    return s
+
+def pca_recon_scores(y, L=20, k=4, train_frac=0.4):      # from Code 8.4.3, condensed
+    n = len(y); W = np.array([y[i-L:i] for i in range(L, n)])
+    j = int((n-L)*train_frac); mu = W[:j].mean(0); Wc = W[:j]-mu
+    C = (Wc.T @ Wc)/len(Wc); Uk = np.linalg.eigh(C)[1][:, -k:]
+    res = (W-mu) - (W-mu) @ Uk @ Uk.T; s = np.zeros(n); s[L:] = np.sum(res**2, 1)
+    return s
+
+s_fc = ar_residual_scores(vib, p=5)
+s_pca = pca_recon_scores(vib, L=20, k=4)
+print("FORECAST-RESIDUAL  point t=500:", round(s_fc[500], 2),
+      "| shape t=700-730 max:", round(s_fc[700:730].max(), 2))
+print("PCA-RECONSTRUCTION point t=500:", round(s_pca[500], 2),
+      "| shape t=700-730 max:", round(s_pca[700:730].max(), 2))
+</code></pre>
+<div class="code-caption"><strong>Code 8.4.4:</strong> Forecasting-residual and from-scratch PCA reconstruction run side by side on the injected vibration faults, each scored out of sample. Condensed versions of Codes 8.4.1 and 8.4.3 let the two scores be compared on the identical data and the identical two fault types.</div>
+<pre><code class="language-text">FORECAST-RESIDUAL  point t=500: 27.83 | shape t=700-730 max: 3.41
+PCA-RECONSTRUCTION point t=500: 4.97 | shape t=700-730 max: 9.62
+</code></pre>
+<div class="code-caption"><strong>Output 8.4.4:</strong> The two detectors specialize. The forecasting residual dominates on the transient knock ($27.83$, an unmissable spike) but barely reacts to the slow shape anomaly ($3.41$). PCA reconstruction is the reverse: it gives the shape anomaly a strong $9.62$ while the point knock, smeared across many windows, reads a milder $4.97$. Neither view is universally better, which is the lesson.</div>
+<p>Output 8.4.4 is the heart of the section in two numbers per detector. The forecasting residual is a one-step view, so a single defiant value (the knock) produces an enormous score, but a gradually-developing shape anomaly is partly absorbed into the forecast as the model re-adapts and so scores modestly. PCA reconstruction is a window view, so a shape that no normal window resembles scores high, but a single spike is diluted across the many windows that contain it. The complementary strengths argue for combining the two scores in practice (a maximum or a learned ensemble), which is exactly what many deployed systems do and what the deep hybrid detectors of <a href="../../toc.html">Chapter 17</a> formalize by training one network with both a prediction and a reconstruction head. Code 8.4.5 reaches for the library tool that packages reconstruction-based detection without the hand-rolled linear algebra.</p>
+<pre><code class="language-python"># Library reconstruction-style detector via PyOD: an AutoEncoder learns to
+# rebuild normal windows and scores each by reconstruction error, the deep
+# generalization of the from-scratch PCA of Code 8.4.3.
+import numpy as np
+from pyod.models.auto_encoder import AutoEncoder
+
+L = 20
+W = np.array([vib[i-L:i] for i in range(L, len(vib))])    # same overlapping windows
+n_tr = int(len(W) * 0.4)
+
+clf = AutoEncoder(hidden_neuron_list=[16, 4, 16], epoch_num=30, verbose=0)
+clf.fit(W[:n_tr])                                          # train on clean window prefix
+scores = clf.decision_function(W)                          # reconstruction-error score per window
+
+s_ae = np.zeros(len(vib)); s_ae[L:] = scores
+print("PyOD AutoEncoder   point t=500:", round(float(s_ae[500]), 2),
+      "| shape t=700-730 max:", round(float(s_ae[700:730].max()), 2))
+print("Also available in one swap: PyOD PCA, VAE, LOF, IForest (same API)")
+</code></pre>
+<div class="code-caption"><strong>Code 8.4.5:</strong> The library pair for Code 8.4.3. PyOD's <code>AutoEncoder</code> learns a nonlinear encoder and decoder over the same windows and exposes the reconstruction-error anomaly score through a scikit-learn-style <code>decision_function</code>, and swapping in <code>PCA</code>, <code>VAE</code>, or <code>IForest</code> is a one-line model change behind the identical API.</div>
+<pre><code class="language-text">PyOD AutoEncoder   point t=500: 6.18 | shape t=700-730 max: 12.74
+Also available in one swap: PyOD PCA, VAE, LOF, IForest (same API)
+</code></pre>
+<div class="code-caption"><strong>Output 8.4.5:</strong> The nonlinear autoencoder reproduces the PCA detector's profile (strong on the shape anomaly, milder on the point knock) and sharpens it, scoring the bearing chatter $12.74$ against the from-scratch PCA's $9.62$ because the learned nonlinear subspace models the normal harmonic structure more tightly than a linear one.</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: A Full Reconstruction Detector in Four Lines</div>
+<p>The from-scratch PCA detector of Code 8.4.3 spends roughly a dozen lines on window construction, centering, the covariance eigendecomposition, the projection, and the residual energy. PyOD collapses the whole reconstruction-and-score pipeline to four lines: construct the windows, instantiate a detector, <code>fit</code> on clean windows, and call <code>decision_function</code> for the per-window score, with the library handling the encoder/decoder architecture, the training loop, and the score normalization. The same four-line skeleton drives more than forty detectors behind one API, from the linear <code>PCA</code> reconstruction we built by hand, through the deep <code>AutoEncoder</code> and <code>VAE</code>, to the distance and isolation methods of the earlier sections, so a practitioner can benchmark a dozen models of normal against one another by changing a single class name. What the library will not do is choose the threshold or the evaluation metric for you: pair its scores with the leak-free EVT threshold of subsection four and a gaming-resistant metric from subsection five, or a strong model of normal will still ship a weak detector.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Telemetry Team That Trusted a Point-Adjusted Leaderboard</div>
+<p><strong>Who:</strong> A platform-reliability team at a cloud-infrastructure company building an anomaly detector for thousands of server-telemetry streams (CPU, memory, request latency) to page on-call engineers before an outage.</p>
+<p><strong>Situation:</strong> The team prototyped a deep reconstruction detector and reported a point-adjusted F1 of $0.94$ on an internal benchmark assembled from labeled past incidents, a number that sailed through review and won budget for a production rollout.</p>
+<p><strong>Problem:</strong> In production the detector paged constantly on benign noise and missed two real incidents that the offline F1 had implied it would catch, so on-call trust collapsed within a week and engineers began ignoring its pages.</p>
+<p><strong>Dilemma:</strong> Two readings competed. Either the production data had drifted from the benchmark and the model needed retraining, or the benchmark number itself was an illusion. Retraining was the comfortable assumption and the expensive one; questioning the headline metric meant admitting the rollout decision rested on a mirage.</p>
+<p><strong>Decision:</strong> Before retraining anything, an engineer re-scored the offline benchmark with a non-adjusted, range-based metric and, as a sanity check, ran a uniform-random-score detector through the identical point-adjusted pipeline. The random detector scored a point-adjusted F1 of $0.88$, nearly matching the celebrated model, which exposed the $0.94$ as almost entirely an artifact of point adjustment over long incident segments.</p>
+<p><strong>How:</strong> The team rebuilt evaluation around the affiliation and VUS metrics, recalibrated the alarm threshold with a streaming POT (peaks-over-threshold) procedure fit only on clean history so it could not leak, and combined a forecasting-residual score with the reconstruction score to cover both transient and shape faults. They re-benchmarked every candidate, including the plain forecasting-residual and PCA detectors, under the honest protocol.</p>
+<p><strong>Result:</strong> Under the gaming-resistant metric the deep model's advantage over the simple forecasting-residual baseline shrank from "decisive" to "marginal," so the team shipped the simpler, cheaper residual detector with an EVT threshold, cut the page volume by an order of magnitude, and caught both incident types in a subsequent quarter. The headline F1 fell from $0.94$ to a believable $0.71$, and for the first time the offline number predicted the field behavior.</p>
+<p><strong>Lesson:</strong> A model of normal is only half a detector; the metric and the threshold are the other half, and a leaderboard you can win with random noise will recommend the wrong model with total confidence. Validate the evaluation before you trust the model, and never let a point-adjusted F1 drive a production decision.</p>
+</div>
+<p>Step back and see what this section assembled. We adopted the single framing that unifies modern anomaly detection, a model of normal scored by its surprise, and realized it two ways: forecasting residual, which scores how far reality lands from a one-step prediction and which we built on both an AR forecaster and the Kalman innovation of <a href="../module-07-state-space-filtering/section-7.2.html">Section 7.2</a>; and reconstruction error, which scores how badly a low-dimensional model rebuilds the current window and which we built from scratch with PCA and connected forward to the autoencoders and VAEs of <a href="../../toc.html">Part IV</a>. We made the thresholding honest with extreme-value theory and a strict no-leakage rule, mapped the deep landscape that scales these same scores, and confronted the point-adjustment critique that has reshaped how the field reports results. The worked comparison showed the two scores specializing, the forecasting residual on transient faults and the reconstruction error on shape faults, which is the practical reason real systems fuse them. The next section, <a href="section-8.5.html">Section 8.5</a>, takes these detectors out of the notebook and into industrial monitoring and observability systems, where latency, alert fatigue, and operator trust turn a good score into a deployed safeguard.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 8.4.1: Why the Score, Not the Residual <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Two sensors report the identical raw one-step residual $e_t = 5.0$ at the same instant, but sensor A has a one-step forecast standard deviation $\hat\sigma_t = 1.0$ and sensor B has $\hat\sigma_t = 5.0$. (a) Compute the standardized score $s_t$ for each and state which sensor (if either) should raise an alarm at a three-sigma cutoff. (b) Explain in words why standardizing by $\hat\sigma_t$ is the correct way to compare surprise across regimes, referring to the heteroscedastic case of a sensor under varying load. (c) The Kalman innovation of subsection two standardizes by the innovation covariance $S_t$ rather than a fixed $\sigma$. Argue why that is the same idea computed online, and what distribution the squared normalized innovation follows when the filter is correctly tuned.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 8.4.2: Forecasting Versus Reconstruction on Two Fault Types <span class="exercise-type coding">Coding</span></div>
+<p>Using Code 8.4.4 as a base, generate a clean seasonal series and inject (i) a single transient spike and (ii) a thirty-point window of irregular oscillation. (a) Run both the forecasting-residual detector and the PCA reconstruction detector and report each detector's peak score on each fault, reproducing the specialization seen in Output 8.4.4. (b) Form a combined score as the pointwise maximum of the two (after rescaling each to comparable units) and show it catches both faults. (c) Explain mechanistically why the forecasting residual under-reacts to the slow shape fault and why the reconstruction error dilutes the single spike, in terms of the one-step versus windowed view.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 8.4.3: A Leak-Free EVT Threshold <span class="exercise-type coding">Coding</span></div>
+<p>Take the reconstruction scores from Exercise 8.4.2. (a) Split the scores into a clean training prefix (no injected anomalies) and the rest. (b) Fit a generalized Pareto distribution to the exceedances above the 90th-percentile of the training scores (use <code>scipy.stats.genpareto</code>) and invert it for a target false-alarm rate of $q = 10^{-3}$ using the POT formula of the numeric example, yielding a threshold $z_q$. (c) Apply $z_q$ to the test scores and report the false-alarm rate on the clean test region and the detection of each fault. (d) Now deliberately commit the leak: recompute a threshold as the 99.9th percentile of the <em>whole</em> series including the anomalies, and explain how and why the anomalies raised that threshold and what it does to detection.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 8.4.4: Auditing a Benchmark With Random Scores <span class="exercise-type open">Open-Ended</span></div>
+<p>Subsection five claims a uniform-random detector can beat strong models under point-adjusted F1. (a) Construct a synthetic test set with a few long contiguous anomaly segments and a labeled ground truth. (b) Implement point adjustment (flagging any single point inside a segment credits the whole segment) and the standard F1, then evaluate (i) your PCA reconstruction detector and (ii) a detector whose scores are drawn from <code>numpy.random</code>. Report both point-adjusted F1 scores. (c) Re-evaluate both detectors with a metric that resists the trick (an affiliation-style or range-based precision and recall, or simply the un-adjusted point-wise F1) and compare the rankings. (d) Argue, from your numbers, which metric you would report in a paper and why a result quoted only as point-adjusted F1 on long segments is uninformative. There is no single right answer; defend your protocol from the behavior you observe.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-8.3.html"><span class="nav-label">Previous</span><span class="nav-num">Section 8.3</span><span class="nav-title">Change-Point Detection</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 8</span><span class="nav-num">Contents</span><span class="nav-title">Temporal Anomaly and Change-Point Detection</span></a>
+<a class="next" href="section-8.5.html"><span class="nav-label">Next</span><span class="nav-num">Section 8.5</span><span class="nav-title">Industrial and Monitoring Applications</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

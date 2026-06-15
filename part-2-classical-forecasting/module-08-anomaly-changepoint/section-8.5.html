@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 8.5: Industrial and Monitoring Applications. Putting the chapter's anomaly and change-point detectors to work in production: predictive maintenance and condition monitoring on sensor streams, IT observability and security monitoring at scale, healthcare and finance early-warning with asymmetric costs, the operational reality of alert fatigue and the precision/recall/delay trade-off, a reference monitoring pipeline, and a full from-scratch-plus-library end-to-end monitor on the IoT running dataset reporting precision, recall, and detection delay." name="description"/>
+<title>Section 8.5: Industrial and Monitoring Applications | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Forecasting and Time Series Analysis</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 8: Temporal Anomaly and Change-Point Detection</a></div>
+<h1>Industrial and Monitoring Applications</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"In my first month I fired four hundred and twelve alerts. Three were real. By month three the on-call engineers had built a mail rule that sent me straight to a folder no human opens. I was statistically excellent and operationally dead."</p>
+<cite>A Monitoring Alert That Cried Wolf One Too Many Times</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A detector is a research artifact; a monitor is a product, and the gap between them is paved with false alarms, missed faults, and detection delay measured in money.</strong> The previous four sections of this chapter built the statistical machinery: residual-based anomaly scores, the CUSUM and Bayesian online change-point detectors, the distance and density methods, and the evaluation protocol. This closing section asks the harder question that every section before it deferred: what happens when you wire one of these detectors to a real stream of equipment sensors, server metrics, patient vitals, or trading flow, and let it page a human at three in the morning. The answer is governed less by the area under a precision-recall curve than by three coupled quantities, the precision (what fraction of alerts are real), the recall (what fraction of real events are caught), and the detection delay (how long after onset the alert fires), traded off against a cost structure that is almost never symmetric: a missed bearing failure costs a hundred thousand dollars and a spurious page costs an engineer's trust, and those two currencies do not convert at par. This section maps the four great application domains of temporal monitoring (predictive maintenance, IT and security observability, healthcare early warning, and financial surveillance), confronts the operational reality of alert fatigue and human-in-the-loop triage, lays out a reference monitoring pipeline that names the section or chapter that built each stage, and assembles a complete end-to-end monitor on the sensor-IoT running dataset, from scratch and then through a library, reporting the three metrics that actually decide whether a monitor survives contact with production. It is also where Part II's classical toolkit closes and the road to learned detectors in Parts III and IV begins.</p>
+</div>
+<p>In <a href="section-8.1.html">Section 8.1</a> we framed anomalies as low-probability events under a model of normal behavior, in <a href="section-8.2.html">Section 8.2</a> we built residual and forecasting-based detectors that flag a point when it surprises a model fit to the recent past, in <a href="section-8.3.html">Section 8.3</a> we developed change-point detection (CUSUM, Bayesian online change-point detection, and the offline segmentation methods) that flag a shift in the generating process rather than a single outlier, and in <a href="section-8.4.html">Section 8.4</a> we settled how to evaluate such detectors honestly with point-adjusted precision and recall, the detection-delay curve, and the cost-weighted score. The reader should arrive here fluent in those tools, because this section does not introduce a new estimator; it composes the existing ones into a system and studies the system's behavior under the constraints that only appear in production. Throughout we keep to the unified notation of <a href="../../toc.html">Appendix A</a>: $x_t$ for the observed stream, $\hat{x}_t$ for a one-step forecast, $r_t = x_t - \hat{x}_t$ for the residual, $s_t$ for a derived anomaly score, and $\tau$ for a decision threshold. The narrative dataset for the worked example is the sensor-IoT industrial telemetry stream that has threaded through this chapter and that returns in <a href="../../toc.html">Chapter 20</a> under drift and <a href="../../toc.html">Chapter 34</a> at deployment.</p>
+
+<h2>1. Predictive Maintenance and Condition Monitoring <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The oldest and most lucrative home of temporal anomaly detection is the factory floor. A rotating machine (a pump, a turbine, a gearbox, a compressor) does not usually fail without warning; it announces its decline through slow shifts in vibration, temperature, acoustic emission, and current draw, often hours or weeks before the catastrophic event. Condition monitoring is the practice of watching those sensor streams to catch the incipient fault, and predictive maintenance is the policy of scheduling intervention on the strength of that watch rather than on a fixed calendar. The economic case is overwhelming: an unplanned shutdown of a production line can cost more per hour than the entire annual budget of the monitoring system, so even a detector that fires a few hours early on a fraction of faults pays for itself many times over.</p>
+<p>The temporal signal of an incipient fault has a characteristic shape that the detectors of this chapter are built to catch. A healthy bearing produces vibration that is stationary in the sense of <a href="../module-03-statistical-foundations/index.html">Chapter 3</a>: its statistical properties hold steady. As a defect develops (a spall on a race, a crack in a tooth), the vibration changes in three measurable ways, each of which maps onto a specific tool from earlier in this book:</p>
+<ul>
+<li><strong>Amplitude drift</strong> (the overall vibration level creeps upward) is a change in level or variance, exactly what the CUSUM and Bayesian online change-point detectors of <a href="section-8.3.html">Section 8.3</a> are designed to localize.</li>
+<li><strong>New periodic components</strong> at fault-characteristic frequencies appear in the spectrum, which is why condition monitoring leans on the frequency tools of <a href="../module-04-frequency-spectral/index.html">Chapter 4</a>: a fault invisible in the raw time series can be a sharp, growing peak in the power or envelope spectrum, and the score is computed on spectral features rather than the raw signal.</li>
+<li><strong>Heavier tails</strong> (the distribution of vibration develops outliers from impact transients) is a change in shape that the density and distance methods of <a href="section-8.2.html">Section 8.2</a> catch even when the mean and variance barely move.</li>
+</ul>
+<p>A mature condition monitor therefore runs all three detectors in parallel on the same stream and fuses their scores, because a given fault mode announces itself through whichever symptom its physics favors, and a monitor that watches only the raw amplitude is blind to the two symptoms that often move first.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Monitor the Residual of a Model of Health, Not the Raw Sensor</div>
+<p>The naive condition monitor thresholds a raw sensor: alert when vibration exceeds a fixed number. This fails on both ends. It misses slow faults whose vibration rises within the nominal band, and it false-alarms on benign operating-point changes (a higher load lawfully raises vibration). The robust pattern, which recurs across every domain in this section, is to fit a model of healthy behavior (a forecast conditioned on load and ambient temperature, or a spectral baseline), compute the residual $r_t = x_t - \hat{x}_t$, and threshold the residual. A residual is by construction invariant to the operating conditions the model already explains, so it isolates the unexplained deterioration, which is the fault. This is the residual-detector idea of <a href="section-8.2.html">Section 8.2</a> stated as an engineering principle: you do not monitor the machine, you monitor the discrepancy between the machine and your best model of a healthy machine.</p>
+</div>
+<p>Condition monitoring is most valuable when it is framed not as a binary healthy-or-faulty label but as an estimate of remaining useful life, the time the machine can keep running before intervention becomes mandatory. Remaining useful life turns a detection into a decision: an alert at the onset of degradation is information, but an alert that says "this bearing has roughly eighty operating hours left" is an action plan that the maintenance scheduler can optimize against. The anomaly score $s_t$ of this chapter feeds remaining-useful-life estimation in a natural way, because a monotonically rising degradation score, fit against historical run-to-failure curves, yields a calibrated time-to-event prediction. We touch the idea here only to place it: the time-to-event modeling that turns a degradation signal into a survival curve is developed properly in <a href="../../toc.html">Chapter 18</a>, and the adaptive recalibration that keeps such a model honest as the machine ages belongs to <a href="../../toc.html">Chapter 21</a>. For this chapter, the detector's job is to produce the rising score; the survival model downstream consumes it.</p>
+<p>The frequency-domain side of condition monitoring rewards a moment of arithmetic, because the fault signatures are not vague: a defect on a specific bearing element rings at a specific, computable frequency, and the detector knows where to look. The next worked example makes that concreteness explicit and shows why a spectral feature can flag a fault that the raw amplitude entirely hides.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: A Fault Hiding in Plain Sight in the Spectrum</div>
+<p>A bearing rotates at $1{,}800$ revolutions per minute, that is $30$ revolutions per second, and its geometry gives a ball-pass frequency for an outer-race defect of about $3.6$ times shaft speed, so a developing outer-race spall rings at roughly $f_{\text{fault}} = 3.6 \times 30 = 108$ hertz. Early in the defect's life this ringing contributes a tiny fraction of the total vibration energy: suppose the broadband healthy vibration has a root-mean-square amplitude of $1.00$ in some sensor unit, and the nascent fault adds a $108$-hertz component of amplitude only $0.05$. The raw root-mean-square barely moves, from $1.000$ to $\sqrt{1.00^2 + 0.05^2} = 1.0012$, a $0.12\%$ change that no time-domain threshold would ever catch against $12\%$ measurement noise. But in the power spectrum of <a href="../module-04-frequency-spectral/index.html">Chapter 4</a>, that same energy concentrates into a single bin at $108$ hertz, where the healthy spectrum is flat and low; the spectral peak at the known fault frequency rises to several times the local noise floor, a clean, large, and growing anomaly score. The fault that is invisible in amplitude is unmistakable in the spectrum precisely because the spectrum concentrates the fault's energy where the detector is looking and spreads the noise everywhere else. This is the engineering reason condition monitoring scores spectral features, not raw signals, and it is the most literal payoff of the frequency tools of <a href="../module-04-frequency-spectral/index.html">Chapter 4</a> in this chapter.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact: The Submarine That Listened to Itself</div>
+<p>Vibration-based condition monitoring has a striking military pedigree. Cold-war submarines carried elaborate self-monitoring rigs not only to detect their own machinery faults but because any vibration they emitted was a beacon to enemy sonar, so a developing bearing fault was simultaneously a maintenance problem and a stealth problem. The accelerometer-and-spectrum techniques refined for that double motive, watching a rotating shaft's vibration spectrum for the telltale sidebands of a defect, are the direct ancestors of the envelope-spectrum analysis that a modern wind-turbine operator runs on a cloud dashboard. The fault frequencies have not changed; only the size of the computer watching them has.</p>
+</div>
+
+<h2>2. IT Observability and Security Monitoring <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The second great domain is the data center, where the streams are not vibration and temperature but request latency, error rate, throughput, queue depth, CPU and memory utilization, and the firehose of structured logs. Modern observability platforms track millions of such key-performance-indicator (KPI) time series simultaneously, and a human cannot watch them; an automated anomaly detector must. This is the lineage that produced the public benchmarks every practitioner cites: the Yahoo Webscope S5 KPI corpus, the Numenta Anomaly Benchmark (NAB) with its emphasis on early detection and its NAB score that explicitly rewards low detection delay, and the AIOps KPI competition datasets from large internet companies. These benchmarks, treated as evaluation infrastructure in <a href="section-8.4.html">Section 8.4</a>, exist precisely because IT KPI anomaly detection is high-volume, high-stakes, and unforgiving of false alarms at scale.</p>
+<p>Two features of IT metrics shape the detector design and recur in the worked example. First, strong and multiple seasonality: web traffic has a daily rhythm and a weekly rhythm, so a request rate that would be alarming at 3 a.m. is perfectly normal at the midday peak. A detector that ignores seasonality drowns in false alarms at every diurnal peak and misses real drops during troughs. The cure is to deseasonalize before scoring, removing the daily and weekly cycle with the seasonal decomposition of <a href="../module-03-statistical-foundations/index.html">Chapter 3</a> so that the residual carries only the unexplained deviation, the same residual-not-raw principle as the factory floor. Second, deploy-related shifts: a software release legitimately changes the level of a metric (a new feature raises latency by a known amount), and this is a change point, not an anomaly. A monitor that pages on every deployment is worse than useless, so production systems either suppress alerts in a window after a known deploy or feed the deploy log to the change-point detector of <a href="section-8.3.html">Section 8.3</a> as a known breakpoint, distinguishing the expected step from an unexpected one.</p>
+<p>The known-breakpoint mechanism is worth spelling out because it is the cleanest example of feeding external knowledge into a detector. A deploy is a change point whose time is known in advance from the deploy log, so rather than ask the change-point detector to discover it (and risk either missing it or, worse, alarming on it as if it were a fault), the monitor is told the breakpoint location and re-estimates its baseline on each side of it. The level shift the deploy caused is then absorbed into the model, the residual against the new baseline returns to flat, and a genuine fault that arrives after the deploy stands out against the corrected baseline instead of being masked by the deploy's step. A monitor that lacks this hook faces an impossible choice on every release: alarm (a false positive on a known-good change) or stay silent through the window where a bad deploy would actually show its damage. The deploy log resolves the dilemma by converting an unknown change point into a known one, which is exactly the kind of side information the adaptive feedback loop of subsection four is built to ingest.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Seasonality Is Signal to a Forecaster and Noise to a Threshold</div>
+<p>The single most common failure of a first IT monitor is thresholding a raw seasonal metric. Because the metric's mean swings by an order of magnitude between its daily trough and peak, any fixed threshold is simultaneously too tight (false alarms at the peak) and too loose (missed drops at the trough). There is no good fixed threshold for a seasonal series; the very notion is incoherent. The resolution is to make the threshold operate on the deseasonalized residual, whose mean is flat by construction, so a single threshold becomes meaningful across the whole day. Equivalently, and more powerfully, the forecast $\hat{x}_t$ that the residual is computed against already encodes the seasonality, so the detector's effective threshold breathes with the daily cycle automatically. Seasonality is information the forecaster should absorb, never noise the thresholder should fight.</p>
+</div>
+<p>The other half of observability is logs, not metrics, and they bend the chapter's tools in a complementary direction. A metric is already numeric and ordered; a log line is text, so before any anomaly detector can run, the stream of log messages must be turned into a time series. The standard pipeline parses each line into a template (the constant skeleton of the message, with variable fields masked) and then counts template occurrences per time window, yielding one count series per template. A surge in a rare error template, a sudden absence of a normally chatty heartbeat template, or a novel template never seen in training are all anomalies in this derived count space, and the residual-and-threshold machinery of <a href="section-8.2.html">Section 8.2</a> applies to each template series exactly as it does to a CPU metric. The twist logs add is the novel-template problem: an entirely new kind of message has no history to deseasonalize against, so it is scored not by a residual but by its mere novelty, the unsupervised out-of-distribution flavor of anomaly detection that returns in learned form with the sequence representations of <a href="../../toc.html">Chapter 16</a>.</p>
+<p>Security monitoring is the adversarial cousin of observability, and it bends the same tools in an important direction. Network intrusion detection watches connection counts, byte volumes, port-scan patterns, and authentication failures for the statistical signature of an attack: a sudden fan-out of connections (a scan), a slow exfiltration that shows as a persistent positive residual in outbound bytes, or a change in the distribution of request types. The change-point and density methods of this chapter apply directly, but the adversarial setting adds a twist absent from machinery monitoring: the anomaly is generated by an intelligent agent who actively shapes the attack to look normal, deliberately keeping each step below threshold or mimicking the diurnal pattern. This is why security detectors favor cumulative methods like CUSUM, which integrate small persistent deviations that an instantaneous threshold would never catch, and why the cost asymmetry (a missed intrusion is catastrophic, a false alarm is merely annoying) is even sharper here than in the factory.</p>
+<p>The cost of getting seasonality wrong is not abstract, and a concrete count makes it vivid. Take a web-traffic metric that swings between a nightly trough near $400$ requests per second and a midday peak near $4{,}000$, observed over two weeks, with one genuine incident: a real, brief traffic collapse to forty percent of baseline at three in the morning on the last day. A fixed raw threshold tuned to catch that collapse (say, alarm below $600$ requests per second) fires on the order of eighty times across the fortnight, once at every nightly trough, and the single real incident is one alarm buried among the eighty: the operator who silences the nightly noise silences the incident with it. Deseasonalize first, subtracting the per-hour median profile so the residual mean is flat, and threshold the residual at five robust standard deviations, and the same incident surfaces as a small handful of flags clustered exactly at the incident, the eighty nightly false alarms gone because the residual at the trough is small by construction. The raw threshold and the deseasonalized threshold see the identical data; one drowns and one catches, and the only difference is whether the seasonality was absorbed by a forecast before the threshold was applied. This is the seasonality insight of the previous callout, and Code 8.5.1 measures it on a simulated traffic series.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(2)
+days, per_day = 14, 24                              # two weeks, hourly samples
+n = days * per_day
+t = np.arange(n)
+# Web traffic: strong diurnal swing between a nightly trough and a midday peak.
+base = 2000 + 1800 * np.sin(2 * np.pi * (t % per_day) / per_day - 1.2).clip(-1, 1)
+traffic = np.clip(base, 200, None) * (1 + 0.05 * rng.standard_normal(n))
+inc = n - per_day + 3                               # one real 3 a.m. incident, last day
+traffic[inc:inc + 2] *= 0.4                         # traffic collapses to 40% of normal
+
+# Approach A: a fixed threshold on the RAW metric (alarm below 600 rps).
+raw_alarms = np.where(traffic < 600)[0]
+
+# Approach B: deseasonalize by the per-hour median profile, threshold the residual.
+hour = t % per_day
+profile = np.array([np.median(traffic[hour == h]) for h in range(per_day)])
+resid = traffic - profile[hour]                    # flat-mean residual r_t
+scale = 1.4826 * np.median(np.abs(resid - np.median(resid)))   # robust scale
+deseason_alarms = np.where(resid < -5 * scale)[0]  # 5 robust sigma below zero
+
+print("real incident at index :", inc)
+print("raw-threshold alarms   :", len(raw_alarms), "(a false-alarm storm)")
+print("deseasonalized alarms  :", list(map(int, deseason_alarms)))
+</code></pre>
+<div class="code-caption"><strong>Code 8.5.1:</strong> The seasonality trap, made concrete. A fixed threshold on the raw seasonal metric fires at every nightly trough; thresholding the deseasonalized residual instead, with the per-hour profile playing the role of the seasonal forecast of <a href="../module-03-statistical-foundations/index.html">Chapter 3</a>, makes a single threshold coherent across the whole day.</div>
+<pre><code class="language-text">real incident at index : 315
+raw-threshold alarms   : 80 (a false-alarm storm)
+deseasonalized alarms  : [199, 223, 252, 297, 315, 316]
+</code></pre>
+<div class="code-caption"><strong>Output 8.5.1:</strong> The raw threshold fires eighty times across the fortnight, burying the one real incident (index $315$) among seventy-nine nightly false alarms, while the deseasonalized residual surfaces the incident cleanly at indices $315$ and $316$ with only a few minor extras. Same data, same incident; the deseasonalization is the entire difference between a usable monitor and an ignored one.</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact: The Benchmark That Started a Decade of Arguments</div>
+<p>The Numenta Anomaly Benchmark did something subversive when it launched in 2015: instead of scoring detectors by raw precision and recall, it defined a scoring function that gives the most credit for catching an anomaly early, inside a window before the labeled point, and gives diminishing or negative credit for late or spurious flags. This single design choice forced the field to admit out loud that detection delay is a first-class metric, not an afterthought, and it provoked years of productive argument about whether its particular window shape and reward curve were the right ones. The arguments were the point: NAB made delay impossible to sweep under the rug, which is exactly the lesson <a href="section-8.4.html">Section 8.4</a> formalized.</p>
+</div>
+
+<h2>3. Healthcare and Finance Monitoring: The Cost Asymmetry <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The third and fourth domains push the cost asymmetry to its extreme and in opposite directions. In clinical monitoring, the stream is the patient's vital signs: heart rate, respiratory rate, blood pressure, oxygen saturation, and temperature, sampled irregularly and noisily on a hospital ward. The goal is an early-warning score that flags patient deterioration (incipient sepsis, respiratory failure, cardiac arrest) hours before the crisis, when intervention is still cheap and effective. This is the healthcare running dataset of the book, the irregularly sampled multivariate clinical series introduced in <a href="../../toc.html">Chapter 2</a> and revisited under filtering in <a href="../../toc.html">Chapter 7</a>. The detector's structure is familiar (a model of a stable patient, a residual, a threshold), but the irregular sampling demands the careful handling of <a href="../../toc.html">Chapter 2</a>, and the cost structure is morally as well as economically asymmetric: a missed deterioration can be fatal, so recall is paramount, yet a ward that floods with false alarms produces alarm fatigue in nurses, who then silence the monitors, which kills the recall the false alarms were protecting. The asymmetry is real but not one-directional, and that tension is the whole design problem.</p>
+<p>A second feature of clinical monitoring deserves emphasis because it distinguishes healthcare from the factory floor: the baseline is per-patient, not per-machine. Two healthy patients can have resting heart rates that differ by thirty beats per minute, so a population threshold is simultaneously too tight for one and too loose for the other, the same incoherence the seasonal-threshold problem exhibited in time. The fix is the same in spirit: the detector must learn or be given each patient's personal baseline (their stable operating point) and score the residual against it, so deterioration is measured as a departure from this patient's own normal rather than from a population average. Early-warning scores that page on absolute thresholds (the widely deployed track-and-trigger charts) trade this personalization away for simplicity and pay for it in both missed subtle deteriorations and a flood of false alarms on patients whose normal sits near a threshold, which is precisely the alarm-fatigue mechanism that leads nurses to silence monitors. The personalization that fixes it is the per-entity baseline that recurs in every domain of this section.</p>
+<p>Financial monitoring inverts the volume and inverts the visibility. The streams are returns, volatilities, order-flow imbalance, and trade-size distributions, and the targets are fraud (anomalous card or account behavior), market abuse (spoofing, layering, insider-driven price moves), and risk-limit breaches. This is the finance running dataset that threads through <a href="../../toc.html">Chapter 5</a> and <a href="../../toc.html">Chapter 19</a>. The defining feature is volatility clustering: financial series are conditionally heteroskedastic, so a return that is a five-sigma event in a calm regime is unremarkable in a turbulent one. A detector that uses a static variance will alarm continuously through any volatile period (a false-alarm storm) and miss the genuinely anomalous trade hidden inside it. The fix is to standardize the residual by a conditional volatility estimate, the GARCH machinery of <a href="../../toc.html">Chapter 5</a>, so that the score $s_t = r_t / \hat{\sigma}_t$ measures surprise relative to the current regime, not relative to a long-run average. The cost asymmetry in finance is double-edged in yet another way: a missed fraud costs the loss, but a false fraud alarm that blocks a legitimate transaction costs a customer and may breach a service agreement, so the threshold is set by an explicit cost ratio rather than by a statistical convention.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Setting the Threshold from the Cost Ratio</div>
+<p>Frame the threshold choice as a decision. Let the cost of a missed event (a false negative) be $C_{\text{FN}}$ and the cost of a false alarm (a false positive) be $C_{\text{FP}}$. Suppose a monitor's score $s_t$ on normal data is approximately Gaussian and a fraction $\pi$ of windows contain a true event. The Bayes-optimal threshold sets the alarm where the expected cost of alarming equals the expected cost of staying silent, which reduces to a likelihood-ratio cut whose level depends only on the ratio $C_{\text{FN}}/C_{\text{FP}}$ and the prior odds. Concretely, take a predictive-maintenance case with $C_{\text{FN}} = 100{,}000$ dollars (an unplanned line stop) and $C_{\text{FP}} = 500$ dollars (a needless inspection), a ratio of $200$. Compared with a cost-symmetric monitor ($C_{\text{FN}}=C_{\text{FP}}$), the optimal threshold must shift to make false negatives $200$ times more reluctant to occur: if the normal score is $\mathcal{N}(0,1)$, moving from a symmetric cut to one that prices a miss at $200\times$ a false alarm lowers the threshold from about $z=2.33$ (a $1\%$ false-alarm rate) to roughly $z=1.3$, accepting about a $10\%$ false-alarm rate to claw back recall. Now invert the costs for a low-stakes consumer metric where a false alarm annoys a user ($C_{\text{FP}}=50$) and a miss is recoverable ($C_{\text{FN}}=100$, ratio $2$): the threshold moves the other way, up to about $z=2.6$, tolerating misses to protect precision. The same detector, the same score distribution, two thresholds that differ by more than a full standard deviation, chosen entirely by the cost ratio. This is why "what threshold should I use?" has no domain-free answer, only a cost-ratio answer.</p>
+</div>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Standardize by the Right Scale or the Threshold Is a Lie</div>
+<p>Across all four domains, the recurring subtlety is the denominator. A raw residual $r_t$ is not comparable across operating regimes: a vibration residual of $0.3$ means deterioration at low load and noise at high load; a return of $-3\%$ is a crisis in a calm market and a Tuesday in a panic. Every robust monitor therefore scores a <em>standardized</em> residual $s_t = r_t / \hat{\sigma}_t$, where $\hat{\sigma}_t$ is the locally appropriate scale: a rolling standard deviation for slowly varying noise, a GARCH conditional volatility for financial returns (<a href="../../toc.html">Chapter 5</a>), or a load-conditioned variance for machinery. Choosing the wrong scale guarantees one of the two failure modes: a too-static scale alarms through every turbulent regime, a too-reactive scale absorbs the anomaly into its own estimate and goes silent. The threshold is only as honest as the scale it divides by.</p>
+</div>
+<p>The four domains share the residual-and-threshold skeleton but differ sharply in the data, the dominant nuisance the detector must neutralize, the metric that matters most, and the cost asymmetry that sets the threshold. Laying them side by side, as in the comparison below, makes the common structure and the domain-specific tuning visible at once, and it explains why a single off-the-shelf detector never transfers cleanly between domains: the estimator is shared, but the deseasonalizer, the scale, and the cost ratio are not.</p>
+<div class="comparison-table">
+<div class="comparison-table-title">The Four Monitoring Domains at a Glance</div>
+<table>
+<thead>
+<tr><th>Domain</th><th>Stream</th><th>Dominant nuisance</th><th>Scale $\hat{\sigma}_t$</th><th>Cost asymmetry</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Predictive maintenance</strong></td><td>Vibration, temperature, current</td><td>Operating-point (load) changes</td><td>Load-conditioned variance</td><td>Miss $\gg$ false alarm (line stop)</td></tr>
+<tr><td><strong>IT / security</strong></td><td>Latency, error rate, logs, flow</td><td>Daily/weekly seasonality, deploys</td><td>Rolling robust scale</td><td>Sharp; intrusion miss catastrophic</td></tr>
+<tr><td><strong>Healthcare</strong></td><td>Irregular multivariate vitals</td><td>Irregular sampling, patient baseline</td><td>Per-patient rolling scale</td><td>Miss can be fatal; alarm fatigue kills recall</td></tr>
+<tr><td><strong>Finance</strong></td><td>Returns, volatility, order flow</td><td>Volatility clustering</td><td>GARCH conditional volatility</td><td>Two-sided: fraud loss vs blocked customer</td></tr>
+</tbody>
+</table>
+</div>
+<p>The cost-ratio argument of the numeric example above is not a one-off; it is the discipline that sets the threshold in every row of that table, and a second, fully worked instance fixes the arithmetic for the financial case where the asymmetry runs the other way.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: A Confusion Matrix Priced by Its Costs</div>
+<p>Run a fraud monitor for one day over $100{,}000$ card transactions, of which $50$ are truly fraudulent (a prior of $\pi = 0.0005$). At one threshold the monitor produces the confusion matrix: $40$ true positives, $10$ false negatives (missed frauds), $300$ false positives (blocked legitimate cards), and the rest true negatives. The detector's recall is $40/50 = 0.80$ and its precision is $40/(40+300) = 0.118$, numbers that look poor by a textbook standard. Now price them. A missed fraud costs the average chargeback $C_{\text{FN}} = 220$ dollars and a blocked legitimate transaction costs the customer-friction and support load $C_{\text{FP}} = 12$ dollars. Total cost at this threshold is $10 \times 220 + 300 \times 12 = 2{,}200 + 3{,}600 = 5{,}800$ dollars. Raise the threshold to cut false positives to $80$ but let recall fall to $0.60$ ($30$ caught, $20$ missed): cost becomes $20 \times 220 + 80 \times 12 = 4{,}400 + 960 = 5{,}360$ dollars, slightly better despite the worse recall, because at a cost ratio of only $220/12 \approx 18$ the false positives were the larger bill. Push the ratio to the predictive-maintenance regime, $C_{\text{FN}} = 100{,}000$, and the first (high-recall) threshold wins overwhelmingly: $10 \times 100{,}000 + 300 \times 12 = 1{,}003{,}600$ versus $20 \times 100{,}000 + 960 = 2{,}000{,}960$. The same two confusion matrices, the same detector, and the cheaper operating point flips entirely with the cost ratio. The lesson is that the threshold is chosen by minimizing expected cost over the confusion matrix, not by maximizing a cost-blind F-score, which is exactly why the cost asymmetry is the protagonist of this subsection.</p>
+</div>
+
+<h2>4. The Operational Reality: Alert Fatigue and the Triage Loop <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Everything to this point concerned the detector. The operational reality concerns the human at the other end of the alert, and it is where most monitoring projects quietly fail. The governing pathology has a name: alert fatigue. A monitor that fires too often, even at a respectable precision, trains its human operators to ignore it, and an ignored monitor has zero effective recall regardless of its statistical recall. The epigraph's monitor was "statistically excellent and operationally dead" precisely because precision below the human tolerance threshold collapses the whole system. The practical consequence is that production monitoring optimizes a constrained objective: maximize recall subject to a precision floor that keeps the humans engaged, and minimize detection delay subject to both. This is a sharper and less forgiving problem than maximizing the area under a curve, because the precision floor is set by human psychology, not by the data.</p>
+<p>The precision/recall/delay trade-off is genuinely three-dimensional and cannot be collapsed to a single curve without losing the engineering decision. Raising the threshold buys precision at the cost of recall and delay (a higher bar means fewer false alarms but also fewer and later true catches). Adding a persistence requirement (alert only after $k$ consecutive scores exceed the threshold) buys precision and crushes false alarms but adds $k$ samples of delay, which in a fast-moving fault is exactly the delay you could not afford. Widening the deseasonalization window stabilizes the baseline and cuts false alarms but blinds the monitor to fast regime changes. Every knob trades among the three, and the right setting depends on the cost ratio of subsection three and the human tolerance of this one. There is no globally best monitor; there is only a monitor tuned to a specific cost structure and a specific operations team.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Precision Floor Is Set by Human Psychology, Not by Statistics</div>
+<p>The constraint that distinguishes a production monitor from a benchmark detector is that precision below a human tolerance threshold, empirically somewhere around fifty to seventy percent actionable alerts for most teams, collapses the effective recall to zero because the humans stop reading the alerts. This makes the operational objective a constrained one, maximize recall and minimize delay subject to $\text{precision} \ge p_{\min}$, where $p_{\min}$ is a property of the operators, not of the data. A detector with $0.95$ area under the precision-recall curve that operates at a point with $5\%$ precision is, in this sense, worthless, while a cruder detector pinned to a $60\%$-precision operating point is valuable. The benchmark optimizes the whole curve; production optimizes a single point under a human constraint, and the two optimizations routinely disagree about which detector is better. This is why the practical-example team's offline area-under-the-curve barely moved while the operational outcome was transformed: they did not change the curve, they moved the operating point and built the triage that let the operators trust it.</p>
+</div>
+<p>A subtle and often-missed consequence is that the three quantities are not symmetric in how a deployment should treat them. Recall is recoverable after the fact in many domains: a missed but slow fault re-triggers on the next sample, and a missed deterioration keeps deteriorating, so a monitor with imperfect instantaneous recall on a sustained event still catches it, only later. False alarms, by contrast, are not recoverable: a spurious page spends an operator's attention irreversibly, and enough of them spend the operator's trust, which is the resource the precision floor protects. Detection delay sits between the two, recoverable in the sense that a late catch is still a catch, but only up to the moment the fault becomes catastrophic, after which delay converts into a miss. This asymmetry argues for a specific deployment posture: tune first to satisfy the precision floor (protect trust), then minimize delay subject to it (catch early), and let recall on sustained events follow from the fact that a persistent fault keeps presenting itself to a trusted, low-delay monitor. The posture inverts only for the rare instantaneous, non-recurring, catastrophic event, where a single missed sample is unrecoverable and recall must dominate from the start.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Observability Team That Tuned for Trust, Not for AUC</div>
+<p><strong>Who:</strong> A site-reliability engineering team at a payments company running automated anomaly detection across roughly forty thousand service KPIs.</p>
+<p><strong>Situation:</strong> They had deployed a residual-based detector (deseasonalize, forecast, threshold the standardized residual) that scored well offline: an area under the precision-recall curve north of $0.9$ on a held-out incident set.</p>
+<p><strong>Problem:</strong> In production it paged the on-call engineers roughly two hundred times a week, of which fewer than ten were actionable. Within a month the engineers had written filters routing most pages to a muted channel, and a genuine database-connection-pool exhaustion went unnoticed for forty minutes because its page landed in the muted channel with the noise.</p>
+<p><strong>Dilemma:</strong> Two paths. Push the threshold up hard to kill the false alarms, accepting that some real but subtle incidents would be missed or caught later, or keep the sensitive threshold and invest in everything downstream of the detector, alert correlation and triage, to make the volume tolerable without sacrificing recall.</p>
+<p><strong>Decision:</strong> They chose the second path, treating the detector's raw alerts as input to a triage layer rather than as pages. They added three downstream stages: a persistence filter (three consecutive breaches), an alert-correlation step that grouped alerts sharing a root cause into one incident, and a feedback loop where every engineer disposition (real / not real) was logged to retrain the threshold per KPI.</p>
+<p><strong>How:</strong> The correlation step keyed alerts by service-dependency graph and time proximity, so a single failing database produced one incident, not the eighty downstream-service alerts it used to spawn. The disposition log fed a weekly recalibration that raised thresholds on chronically noisy KPIs and lowered them on KPIs that had recently produced missed incidents, the adaptive recalibration that <a href="../../toc.html">Chapter 21</a> develops in full.</p>
+<p><strong>Result:</strong> Weekly pages dropped from about two hundred to about fifteen, actionable fraction rose above sixty percent, the engineers un-muted the channel, and median detection delay on real incidents fell because the now-trusted alerts were acted on immediately rather than after a skeptical second look. The offline AUC barely moved; the operational outcome was transformed.</p>
+<p><strong>Lesson:</strong> A monitor's value is decided downstream of the detector, in correlation, triage, and feedback, not upstream in the score. Optimize for the trust of the humans who act on the alerts, because their attention is the scarce resource the whole system spends. The right metric is the actionable-alert fraction the operators experience, not the curve the data scientist plots.</p>
+</div>
+<p>The cure for alert volume is not only a higher threshold; it is structure. A production monitor wraps the raw detector in three downstream layers, each attacking the alert-fatigue problem from a different side:</p>
+<ul>
+<li><strong>Suppression and persistence.</strong> A breach becomes an alert only after it persists for $k$ samples or clears a deduplication window, killing the single-sample flicker that produces most spurious pages. This is the persistence-and-cooldown logic the worked example builds explicitly.</li>
+<li><strong>Correlation and root-cause grouping.</strong> Alerts sharing a cause (the same failing database, the same deploy, the same upstream dependency) are grouped into one incident using the dependency graph and temporal proximity, so one database failure pages once with the root cause attached rather than eighty times with the symptoms.</li>
+<li><strong>Human-in-the-loop triage and feedback.</strong> A person dispositions each incident as real or not, and that disposition is captured and fed back as a label that recalibrates the threshold and retrains the model, so the monitor that paged on a benign deploy last week learns not to page on the next one.</li>
+</ul>
+<p>The third layer closes the loop of Figure 8.5.1. This feedback-and-retrain cycle is the seed of the adaptive systems of <a href="../../toc.html">Chapter 21</a> and the full deployment-and-monitoring discipline of <a href="../../toc.html">Chapter 34</a>; here we note only that a monitor without a feedback loop is frozen at its launch-day calibration and decays as the world drifts beneath it, the drift problem that <a href="../../toc.html">Chapter 20</a> takes up directly. A monitor is a loop, not a line, because the world it watches does not hold still.</p>
+
+<h2>5. A Reference Monitoring Pipeline <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>It is worth drawing the whole system once, because every successful monitor across all four domains is a specialization of the same pipeline, and naming its stages lets us see exactly which earlier section built each one. Figure 8.5.1 lays out the reference pipeline as a left-to-right flow from raw ingestion to human triage and back, with a feedback arc that turns the line into a loop. Reading it left to right: the raw stream is ingested and cleaned (the data-engineering hygiene of <a href="../../toc.html">Chapter 2</a>); the seasonal and trend structure is removed by a forecast or decomposition (<a href="../module-03-statistical-foundations/index.html">Chapter 3</a>), leaving a residual; the residual is standardized by a local scale and turned into an anomaly score (<a href="section-8.2.html">Section 8.2</a>, with the change-point variant of <a href="section-8.3.html">Section 8.3</a>); the score is compared against a possibly dynamic threshold to emit a raw alert; the raw alerts are correlated and triaged with a human in the loop; and the dispositions feed back to retrain the model and recalibrate the threshold, the adaptive loop of <a href="../../toc.html">Chapter 21</a>.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A left-to-right monitoring pipeline of six boxed stages, ingest, deseasonalize and forecast, residual score, threshold and alert, correlate and triage, with each stage labeled by the chapter or section that built it, and a curved feedback arrow returning from the triage stage to the forecast stage.">
+<style>
+  .stg{fill:var(--surface-color,#f4f6f8);stroke:var(--accent-color,#3b6ea5);stroke-width:2;rx:8;}
+  .sl{font-family:var(--font-sans,sans-serif);font-size:12.5px;font-weight:700;fill:var(--text-color,#222);text-anchor:middle;}
+  .rl{font-family:var(--font-sans,sans-serif);font-size:10.5px;fill:var(--text-muted,#666);text-anchor:middle;}
+  .flow{stroke:var(--accent-color,#3b6ea5);stroke-width:2.2;fill:none;marker-end:url(#ah85);}
+  .fb{stroke:var(--warning-color,#d98b2b);stroke-width:2;fill:none;stroke-dasharray:6 4;marker-end:url(#ah85b);}
+</style>
+<defs>
+  <marker id="ah85" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--accent-color,#3b6ea5)"/></marker>
+  <marker id="ah85b" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--warning-color,#d98b2b)"/></marker>
+</defs>
+<rect class="stg" x="20" y="90" width="120" height="64" rx="8"/>
+<text class="sl" x="80" y="116">Ingest</text>
+<text class="sl" x="80" y="132">&amp; clean</text>
+<text class="rl" x="80" y="150">Chapter 2</text>
+<rect class="stg" x="170" y="90" width="130" height="64" rx="8"/>
+<text class="sl" x="235" y="114">Deseasonalize</text>
+<text class="sl" x="235" y="130">/ forecast</text>
+<text class="rl" x="235" y="148">Chapter 3</text>
+<rect class="stg" x="330" y="90" width="120" height="64" rx="8"/>
+<text class="sl" x="390" y="114">Residual</text>
+<text class="sl" x="390" y="130">score</text>
+<text class="rl" x="390" y="148">Section 8.2</text>
+<rect class="stg" x="480" y="90" width="120" height="64" rx="8"/>
+<text class="sl" x="540" y="114">Threshold</text>
+<text class="sl" x="540" y="130">&amp; alert</text>
+<text class="rl" x="540" y="148">Section 8.3</text>
+<rect class="stg" x="630" y="90" width="130" height="64" rx="8"/>
+<text class="sl" x="695" y="114">Correlate</text>
+<text class="sl" x="695" y="130">&amp; triage</text>
+<text class="rl" x="695" y="148">human-in-loop</text>
+<path class="flow" d="M 140 122 L 168 122"/>
+<path class="flow" d="M 300 122 L 328 122"/>
+<path class="flow" d="M 450 122 L 478 122"/>
+<path class="flow" d="M 600 122 L 628 122"/>
+<text class="sl" x="800" y="118">Action</text>
+<text class="rl" x="800" y="135">page / ticket</text>
+<path class="flow" d="M 760 122 L 788 122"/>
+<path class="fb" d="M 695 154 C 695 250, 235 250, 235 156"/>
+<text class="rl" x="465" y="270" fill="var(--warning-color,#d98b2b)">Feedback: dispositions retrain the model and recalibrate the threshold (Chapter 21)</text>
+<text class="sl" x="440" y="40">A monitor is a loop, not a line</text>
+</svg>
+<figcaption><strong>Figure 8.5.1:</strong> The reference monitoring pipeline. Each solid stage is built by an earlier part of the book: ingestion and cleaning by <a href="../../toc.html">Chapter 2</a>, deseasonalization and forecasting by <a href="../module-03-statistical-foundations/index.html">Chapter 3</a> (with spectral features from <a href="../module-04-frequency-spectral/index.html">Chapter 4</a> where faults live in frequency), residual scoring by <a href="section-8.2.html">Section 8.2</a>, thresholding and change-point alerting by <a href="section-8.3.html">Section 8.3</a>, and evaluation of the whole by <a href="section-8.4.html">Section 8.4</a>. The dashed feedback arc, where human dispositions retrain the model and recalibrate the threshold, is what turns the pipeline from a line into a loop and is developed as adaptive monitoring in <a href="../../toc.html">Chapter 21</a> and deployment in <a href="../../toc.html">Chapter 34</a>.</figcaption>
+</figure>
+<div class="callout looking-back">
+<div class="callout-title">Looking Back: Part II Closes With a Complete Classical Toolkit</div>
+<p>This section ends Chapter 8 and with it Part II, so it is the right moment to take stock of the classical temporal toolkit the book has assembled. From <a href="../module-03-statistical-foundations/index.html">Chapter 3</a> we have the statistical foundations: stationarity, autocorrelation, and decomposition. From <a href="../module-04-frequency-spectral/index.html">Chapter 4</a> we have the frequency domain: the spectrum, filtering, and the spectral features that reveal faults invisible in time. From <a href="../../toc.html">Chapter 5</a> we have univariate forecasting: AR, ARIMA, exponential smoothing, and the GARCH volatility models that supplied the conditional scale of subsection three. From <a href="../../toc.html">Chapter 6</a> we have multivariate and econometric models: the VAR and its causal and impulse-response analysis. From <a href="../../toc.html">Chapter 7</a> we have state-space models and the Kalman filter, the recursive estimator of a hidden state. And from this Chapter 8 we have the anomaly and change-point detectors that watch all of the above for the moment the process departs from its model. Every monitor in this section is built entirely from these classical pieces: a forecaster to deseasonalize, a residual to score, a change-point test to alert, an evaluation protocol to judge. The classical toolkit is, as of this page, complete. It is also, as the next callout argues, about to be rebuilt in learned form.</p>
+</div>
+<div class="callout thesis-thread">
+<div class="callout-title">Temporal Thread: Every Classical Detector Returns as a Learned One in Parts III and IV</div>
+<p>The detectors of this chapter all share a structure: a model of normal behavior, a residual against it, and a threshold on the residual. That structure is exactly the structure of the deep methods to come, with the hand-specified model replaced by a learned one. The forecast that deseasonalizes the stream becomes a deep forecaster (<a href="../../toc.html">Chapter 14</a>) or a temporal foundation model (<a href="../../toc.html">Chapter 15</a>), whose richer normal-behavior model yields a sharper residual. The reconstruction-error anomaly score becomes the reconstruction error of a temporal autoencoder or the likelihood under a deep generative temporal model (<a href="../../toc.html">Chapter 17</a>), which learns the manifold of normal sequences instead of assuming a parametric one. The change-point detector returns as a learned representation whose distance shift signals a regime change, built on the self-supervised temporal representations of <a href="../../toc.html">Chapter 16</a>. The feedback loop of subsection four becomes online and continual learning under drift (<a href="../../toc.html">Chapter 20</a>) and the adaptive systems of <a href="../../toc.html">Chapter 21</a>. Part II gave you the detectors with their internals exposed; Parts III and IV give you the same detectors with the internals learned from data, more powerful and less interpretable, and you will understand them precisely because you built their classical ancestors here. Route through the <a href="../../toc.html">Table of Contents</a> to see the full arc.</p>
+</div>
+
+<h2>6. Worked Example: An End-to-End Monitor on the IoT Stream <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now assemble the whole pipeline of Figure 8.5.1 into a small, complete monitor and run it on the sensor-IoT running dataset: a bearing-vibration stream with a strong daily duty cycle and an injected incipient fault that ramps up over a few hours near the end. The monitor walks every stage of the reference pipeline in turn. It deseasonalizes the stream against its daily profile (the ingest-and-deseasonalize stages), computes a standardized forecast residual against a robust scale (the residual-score stage of <a href="section-8.2.html">Section 8.2</a>), applies a threshold with a persistence requirement (the threshold-and-alert stage of <a href="section-8.3.html">Section 8.3</a>), and emits alerts with a cooldown so that a single sustained fault produces one alert rather than a flapping storm (the anti-flapping discipline of subsection four).</p>
+<p>We build the monitor from scratch first, so every stage of Figure 8.5.1 is concrete rather than hidden behind a library call, then run a packaged library detector on the identical residual for comparison, the from-scratch-plus-library pairing this book uses throughout. For both we report the three production metrics that decide a monitor's fate: precision (the fraction of alerts that are real), recall (the fraction of real events caught), and detection delay (the lag from true onset to the first true alert), scored with the point-adjusted protocol of <a href="section-8.4.html">Section 8.4</a>. Code 8.5.2 builds the dataset and the deseasonalizing residual.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(85)
+
+# --- Sensor-IoT running dataset: bearing vibration with a daily duty cycle ---
+days, per_day = 21, 144          # 144 samples/day = one every 10 minutes
+n = days * per_day
+t = np.arange(n)
+phase = 2 * np.pi * (t % per_day) / per_day
+season = 1.0 + 0.6 * np.sin(phase - 0.5)        # daily load cycle (the seasonality)
+noise = 0.12 * rng.standard_normal(n)
+x = season + noise                               # healthy vibration amplitude
+
+# Inject an incipient fault: a slow upward ramp over the last ~6 hours.
+fault_start = n - 40                             # onset index (ground truth)
+ramp = np.clip((t - fault_start) / 30.0, 0, None) * 0.9
+x = x + ramp                                     # deterioration rides on top of season
+
+# --- Stage 1-2: deseasonalize by the per-slot daily profile (Chapter 3) ---
+train = fault_start - per_day                    # fit the profile on healthy history only
+slot = t % per_day
+profile = np.array([x[:train][slot[:train] == s].mean() for s in range(per_day)])
+deseason = x - profile[slot]                     # residual r_t = x_t - seasonal forecast
+print("healthy residual std :", round(deseason[:train].std(), 4))
+print("residual at fault end:", round(deseason[-1], 4))
+</code></pre>
+<div class="code-caption"><strong>Code 8.5.2:</strong> Building the IoT vibration stream and the deseasonalized residual. The per-slot daily profile is the seasonal forecast of <a href="../module-03-statistical-foundations/index.html">Chapter 3</a>, fit only on healthy history so the injected fault cannot leak into the baseline; the residual <code>deseason</code> is what the detector actually scores, isolating deterioration from the lawful daily load cycle.</div>
+<pre><code class="language-text">healthy residual std : 0.116
+residual at fault end: 1.3871
+</code></pre>
+<div class="code-caption"><strong>Output 8.5.2:</strong> Deseasonalization flattens the daily cycle so the healthy residual is small (standard deviation about $0.12$, the injected noise level), while the fault drives the end-of-stream residual to roughly $1.39$, about twelve healthy standard deviations, exactly the separation a residual threshold is meant to exploit.</div>
+<p>With a clean residual in hand, Code 8.5.3 implements the rest of the pipeline from scratch: a standardized score using a rolling robust scale (the median absolute deviation, which the fault cannot inflate the way it would inflate a plain standard deviation), a dynamic threshold, and an alerting rule with a persistence requirement and a cooldown to prevent flapping.</p>
+<pre><code class="language-python">def mad_scale(v):
+    """Robust scale: median absolute deviation, rescaled to match the std
+    of a Gaussian. Robust so the fault itself does not inflate the scale."""
+    med = np.median(v)
+    return 1.4826 * np.median(np.abs(v - med)) + 1e-9
+
+def monitor(resid, train_end, win=288, z=4.0, persist=3, cooldown=48):
+    """From-scratch monitor: standardized score, dynamic threshold, alert
+    with persistence (k breaches in a row) and a cooldown (no re-alert for
+    `cooldown` steps after firing, so one sustained fault gives one alert)."""
+    base_loc = np.median(resid[:train_end])
+    base_scale = mad_scale(resid[:train_end])      # warm-up scale before the window fills
+    alerts, run, cool = [], 0, 0
+    for i in range(len(resid)):
+        lo = max(0, i - win)                       # rolling window of recent residuals
+        scale = mad_scale(resid[lo:i]) if i > 30 else base_scale
+        score = (resid[i] - base_loc) / scale      # standardized anomaly score s_t
+        run = run + 1 if score > z else 0          # count consecutive breaches
+        if cool > 0:
+            cool -= 1                              # suppress alerts during cooldown
+        elif run >= persist:                       # fire only after `persist` breaches
+            alerts.append(i)
+            cool = cooldown                         # open the cooldown window
+            run = 0
+    return alerts
+
+alerts = monitor(deseason, train_end=train)
+print("alert indices         :", alerts)
+print("ground-truth onset    :", fault_start)
+if alerts:
+    print("detection delay (steps):", alerts[0] - fault_start)
+</code></pre>
+<div class="code-caption"><strong>Code 8.5.3:</strong> The from-scratch monitor: robust standardized scoring, a persistence requirement (<code>persist</code> consecutive breaches), and a <code>cooldown</code> so one sustained fault yields a single alert. The median-absolute-deviation scale is the standardize-by-the-right-scale principle of subsection three made concrete, and the cooldown is the anti-flapping discipline of subsection four.</div>
+<pre><code class="language-text">alert indices         : [3003]
+ground-truth onset    : 2984
+detection delay (steps): 19
+</code></pre>
+<div class="code-caption"><strong>Output 8.5.3:</strong> The monitor fires exactly once, at index $3003$, nineteen steps (about three hours and ten minutes) after the true fault onset at $2984$. The single clean alert is the payoff of the persistence-plus-cooldown rule: a naive per-sample threshold would have fired repeatedly across the ramp, the flapping the cooldown exists to prevent.</div>
+<p>One alert is good, but a monitor is judged by the three production metrics on the whole stream, so Code 8.5.4 scores the run with point-adjusted precision and recall and the detection delay of <a href="section-8.4.html">Section 8.4</a>, treating the fault as a single labeled event window.</p>
+<pre><code class="language-python">def score_monitor(alerts, onset, end, tol=6):
+    """Point-adjusted precision/recall + detection delay over one event window.
+    An alert is a true positive if it lands in [onset, end]; the event is
+    recalled if at least one alert falls in the window; delay = first such hit."""
+    event = set(range(onset, end + 1))
+    tp = [a for a in alerts if a in event]
+    fp = [a for a in alerts if a not in event]
+    precision = len(tp) / len(alerts) if alerts else 0.0
+    recall = 1.0 if tp else 0.0                    # single event: caught or not
+    delay = (min(tp) - onset) if tp else None
+    return precision, recall, delay, len(fp)
+
+prec, rec, delay, n_fp = score_monitor(alerts, onset=fault_start, end=n - 1)
+print(f"precision={prec:.2f}  recall={rec:.2f}  delay={delay} steps  false_alarms={n_fp}")
+</code></pre>
+<div class="code-caption"><strong>Code 8.5.4:</strong> Scoring the monitor with the point-adjusted precision, recall, and detection-delay metrics of <a href="section-8.4.html">Section 8.4</a>. Because the injected fault is a single sustained event, recall is binary (the event is caught or missed) and the delay is the lag from true onset to the first in-window alert, the three numbers that decide a monitor's fate in production.</div>
+<pre><code class="language-text">precision=1.00  recall=1.00  delay=19 steps  false_alarms=0
+</code></pre>
+<div class="code-caption"><strong>Output 8.5.4:</strong> Perfect precision and recall with zero false alarms and a nineteen-step delay on this stream. The headline result is the nineteen-step delay, the metric an operator cares about: the fault was caught about three hours after onset, early enough to schedule intervention before the deterioration reached the catastrophic band, with the delay being the price the persistence-plus-cooldown rule paid for firing exactly once.</div>
+<p>That was the transparent machinery, every box of Figure 8.5.1 hand-built so the pipeline is concrete rather than asserted. In production you would not hand-roll the seasonal profile, the robust scale, the persistence logic, and the scoring; a mature library packages the residual-and-threshold monitor behind a small interface. Code 8.5.5 is the library shortcut using the same dataset, here through scikit-learn's robust Gaussian estimator <code>MinCovDet</code> thresholded at a chi-square cutoff on the Mahalanobis distance, the principled way to flag a residual that no longer looks like healthy noise.</p>
+<pre><code class="language-python">import numpy as np
+from scipy.stats import chi2
+from sklearn.covariance import MinCovDet
+
+# Reuse the deseasonalized residual from Code 8.5.2 as the detector input.
+feats = deseason.reshape(-1, 1)                    # one feature: the residual
+rob = MinCovDet(random_state=0).fit(feats[:train]) # robust Gaussian of healthy noise
+d2 = rob.mahalanobis(feats)                        # squared Mahalanobis distance = score
+thr = chi2.ppf(0.9999, df=1)                       # chi-square cutoff sets the threshold
+flagged = np.where(d2 > thr)[0]
+
+# Collapse contiguous flags into single alerts (the cooldown, library-side).
+alerts_lib = [g[0] for g in np.split(flagged, np.where(np.diff(flagged) > 48)[0] + 1) if len(g)]
+prec, rec, delay, n_fp = score_monitor(alerts_lib, onset=fault_start, end=n - 1)
+print("library alerts        :", [int(a) for a in alerts_lib])
+print(f"precision={prec:.2f}  recall={rec:.2f}  delay={delay} steps  false_alarms={n_fp}")
+</code></pre>
+<div class="code-caption"><strong>Code 8.5.5:</strong> The library shortcut: scikit-learn's <code>MinCovDet</code> fits a robust Gaussian to the healthy residual, and a chi-square quantile on the Mahalanobis distance sets a principled, contamination-free threshold, with contiguous flags collapsed into single alerts. The robust-scale, standardized-score, and persistence logic that took roughly forty lines across Codes 8.5.3 and 8.5.4 collapse to about eight here, a fivefold reduction, with the estimator handling the robust location and scale, the distance score, and the statistically calibrated cutoff internally.</div>
+<pre><code class="language-text">library alerts        : [2995]
+precision=1.00  recall=1.00  delay=11 steps  false_alarms=0
+</code></pre>
+<div class="code-caption"><strong>Output 8.5.5:</strong> The <code>MinCovDet</code> monitor catches the same fault with perfect precision and recall and a shorter eleven-step delay, because the chi-square threshold fires as soon as the residual clears the healthy Gaussian band rather than waiting for three consecutive breaches. The from-scratch monitor traded eight steps of delay for the explicit persistence guarantee; the library trades that hand-tuned conservatism for a statistically calibrated cutoff, the classic exchange this book keeps surfacing.</div>
+<p>The two monitors agree where it matters (both catch the fault, both with perfect precision and recall on this stream) and differ exactly where the design choices live: the from-scratch monitor's persistence requirement makes it conservative and slow but immune to single-sample flicker, while the library's calibrated threshold makes it faster but reliant on the residual genuinely being Gaussian under health. Neither is universally better; the right choice is set by the cost ratio of subsection three (how much is each step of delay worth against each false alarm) and by how trustworthy the healthy-residual model is. What both share, and what no choice of detector escapes, is everything downstream: both produce a raw alert that still needs correlation, triage, and a feedback loop before it is a monitor a team will trust.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: A Production Monitor in a Few Lines</div>
+<p>The from-scratch monitor of Codes 8.5.3 and 8.5.4 exists to expose the mechanism: the robust scale, the standardized score, the persistence-and-cooldown alerting, and the point-adjusted scoring are all visible and tunable. In production you reach instead for a packaged detector. Scikit-learn's <code>MinCovDet</code> (used above), <code>IsolationForest</code>, and <code>LocalOutlierFactor</code> wrap the robust-Gaussian and density-based scoring of <a href="section-8.2.html">Section 8.2</a>; the <code>ruptures</code> library packages the change-point detectors (PELT, binary segmentation, window-based) of <a href="section-8.3.html">Section 8.3</a> behind a one-line <code>predict</code>; and dedicated time-series anomaly toolkits such as PyOD, Merlion, and the Nixtla anomaly utilities fold deseasonalization, scoring, and thresholding into a single fit-predict object. Roughly forty lines of hand-written scale, score, persistence, and metric code become about eight. What no library does for you is choose the threshold against your cost ratio (subsection three) or build the correlation, triage, and feedback layer (subsection four); the library gives you the detector, but the monitor (the loop of Figure 8.5.1) is still yours to assemble, exactly as the deployment discipline of <a href="../../toc.html">Chapter 34</a> insists.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Foundation Models and Tuning-Free Monitoring (2024 to 2026)</div>
+<p>Industrial monitoring is being reshaped by the temporal foundation models that <a href="../../toc.html">Chapter 15</a> introduces. The headline 2024 to 2026 development is zero-shot and tuning-free anomaly detection: rather than fit a bespoke forecaster per KPI, a pretrained model such as Chronos, TimesFM, Moirai, or MOMENT forecasts the stream out of the box, and the residual against its forecast becomes the anomaly score with no per-series training, directly attacking the alert-fatigue problem by making good baselines cheap to deploy across millions of series. A parallel thread sharpens the evaluation this chapter built on: the 2022 critique by Kim and colleagues showed that the point-adjustment protocol of <a href="section-8.4.html">Section 8.4</a> can flatter weak detectors, prompting the TSB-AD benchmark (NeurIPS 2024) and the VUS (volume under the surface) metrics to re-rank methods under fairer protocols, and the early verdict is sobering: simple residual and distance methods, the ones built in this chapter, remain remarkably competitive against elaborate deep detectors once the evaluation is corrected. A third thread, multivariate and graph-aware monitoring, learns the dependency structure among thousands of KPIs so that the alert correlation of subsection four is itself learned rather than hand-keyed to a service graph, connecting forward to the spatio-temporal models of <a href="../../toc.html">Chapter 32</a>. The throughline is the throughline of this whole section: the detector is necessary but not sufficient, and the 2024 to 2026 frontier is as much about evaluation honesty and operational cost as about model capacity.</p>
+</div>
+<p>Step back and see what the section, the chapter, and Part II assembled. We took the detectors of the previous four sections and wired them into systems for four domains: predictive maintenance reading the residual of a health model and feeding remaining-useful-life estimation, IT and security observability deseasonalizing high-volume KPIs and integrating slow adversarial deviations, healthcare early warning trading recall against alarm fatigue, and financial surveillance standardizing by conditional volatility against an explicit cost ratio. We confronted the operational reality that a monitor's value lives downstream of the detector, in the precision floor set by human trust, the three-way precision-recall-delay trade-off, and the correlation-triage-feedback loop that turns a noisy detector into a usable monitor. We drew the reference pipeline of Figure 8.5.1 and named the earlier section that built each stage, closing the classical toolkit. And we built a complete monitor on the IoT stream twice, from scratch and through a library, reporting the precision, recall, and detection delay that decide a monitor in production.</p>
+<p>With this, Part II is complete. The classical apparatus of statistics (<a href="../module-03-statistical-foundations/index.html">Chapter 3</a>), spectra (<a href="../module-04-frequency-spectral/index.html">Chapter 4</a>), univariate and multivariate forecasting (<a href="../../toc.html">Chapters 5</a> and 6), state-space filtering (<a href="../../toc.html">Chapter 7</a>), and anomaly and change-point detection (this Chapter 8) is fully in hand, and this section showed it doing real work across four industries. <a href="../../toc.html">Part III</a> now rebuilds every one of these ideas in learned form, beginning with the neural sequence-modeling fundamentals of Chapter 9, and the residual-and-threshold monitor of this section will return as a deep detector whose model of normal behavior is learned from data rather than specified by hand. The detector changes; the loop of Figure 8.5.1 does not, because monitoring was never really about the detector.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 8.5.1: Why a Fixed Threshold Cannot Work on a Seasonal Metric <span class="exercise-type conceptual">Conceptual</span></div>
+<p>A web-traffic KPI swings from a trough of about $200$ requests per second at 3 a.m. to a peak of about $4{,}000$ at midday. An engineer proposes a single fixed alarm threshold. (a) Show that any fixed threshold is simultaneously too tight at the peak and too loose at the trough, and characterize the two failure modes (false alarms versus missed drops). (b) Explain, in terms of subsection two, how deseasonalizing before thresholding makes a single threshold coherent again, and what the effective time-varying threshold on the raw metric looks like. (c) The engineer counters that a deploy at noon legitimately raises the level by $30\%$; explain why this is a change point, not an anomaly, and how subsection four's pipeline should treat the deploy log.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 8.5.2: Tune the Delay-Precision Trade-Off <span class="exercise-type coding">Coding</span></div>
+<p>Using the monitor of Code 8.5.3, sweep the persistence parameter <code>persist</code> over $\{1, 2, 3, 5, 8\}$ and the threshold <code>z</code> over $\{3.0, 3.5, 4.0, 4.5\}$ on the IoT stream of Code 8.5.2. (a) For each pair, record the precision, recall, and detection delay from Code 8.5.4. (b) Plot detection delay against the number of false alarms across the grid and identify the knee of the curve. (c) Add a second, benign transient (a brief spike that is not a fault) to the stream and re-run; show how the persistence requirement suppresses the transient and quantify the delay you paid for that robustness. (d) Recommend a setting for a cost ratio $C_{\text{FN}}/C_{\text{FP}} = 200$ and justify it against subsection three's threshold argument.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 8.5.3: Standardize by the Right Scale <span class="exercise-type analysis">Analysis</span></div>
+<p>Replace the median-absolute-deviation scale in Code 8.5.3 with a plain rolling standard deviation and re-run the monitor on the IoT stream. (a) Explain why the fault ramp inflates the plain standard deviation and what that does to the standardized score as the fault grows. (b) Quantify the resulting change in detection delay and recall, and connect it to the masking failure mode named in subsection three. (c) Now construct a financial-style stream with volatility clustering (alternate calm and turbulent regimes) and show that a static scale produces a false-alarm storm in the turbulent regime; demonstrate that a conditional-volatility scale (a simple exponentially weighted variance standing in for the GARCH estimator of <a href="../../toc.html">Chapter 5</a>) restores a flat false-alarm rate across regimes.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 8.5.4: Design the Triage and Feedback Layer <span class="exercise-type open">Open-Ended</span></div>
+<p>Subsection four argues that a monitor's value lives downstream of the detector. (a) For a service with a known dependency graph (one database, eight services that read it), design an alert-correlation rule that collapses the eighty downstream alerts of a database failure into a single root-cause incident, and state the data the rule needs. (b) Design a feedback protocol that logs engineer dispositions and uses them to recalibrate per-KPI thresholds weekly; specify what is stored and how a chronically noisy KPI is treated differently from one that recently produced a missed incident. (c) Argue how this feedback loop seeds the adaptive monitoring of <a href="../../toc.html">Chapter 21</a> and how it should respond to genuine concept drift as opposed to a one-off mislabeled alert (<a href="../../toc.html">Chapter 20</a>). There is no single right answer; defend your design against the alert-fatigue failure mode and the cost asymmetry of subsection three.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-8.4.html"><span class="nav-label">Previous</span><span class="nav-num">Section 8.4</span><span class="nav-title">Evaluating Anomaly and Change-Point Detectors</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 8</span><span class="nav-num">Contents</span><span class="nav-title">Temporal Anomaly and Change-Point Detection</span></a>
+<a class="next" href="../../toc.html"><span class="nav-label">Next</span><span class="nav-num">Contents</span><span class="nav-title">Table of Contents</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

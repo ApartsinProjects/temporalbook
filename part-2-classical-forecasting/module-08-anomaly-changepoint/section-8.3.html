@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 8.3: Change-Point Detection (offline and online). Distinguishing brief anomalies from persistent regime shifts; the cost-plus-penalty segmentation framework; exact dynamic programming with PELT and binary segmentation; the likelihood-ratio and CUSUM view of a single change point; Bayesian Online Change-Point Detection with its run-length posterior; detection delay versus false-alarm trade-offs; and a full worked example building a piecewise-constant signal, detecting change points from scratch with a likelihood-ratio scan, running PELT and Binseg via the ruptures library, and sketching BOCPD on a streaming version." name="description"/>
+<title>Section 8.3: Change-Point Detection (offline and online) | Building Temporal AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Temporal AI: From Forecasting to Sequential Decision Making</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Forecasting and Time Series Analysis</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 8: Temporal Anomaly and Change-Point Detection</a></div>
+<h1>Change-Point Detection (offline and online)</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"For three weeks the dashboard was green and I was proud. Then someone pulled last quarter's data and discovered the mean had moved on a Tuesday in March, quietly, while I was busy congratulating myself for catching spikes. The spikes were never the problem. The new normal was."</p>
+<cite>A Regime That Changed When the Dashboard Was Not Looking</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A change point is not a spike; it is the moment the rules of the data-generating process change and stay changed, and detecting it is a different problem from catching anomalies, with its own framework: split the series into segments, pay a cost for how badly each segment is modelled by a single regime, and pay a penalty for every split you introduce, then find the segmentation that minimizes the total.</strong> The anomaly detectors of the previous sections answer "is this single point weird?" Change-point detection answers a deeper question: "did the distribution that generates the data shift, and if so, when?" That distinction drives everything here. Offline (retrospective) methods see the whole series at once and solve the segmentation optimally by dynamic programming (PELT) or greedily (binary segmentation). Online (sequential) methods see one sample at a time and must declare a change with minimal delay while keeping false alarms rare, a tension formalized by CUSUM and by Bayesian Online Change-Point Detection. This section builds both views from the cost-plus-penalty principle, derives the likelihood-ratio and CUSUM statistics from scratch, sketches the run-length posterior of BOCPD, and ends with a worked pipeline that detects the change points of a synthetic regime-switching signal by hand and through the <code>ruptures</code> library.</p>
+</div>
+<p>In <a href="section-8.2.html">Section 8.2</a> we built statistical control charts (Shewhart, EWMA, CUSUM) that monitor a stream and raise an alarm when a process drifts off target. Those charts are tuned to detect a shift quickly, but they answer a yes-or-no monitoring question and do not, by themselves, partition a recorded history into its constituent regimes. This section completes the picture. We treat the change point as a first-class object to be located, not merely flagged, and we develop the two regimes of the problem that recur throughout temporal AI: the retrospective analysis of a fixed dataset and the sequential analysis of a live stream. The persistent-shift idea connects backward to the non-stationarity of <a href="../module-03-statistical-foundations/section-3.1.html">Section 3.1</a>, where we first defined stationarity and warned that real series violate it, and forward to concept drift, the supervised-learning cousin of change-point detection that <a href="../../toc.html">Chapter 20</a> treats in full. Throughout we use the notation of the unified table in <a href="../../toc.html">Appendix A</a>: $x_{1:n} = (x_1, \dots, x_n)$ for the observed series, $\tau$ for a change-point location, and $\mathcal{C}(\cdot)$ for a segment cost.</p>
+
+<h2>1. Anomalies Versus Change Points <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The single most useful idea in this section is also the simplest: an anomaly is transient and a change point is permanent. An anomaly is a brief deviation, one or a few samples that depart from the local pattern and then the series returns to its previous behavior, the lone temperature spike, the one fraudulent transaction, the sensor glitch. A change point is a persistent shift in the generating distribution: after the change point the series keeps obeying a different law (a new mean, a new variance, a new correlation structure, a new trend) and never reverts on its own. The mental test is the recovery test. Mask a candidate region and ask what the series does afterward. If it snaps back to the old regime, the region was an anomaly. If it settles into a new regime, you have found a change point.</p>
+<p>This distinction matters because it changes what you should do. An anomaly is usually something to filter, flag, or repair; a change point is something to adapt to. A forecaster that treats a regime shift as a string of anomalies will keep "correcting" data that is in fact the new truth, and a forecaster that treats an anomaly as a regime shift will throw away a perfectly good model over a single glitch. The two failures are mirror images, and both are expensive: the first floods an operations team with alerts about a new normal that is not going away (the practical example at the end of this section is exactly this story), and the second resets a working model every time a sensor hiccups. Figure 8.3.1 contrasts the two on a shared time axis.</p>
+<figure class="diagram">
+<svg viewBox="0 0 760 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two stacked panels sharing a time axis. The top panel shows a flat series with a single isolated spike that returns to the same baseline, labelled anomaly. The bottom panel shows a series whose mean steps up permanently at a marked location and stays at the new level, labelled change point.">
+<style>
+  .axcp{stroke:var(--text-muted,#666);stroke-width:1.4;marker-end:url(#ahcp);}
+  .sig{fill:none;stroke:var(--accent-color,#3b6ea5);stroke-width:2.2;}
+  .mk{stroke:var(--warning-color,#d98b2b);stroke-width:1.8;stroke-dasharray:5 3;}
+  .lbl{font-family:var(--font-sans,sans-serif);font-size:13px;font-weight:700;fill:var(--text-color,#222);}
+  .sub{font-family:var(--font-sans,sans-serif);font-size:11px;fill:var(--text-muted,#666);text-anchor:middle;}
+</style>
+<defs>
+  <marker id="ahcp" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--text-muted,#666)"/></marker>
+</defs>
+<text class="lbl" x="20" y="24">Anomaly: a brief deviation that reverts</text>
+<line class="axcp" x1="40" y1="110" x2="720" y2="110"/>
+<path class="sig" d="M 40 95 L 180 95 L 200 95 L 210 50 L 220 95 L 360 95 L 540 95 L 720 95"/>
+<text class="sub" x="210" y="42">single spike, then back to baseline</text>
+<text class="lbl" x="20" y="178">Change point: a persistent shift that stays</text>
+<line class="axcp" x1="40" y1="250" x2="720" y2="250"/>
+<path class="sig" d="M 40 235 L 360 235 L 360 175 L 720 175"/>
+<line class="mk" x1="360" y1="160" x2="360" y2="260"/>
+<text class="sub" x="360" y="155" fill="var(--warning-color,#d98b2b)">change point tau</text>
+<text class="sub" x="180" y="270">old regime</text>
+<text class="sub" x="540" y="270">new regime (does not revert)</text>
+</svg>
+<figcaption><strong>Figure 8.3.1:</strong> Anomaly versus change point on a shared time axis. Top: an anomaly is one or a few samples that depart and then return to the same baseline, so the regime is unchanged. Bottom: a change point at $\tau$ is a permanent shift in the generating distribution (here the mean steps up and stays up), so the series obeys a new law forever after. The recovery test, whether the series reverts after the candidate region, is what separates the two.</figcaption>
+</figure>
+<p>Formally, model the series as independent draws whose distribution can change at a finite set of unknown locations $0 = \tau_0 < \tau_1 < \cdots < \tau_m < \tau_{m+1} = n$. On segment $j$, spanning samples $\tau_{j}+1$ through $\tau_{j+1}$, the data follow a single distribution $F_j$, and the change points are exactly the boundaries where $F_j \ne F_{j+1}$. A pure mean-shift model writes $x_t = \mu_j + \varepsilon_t$ with $\mu_j$ constant within a segment; a variance-change model holds the mean fixed and lets $\sigma_j^2$ jump; a correlation-change model lets the dependence structure shift while marginals stay put. The detector's job is to estimate the number $m$ and the locations $\{\tau_j\}$ from the data alone. This is harder than anomaly detection precisely because $m$ is unknown: every additional change point can only reduce the within-segment cost, so something must stop the model from declaring a change at every sample. That something is the penalty, and it is the subject of the next subsection.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Recovery Test Decides Which Problem You Are Solving</div>
+<p>Before choosing any algorithm, decide whether you are hunting anomalies or change points, because the two need opposite treatment and the same raw event can be either. A pump that overheats for ten seconds and cools down is an anomaly; a pump whose baseline temperature steps up two degrees and stays there has crossed a change point, even if no single reading ever looks alarming. The tell is persistence, not magnitude: a small permanent shift is a change point, a large transient spike is an anomaly. Detectors built for one fail silently on the other. A control chart tuned to catch spikes can sail past a slow regime change (the epigraph's quiet Tuesday), and a segmentation tuned to find regimes will absorb a lone spike into a one-sample segment unless you cap the minimum segment length. Naming the problem first is not pedantry; it is what prevents the two most common failures in this chapter.</p>
+</div>
+
+<h2>2. Offline Detection: Cost Plus Penalty, PELT, and Binary Segmentation <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Offline, or retrospective, detection has the whole series in hand and asks for the best segmentation of all of it at once. The dominant framework is cost-plus-penalty. Assign each candidate segment a cost $\mathcal{C}(x_{a+1:b})$ that measures how badly a single regime fits the samples from $a+1$ to $b$ (low cost means the segment is homogeneous), then choose the set of change points $\tau_1 < \cdots < \tau_m$ that minimizes the total segment cost plus a penalty $\beta$ paid once per change point:</p>
+$$\min_{m,\;\tau_1 < \cdots < \tau_m} \;\; \sum_{j=0}^{m} \mathcal{C}\bigl(x_{\tau_j + 1 : \tau_{j+1}}\bigr) \;+\; \beta\, m.$$
+<p>The two terms pull in opposite directions, and that tension is the whole story. The cost term always falls as you add change points (more segments fit the data more tightly, and with one segment per sample the cost can be driven to zero), so without the penalty the optimum is the absurd segmentation that calls every sample its own regime. The penalty $\beta m$ charges a fixed price for each split, so a change point survives only if it lowers the cost by more than $\beta$. The penalty is therefore the knob that sets the number of change points: small $\beta$ yields many, large $\beta$ yields few. The most common penalties are information criteria carried over from <a href="../module-05-univariate-forecasting/section-5.7.html">Section 5.7</a>: the Bayesian Information Criterion sets $\beta = p \ln n$ where $p$ is the number of parameters per segment, penalizing splits by the log of the sample size, while the Akaike criterion uses the lighter $\beta = 2p$.</p>
+<p>The natural cost for a mean-and-variance Gaussian segment is the negative log-likelihood of the maximum-likelihood fit on that segment. For a segment of length $L = b - a$ with sample variance $\hat\sigma^2$, the Gaussian negative log-likelihood reduces (up to constants) to</p>
+$$\mathcal{C}(x_{a+1:b}) \;=\; L \,\ln \hat\sigma^2_{a+1:b}, \qquad \hat\sigma^2_{a+1:b} \;=\; \frac{1}{L}\sum_{t=a+1}^{b} (x_t - \bar x_{a+1:b})^2,$$
+<p>so a segment whose samples scatter tightly around their own mean is cheap and one that must straddle a hidden shift is expensive. The choice of cost function is where you tell the detector what kind of change you care about, and it is the single most consequential modelling decision in offline detection. An $\ell_2$ cost $\mathcal{C} = \sum_t (x_t - \bar x)^2$ targets mean shifts only and is blind to a regime that changes variance while keeping its mean: feed it a segment whose mean is constant but whose noise doubles and it sees nothing to split. A Gaussian mean-and-variance cost (the log-variance form above) catches both. A kernel cost, which compares segments through a feature map such as the radial-basis kernel, targets arbitrary distributional change including shifts in higher moments or in the shape of the distribution. A rank-based or nonparametric cost trades a little power for robustness to outliers, catching shifts a Gaussian model would smear. The cost-plus-penalty machinery is identical across all of them; you swap the per-segment cost to swap the kind of change you detect, which is exactly why the <code>ruptures</code> library exposes the cost as a one-word argument in the worked example below.</p>
+<p>How do we actually minimize the objective? Naively there are $2^{n-1}$ possible segmentations, far too many to enumerate. Two classes of algorithm make it tractable, and they trade exactness against speed.</p>
+<p><strong>Exact dynamic programming and PELT.</strong> Let $F(b)$ be the optimal total cost of segmenting the prefix $x_{1:b}$. The last segment ends at $b$ and begins at some earlier change point $t$, which gives the Bellman recursion</p>
+$$F(b) \;=\; \min_{0 \,\le\, t \,<\, b} \Bigl[\, F(t) \;+\; \mathcal{C}(x_{t+1:b}) \;+\; \beta \,\Bigr], \qquad F(0) = -\beta,$$
+<p>solved left to right; the change points are recovered by tracing back the minimizing $t$ at each step. Plain dynamic programming costs $O(n^2)$ because each $b$ scans all earlier $t$. The Pruned Exact Linear Time algorithm (PELT) of Killick, Fearnhead, and Eckley (2012) keeps the exactness but prunes the candidate set: a candidate change point $t$ can be discarded forever once $F(t) + \mathcal{C}(x_{t+1:b}) + K \ge F(b)$ for a constant $K$, because such a $t$ can never be the optimal last change point for any later endpoint. With this pruning, and under mild conditions on the change-point spacing, PELT runs in expected $O(n)$ time while still returning the globally optimal segmentation, which is why it is the default exact method in practice.</p>
+<div class="callout looking-back">
+<div class="callout-title">Looking Back: The Same Bellman Recursion You Will Meet Again in Decision Making</div>
+<p>The optimal-segmentation recursion $F(b) = \min_t [F(t) + \mathcal{C}(x_{t+1:b}) + \beta]$ is a Bellman equation, the identical dynamic-programming pattern that organizes far more of this book than change-point detection. It says the best way to segment a prefix is the best way to segment some shorter prefix, plus the cost of the final segment, a decompose-into-subproblems structure you have already seen implicitly in the Viterbi-style recursions of state-space models (<a href="../module-07-state-space-filtering/index.html">Chapter 7</a>) and will see explicitly as the value-function recursion of Markov decision processes in <a href="../../toc.html">Chapter 22</a>. There, $F(\cdot)$ becomes the optimal value of a state and $\mathcal{C}(\cdot)$ becomes a reward, but the shape of the recursion (optimal whole equals best split plus optimal remainder) is the same. PELT's pruning, which discards states that can never be optimal, is itself a cousin of the bounding tricks that make planning tractable. Recognizing one Bellman recursion teaches you to recognize all of them.</p>
+</div>
+<p><strong>Binary segmentation.</strong> The classic greedy alternative is binary segmentation. Scan the whole series for the single best split (the location that most reduces the total cost), accept it if the reduction beats the penalty, then recurse independently on the left and right pieces, stopping when no further split pays for itself. Binary segmentation is fast, $O(n \log n)$, and trivial to implement, but it is approximate: because it commits to one split before looking for the next, it can misplace change points when two real changes interact, and it is biased when segments are short. Refinements (wild binary segmentation, which scans many random sub-intervals, and the SeedBS variant) repair much of this at modest extra cost. Table 8.3.1 lays the offline methods side by side.</p>
+<div class="comparison-table">
+<div class="comparison-table-title">Offline Change-Point Methods Compared</div>
+<table>
+<thead>
+<tr><th>Method</th><th>Optimality</th><th>Typical cost</th><th>Best when</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Dynamic programming</strong></td><td>Exact global optimum</td><td>$O(n^2)$</td><td>Short series, or a fixed known number of change points</td></tr>
+<tr><td><strong>PELT</strong></td><td>Exact global optimum</td><td>$O(n)$ expected (with pruning)</td><td>Long series, unknown number of change points, penalized objective</td></tr>
+<tr><td><strong>Binary segmentation</strong></td><td>Greedy approximation</td><td>$O(n \log n)$</td><td>Quick first pass, well-separated changes</td></tr>
+<tr><td><strong>Window / sliding</strong></td><td>Local approximation</td><td>$O(n w)$</td><td>Streaming-friendly, single dominant change in a window</td></tr>
+</tbody>
+</table>
+</div>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: One Split Either Pays for Itself or It Does Not</div>
+<p>Take eight samples that are clearly two regimes, $x = (1.0, 0.9, 1.1, 1.0,\; 5.0, 4.9, 5.1, 5.0)$, and use the $\ell_2$ mean-shift cost $\mathcal{C} = \sum (x_t - \bar x)^2$ with a penalty $\beta = 2$. With no split, the global mean is $\bar x = 3.0$ and the cost is the total sum of squared deviations: each low point contributes about $4.0$ and each high point about $4.0$, summing to roughly $32.05$. Now split at $\tau = 4$. The left segment has mean $1.0$ and cost $0.02$; the right segment has mean $5.0$ and cost $0.02$; the total segment cost is $0.04$, plus one penalty $\beta = 2$ for the single change point, giving $2.04$. The split slashes the objective from $32.05$ to $2.04$, an overwhelming win, so the change point is accepted. Now imagine the two halves had nearly equal means, say all eight values near $3.0$: the no-split cost would already be tiny, the split would buy a negligible cost reduction, and the $\beta = 2$ penalty would make the split strictly worse, so it is correctly rejected. The penalty is the referee that lets the obvious change through and turns the spurious one away.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact: The Name PELT Hides a Small Computational Miracle</div>
+<p>Exact change-point detection by dynamic programming was an $O(n^2)$ textbook exercise for decades, fast enough for a few hundred points and hopeless for a million. The 2012 PELT paper's quiet contribution was a pruning inequality showing that most candidate change points can be thrown away permanently the moment they fall behind the running optimum, and that under realistic spacing of the true changes the surviving candidate set stays bounded, dragging the cost down to expected linear time. The miracle is that none of this approximates: PELT returns the identical globally optimal segmentation that the $O(n^2)$ recursion would, just without examining the candidates it can prove are dead. It is the rare case where you get exactness and speed at once, which is why "PELT with an information-criterion penalty" is the boring, correct default that most practitioners should try first.</p>
+</div>
+
+<h2>3. The Likelihood-Ratio and CUSUM View of a Single Change <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Before tackling many change points, it pays to understand one perfectly, because the single-change case has a clean optimal statistic that every multiple-change method inherits. Suppose the series is Gaussian with known variance $\sigma^2$, and we test the hypothesis that the mean shifts exactly once. Under the null $H_0$ there is no change: all $n$ samples share one mean $\mu_0$. Under the alternative $H_1(\tau)$ the mean is $\mu_0$ up to time $\tau$ and $\mu_1 \ne \mu_0$ afterward. For a fixed candidate $\tau$, the generalized log-likelihood ratio (with the means replaced by their sample estimates) reduces to a comparison of within-segment fit, and maximizing it over all candidate locations gives the test statistic</p>
+$$\Lambda \;=\; \max_{1 \,\le\, \tau \,<\, n} \;\frac{\tau (n - \tau)}{n}\,\frac{\bigl(\bar x_{1:\tau} - \bar x_{\tau+1:n}\bigr)^2}{\sigma^2},$$
+<p>where $\bar x_{1:\tau}$ and $\bar x_{\tau+1:n}$ are the pre- and post-candidate means. The statistic is large when some split produces two segments whose means are far apart, and the weight $\tau(n-\tau)/n$ rewards balanced splits (a change in the middle is easier to detect than one at the very edge, where one segment has almost no data). The estimated change point is the $\tau$ that achieves the maximum, and a change is declared when $\Lambda$ exceeds a threshold chosen to control the false-alarm rate. This single-change likelihood-ratio scan is exactly what binary segmentation calls at every recursion, so understanding it here explains the inner loop of subsection two.</p>
+<p>The same idea, recast for a stream that arrives one sample at a time, is the CUSUM statistic we met as a control chart in <a href="section-8.2.html">Section 8.2</a>. CUSUM accumulates the log-likelihood ratio of "post-change" against "pre-change" for each new sample and resets the accumulation whenever it would go negative, so it tracks the running evidence that a change has already happened. For a shift in the mean of a Gaussian, the one-sided upward CUSUM is the recursion</p>
+$$S_0 = 0, \qquad S_t \;=\; \max\!\bigl(0,\; S_{t-1} + (x_t - \mu_0) - k\bigr),$$
+<p>where $\mu_0$ is the in-control mean and $k$ is a slack (reference value) usually set to half the smallest shift worth detecting. The statistic stays near zero while the data sit at $\mu_0$, but once the mean shifts upward the increments become persistently positive and $S_t$ climbs steadily until it crosses an alarm threshold $h$. The link to this section's framework is exact: CUSUM is the sequential, recursive form of the same likelihood-ratio test that the offline scan computes in one shot over the whole series. The offline scan asks "where is the single best split?" with all data visible; CUSUM asks "has the split already happened?" with data arriving live. The connection is summarized below before we turn to the fully Bayesian streaming detector.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Offline and Online Are the Same Test, Read in Two Directions</div>
+<p>The likelihood-ratio scan of this subsection and the CUSUM chart of <a href="section-8.2.html">Section 8.2</a> are not rival techniques; they are the identical statistical idea (compare the data's fit before and after a hypothesized change) executed under two different information regimes. Offline, you see all $n$ samples and maximize the ratio over every possible split location, so you get the exact location of the most likely single change but only after the fact. Online, you accumulate the same ratio sample by sample and trigger when it crosses a threshold, so you get an early warning but pay for it with detection delay and the risk of false alarms. Every method in this section is one of these two readings of the likelihood ratio: PELT and binary segmentation generalize the offline scan to many changes, while CUSUM and BOCPD generalize the online accumulation. Master the single-change likelihood ratio and the rest is bookkeeping.</p>
+</div>
+<p>Code 8.3.0 makes the equivalence tangible: it runs the recursive CUSUM on a stream that shifts halfway through and reports the alarm time, so you can watch the accumulating evidence cross the threshold in real time.</p>
+<pre><code class="language-python">import numpy as np
+
+def cusum_detect(x, mu0, k, h):
+    """One-sided upward CUSUM. Accumulates evidence that the mean rose
+    above mu0; resets to 0 when evidence goes negative; alarms at h.
+    Returns (alarm_time or None, the running statistic S)."""
+    S = 0.0
+    track = np.empty(len(x))
+    alarm = None
+    for t, xt in enumerate(x):
+        S = max(0.0, S + (xt - mu0) - k)     # accumulate, floored at zero
+        track[t] = S
+        if alarm is None and S > h:           # first crossing is the detection
+            alarm = t
+    return alarm, track
+
+rng = np.random.default_rng(3)
+stream = np.concatenate([rng.normal(0.0, 1.0, 200),   # in-control: mean 0
+                         rng.normal(1.0, 1.0, 200)])  # shift to mean 1 at t=200
+alarm, _ = cusum_detect(stream, mu0=0.0, k=0.5, h=4.0)
+print("true shift at: 200   CUSUM alarm at:", alarm, " delay:", alarm - 200)
+</code></pre>
+<div class="code-caption"><strong>Code 8.3.0:</strong> CUSUM from scratch, the sequential reading of the single-change likelihood ratio. The statistic floors at zero so it ignores downward noise, then climbs once the post-shift increments turn persistently positive; the first crossing of <code>h</code> is the detection, and the gap from sample $200$ is the detection delay of subsection four.</div>
+<pre><code class="language-text">true shift at: 200   CUSUM alarm at: 208  delay: 8</code></pre>
+<div class="code-caption"><strong>Output 8.3.0:</strong> CUSUM fires eight samples after the true shift, matching the back-of-envelope $h/(\text{shift}-k) = 4/0.5 = 8$ of the delay numeric example below, a concrete instance of the offline-online equivalence: the same likelihood ratio, accumulated rather than scanned.</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact: CUSUM Was Born on a Factory Floor, Not in a Statistics Department</div>
+<p>The cumulative-sum chart was introduced by E. S. Page in 1954 while quantifying how quickly an industrial process could be caught drifting off specification. Page's quarry was the average run length: how many in-control samples pass before a false alarm, versus how many out-of-control samples pass before a true detection. Those two run lengths are still the currency of every sequential detector we build today, including the Bayesian one in the next subsection, which is a small reminder that the delay-versus-false-alarm trade-off at the heart of modern streaming change detection was already the central question seventy years ago, just dressed in the language of quality control rather than online learning.</p>
+</div>
+
+<h2>4. Online Detection: Bayesian Online Change-Point Detection <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>CUSUM gives a single threshold-crossing alarm. Bayesian Online Change-Point Detection (BOCPD), introduced by Adams and MacKay (2007), gives something richer for the streaming setting: at every time step it maintains a full posterior distribution over the run length, the number of samples since the most recent change point. Let $r_t$ be the run length at time $t$. If $r_t = 0$ a change just occurred; if $r_t = 12$ the current regime has lasted twelve samples. BOCPD recursively updates the posterior $P(r_t \mid x_{1:t})$ as each new sample arrives, and a change is signalled when probability mass collapses onto $r_t = 0$.</p>
+<p>The recursion has two ingredients. First, a hazard function $H(r)$ giving the prior probability that a change occurs given the current run length; a constant hazard $H(r) = 1/\lambda$ encodes a geometric prior on segment lengths with expected length $\lambda$. Second, a predictive distribution $\pi^{(r)}(x_t)$ that scores the new sample under the segment of length $r$ (for a Gaussian with a conjugate prior, this is a closed-form Student-$t$). The joint distribution over run length and data then updates by a message-passing recursion that splits the mass at each step into a "growth" branch (the run continues, $r_t = r_{t-1} + 1$) and a "change" branch (the run resets, $r_t = 0$):</p>
+$$\underbrace{P(r_t = r_{t-1}+1,\, x_{1:t})}_{\text{growth}} = P(r_{t-1},\, x_{1:t-1})\,\pi^{(r_{t-1})}(x_t)\,\bigl(1 - H(r_{t-1})\bigr),$$
+$$\underbrace{P(r_t = 0,\, x_{1:t})}_{\text{change}} = \sum_{r_{t-1}} P(r_{t-1},\, x_{1:t-1})\,\pi^{(r_{t-1})}(x_t)\,H(r_{t-1}).$$
+<p>Normalizing the joint at each step yields the run-length posterior $P(r_t \mid x_{1:t})$. The intuition is that each existing run-length hypothesis predicts the next sample; hypotheses that predict it well grow their mass, hypotheses that predict it badly shrink, and whenever the newest sample is poorly explained by every ongoing run, mass floods into $r_t = 0$ and a change is declared. It helps to picture the posterior as a histogram over "how long has the current regime lasted." During a stable regime that histogram develops a single tall peak that marches steadily to the right (the run-length most-probable estimate ticks up by one each sample, since the regime keeps lasting). At a true change point the new sample is improbable under every ongoing run, the change branch collects almost all the mass, the peak collapses back to $r_t = 0$, and the march begins again from zero. Reading off the location of that peak over time, as the worked example does, turns the full posterior into a simple change-detection signal: a sawtooth that climbs through each regime and drops at each boundary.</p>
+<p>The cost is one growing distribution per step (the support of $r_t$ expands by one each sample), so practical implementations cap or prune the run length to keep memory bounded, discarding run-length hypotheses whose posterior mass has fallen below a threshold. That pruning is not a detail; it is exactly the streaming constraint that the online-learning methods of <a href="../../toc.html">Chapter 20</a> wrestle with at scale, where a detector cannot store all of history and must summarize the past in bounded state. BOCPD also illustrates a clean separation that recurs in sequential AI: the hazard function encodes a prior belief about how often regimes change, the predictive distribution encodes a model of what each regime looks like, and the recursion combines them. Swap in a richer predictive (a neural one, per the research frontier) and the same skeleton detects changes in series no Gaussian could model.</p>
+<p>Every online detector lives or dies by one trade-off: detection delay against false-alarm rate. Make the detector eager (low threshold, high hazard) and it catches real changes quickly but also fires on noise; make it cautious and it stops false alarms but reacts late, sometimes far too late for the change to be actionable. There is no free lunch: for a fixed amount of data per sample, reducing the expected detection delay necessarily raises the false-alarm probability, and the only ways to improve both at once are to gather more informative data or to accept a longer averaging window. This is the streaming-detection analogue of the bias-variance trade-off, and it governs how aggressively you can tune $H$, $k$, $h$, or the BOCPD hazard.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: The Delay-Versus-False-Alarm Dial on a CUSUM</div>
+<p>Run the upward CUSUM $S_t = \max(0, S_{t-1} + (x_t - \mu_0) - k)$ on a Gaussian stream with in-control mean $\mu_0 = 0$, noise standard deviation $\sigma = 1$, slack $k = 0.5$, and a true upward shift to mean $1.0$ that begins at sample $200$. With a tight alarm threshold $h = 4$, the accumulating drift of $1.0 - 0.5 = 0.5$ per post-change sample needs about $4 / 0.5 = 8$ samples to push $S_t$ across $h$, so the typical detection delay is roughly eight samples, but the same low threshold means in-control noise occasionally accumulates to $4$ as well, producing a false alarm every few hundred samples. Raise the threshold to $h = 8$ and the expected delay roughly doubles to about sixteen samples, while the in-control average run length to a false alarm stretches to several thousand samples. The threshold is a single dial: every notch you turn it up trades faster but noisier detection for slower but cleaner detection, and no setting escapes the trade-off, it only slides you along the curve.</p>
+</div>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Reading the Run-Length Sawtooth</div>
+<p>Suppose BOCPD runs on a stream that holds one regime for samples $1$ through $40$, then changes. Track the most probable run length $\hat r_t = \arg\max_r P(r_t \mid x_{1:t})$. Early on, at $t = 5$, the posterior favours $\hat r_5 = 4$ (four samples into the current run). The regime is stable, so the peak climbs one step per sample: $\hat r_{20} = 19$, $\hat r_{40} = 39$. Now the change arrives at $t = 41$. The new sample $x_{41}$ is improbable under the run that has lasted forty samples (it expects the old mean), so the predictive $\pi^{(40)}(x_{41})$ is tiny, the growth branch for that hypothesis collapses, and the change branch (run resets to zero) collects the mass. Within a sample or two the most probable run length drops from near $40$ back toward $0$, and the climb restarts. Plotted over time, $\hat r_t$ is a sawtooth: a steady ramp through each regime and a sharp fall at each boundary. Detecting changes is then as simple as flagging the falls, which is exactly the <code>drops</code> rule in the worked example's Code 8.3.3. The height of each tooth equals the length of the regime, so the posterior literally measures how long each regime lasted, a richer output than a bare alarm.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Change-Point Detection Meets Deep and Differentiable Methods (2024 to 2026)</div>
+<p>Classical change-point detection is enjoying a deep-learning second life, and the 2024 to 2026 literature clusters in three directions. First, neural and kernel detectors: KL-CPD and the broader two-sample-test family learn a representation in which distributional change is easy to spot, while the maximum-mean-discrepancy and neural-tangent-kernel costs slot directly into the cost-plus-penalty framework of subsection two as drop-in replacements for the Gaussian cost. Second, foundation-model and self-supervised approaches, in which a pretrained temporal encoder (the lineage of TimesFM, Moirai, and MOMENT covered in <a href="../../toc.html">Chapter 15</a>) supplies the features whose abrupt change marks a regime boundary, letting one model segment series it was never trained on. Third, scalable online Bayesian methods: recent work makes BOCPD robust to outliers (so a single anomaly no longer triggers a spurious change, exactly the anomaly-versus-change distinction of subsection one) and couples the run-length posterior with online learners that reset their parameters at detected changes, the precise mechanism the drift-adaptation systems of <a href="../../toc.html">Chapter 20</a> need. The unifying theme is that the cost-plus-penalty and run-length-posterior skeletons survive intact; what changes is that the per-segment model graduates from a Gaussian to a learned one.</p>
+</div>
+
+<h2>5. Worked Example: Detecting Regimes From Scratch and With ruptures <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>We now run the full pipeline on a synthetic regime-switching signal, the sensor-IoT running thread of Part II: imagine a vibration sensor on a machine whose operating mode changes a few times over a shift, each mode having its own mean amplitude. Code 8.3.1 builds a piecewise-constant signal with three true change points and implements the single-change likelihood-ratio scan of subsection three, then drives it greedily (binary segmentation) to recover all the changes from scratch.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(8)
+
+# Piecewise-constant signal: four regimes, three true change points.
+true_cps = [200, 450, 600]               # sample indices where the mean shifts
+means    = [0.0, 3.0, 1.0, 4.0]          # mean amplitude of each regime
+segs = np.split(np.arange(800), true_cps)
+signal = np.concatenate([m + rng.normal(0, 0.8, len(s))
+                         for m, s in zip(means, segs)])
+
+def best_single_split(x):
+    """Generalized likelihood-ratio scan for ONE mean change in x.
+    Returns (best_index, statistic) maximizing tau(n-tau)/n * (mean gap)^2."""
+    n = len(x)
+    if n < 4:
+        return None, 0.0
+    csum = np.concatenate([[0.0], np.cumsum(x)])     # prefix sums for O(1) segment means
+    best_stat, best_tau = 0.0, None
+    for tau in range(2, n - 1):                       # need >=2 points each side
+        left_mean  = csum[tau] / tau
+        right_mean = (csum[n] - csum[tau]) / (n - tau)
+        stat = (tau * (n - tau) / n) * (left_mean - right_mean) ** 2
+        if stat > best_stat:
+            best_stat, best_tau = stat, tau
+    return best_tau, best_stat
+
+def binseg(x, threshold, offset=0, found=None):
+    """Binary segmentation: recursively accept the best split while it
+    beats the threshold, recursing on each resulting sub-segment."""
+    if found is None:
+        found = []
+    tau, stat = best_single_split(x)
+    if tau is not None and stat > threshold:
+        found.append(offset + tau)                    # record absolute location
+        binseg(x[:tau], threshold, offset, found)     # recurse left
+        binseg(x[tau:], threshold, offset + tau, found)  # recurse right
+    return sorted(found)
+
+detected = binseg(signal, threshold=40.0)
+print("true change points    :", true_cps)
+print("detected change points:", detected)
+</code></pre>
+<div class="code-caption"><strong>Code 8.3.1:</strong> A from-scratch detector. <code>best_single_split</code> implements the generalized likelihood-ratio statistic $\tau(n-\tau)/n\,(\bar x_{1:\tau} - \bar x_{\tau+1:n})^2$ using prefix sums for constant-time segment means, and <code>binseg</code> wraps it in the greedy recursion of subsection two, so the offline scan and binary segmentation are concrete rather than asserted.</div>
+<pre><code class="language-text">true change points    : [200, 450, 600]
+detected change points: [201, 449, 601]
+</code></pre>
+<div class="code-caption"><strong>Output 8.3.1:</strong> The from-scratch binary segmentation recovers all three change points within a sample or two of the truth, because each mean shift (0 to 3, 3 to 1, 1 to 4) is large relative to the noise standard deviation of $0.8$ and the threshold of $40$ admits exactly those three splits while rejecting spurious ones.</div>
+<p>The from-scratch code makes the mechanism transparent, but in production you would reach for the <code>ruptures</code> library, which packages PELT, binary segmentation, window-based, and dynamic-programming search behind a uniform interface with a menu of cost functions. Code 8.3.2 is the library shortcut: the exact same detection, both with the optimal PELT search and with the greedy Binseg, in a handful of lines.</p>
+<pre><code class="language-python">import ruptures as rpt
+
+# Same signal as Code 8.3.1. ruptures expects a column vector.
+sig = signal.reshape(-1, 1)
+
+# PELT: exact, penalized, unknown number of change points.
+pelt = rpt.Pelt(model="l2", min_size=20).fit(sig)
+cps_pelt = pelt.predict(pen=30.0)        # 'pen' is the per-change penalty beta
+
+# Binary segmentation: greedy, ask for the known number of changes.
+binseg = rpt.Binseg(model="l2", min_size=20).fit(sig)
+cps_binseg = binseg.predict(n_bkps=3)    # request exactly 3 break points
+
+print("PELT change points  :", cps_pelt)     # trailing value is n (end marker)
+print("Binseg change points:", cps_binseg)
+</code></pre>
+<div class="code-caption"><strong>Code 8.3.2:</strong> The same segmentation through <code>ruptures</code>. Choosing the search class (<code>Pelt</code>, <code>Binseg</code>) and the cost model (<code>"l2"</code> for mean shifts) is all the configuration needed; <code>min_size</code> enforces a minimum segment length so a lone anomaly cannot become its own one-sample regime, directly enforcing the anomaly-versus-change distinction of subsection one.</div>
+<pre><code class="language-text">PELT change points  : [201, 449, 601, 800]
+Binseg change points: [201, 449, 601, 800]
+</code></pre>
+<div class="code-caption"><strong>Output 8.3.2:</strong> Both <code>ruptures</code> searches return the same three change points as the from-scratch detector (the trailing $800$ is the end-of-series marker the library always appends). PELT found them by penalized exact optimization, Binseg by greedy recursion given the known count, and both agree with Output 8.3.1.</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: A Whole Offline Pipeline in Two Lines per Method</div>
+<p>The from-scratch likelihood-ratio scan and binary segmentation of Code 8.3.1 run to about forty lines, and a hand-rolled PELT with its pruning logic would add forty more. With <code>ruptures</code> each method is two lines: pick a search class (<code>Pelt</code>, <code>Binseg</code>, <code>Window</code>, or <code>Dynp</code> for exact dynamic programming), pick a cost <code>model</code> (<code>"l2"</code> for mean shifts, <code>"normal"</code> for mean-and-variance, <code>"rbf"</code> for arbitrary distributional change via a kernel), call <code>fit</code> then <code>predict</code>. The library handles the prefix-sum bookkeeping, the PELT pruning that delivers expected linear time, the penalty-versus-count interface (<code>pen</code> for a penalty, <code>n_bkps</code> for a fixed number), and the minimum-segment-length constraint internally, collapsing roughly eighty lines of careful from-scratch code into a few. For the online side, the <code>bayesian_changepoint_detection</code> package and the streaming detectors in <code>river</code> provide BOCPD and sequential alternatives with the same economy. What the library cannot choose for you is the cost model and the penalty: those encode what kind of change you care about and how many you expect, and they remain your modelling decisions.</p>
+</div>
+<p>Finally, the streaming view. Code 8.3.3 sketches Bayesian Online Change-Point Detection on the same signal fed one sample at a time, tracking the run-length posterior and flagging a change whenever the most probable run length collapses toward zero. This is the from-scratch counterpart to the recursion of subsection four, kept deliberately compact with a Gaussian predictive of fixed variance.</p>
+<pre><code class="language-python">import numpy as np
+from scipy.stats import norm
+
+def bocpd_stream(x, hazard=1/250, mu0=2.0, kappa=0.1, sig=0.8, run_cap=400):
+    """Bayesian Online Change-Point Detection with a Gaussian predictive.
+    Returns, for each t, the most probable run length. A sharp drop to ~0
+    marks a detected change. Run length is capped to bound memory."""
+    R = np.array([1.0])                    # run-length posterior, starts at r=0
+    means = np.array([mu0])                # running posterior mean per run length
+    counts = np.array([kappa])             # pseudo-count per run length
+    map_run = []
+    for xt in x:
+        pred = norm.pdf(xt, loc=means, scale=sig)       # predictive prob per run length
+        growth = R * pred * (1 - hazard)                 # run continues
+        change = np.array([np.sum(R * pred * hazard)])   # run resets to 0
+        R = np.concatenate([change, growth])
+        R /= R.sum()                                     # normalize the posterior
+        # Update sufficient statistics for each (now shifted) run length.
+        new_mean = (means * counts + xt) / (counts + 1)
+        means = np.concatenate([[mu0], new_mean])
+        counts = np.concatenate([[kappa], counts + 1])
+        if len(R) > run_cap:                             # prune to bound memory
+            R, means, counts = R[:run_cap], means[:run_cap], counts[:run_cap]
+            R /= R.sum()
+        map_run.append(int(np.argmax(R)))                # most probable run length
+    return np.array(map_run)
+
+map_run = bocpd_stream(signal)
+# A change is where the most probable run length drops sharply back toward 0.
+drops = [t for t in range(1, len(map_run))
+         if map_run[t] < 0.4 * map_run[t - 1] and map_run[t - 1] > 30]
+print("BOCPD run-length resets near:", drops)
+</code></pre>
+<div class="code-caption"><strong>Code 8.3.3:</strong> A compact from-scratch BOCPD. The run-length posterior <code>R</code> grows by one entry per sample (the growth branch) plus a reset entry (the change branch), is renormalized each step, and is pruned at <code>run_cap</code> to bound memory; a sharp collapse of the most probable run length back toward zero marks a detected change, the streaming analogue of the offline splits found above.</div>
+<pre><code class="language-text">BOCPD run-length resets near: [203, 452, 604]
+</code></pre>
+<div class="code-caption"><strong>Output 8.3.3:</strong> Online BOCPD detects the same three regime changes, but slightly later than the offline methods (near $203, 452, 604$ versus the true $200, 450, 600$), because a sequential detector must accumulate a few post-change samples before the run-length posterior is confident enough to reset. That lag is the detection delay of subsection four made visible.</div>
+<p>The three outputs together tell the section's whole story. The offline detectors of Codes 8.3.1 and 8.3.2 pinpoint the change points almost exactly because they see the entire series and optimize globally; the online detector of Code 8.3.3 finds the same changes but a few samples late, paying the detection-delay price for the privilege of flagging changes as they happen rather than in hindsight. Choosing between them is choosing your information regime: retrospective analysis of a recorded history wants PELT, while a live monitoring stream wants CUSUM or BOCPD, and the cost-plus-penalty and run-length-posterior skeletons we built make both the same idea seen from two sides.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Energy Team That Mistook a Regime Shift for a Month of Anomalies</div>
+<p><strong>Who:</strong> A grid-analytics team at a regional electricity utility, monitoring per-feeder load to forecast demand and flag faults.</p>
+<p><strong>Situation:</strong> Each feeder had an anomaly detector tuned to catch short load spikes (equipment faults, momentary surges), and it worked well for transient events.</p>
+<p><strong>Problem:</strong> When a large new data center came online on one feeder, its baseline load stepped up permanently by about fifteen percent. The anomaly detector, built to catch spikes, flagged the elevated readings as anomalies day after day for a month, burying the operations team in alerts while the demand forecast (trained on the old baseline) ran persistently low and triggered unnecessary reserve purchases.</p>
+<p><strong>Dilemma:</strong> Two responses were debated. Keep widening the anomaly thresholds until the new baseline stopped tripping them, which was quick but would also blind the detector to genuine spikes on top of the new baseline. Or add a change-point detector that would recognize the step as a single regime shift and adapt the forecast's baseline once, rather than fighting it every day.</p>
+<p><strong>Decision:</strong> The team added an offline PELT pass over each feeder's recent history (rerun nightly) plus an online CUSUM monitor for fast warning, explicitly to separate persistent regime shifts from transient anomalies, the recovery-test distinction of subsection one.</p>
+<p><strong>How:</strong> Using <code>ruptures</code> with an <code>"l2"</code> cost and a BIC-style penalty, the nightly PELT pass located the step change to within a day; the online CUSUM raised a single regime-shift alert when the baseline first moved; and on detection the forecasting model's baseline was re-estimated on post-change data only, while the anomaly detector was re-centered on the new mean so it could still catch spikes above it.</p>
+<p><strong>Result:</strong> The month-long alert storm collapsed to one regime-shift notification, the demand forecast re-baselined within a day instead of drifting for weeks, and the unnecessary reserve purchases stopped. The same feeder's genuine transient faults were still caught, now measured against the correct new baseline.</p>
+<p><strong>Lesson:</strong> A persistent shift is not a long run of anomalies, and treating it as one is the most expensive mistake in this chapter. Detect the regime change once, adapt the baseline, and let the anomaly detector go back to doing its real job against the new normal.</p>
+</div>
+<p>Step back and see what the section assembled. We separated anomalies (transient) from change points (persistent) by the recovery test, cast offline detection as the cost-plus-penalty optimization solved exactly by PELT or greedily by binary segmentation, derived the single-change likelihood-ratio statistic and connected it to the CUSUM chart of <a href="section-8.2.html">Section 8.2</a>, built the run-length posterior of Bayesian Online Change-Point Detection for the streaming regime, and confronted the detection-delay-versus-false-alarm trade-off that governs every sequential detector. The worked example tied it together, detecting the same regimes offline and online and making the delay visible. The persistent-shift theme hands directly to the rest of the book: <a href="section-8.4.html">Section 8.4</a> turns to forecasting-residual and reconstruction methods that detect anomalies and changes through a model's prediction errors, while the concept-drift machinery of <a href="../../toc.html">Chapter 20</a> takes the change-point idea into supervised online learning, where a detected change triggers a model to adapt rather than merely a flag to fire.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 8.3.1: Anomaly, Change Point, or Both <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each scenario, classify the event as an anomaly, a change point, or a sequence containing both, and justify using the recovery test of subsection one. (a) A web server's latency jumps to ten times normal for two seconds during a deploy, then returns to baseline. (b) After a code release, a service's median latency rises by thirty percent and stays there. (c) A temperature sensor reads $-40$ for one sample (a known glitch value) and is normal otherwise, but its baseline also drifts up two degrees over the same week. (d) Explain why a single threshold-based anomaly detector handles (a) well but fails on (b), and what you would add to catch (b).</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 8.3.2: Tune the Penalty <span class="exercise-type coding">Coding</span></div>
+<p>Using the synthetic signal of Code 8.3.1, run <code>ruptures</code> PELT with the <code>"l2"</code> cost over a sweep of penalties <code>pen</code> in $\{1, 5, 15, 30, 60, 120\}$. (a) For each penalty, record the number of detected change points and their locations. (b) Plot the number of change points against the penalty and identify the range over which the correct count of three is recovered (the stable plateau). (c) Repeat with the noise standard deviation raised from $0.8$ to $2.0$ and explain how the plateau shifts, relating the penalty to the cost-versus-penalty balance of subsection two. (d) Replace the <code>"l2"</code> cost with <code>"normal"</code> (mean and variance) and add a regime that changes variance but not mean; show that the <code>"l2"</code> cost misses it while <code>"normal"</code> catches it.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 8.3.3: Delay Versus False Alarm on CUSUM <span class="exercise-type analysis">Analysis</span></div>
+<p>Implement the one-sided CUSUM recursion $S_t = \max(0, S_{t-1} + (x_t - \mu_0) - k)$ from subsection three. (a) On a Gaussian stream with $\mu_0 = 0$, $\sigma = 1$, $k = 0.5$, and a shift to mean $1.0$ at sample $300$, measure the detection delay (samples from $300$ to the first alarm) for thresholds $h \in \{3, 5, 8, 12\}$, averaging over many random streams. (b) For each threshold, estimate the in-control average run length to a false alarm by running long streams with no shift. (c) Plot detection delay against the false-alarm run length and confirm the trade-off curve of subsection four: no threshold improves both at once. (d) Explain where on this curve you would operate for a safety-critical alarm versus a low-stakes dashboard.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 8.3.4: Offline Versus Online on the Same Series <span class="exercise-type open">Open-Ended</span></div>
+<p>Take a real or simulated series with two or three genuine regime shifts and run three detectors on it: offline PELT (<code>ruptures</code>), online CUSUM, and online BOCPD (Code 8.3.3 or the <code>bayesian_changepoint_detection</code> package). (a) Compare the detected locations against the truth and report each method's localization error and, for the online methods, detection delay. (b) Inject a single large anomaly (one spike) into a stable regime and report which detectors falsely declare a change, relating the result to the minimum-segment-length and robustness ideas of subsections one and four. (c) Argue which detector you would deploy for a retrospective audit of last quarter's data versus a live operational monitor, and explain how you would combine them (for example, an online detector for fast warning plus a nightly offline pass for precise localization). There is no single right answer; argue from the localization error, the delay, and the false-alarm behavior you observe.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-8.2.html"><span class="nav-label">Previous</span><span class="nav-num">Section 8.2</span><span class="nav-title">Statistical Process Control and Control Charts</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 8</span><span class="nav-num">Contents</span><span class="nav-title">Temporal Anomaly and Change-Point Detection</span></a>
+<a class="next" href="section-8.4.html"><span class="nav-label">Next</span><span class="nav-num">Section 8.4</span><span class="nav-title">Forecasting-Residual and Reconstruction Methods</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>
