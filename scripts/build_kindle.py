@@ -1,23 +1,23 @@
 """Build the KFX-ready Kindle EPUB from the math-rasterized EPUB.
 
-Chain (math already rasterized to images in building-vision-ai-mathimg.epub):
+Chain (math already rasterized to images in building-temporal-ai-mathimg.epub):
   1. sanitize_epub_kindle.py   rem/px->em, font-size 0/inherit/0em fix, system-ui->sans-serif, inline-block->inline
   2. fix_kfx_svg_text_attrs    SVG <text> px->em, proprietary font-family (incl. Verdana)->generic
   3. fix_svg_style_kdp         inline SVG <style> rules -> presentation attrs
   4. fix_svg_kfx_normalize     SVG element/attr case, width/height, font shorthand, svg CSS rules
   5. strip KaTeX               remove now-unused katex.min.css + KaTeX fonts + links + manifest items
 
-Output: KDP/output/building-vision-ai-kindle.epub
+Output: KDP/output/building-temporal-ai-kindle.epub
 """
 import subprocess, sys, re, zipfile
 from pathlib import Path
 
-ROOT = Path("E:/Projects/VisionBook")
-SK = Path("C:/Users/apart/.claude/skills/epub2kpf/scripts")
+ROOT = Path("E:/Projects/taibook")
+SK = Path("E:/Projects/claude-skills/epub2kpf/scripts")
 PY = "C:/Python314/python.exe"
-MATHIMG = ROOT / "KDP/output/building-vision-ai-mathimg-diagrams.epub"
-KINDLE_TMP = ROOT / "KDP/output/building-vision-ai-mathimg-diagrams-kindle.epub"
-OUT = ROOT / "KDP/output/building-vision-ai-kindle.epub"
+MATHIMG = ROOT / "KDP/output/building-temporal-ai-mathimg-diagrams.epub"
+KINDLE_TMP = ROOT / "KDP/output/building-temporal-ai-mathimg-diagrams-kindle.epub"
+OUT = ROOT / "KDP/output/building-temporal-ai-kindle.epub"
 
 
 def run(*args):

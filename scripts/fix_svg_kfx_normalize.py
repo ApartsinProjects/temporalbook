@@ -18,7 +18,7 @@ What this does, scoped to <svg>...</svg> only (prose/code untouched):
      (drop-shadow effects KFX cannot render; an empty filter renders transparent).
 
 Rebuilds a valid EPUB in place (writes via temp, mimetype stored first).
-Usage: python scripts/fix_svg_kfx_normalize.py KDP/output/building-vision-ai-kindle.epub
+Usage: python scripts/fix_svg_kfx_normalize.py KDP/output/building-temporal-ai-kindle.epub
 """
 import re
 import sys
