@@ -19,6 +19,7 @@ const GUARDRAILS = `HARD EDITING GUARDRAILS (a violation is worse than a missed 
 - XHTML strict: SVG uses camelCase viewBox; alt= is plain text only (no tags/entities); every tag closed; no self-closing non-void tags like <div/>; <pre> must wrap <code>; code captions go BELOW the code as <div class="code-caption">.
 - Do NOT add new math unless the section <head> already includes katex.min.css (it does). Do NOT insert new figures/images or renumber anything.
 - Idempotent: if a fix says add an epigraph/bibliography/callout that already exists, skip it (do not duplicate).
+- Do NOT touch the footer/boilerplate: the edition-line, the copyright line (&copy; ... &middot; ... Contents), chapter-nav, or header. Leave &copy; and &middot; exactly as they are (book-wide convention, normalized later at build time).
 - Re-read the file immediately before each edit. Prioritize high and medium severity findings. Make every edit count.`
 
 const REVIEW_SCHEMA = {
@@ -146,7 +147,7 @@ Section files: ${secList}
 
 For each section file check and, where trivial and safe, FIX in place:
 - em-dash / en-dash / double-hyphen anywhere (replace with comma/colon/parentheses/separate sentences) [FIX].
-- illegal named HTML entities (&mdash; &hellip; &rsaquo; &middot; etc.) -> replace with plain ASCII [FIX].
+- illegal named HTML entities (&mdash; &hellip; &rsaquo; etc.) -> replace with plain ASCII [FIX]. DO NOT change &copy; or &middot; (book-wide footer convention, leave them).
 - lowercase viewbox= on <svg> -> viewBox= [FIX].
 - alt= containing tags or entities -> plain text [FIX].
 - <pre> not wrapping <code>; code caption above instead of below.
@@ -160,10 +161,10 @@ Report issues you could NOT safely auto-fix as strings. Set pass=true only if ze
 
 // INVENTORY: edit this block per part, then re-invoke the workflow.
 const INV = {
-  partName: 'part-1-foundations',
+  partName: 'part-9-applications-future',
   chapters: [
-    { dir: 'part-1-foundations/module-01-intro-temporal-intelligence', sections: ['section-1.1.html', 'section-1.2.html', 'section-1.3.html', 'section-1.4.html', 'section-1.5.html', 'section-1.6.html', 'section-1.7.html'] },
-    { dir: 'part-1-foundations/module-02-temporal-data-engineering', sections: ['section-2.1.html', 'section-2.2.html', 'section-2.3.html', 'section-2.4.html', 'section-2.5.html', 'section-2.6.html', 'section-2.7.html'] },
+    { dir: 'part-9-applications-future/module-35-industrial-applications', sections: ['section-35.1.html', 'section-35.2.html', 'section-35.3.html', 'section-35.4.html', 'section-35.5.html', 'section-35.6.html'] },
+    { dir: 'part-9-applications-future/module-36-general-temporal-intelligence', sections: ['section-36.1.html', 'section-36.2.html', 'section-36.3.html', 'section-36.4.html', 'section-36.5.html'] },
   ],
 }
 
