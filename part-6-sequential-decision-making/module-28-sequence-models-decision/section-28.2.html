@@ -228,6 +228,7 @@ epoch 100  action-MSE = 0.5489
 epoch 150  action-MSE = 0.4602
 </code></pre>
 <div class="code-caption"><strong>Output 28.2.2:</strong> The supervised action-prediction loss falls steadily, confirming the model is learning the return-conditioned action distribution from offline data. On this random toy set the loss plateaus above zero because there is no real structure to fit; on D4RL it would fall much further.</div>
+<p>Predicting the action from the <em>state</em> position (the index <code>h[:, :, 1]</code>) is correct rather than a bug: in the $(\hat{R}_t, s_t, a_t)$ order the state token sits after that step's return-to-go, so under the causal mask it already attends to $\hat{R}_t$ before producing $\hat{a}_t$, and the return conditioning is intact. The action token's own slot is reserved for predicting the <em>next</em> step's return and state, never its own action. The return-conditioned rollout of Code 28.2.4 puts this prediction to work as a controller, so you can watch the state-position action actually drive an environment.</p>
 <p>Now the library equivalent. The full from-scratch model and training loop above ran roughly 50 lines including the architecture. HuggingFace ships the identical architecture as <code>DecisionTransformerModel</code>; Code 28.2.3 instantiates it and runs a forward pass in about a dozen lines, with the token embedding, interleaving, causal masking, and prediction heads all internal.</p>
 <pre><code class="language-python">from transformers import DecisionTransformerConfig, DecisionTransformerModel
 
@@ -288,14 +289,14 @@ print(f"target return = 10.0   achieved return = {got:.3f}")
 <div class="callout-title">Library Shortcut: Offline RL Sequence Models in d3rlpy</div>
 <p>Beyond HuggingFace's architecture-only <code>DecisionTransformerModel</code>, the offline-RL library <code>d3rlpy</code> ships a full training-and-evaluation pipeline for Decision Transformers (and for value-based offline methods such as CQL and IQL for comparison). What took the roughly 50 lines of dataset construction, return-to-go computation, training loop, and rollout across Codes 28.2.1 through 28.2.4 collapses to a few lines: load a D4RL dataset, construct a <code>DecisionTransformer</code> with a context size and target return, call <code>.fit()</code>, and evaluate. The library handles return-to-go computation, state normalization, the context windowing of subsection four, and the conditioned rollout internally, and exposes the target-return knob directly so you can sweep the extrapolation behavior of subsection three with a single argument.</p>
 <pre><code class="language-python">import d3rlpy
-dataset, env = d3rlpy.datasets.get_d4rl("hopper-medium-v0")     # standard offline benchmark
+dataset, env = d3rlpy.datasets.get_d4rl("hopper-medium-v2")     # standard offline benchmark
 dt = d3rlpy.algos.DecisionTransformerConfig(context_size=20).create(device="cuda:0")
 dt.fit(dataset, n_steps=100_000)                                # full supervised training
 # Evaluate conditioned on a target return at or just above the dataset max (subsection 3).
 evaluator = d3rlpy.metrics.EnvironmentEvaluator(env, target_return=3600.0)
 print("normalized score:", evaluator(dt, dataset))
 </code></pre>
-<p>The line-count reduction is roughly tenfold over the from-scratch pipeline, and crucially the library's defaults (normalization, return scaling, context windowing) are the ones tuned to actually reach published D4RL scores, which a naive from-scratch implementation usually does not without the same care.</p>
+<p>The line-count reduction is roughly tenfold over the from-scratch pipeline, and crucially the library's defaults (normalization, return scaling, context windowing) are the ones tuned to actually reach published D4RL scores, which a naive from-scratch implementation usually does not without the same care. One currency note: the classic <code>d4rl</code> locomotion datasets used here are the <code>-v2</code> revisions (the original <code>-v0</code> versions are deprecated), and as of 2026 classic D4RL is itself superseded by Minari, so current code loads the same benchmarks with <code>d3rlpy.datasets.get_minari</code> under d3rlpy v2.</p>
 </div>
 <div class="callout looking-back">
 <div class="callout-title">Looking Back: The MDP Returns as a Sequence Model</div>
@@ -304,6 +305,15 @@ print("normalized score:", evaluator(dt, dataset))
 
 <h2>6. Summary and Exercises</h2>
 <p>This section recast offline reinforcement learning as sequence modeling through two architectures. The Decision Transformer represents a trajectory as $(\hat{R}_t, s_t, a_t)$ triples, trains a causal Transformer by supervised next-action prediction, and acts by conditioning on a desired return-to-go, a reactive, return-conditioned policy with the stability of language-model training. The Trajectory Transformer models the full joint distribution over states, actions, and rewards and plans by beam search over that learned simulator, trading test-time compute for lookahead and a better shot at stitching. The contrast exposes the approach's two structural limits: return-conditioned imitation cannot reliably exceed the data's returns (extrapolation) and does not automatically recombine sub-trajectories (stitching), the gaps that <a href="section-28.3.html">Section 28.3</a> and the planners of <a href="../module-29-world-models-planning/index.html">Chapter 29</a> address. We built a minimal Decision Transformer, ran the HuggingFace equivalent at a fraction of the line count, and rolled out a return-conditioned controller.</p>
+<div class="callout warning">
+<div class="callout-title">Common Pitfalls: Building and Conditioning a Decision Transformer</div>
+<p>Three mistakes recur when readers first implement and deploy the architecture of this section, and each fails quietly rather than loudly:</p>
+<ul>
+<li><strong>Placing the return token after the action.</strong> The order must be $(\hat{R}_t, s_t, a_t)$. If the return-to-go follows the action, the action token can no longer attend to that step's target under the causal mask, the conditioning is gone, and the model degenerates into plain behavior cloning that no return knob can steer.</li>
+<li><strong>Conditioning above the data's support.</strong> Writing a target return far beyond the dataset maximum asks for behavior the model never saw and produces out-of-distribution actions that do not deliver the requested return. Set the target at or just slightly above the dataset's best return, as subsection three prescribes.</li>
+<li><strong>Expecting a vanilla Decision Transformer to stitch.</strong> Return-conditioned imitation reproduces demonstrated behaviors; it does not recombine a good A-to-B path with a good B-to-C path into an unseen A-to-C route. When the data is fragmentary and the task needs stitching, reach for a value-augmented or planning method, not the plain recipe.</li>
+</ul>
+</div>
 <p>The exercises below come in three types: conceptual (reason about the architecture and its limits), implementation (extend the code), and open-ended (explore a research direction).</p>
 <ol class="exercises">
 <li><strong>Conceptual.</strong> Explain precisely why placing the return-to-go token <em>before</em> the state and action tokens (rather than after) is essential to the Decision Transformer working as a controller at test time. What would break if the order were $(s_t, a_t, \hat{R}_t)$? Then describe, using the stitching example of subsection three (a good A-to-B trajectory and a good B-to-C trajectory but no A-to-C), why a vanilla Decision Transformer typically fails to find the A-to-C route while a value-based offline method can.</li>
@@ -312,15 +322,14 @@ print("normalized score:", evaluator(dt, dataset))
 </ol>
 
 <nav class="chapter-nav">
-<a class="prev" href="section-28.1.html">&#8592; 28.1 Reinforcement Learning as Sequence Modeling</a>
+<a class="prev" href="section-28.1.html">&#8592; 28.1 RL as Sequence Modeling</a>
 <a class="up" href="index.html">Chapter 28 Contents</a>
 <a class="next" href="section-28.3.html">28.3 Return-Conditioned and Goal-Conditioned Policies &#8594;</a>
 </nav>
 </main>
-<footer class="book-footer">
-<p class="edition-line">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
-<p class="copyright">&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
-<p class="last-updated"><script>document.write("Last updated " + document.lastModified);</script></p>
+<footer>
+<p class="footer-title">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
 </footer>
 </body>
 </html>
