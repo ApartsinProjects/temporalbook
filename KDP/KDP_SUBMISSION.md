@@ -38,7 +38,7 @@ python KDP/cover/composite_cover.py               # -> KDP/cover/cover_kdp.jpg
 - **Language:** English
 - **Book Title:** Building Temporal AI
 - **Subtitle:** From Forecasting to Sequential Decision Making
-- **Edition number:** 1
+- **Edition number:** 2
 - **Author:** Alexander Apartsin
 - **Contributor:** Yehudit Aperstein (Author)
 - **Description:** paste the rendered text of `KDP/metadata/description.html`

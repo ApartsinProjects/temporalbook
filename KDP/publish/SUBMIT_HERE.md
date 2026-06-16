@@ -13,7 +13,7 @@ issues** (see `_proof_Summary_Log.csv` / `_proof_QualityReport.csv`).
 | **Description** | paste `description.txt` (or the HTML in `description.html`) |
 | **Title** | Building Temporal AI |
 | **Subtitle** | From Forecasting to Sequential Decision Making |
-| **Edition** | 1 |
+| **Edition** | 2 |
 | **Author** | Alexander Apartsin |
 | **Contributor** | Yehudit Aperstein (Author) |
 | **Keywords (7)** | see `metadata.yaml` -> `keywords` |

@@ -14,7 +14,7 @@ The full editorial plan (parts, chapters, sections, change log) lives in
 - **Target Audience**: Senior undergraduates, graduate students, researchers, and practitioners with linear algebra, probability, calculus, and introductory machine learning. No prior time-series experience required; appendices A-D provide refreshers.
 - **Output Format**: HTML chapter files linking to the shared stylesheet `styles/book.css`
 - **Author/Footer line**: `© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a>` (adjust relative depth per file location)
-- **Edition line for footers**: `Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition`
+- **Edition line for footers**: `Building Temporal AI: From Forecasting to Sequential Decision Making, Second Edition`
 - **Sibling book (style reference)**: Building Vision AI (visionbook.apartsin.com). taibook reuses its callout system, stylesheet, vendor stack, and house style verbatim.
 
 ## The Nine-Part Arc

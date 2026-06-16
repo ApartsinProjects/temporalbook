@@ -216,6 +216,84 @@ def sb3_seed(seed):
 <p>The hand-rolled IQM and percentile bootstrap of Code 25.5.1 ran about 15 lines of careful statistics. <code>rliable</code> collapses all of it, and adds the stratified multi-task bootstrap, performance profiles, and probability-of-improvement, to a few calls: <code>rly.get_interval_estimates(scores_dict, metrics.aggregate_iqm)</code> returns the point estimate and confidence interval, and <code>rly.create_performance_profile</code> draws the run-fraction-above-threshold curve that dominates point comparisons. The library internally manages the resampling, the stratification across tasks, and the quantile extraction. Pair it with Stable-Baselines3 (which handles training, vectorized environments, and the separate <code>evaluate_policy</code> pass) or CleanRL (single-file reference implementations whose every detail is visible) and the full honest pipeline, train many seeds, evaluate each properly, aggregate robustly, is a short script rather than a research project.</p>
 </div>
 
+<h2>6. Tracking and Scaling Your Experiments <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The multi-seed harness produces a final number per seed, but a deep RL run is a trajectory through training, and the diagnosis of why a seed failed lives in the curves you watch <em>during</em> training: the episode return that should climb but stalls, the policy or value loss that should fall but spikes, the exploration rate (epsilon, or the PPO policy-update KL divergence) that should decay on schedule. Reading these from <code>print</code> statements is hopeless across ten seeds and several methods, so the field standardizes on experiment-tracking dashboards that log scalars over training steps and overlay runs for comparison. Two tools dominate: TensorBoard, the local, file-based logger that ships with the deep learning stack, and Weights and Biases (<code>wandb</code>), the hosted service that adds run grouping, hyperparameter sweeps, and team sharing. They matter more in RL than almost anywhere else precisely because of the seed variance of subsection one: a single noisy return curve is uninterpretable, but ten overlaid curves, or an IQM band across seeds, immediately separates a method that works from one that got lucky once.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: TensorBoard, Weights and Biases, and Ray RLlib</div>
+<p>You should almost never hand-roll experiment logging or distributed training. <strong>TensorBoard</strong> (via <code>torch.utils.tensorboard.SummaryWriter</code>) writes scalars to a local event file that the <code>tensorboard</code> web UI plots live, with no account and no network. <strong>Weights and Biases</strong> (<code>wandb.init</code> plus <code>wandb.log</code>) sends the same scalars to a hosted dashboard that overlays runs, groups them by seed or hyperparameter, and runs automated sweeps. <strong>Ray RLlib</strong> is the scale-out training library: where Stable-Baselines3 (used throughout this chapter) is the single-machine workhorse, RLlib distributes rollout collection and learner updates across many CPUs, GPUs, and machines, and logs to TensorBoard and Weights and Biases out of the box. Reach for these three together: log every run, compare across seeds, and scale the training when one machine is no longer enough.</p>
+</div>
+<p>Code 25.5.4 wires TensorBoard into a typical training loop. The pattern is the same regardless of algorithm: open a <code>SummaryWriter</code>, and after each update call <code>add_scalar(tag, value, step)</code> for every quantity you want to watch. The tags become the curve names in the UI, and the step is the training timestep, so runs with different wall-clock speeds still align on the x-axis.</p>
+<pre><code class="language-python">from torch.utils.tensorboard import SummaryWriter
+
+def train_with_tensorboard(seed, total_updates=500, logdir="runs"):
+    """Log RL training curves to a local TensorBoard event file."""
+    rng = set_global_seeds(seed)
+    writer = SummaryWriter(f"{logdir}/ppo_seed{seed}")       # one run = one subdir
+    epsilon = 1.0
+    for update in range(total_updates):
+        # --- one real PPO/DQN update would happen here; we model its scalars ---
+        episode_return = 500 * (1 - np.exp(-update / 150)) + rng.normal(0, 40)
+        policy_loss = 1.0 * np.exp(-update / 200) + abs(rng.normal(0, 0.02))
+        approx_kl = 0.02 * np.exp(-update / 300) + abs(rng.normal(0, 0.001))
+        epsilon = max(0.05, epsilon * 0.99)                  # exploration schedule
+        # --- log the noisy RL scalars against the training step ---
+        writer.add_scalar("charts/episode_return", episode_return, update)
+        writer.add_scalar("losses/policy_loss", policy_loss, update)
+        writer.add_scalar("losses/approx_kl", approx_kl, update)
+        writer.add_scalar("charts/epsilon", epsilon, update)
+    writer.close()                                           # flush the event file
+
+train_with_tensorboard(seed=0)
+# Then view the curves locally:  tensorboard --logdir runs
+</code></pre>
+<div class="code-caption"><strong>Code 25.5.4:</strong> TensorBoard logging. A single <code>SummaryWriter</code> per run writes each scalar (episode return, policy loss, KL divergence, epsilon) against the training step with <code>add_scalar</code>; launching <code>tensorboard --logdir runs</code> plots them live and overlays every seed's subdirectory on the same axes.</div>
+<p>Code 25.5.5 logs the identical quantities to Weights and Biases. The shape is the same, an init call to start the run and a <code>log</code> call per step, but the run is tagged with its config and seed so the hosted dashboard can group the ten seeds into one comparison and compute aggregate bands automatically.</p>
+<pre><code class="language-python">import wandb
+
+def train_with_wandb(seed, total_updates=500):
+    """Log the same RL curves to a hosted Weights and Biases dashboard."""
+    rng = set_global_seeds(seed)
+    wandb.init(project="deep-rl-ch25", group="ppo-cartpole",
+               name=f"seed{seed}", config={"seed": seed, "algo": "PPO"})
+    epsilon = 1.0
+    for update in range(total_updates):
+        episode_return = 500 * (1 - np.exp(-update / 150)) + rng.normal(0, 40)
+        policy_loss = 1.0 * np.exp(-update / 200) + abs(rng.normal(0, 0.02))
+        approx_kl = 0.02 * np.exp(-update / 300) + abs(rng.normal(0, 0.001))
+        epsilon = max(0.05, epsilon * 0.99)
+        wandb.log({"episode_return": episode_return,        # one dict per step
+                   "policy_loss": policy_loss,
+                   "approx_kl": approx_kl,
+                   "epsilon": epsilon}, step=update)
+    wandb.finish()                                           # close the run
+
+for s in range(10):                                          # group all seeds in the UI
+    train_with_wandb(seed=s)
+</code></pre>
+<div class="code-caption"><strong>Code 25.5.5:</strong> Weights and Biases logging. <code>wandb.init</code> opens a run tagged with its <code>config</code> and a <code>group</code>, <code>wandb.log</code> sends a dict of the same scalars per step, and because every seed shares the group the hosted UI overlays all ten curves and draws the mean-and-band aggregate that makes seed variance legible at a glance.</div>
+<p>Both loggers answer the diagnosis problem; neither answers the throughput problem. When honest evaluation demands ten or more seeds, each needing millions of environment steps, single-machine training (the Stable-Baselines3 path of Code 25.5.3) becomes the bottleneck. Ray RLlib is the scale-out answer: it distributes rollout collection across many parallel workers and runs the learner on a GPU, so the same PPO that takes hours on one core finishes in minutes across a cluster. Code 25.5.6 is the minimal RLlib PPO loop, a config object plus a <code>train()</code> iteration, with the same per-iteration metrics you logged above available in the returned result dict.</p>
+<pre><code class="language-python">from ray.rllib.algorithms.ppo import PPOConfig
+
+# Configure distributed PPO: rollout workers collect, the learner updates.
+config = (
+    PPOConfig()
+    .environment("CartPole-v1")
+    .env_runners(num_env_runners=8)        # 8 parallel rollout workers (scale out)
+    .training(lr=3e-4, train_batch_size=4000, gamma=0.99)
+    .resources(num_gpus=0)                 # set 1+ to put the learner on a GPU
+)
+algo = config.build()
+
+for i in range(20):                        # each .train() = one distributed iteration
+    result = algo.train()
+    ret = result["env_runners"]["episode_return_mean"]
+    print(f"iter {i:2d}  episode_return_mean = {ret:6.1f}")
+
+algo.stop()                                # release the Ray workers
+</code></pre>
+<div class="code-caption"><strong>Code 25.5.6:</strong> Distributed PPO with Ray RLlib. The <code>PPOConfig</code> builder declares the environment, the number of parallel rollout workers, and the learner hyperparameters; each <code>algo.train()</code> call runs one full distributed iteration and returns a metrics dict (episode return, losses, KL) that RLlib also streams to TensorBoard and Weights and Biases automatically.</div>
+<p>The rule of thumb is simple: reach for Ray RLlib when you need to scale out (distributed or multi-GPU training, many parallel environments, large sweeps across seeds and hyperparameters), and stay with Stable-Baselines3 (used throughout this chapter) when a single machine suffices and you want the smallest, most readable training loop. Either way, log every run to TensorBoard or Weights and Biases from the first experiment, because in a field this noisy the curve you forgot to record is the diagnosis you cannot make.</p>
+
 <div class="callout looking-back">
 <div class="callout-title">Looking Back: Closing Chapter 25, and the Road to Advanced RL</div>
 <p>Chapter 25 took the value-based and policy-based foundations of <a href="../module-24-bandits-rl-foundations/index.html">Chapter 24</a> and scaled them to neural function approximators: deep Q-networks, policy gradients, actor-critic methods, and PPO, the workhorse that trains stably enough to be a default. This closing section delivered the discipline that makes any of those results trustworthy: deep RL is brittle by its nature, so a result is the multi-seed confidence interval, not the curve; stability is signal conditioning against a non-stationary, self-generated data stream; and the most professional move is often to recognize that a bandit, a model-predictive controller, or a supervised baseline is the better tool. The thread of Part VI now turns to the methods that attack deep RL's deepest weaknesses head-on. <a href="../module-26-advanced-rl/index.html">Chapter 26</a> (Advanced Reinforcement Learning) takes up <em>model-based</em> RL, which learns a world model to slash the sample inefficiency this section lamented; <em>offline</em> RL, which learns from a fixed dataset with no risky online exploration, the safe alternative subsection four pointed to; <em>multi-agent</em> RL, where the non-stationarity of subsection one is compounded because every other agent is learning too; and <em>safe</em> RL, which builds the deployment guarantees the warehouse team needed by construction. The brittleness you now know how to measure is exactly what the next chapter sets out to engineer away.</p>
@@ -225,6 +303,7 @@ def sb3_seed(seed):
 <ol class="exercises">
 <li><strong>Conceptual.</strong> A colleague reports that their new method "beats PPO, achieving a final return of 820 versus PPO's 610", citing a single training run of each. List four distinct reasons, drawn from subsections one and two, that this comparison may be meaningless, and state the minimal evaluation protocol (seed count, aggregation statistic, interval, evaluation-episode count, train/eval separation) you would require before believing the claim.</li>
 <li><strong>Implementation.</strong> Extend Code 25.5.1 to compare two methods. Add a second <code>train_and_eval</code> whose true mean is 560 (versus method A's 500) with the same spread, run both over 10 seeds, and compute the <em>probability of improvement</em> (the bootstrap probability that a random A-seed beats a random B-seed) instead of just comparing IQMs. Then rerun with only 3 seeds each and show that the conclusion becomes unreliable. Report both the point estimate and its bootstrap interval at each seed count.</li>
+<li><strong>Tooling.</strong> Take the multi-seed loop of Code 25.5.4 (or 25.5.5) and log all four scalars (episode return, policy loss, approximate KL, epsilon) for ten seeds, grouped so a single dashboard overlays them. In TensorBoard, use the run selector to view all ten <code>episode_return</code> curves at once; in Weights and Biases, set the group and read the auto-computed mean-and-band. Then convert one of the single-machine Stable-Baselines3 seeds from Code 25.5.3 into the Ray RLlib <code>PPOConfig</code> loop of Code 25.5.6, raise <code>num_env_runners</code>, and report the wall-clock per training iteration as you scale the worker count.</li>
 <li><strong>Open-ended.</strong> Take a problem from your own domain that you might be tempted to solve with deep RL (a recommendation, a control, or a scheduling task). Apply the decision rule of subsection four explicitly: is it one-step (a bandit)? Do you have a dynamics model (MPC)? Do you have demonstrations (imitation or offline RL)? Can it be cast as prediction-plus-rule? Write a one-page justification for either using deep RL or choosing a simpler method, and include an honest estimate of the compute and tuning cost (seeds, environment steps, wall-clock) the deep RL path would incur versus the alternative.</li>
 </ol>
 
@@ -235,7 +314,7 @@ def sb3_seed(seed):
 </nav>
 </main>
 <footer class="book-footer">
-<p class="footer-edition">Building Temporal AI: From Forecasting to Sequential Decision Making, First Edition</p>
+<p class="footer-edition">Building Temporal AI: From Forecasting to Sequential Decision Making, Second Edition</p>
 <p class="footer-copyright">&copy; 2026 Alexander Apartsin &middot; <a href="../../toc.html">Contents</a></p>
 <script>document.write('<p class="footer-updated">Last updated: ' + document.lastModified + '</p>');</script>
 </footer>
