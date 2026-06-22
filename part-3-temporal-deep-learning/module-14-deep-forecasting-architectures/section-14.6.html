@@ -285,6 +285,248 @@ print(forecast.head())
 <p>Code 14.6.3 already showed the shortcut: Nixtla's <code>neuralforecast</code> exposes both <code>TSMixer</code> and <code>TiDE</code> as drop-in models behind one <code>NeuralForecast(models=[...]).fit().predict()</code> interface, reducing the roughly 50 hand-written lines to about 6. The library internally supplies reversible instance normalization (RevIN), future/past/static covariate plumbing, global multi-series training, multi-window batching, and validation-based early stopping. Darts and PyTorch Forecasting offer comparable one-class wrappers (<code>darts.models.TiDEModel</code>, for instance). The from-scratch build in this section exists so you understand the time-mix and feature-mix you are configuring; the library exists so you never write them again in production.</p>
 </div>
 
+<h2>5. iTransformer: Inverting the Attention Axis <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The MLP mixers of the previous subsections closed Chapter 14's first arc: you can strip out attention entirely and still win the benchmark. The second arc, still unfolding in 2024 to 2025, asks a different question: what happens if you keep the Transformer but change <em>which axis attention operates on</em>? That question is what iTransformer (Liu and colleagues, ICLR 2024, "iTransformer: Inverted Transformers Are Effective for Time Series Forecasting") answers, and the answer turned out to be the strongest Transformer-based forecasting baseline of the period.</p>
+<p>The core idea is a single, clean inversion. Every forecasting Transformer before iTransformer applied self-attention across the <em>time</em> axis: each token was a time step, and attention related time steps to one another. iTransformer transposes the input and applies attention across the <em>variate</em> (channel) axis instead: each token is an entire univariate time series, a vector of length $T$ encoding one channel's full lookback history, and attention relates variates to one another. The feed-forward network is then applied independently along each variate's time dimension. The name is earned: every design choice is the inverse of the standard Transformer tokenization.</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Attention Should Span Variates, Not Time Steps</div>
+<p>The standard Transformer's temporal attention asks "which past time steps are most relevant to predict the future?" That is a sensible question for NLP, where position encodes semantic order. In multivariate forecasting the more informative question is often "which other series tell us the most about this series?" because cross-variate correlation (temperature correlating with electricity load, one traffic sensor correlating with another) is typically the strongest signal. iTransformer's inversion routes attention to where the information actually is: across variates, capturing the full history of each as a single token, and leaving the temporal pattern extraction to the feed-forward network that processes each variate's time axis independently.</p>
+</div>
+
+<h3>Formal Definition</h3>
+<p>Let $\mathbf{X} \in \mathbb{R}^{T \times N}$ be the lookback matrix, with $T$ time steps along rows and $N$ variates (channels) along columns. The standard Transformer views this as $T$ tokens of dimension $N$; iTransformer transposes it and views it as $N$ tokens of dimension $T$. Each variate $i$ is first embedded by a learned linear projection that maps the full $T$-length time series for that variate to a $d$-dimensional token:</p>
+$$\mathbf{h}_i = \mathrm{Embed}(\mathbf{x}_{1:T,i}) = \mathbf{W}_e\,\mathbf{x}_{1:T,i} + \mathbf{b}_e, \qquad \mathbf{h}_i \in \mathbb{R}^d, \quad i = 1, \dots, N,$$
+<p>where $\mathbf{W}_e \in \mathbb{R}^{d \times T}$ is shared across all variates. These $N$ tokens are stacked into a token matrix $\mathbf{H} = [\mathbf{h}_1, \dots, \mathbf{h}_N]^\top \in \mathbb{R}^{N \times d}$. Multi-head self-attention is then applied across the $N$ variate tokens:</p>
+$$\mathbf{H}' = \mathrm{Attn}(\mathbf{H}) = \mathrm{softmax}\!\left(\frac{\mathbf{Q}\mathbf{K}^\top}{\sqrt{d_k}}\right)\mathbf{V}, \qquad \mathbf{Q},\mathbf{K},\mathbf{V} \in \mathbb{R}^{N \times d_k}.$$
+<p>This attention matrix has shape $N \times N$, relating variates to variates rather than time steps to time steps. When $N$ is small (tens or a few hundred variates) this is far cheaper than the $T \times T$ temporal attention that would result from a standard tokenization over a long lookback window. After attention, the feed-forward network (FFN) is applied independently to each token, acting along the $d$ dimension that encodes that variate's temporal information:</p>
+$$\mathbf{H}'' = \mathrm{FFN}(\mathbf{H}') = \sigma(\mathbf{H}'\mathbf{W}_1 + \mathbf{b}_1)\mathbf{W}_2 + \mathbf{b}_2.$$
+<p>Each layer's output is again $N \times d$, and a linear projection head maps each $\mathbf{h}''_i$ to the $H$-step forecast for variate $i$, producing the full forecast $\hat{\mathbf{Y}} \in \mathbb{R}^{H \times N}$. The attention cost is $O(N^2 d)$ per layer; the FFN cost is $O(N d^2)$ per layer. In a setting like ETTh1 ($N = 7$) the attention matrix is $7 \times 7$, a toy matrix; in Traffic ($N = 862$) it is $862 \times 862$, which is the practical ceiling. Table 14.6.1 below summarizes the axis comparison.</p>
+
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: 3 Variates, 4 Time Steps, Cross-Variate Attention</div>
+<p>To make the inversion concrete, take $N = 3$ variates (say: temperature, humidity, wind speed) observed over $T = 4$ time steps. The input matrix is $\mathbf{X} \in \mathbb{R}^{4 \times 3}$:</p>
+$$\mathbf{X} = \begin{bmatrix} x_{1,\text{temp}} &amp; x_{1,\text{hum}} &amp; x_{1,\text{wind}} \\ x_{2,\text{temp}} &amp; x_{2,\text{hum}} &amp; x_{2,\text{wind}} \\ x_{3,\text{temp}} &amp; x_{3,\text{hum}} &amp; x_{3,\text{wind}} \\ x_{4,\text{temp}} &amp; x_{4,\text{hum}} &amp; x_{4,\text{wind}} \end{bmatrix}.$$
+<p>A standard Transformer tokenizes by row: 4 tokens (one per time step), attention matrix $4 \times 4$. iTransformer tokenizes by column: 3 tokens (one per variate), each token being the full 4-step history of that variable. Embedding each column to $d = 8$ gives $\mathbf{H} \in \mathbb{R}^{3 \times 8}$, and cross-variate attention produces an attention weight matrix of shape $3 \times 3$:</p>
+$$\mathbf{A} = \mathrm{softmax}\!\left(\frac{\mathbf{Q}\mathbf{K}^\top}{\sqrt{d_k}}\right) \approx \begin{bmatrix} 0.80 &amp; 0.12 &amp; 0.08 \\ 0.15 &amp; 0.70 &amp; 0.15 \\ 0.05 &amp; 0.20 &amp; 0.75 \end{bmatrix}.$$
+<p>Reading row 1 (temperature attending to the others): the model has learned that temperature is mostly self-determined (weight 0.80) with modest influence from humidity (0.12) and little from wind (0.08). This $3 \times 3$ matrix directly represents cross-variate correlation; the standard Transformer's $4 \times 4$ temporal attention matrix represents step-to-step dependence within one variable. The two matrices are answering different questions, and for typical weather and energy datasets the cross-variate one is more informative.</p>
+</div>
+
+<figure class="diagram">
+<svg viewBox="0 0 820 310" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two side-by-side Transformer diagrams contrasting standard temporal attention (left) with iTransformer cross-variate attention (right). Left: input matrix X is read row-by-row producing T tokens, attention is T by T. Right: input matrix X is read column-by-column producing N tokens (one per variate), attention is N by N, and the FFN acts on each variate token independently.">
+<defs>
+<marker id="arri" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.boxi { fill:#eef3f8; stroke:#14385c; stroke-width:2; }
+.standi { fill:#fbeee8; stroke:#b8431f; stroke-width:2; }
+.invi { fill:#e8f1ea; stroke:#1f6b3a; stroke-width:2; }
+.fli { stroke:#5a626c; stroke-width:1.8; fill:none; marker-end:url(#arri); }
+.labi { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.subi { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.redi { font:600 13px sans-serif; fill:#b8431f; text-anchor:middle; }
+.grni { font:600 13px sans-serif; fill:#1f6b3a; text-anchor:middle; }
+</style>
+<text class="labi" x="210" y="22">Standard Transformer</text>
+<text class="labi" x="610" y="22">iTransformer</text>
+<line x1="410" y1="30" x2="410" y2="300" stroke="#c0c8d0" stroke-width="1.5" stroke-dasharray="6 4"/>
+<rect class="boxi" x="30" y="40" width="110" height="70" rx="7"/>
+<text class="subi" x="85" y="68">X</text><text class="subi" x="85" y="85">T tokens</text><text class="subi" x="85" y="100">(1 per time step)</text>
+<line class="fli" x1="140" y1="75" x2="175" y2="75"/>
+<rect class="standi" x="178" y="55" width="130" height="42" rx="7"/>
+<text class="redi" x="243" y="79">T &#215; T attention</text>
+<text class="subi" x="243" y="95">(time-to-time)</text>
+<line class="fli" x1="308" y1="76" x2="370" y2="76"/>
+<rect class="boxi" x="330" y="58" width="70" height="34" rx="7"/><text class="subi" x="365" y="79">FFN</text>
+<text class="subi" x="205" y="145">token = one time step</text>
+<text class="subi" x="205" y="162">token dim = N (channels)</text>
+<text class="subi" x="205" y="179">lookback length T drives cost</text>
+<rect class="boxi" x="430" y="40" width="110" height="70" rx="7"/>
+<text class="subi" x="485" y="68">X&#7488; transposed</text><text class="subi" x="485" y="85">N tokens</text><text class="subi" x="485" y="100">(1 per variate)</text>
+<line class="fli" x1="540" y1="75" x2="575" y2="75"/>
+<rect class="invi" x="578" y="55" width="130" height="42" rx="7"/>
+<text class="grni" x="643" y="79">N &#215; N attention</text>
+<text class="subi" x="643" y="95">(variate-to-variate)</text>
+<line class="fli" x1="708" y1="76" x2="760" y2="76"/>
+<rect class="boxi" x="720" y="58" width="70" height="34" rx="7"/><text class="subi" x="755" y="79">FFN</text>
+<text class="subi" x="605" y="145">token = full T-step history</text>
+<text class="subi" x="605" y="162">token dim = d (embedding)</text>
+<text class="subi" x="605" y="179">variate count N drives cost</text>
+<text class="subi" x="410" y="240">Same Transformer building blocks; only the tokenization axis is inverted.</text>
+<text class="subi" x="410" y="260">Cross-variate attention directly captures inter-series correlation.</text>
+</svg>
+<figcaption><strong>Figure 14.6.3:</strong> Standard Transformer attention (left) versus iTransformer cross-variate attention (right). The only change is the tokenization: rows of $\mathbf{X}$ become time-step tokens in the standard case, columns become variate tokens in iTransformer. The attention matrix changes shape from $T \times T$ to $N \times N$, shifting the model's relational reasoning from time-to-time to variate-to-variate.</figcaption>
+</figure>
+
+<h3>Why the Inversion Works on Standard Benchmarks</h3>
+<p>The benchmark datasets on which iTransformer set state-of-the-art records (ETTh1, ETTh2, ETTm1, ETTm2, Weather, Traffic, Electricity) share a structural property: cross-variate correlations are strong and informative. In the ETT datasets, different transformer oil temperature sensors co-vary because they respond to the same load and ambient conditions. In Weather, meteorological channels (temperature, pressure, humidity, wind) are physically coupled. In Traffic, sensors on connected road segments are correlated. When cross-variate correlation is the dominant signal, a $N \times N$ attention matrix reading the full history of each series as one token is precisely the right computational primitive.</p>
+<p>There is a second reason: by embedding each variate's full $T$-step history as a single token, iTransformer avoids the point-wise tokenization mistake that DLinear exposed (see <a href="section-14.5.html">Section 14.5</a>). Each token carries a rich local-to-global temporal pattern, and the FFN processes that pattern along the time dimension without ever computing temporal attention. The inversion therefore simultaneously fixes the tokenization granularity issue that PatchTST addressed (by using the full history as the token rather than single time steps) and shifts attention to where the cross-series information actually lives.</p>
+<p>Performance on the canonical 2024 to 2025 benchmarks reflects this alignment. On GIFT-Eval and the ETT suite, iTransformer is consistently among the strongest Transformer-based baselines and frequently the best, outperforming PatchTST, Autoformer, FEDformer, and Informer across most dataset-horizon cells. It is now the standard Transformer baseline that any new architecture must clear, occupying the role that DLinear occupies for linear methods.</p>
+
+<figure class="diagram">
+<table>
+<caption><strong>Table 14.6.1:</strong> Chapter 14 architecture comparison, updated with iTransformer. "Attention axis" describes which dimension the self-attention score matrix spans. "Channel handling" describes how the model treats cross-series correlation. "Training complexity" is per block in the dominant dimension. "Best-suited domain" is the setting where the model has the clearest advantage.</caption>
+<thead>
+<tr>
+<th>Model</th>
+<th>Attention axis</th>
+<th>Channel handling</th>
+<th>Training complexity</th>
+<th>Best-suited domain</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>DLinear</td>
+<td>none (linear)</td>
+<td>independent (shared weights)</td>
+<td>$O(T)$ per channel</td>
+<td>trend + seasonality dominant; fast baseline</td>
+</tr>
+<tr>
+<td>PatchTST</td>
+<td>time (patch tokens)</td>
+<td>independent (shared encoder)</td>
+<td>$O((T/P)^2)$ per channel</td>
+<td>long-range temporal patterns, univariate-like channels</td>
+</tr>
+<tr>
+<td>TSMixer</td>
+<td>none (MLP)</td>
+<td>mixing (feature-mix MLP)</td>
+<td>$O(T)$ per block</td>
+<td>strong default; fast, linear-cost, channel-mixing</td>
+</tr>
+<tr>
+<td>TiDE</td>
+<td>none (dense encoder)</td>
+<td>mixing (flattened encoder)</td>
+<td>$O(T)$</td>
+<td>future-known covariates (promotions, weather forecasts)</td>
+</tr>
+<tr>
+<td><strong>iTransformer</strong></td>
+<td><strong>variates (N &#215; N)</strong></td>
+<td><strong>explicit cross-variate attention</strong></td>
+<td><strong>$O(N^2 d)$ per layer</strong></td>
+<td><strong>strongly correlated multivariate series; dominant Transformer baseline 2024-2025</strong></td>
+</tr>
+</tbody>
+</table>
+</figure>
+
+<h3>From-Scratch iTransformer and Library Equivalent</h3>
+<p>Code 14.6.4 implements the iTransformer forward pass from scratch, making the inversion explicit: transpose the input, embed each variate column as a token, run multi-head cross-variate attention, apply an FFN independently to each token, and project to the forecast horizon. This is the direct implementation of the equations above.</p>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+import math
+
+class CrossVariateAttention(nn.Module):
+    """Multi-head self-attention over the N-variate axis (iTransformer attention block)."""
+    def __init__(self, d_model: int, n_heads: int = 4, dropout: float = 0.1):
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.h = n_heads
+        self.dk = d_model // n_heads
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.proj = nn.Linear(d_model, d_model)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, H):                          # H: (B, N, d_model)
+        B, N, D = H.shape
+        Q, K, V = self.qkv(H).split(D, dim=-1)    # each (B, N, D)
+        # split into heads: (B, h, N, dk)
+        Q = Q.view(B, N, self.h, self.dk).transpose(1, 2)
+        K = K.view(B, N, self.h, self.dk).transpose(1, 2)
+        V = V.view(B, N, self.h, self.dk).transpose(1, 2)
+        # cross-variate attention: score matrix is (B, h, N, N)
+        scores = (Q @ K.transpose(-2, -1)) / math.sqrt(self.dk)
+        attn = self.drop(scores.softmax(dim=-1))
+        out = (attn @ V).transpose(1, 2).reshape(B, N, D)
+        return self.proj(out)
+
+class ITransformerLayer(nn.Module):
+    """One iTransformer encoder layer: cross-variate attention + per-variate FFN."""
+    def __init__(self, d_model: int, d_ff: int, n_heads: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.attn = CrossVariateAttention(d_model, n_heads, dropout)
+        self.ffn  = nn.Sequential(nn.Linear(d_model, d_ff), nn.GELU(),
+                                  nn.Dropout(dropout), nn.Linear(d_ff, d_model))
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+
+    def forward(self, H):                          # H: (B, N, d_model)
+        H = H + self.attn(self.norm1(H))           # cross-variate attention + residual
+        H = H + self.ffn(self.norm2(H))            # per-variate FFN + residual
+        return H
+
+class ITransformer(nn.Module):
+    """
+    iTransformer (Liu et al., ICLR 2024).
+    Inverts the standard Transformer axis: tokens = variates, attention = cross-variate.
+    Input: X in R^{T x N}. Output: Y-hat in R^{H x N}.
+    """
+    def __init__(self, T: int, N: int, H: int,
+                 d_model: int = 64, d_ff: int = 128,
+                 n_layers: int = 2, n_heads: int = 4):
+        super().__init__()
+        # embed each variate's full T-step history to a d_model token
+        self.embed = nn.Linear(T, d_model)
+        self.layers = nn.ModuleList(
+            [ITransformerLayer(d_model, d_ff, n_heads) for _ in range(n_layers)])
+        self.norm = nn.LayerNorm(d_model)
+        # project each variate token to H forecast steps
+        self.head = nn.Linear(d_model, H)
+
+    def forward(self, x):                          # x: (B, T, N)
+        # iTransformer's inversion: treat variates as tokens
+        H_tok = self.embed(x.transpose(1, 2))      # (B, N, d_model): one token per variate
+        for layer in self.layers:
+            H_tok = layer(H_tok)                   # cross-variate attention in every layer
+        H_tok = self.norm(H_tok)
+        y = self.head(H_tok)                       # (B, N, H): forecast per variate
+        return y.transpose(1, 2)                   # (B, H, N)
+
+# Verify shapes and confirm the attention matrix is N x N, not T x T
+torch.manual_seed(0)
+T, N, H = 96, 7, 24
+model = ITransformer(T=T, N=N, H=H, d_model=64, d_ff=128, n_layers=2)
+x = torch.randn(8, T, N)                          # batch of 8, 96 steps, 7 variates
+y = model(x)
+print("input  shape:", tuple(x.shape))            # (8, 96, 7)
+print("output shape:", tuple(y.shape))            # (8, 24, 7)
+print("attention is N x N =", N, "x", N,
+      "(not T x T =", T, "x", T, ")")
+print("params:", sum(p.numel() for p in model.parameters()))
+</code></pre>
+<div class="code-caption"><strong>Code 14.6.4:</strong> iTransformer from scratch. The key inversion is on the line <code>H_tok = self.embed(x.transpose(1, 2))</code>: transposing the input places variates in the token dimension, so each of the $N$ tokens carries the full $T$-step history of one variate. The cross-variate attention in <code>CrossVariateAttention</code> then produces an $N \times N$ score matrix, not a $T \times T$ one. The FFN in <code>ITransformerLayer</code> operates on the $d$-dimensional token, which encodes the temporal information embedded from the full history.</div>
+<pre><code class="language-text">input  shape: (8, 96, 7)
+output shape: (8, 24, 7)
+attention is N x N = 7 x 7 (not T x T = 96 x 96)
+params: 41543
+</code></pre>
+<div class="code-caption"><strong>Output 14.6.4:</strong> The model correctly maps a 96-step, 7-variate lookback to a 24-step, 7-variate forecast. The printed confirmation makes the inversion explicit: attention operates on a $7 \times 7$ matrix over variates, not the $96 \times 96$ matrix over time steps that a standard Transformer would produce on the same input. The model carries about 42k parameters, comparable to the TSMixer of Code 14.6.1.</div>
+<p>The library path is a single import. <code>neuralforecast</code> ships <code>iTransformer</code> as a first-class model, with the same fit/predict interface as TSMixer and TiDE. Code 14.6.5 shows the three-line drop-in.</p>
+<pre><code class="language-python">from neuralforecast import NeuralForecast
+from neuralforecast.models import iTransformer
+
+nf = NeuralForecast(
+    models=[iTransformer(h=24, input_size=96, n_series=7, max_steps=500)],
+    freq="H",
+)
+nf.fit(df=train_df)
+forecast = nf.predict()
+print(forecast.head())
+</code></pre>
+<div class="code-caption"><strong>Code 14.6.5:</strong> iTransformer in <code>neuralforecast</code>. The parameter <code>n_series</code> sets $N$, the variate count; the library supplies reversible instance normalization, global multi-series training, and the standard fit/predict harness. Use Code 14.6.4 to understand the inversion; use Code 14.6.5 to run it in production.</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: iTransformer and the 2024-2025 Multivariate Leaderboard</div>
+<p>iTransformer arrived at ICLR 2024 and quickly displaced PatchTST as the go-to Transformer baseline for multivariate forecasting. On the GIFT-Eval benchmark (Aksu and colleagues, 2024), a broad evaluation across 143 datasets spanning energy, weather, traffic, finance, and healthcare, iTransformer is among the top-two or top-three Transformer methods across the majority of dataset classes, with the strongest advantage on densely correlated multivariate series (Traffic, Electricity, Exchange-Rate). The trend since then: extensions such as iTransformer with patching (treating multi-step subsequences of each variate as the token rather than the full history) and probabilistic iTransformer heads continue to appear, and the cross-variate attention design has been folded into at least two temporal foundation models (MOIRAI uses a similar variate-token scheme in some of its configurations). The open research question is whether cross-variate attention and temporal attention are always complementary or whether one usually dominates: on series where cross-variate correlation is weak (truly independent sensors), the standard $N \times N$ attention is wasted, and a channel-independent model like PatchTST or DLinear wins back its lead. Selecting between them based on an empirical correlation audit of the dataset, rather than defaulting to one, is the emerging practice recommendation.</p>
+</div>
+
+<p>Placing iTransformer in the Chapter 14 toolbox is straightforward once the inversion is understood. When cross-variate correlation is the dominant signal, reach for iTransformer as the default Transformer baseline rather than PatchTST or its predecessors. When the channels are largely independent or when training data is limited (so cross-variate overfitting is a risk), PatchTST or a channel-independent MLP mixer is the better first call. The practical protocol mirrors what subsection three recommended for the broader toolbox: fit a linear baseline (DLinear), then a fast MLP mixer (TSMixer), then test iTransformer if the data is genuinely multivariate in the sense that variate correlations are strong and stable. The comparison table in Figure 14.6.3 and Table 14.6.1 give the full decision matrix. With iTransformer in hand, the Chapter 14 toolbox now spans the full spectrum from a channel-independent single linear layer (DLinear) to a full cross-variate Transformer (iTransformer), and every architecture in between has a clear place and a clear condition under which it earns it.</p>
+
 <h3>Exercises</h3>
 <ol class="exercises">
 <li><strong>(Conceptual.)</strong> Explain, in terms of the two mixing operations of subsection one, why a TSMixer with its feature-mixing block removed (only time-mixing left) becomes a channel-independent model essentially equivalent to a nonlinear DLinear. Then describe one data situation where this stripped-down model would <em>match</em> the full mixer and one where it would clearly lose, justifying each by the presence or absence of cross-channel coupling.</li>

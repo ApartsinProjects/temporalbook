@@ -256,6 +256,124 @@ adv-trained: clean=0.972  PGD@0.05=0.829
 <p>The from-scratch FGSM and PGD of Code 33.2.2 ran about 18 lines of gradient, sign, and projection bookkeeping; <code>torchattacks</code> collapses each to a one-line constructor (<code>torchattacks.FGSM(model, eps=...)</code>, <code>torchattacks.PGD(model, eps=..., alpha=..., steps=...)</code>) and exposes the strong modern attacks (AutoAttack, C&amp;W, DeepFool) and an <code>atk.save</code> data pipeline behind the same call, handling the gradient computation, the per-step projection, random restarts, and batching internally. For the defense side, <code>torchattacks</code> integrates directly into a training loop (generate <code>atk(x, y)</code> and train on it), and the broader ecosystem (the adversarial-robustness toolboxes and <code>foolbox</code>) adds certified defenses and standardized robustness benchmarks. The line you save is not just length: the library's attacks are battle-tested, so you are measuring robustness against a strong adversary rather than against a possibly buggy hand-rolled one.</p>
 </div>
 
+<h2>7. Mechanistic Interpretability for Temporal Transformers <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Saliency maps and attention visualizations, the subjects of this section, answer the question "which input timesteps influenced this prediction most?" That is a <em>correlational</em> answer: it tells you what the model attended to, not what computation it performed to get there. Mechanistic interpretability asks the sharper question: what algorithm does each attention head implement? Not "head 3 attends to lag-7" but "head 3 computes a seasonal-spike detector that passes a signal only when the current value exceeds a rolling maximum by more than two standard deviations." Answering the algorithmic question requires tools beyond gradient attribution: activation patching, sparse autoencoders, and causal attention graphs. Applied to temporal Transformers, these tools reveal a surprisingly structured internal organization in which different heads specialise for different temporal components (trend, seasonality, residual) and pass signals to each other in a directed causal graph.</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Activation Patching in Time-Series Transformers</div>
+<p>arXiv 2511.21514 (2024) adapts the activation-patching technique developed for language models to time-series Transformers, constructing causal graphs that identify which heads are causally responsible for seasonal versus trend versus residual detection. The key finding is that the causal graph is not flat: seasonal-detector heads in early layers feed their outputs to anomaly-decision heads in later layers through a small number of high-weight edges, and ablating any one of those edges collapses the model's ability to flag anomalies even when the global attention weights look unchanged. This structural sparsity is the mechanistic result that saliency maps cannot reveal.</p>
+</div>
+
+<h3>7.1 Activation Patching: From Correlation to Causation</h3>
+<p>The standard gradient saliency map computes $\partial \hat{y} / \partial x_t$ and treats large magnitude as evidence that timestep $t$ is important. But importance in this sense is correlational: a large gradient at $t$ means the output is sensitive to $x_t$ in the neighborhood of the current input, not that the model uses $x_t$ through any particular computational pathway. Activation patching makes the causal claim precise.</p>
+
+<p>The setup requires two inputs: a <em>clean</em> input $\mathbf{x}^*$ on which the model gives the correct output, and a <em>corrupted</em> input $\tilde{\mathbf{x}}$ on which the model fails. For a seasonal anomaly detector, the clean input is a time series with a genuine seasonal spike and the corrupted input has that spike replaced by the seasonal mean (so the model should no longer flag an anomaly but does not see that it was patched). The patching experiment then proceeds layer by layer: run the corrupted input through the model, but at layer $\ell$ and head $h$, <em>replace</em> the activation with the activation computed on the clean input, and measure the logit difference $\Delta_{\ell,h} = \hat{y}^{\text{patched}} - \hat{y}^{\text{corrupted}}$. A large positive $\Delta_{\ell,h}$ means layer $\ell$, head $h$ is <em>causally</em> responsible for the correct detection: restoring its clean activation restores the correct output. Formally:</p>
+
+$$\Delta_{\ell,h} = f_\theta\!\left(\tilde{\mathbf{x}}\,\Big|\,\mathbf{a}_{\ell,h} \leftarrow \mathbf{a}^*_{\ell,h}\right)[\hat{y}^*] - f_\theta(\tilde{\mathbf{x}})[\hat{y}^*]$$
+
+<p>where $\mathbf{a}^*_{\ell,h}$ is the clean activation at layer $\ell$, head $h$, and the outer expression extracts the logit for the correct class $\hat{y}^*$. Running this experiment for every $(\ell, h)$ pair produces a heatmap of causal responsibility that is qualitatively different from the gradient heatmap: it tells you which computation, not which input, matters.</p>
+
+<h3>7.2 Sparse Autoencoders for the Residual Stream</h3>
+<p>A Transformer's residual stream, the vector that accumulates across layers, is a superposition of many simultaneously active features. Standard dimensionality-reduction techniques (PCA, t-SNE) compress this representation but do not yield interpretable features because real features are sparse in the residual basis, not in the principal-component basis. Sparse autoencoders (SAEs) learn a dictionary of $K \gg d$ features (typically $K \approx 100{,}000$ for $d = 512$) such that any residual-stream vector $\mathbf{r} \in \mathbb{R}^d$ is approximated as a sparse linear combination:</p>
+
+$$\mathbf{r} \approx \sum_{k=1}^{K} \alpha_k \mathbf{e}_k, \quad \|\boldsymbol{\alpha}\|_0 \ll K$$
+
+<p>where the $\mathbf{e}_k$ are learned dictionary atoms and $\boldsymbol{\alpha}$ is a sparse coefficient vector produced by an encoder $\mathbf{z} = \text{ReLU}(W_\text{enc}\mathbf{r} + \mathbf{b}_\text{enc})$ trained with an $L_1$ sparsity penalty. For temporal models, training an SAE on the residual stream of a time-series Transformer and then manually inspecting the maximally-activating sequences for each dictionary atom reveals interpretable temporal features: one atom fires on seasonal spikes, another on trend reversals, a third on lag-7 autocorrelation signals, a fourth on missing-value boundaries. The dictionary provides a human-readable vocabulary for what the model's internal representations encode.</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: SAE Features Are Not Neurons</div>
+<p>Individual neurons in a Transformer's residual stream are polysemantic: each neuron activates for multiple unrelated features (a phenomenon called superposition). SAEs resolve this by projecting the residual stream into an overcomplete basis where each basis vector is monosemantic: it activates for one interpretable concept. For temporal models this matters practically: a "lag-7 autocorrelation" SAE feature can be ablated to measure how much the model's weekly-seasonality forecasts depend on that specific signal, a test that is impossible to run on a polysemantic neuron.</p>
+</div>
+
+<h3>7.3 Causal Attention Graphs</h3>
+<p>Activation patching identifies which heads are causally important; combining patching results across all head pairs produces a directed causal attention graph. Define a directed edge from head $(\ell, h)$ to head $(\ell', h')$ if patching $(\ell, h)$'s output significantly changes the causal contribution $\Delta_{\ell',h'}$ of head $(\ell', h')$: i.e., head $(\ell, h)$'s computation is an input to head $(\ell', h')$'s computation. Formally, using path patching (an extension of activation patching that holds all other activations fixed while routing a single residual-stream path):</p>
+
+$$E_{(\ell,h)\to(\ell',h')} = \Delta_{\ell',h'}\!\Big|_{\mathbf{a}_{\ell,h} \text{ patched to clean}}$$
+
+<p>For time-series classifiers and anomaly detectors, arXiv 2511.21514 reports a consistent graph structure: a small number of early-layer heads detect specific temporal components (a seasonal detector, a trend detector, a residual-variance detector), and their outputs flow through a compact set of edges to late-layer heads that aggregate the components into a classification decision. The anomaly-decision heads do not directly attend to raw input; they receive pre-processed temporal-component signals from the detector heads. This is the algorithmic story that neither attention weights nor gradient saliency maps could tell.</p>
+
+<h3>7.4 Code: Activation Patching Loop in PyTorch</h3>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+from copy import deepcopy
+
+def activation_patching_experiment(model, x_clean, x_corrupt, target_class,
+                                   num_layers, num_heads):
+    """
+    Run activation patching across all (layer, head) pairs.
+    Returns delta[L, H]: causal importance of each head.
+    model: a Transformer with model.blocks[l].attn as the attention module
+    x_clean, x_corrupt: (B, T, C) tensors, B=1 for simplicity
+    target_class: int, the correct class index
+    """
+    model.eval()
+    delta = torch.zeros(num_layers, num_heads)
+
+    # Cache clean activations for every layer and head
+    clean_activations = {}
+
+    hooks = []
+    def make_cache_hook(layer_idx, head_idx):
+        def hook(module, input, output):
+            # output: (B, T, d_head) per head — split if needed
+            clean_activations[(layer_idx, head_idx)] = output.detach().clone()
+        return hook
+
+    # Register forward hooks on each attention head output
+    for l in range(num_layers):
+        for h in range(num_heads):
+            hook = model.blocks[l].attn.heads[h].register_forward_hook(
+                make_cache_hook(l, h)
+            )
+            hooks.append(hook)
+
+    with torch.no_grad():
+        logits_clean = model(x_clean)
+        baseline_score = logits_clean[0, target_class].item()
+
+    for hook in hooks:
+        hook.remove()
+
+    # Corrupted baseline (no patching)
+    with torch.no_grad():
+        logits_corrupt = model(x_corrupt)
+    corrupt_score = logits_corrupt[0, target_class].item()
+
+    # Patch each (l, h) in turn: replace corrupted activation with clean one
+    for l in range(num_layers):
+        for h in range(num_heads):
+            patched_model = deepcopy(model)
+            clean_act = clean_activations[(l, h)]
+
+            def make_patch_hook(act):
+                def hook(module, input, output):
+                    return act  # replace with clean activation
+                return hook
+
+            ph = patched_model.blocks[l].attn.heads[h].register_forward_hook(
+                make_patch_hook(clean_act)
+            )
+            with torch.no_grad():
+                logits_patched = patched_model(x_corrupt)
+            ph.remove()
+
+            patched_score = logits_patched[0, target_class].item()
+            delta[l, h] = patched_score - corrupt_score
+
+    return delta  # large positive = causally important head
+
+# Example usage
+# delta = activation_patching_experiment(model, x_clean, x_corrupt,
+#                                        target_class=1, num_layers=6,
+#                                        num_heads=8)
+# print("Most causally important head:", delta.argmax().item())
+# Layer, head = divmod(delta.argmax().item(), 8)
+</code></pre>
+<div class="code-caption"><strong>Code 33.2.5:</strong> Activation patching loop for a temporal Transformer. For each (layer, head) pair, the corrupted input's activation is replaced with the clean activation and the logit-difference on the target class is recorded. Large positive values identify heads that are causally responsible for the correct prediction, going beyond what gradient saliency can reveal.</div>
+
+<p>Mechanistic interpretability sits at the frontier of what is operationally possible today: the tools exist, the results are reproducible, and the causal graph structure they reveal has direct consequences for model editing, pruning, and robustness. A head identified as causally essential for seasonal-anomaly detection is a head that an adversary can target specifically; knowing the graph structure of your model's internal computation is therefore not only an interpretability result but a security input. That link between interpretability and robustness is the bridge to the next section, where we evaluate how fragile the large pretrained temporal foundation models, the very models that mechanistic interpretability is now being applied to, turn out to be under adversarial attack.</p>
+
 <h2>6. Exercises</h2>
 <p>Three exercises, one of each type, building directly on this section. Selected solutions appear in <a href="../../appendices/G-solutions/index.html">Appendix G</a>.</p>
 <div class="callout exercise">

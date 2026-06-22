@@ -286,6 +286,163 @@ gail.train(total_timesteps=200_000)                 # full adversarial training,
 <p>The from-scratch GAIL of Code 27.4.1 and 27.4.2 ran roughly 60 lines of discriminator, rollout, reward, and policy-gradient bookkeeping. The <code>imitation</code> library (Code 27.4.3) collapses all of it to one <code>GAIL(...).train(...)</code> call, and swapping in <code>AIRL</code> for transferable reward recovery is a one-word change of the import and class. The library handles internally: the discriminator architecture and its training schedule, the $-\log(1-D)$ reward wiring, the PPO or TRPO inner loop from Stable-Baselines3, observation normalization, and the alternating-update bookkeeping that keeps the adversarial game from diverging. The same library exposes behavioral cloning (<code>imitation.algorithms.bc</code>) from <a href="section-27.3.html">Section 27.3</a> and DAgger, so the whole imitation family lives behind one consistent interface; reach for it for any real imitation project, and keep the from-scratch version for understanding what the call is doing.</p>
 </div>
 
+<h2>6. Diffusion Policy: Generating Actions via Denoising <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Behavioral cloning and DAgger, the subjects of <a href="section-27.3.html">Section 27.3</a>, share a structural limitation that no amount of additional data can cure: they must output a single deterministic (or unimodal) action for each observation. This is fine when the expert is consistent, but human demonstrations are rarely consistent across every situation. A human teleoperation dataset for a pick-and-place task will contain trials where the operator grasped from the left and trials where the same operator grasped from the right, depending on attention, hand fatigue, and the exact starting pose. Behavioral cloning, confronted with this bimodal distribution, finds the average: it predicts a grasp point halfway between left and right, which is wrong for both modes and often physically impossible. The result is not slow learning; it is principled failure at a category of tasks where multimodal demonstrations are unavoidable. Diffusion Policy (Chi et al., 2023; Chi et al., IJRR 2025) solves this by replacing the single action prediction with a generative process that can represent the full multimodal distribution of expert actions.</p>
+
+<h3>The Core Idea: Actions as Samples from a Diffusion Process</h3>
+<p>Standard behavioral cloning maps an observation $o$ to a single action $a = \pi_\theta(o)$. Diffusion Policy instead treats action generation as a denoising problem. The policy is not a function that outputs one action; it is a score network that learns to iteratively refine Gaussian noise into a clean action drawn from the true conditional distribution $p(a \mid o)$. Because the full distribution is modeled (not just its mean), the policy can represent configurations where expert demonstrations cluster around several distinct action modes, and each inference call produces a coherent sample from whichever mode is appropriate given the noise trajectory.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Averaging Kills Multimodal Distributions</div>
+<p>If demonstrations show "go left 50% of the time and go right 50% of the time", behavioral cloning minimizes mean squared error and learns "go straight 100% of the time", which crashes into the wall. Diffusion Policy learns the distribution and samples from it, producing "go left" or "go right" with equal probability, both of which reach the goal. The improvement is not marginal: on the RoboMimic benchmark's hardest "Can" manipulation task, Diffusion Policy (CNN-based) achieves 63% task success versus behavioral cloning's 22%, a factor of three from this single architectural change.</p>
+</div>
+
+<h3>Training: The Noise Prediction Objective</h3>
+<p>Diffusion Policy adopts the denoising diffusion probabilistic model (DDPM) training formulation. Let $a_0$ denote a clean expert action from the demonstration dataset and let $\bar{\alpha}_k = \prod_{i=1}^{k} \alpha_i$ be the cumulative noise schedule at diffusion step $k \in \{0, 1, \dots, K\}$. The forward noising process adds Gaussian noise to a clean action according to</p>
+$$a_k = \sqrt{\bar{\alpha}_k}\, a_0 + \sqrt{1 - \bar{\alpha}_k}\, \varepsilon, \qquad \varepsilon \sim \mathcal{N}(0, I).$$
+<p>A neural network $\varepsilon_\theta(a_k, o, k)$ is trained to predict the noise $\varepsilon$ that was added, given the noisy action $a_k$, the current observation $o$, and the noise level $k$. The training objective is the simple mean squared noise prediction error:</p>
+$$\mathcal{L}(\theta) = \mathbb{E}_{a_0 \sim \mathcal{D},\, \varepsilon \sim \mathcal{N}(0,I),\, k \sim \text{Uniform}(1,K)} \Big[ \big\| \varepsilon - \varepsilon_\theta(a_k, o, k) \big\|^2 \Big].$$
+<p>This is identical to the score matching objective used in image diffusion models (Ho et al., 2020), applied to the action space rather than the pixel space. The network never explicitly models the distribution $p(a \mid o)$; instead it models the score (the gradient of the log-density), which is sufficient to generate samples via denoising.</p>
+
+<h3>Inference: DDPM and DDIM Denoising</h3>
+<p>To generate an action at deployment time, Diffusion Policy starts from pure Gaussian noise $a_K \sim \mathcal{N}(0, I)$ and iteratively denoises for $K$ steps. Under the DDPM schedule, each denoising step is</p>
+$$a_{k-1} = \frac{1}{\sqrt{\alpha_k}} \left( a_k - \frac{1 - \alpha_k}{\sqrt{1 - \bar{\alpha}_k}}\, \varepsilon_\theta(a_k, o, k) \right) + \sigma_k\, z, \qquad z \sim \mathcal{N}(0, I),$$
+<p>where $\sigma_k^2$ is the variance of the reverse step, typically set to $\beta_k = 1 - \alpha_k$ or the geometric interpolation of Ho et al. (2020). DDPM requires $K = 100$ denoising steps, which at 10 ms per network forward pass gives 1 s of inference latency, too slow for real-time robot control. The denoising diffusion implicit model (DDIM, Song et al., 2020) reduces this to $K = 10$ deterministic steps with no stochasticity ($z = 0$ and the update becomes a direct estimate of $a_0$ followed by re-noising), achieving comparable action quality at one-tenth the latency. Chi et al. (2023) use DDIM at $K = 10$ for all real-robot experiments, achieving 10 Hz control.</p>
+
+<h3>Architecture: U-Net and Transformer Noise Predictors</h3>
+<p>Because robot policies often predict an entire short horizon of future actions rather than a single step, $a_0$ is an <em>action chunk</em> of shape $(H, d_a)$ where $H$ is the prediction horizon and $d_a$ is the action dimension. The noise predictor $\varepsilon_\theta$ must operate over this temporal dimension. Two architectures are standard. The first is a 1D convolutional U-Net applied along the time axis of the action sequence, adapted from Janner et al.'s Diffuser (2022); skip connections across encoder and decoder resolutions help the network predict structured noise patterns. The second is a Transformer operating on the $H$ action tokens with the observation $o$ injected as cross-attention context, called Diffusion Policy Transformer (DP-T); the Transformer variant is slightly stronger on tasks requiring long-range temporal coherence but is more expensive to train.</p>
+<p>The action chunking strategy deserves emphasis. Rather than predicting one action and replanning at every step, Diffusion Policy predicts $H = 16$ future actions simultaneously and executes the first 8 before replanning. This halves the number of denoising calls and, more importantly, forces the diffusion process to generate <em>temporally consistent</em> action sequences: all 16 steps are denoised together, so the policy cannot produce an incoherent action at step 5 while recovering at step 6. Temporal consistency is a property that no single-step policy can have, and it is a structural advantage of the chunk formulation.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Diff-DAgger and Online Correction</div>
+<p>A natural limitation of Diffusion Policy trained purely offline is that it cannot recover when the robot reaches a state outside the demonstration support, the same distribution-shift problem that motivated DAgger in <a href="section-27.3.html">Section 27.3</a>. Diff-DAgger (Ze et al., 2024) addresses this by combining Diffusion Policy with the DAgger correction loop: after each deployment rollout, the policy estimates its own uncertainty by measuring the variance across multiple denoising samples from the same observation, queries a human expert for correction labels precisely at the high-variance states, and adds those expert-labeled states to the training set before fine-tuning. Because the diffusion process is generative, disagreement across samples is a principled uncertainty signal, giving Diff-DAgger a natural "when to ask" criterion that standard DAgger lacks. On several manipulation benchmarks, Diff-DAgger requires 40-60% fewer expert interventions than DAgger with behavioral cloning to reach the same task success rate.</p>
+</div>
+
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Three-Step DDIM Denoising for a 2D Action</div>
+<p>Consider a robot with a 2D end-effector action $a = (x, y)$. The observation $o$ shows a goal object at approximately $(0.3, 0.3)$. We run DDIM denoising with $K = 3$ steps (a minimal illustration; real policies use 10-100 steps). The noise schedule gives $\bar{\alpha}_3 = 0.01$, $\bar{\alpha}_2 = 0.10$, $\bar{\alpha}_1 = 0.50$, $\bar{\alpha}_0 = 1.0$.</p>
+<p><strong>Start:</strong> $a_3 = (1.2,\,-0.8)$ sampled from $\mathcal{N}(0, I)$.</p>
+<p><strong>Step 3 to 2:</strong> The noise predictor, conditioned on $o$ (goal at $(0.3, 0.3)$), estimates the noise as $\varepsilon_\theta(a_3, o, 3) \approx (0.92,\,-1.08)$. DDIM computes an estimate of the clean action: $\hat{a}_0 = (a_3 - \sqrt{1-\bar{\alpha}_3}\,\varepsilon_\theta) / \sqrt{\bar{\alpha}_3} \approx (0.32,\,0.29)$. Re-noising to level 2: $a_2 = \sqrt{\bar{\alpha}_2}\,\hat{a}_0 + \sqrt{1-\bar{\alpha}_2}\,\varepsilon_\theta \approx (0.93,\,-0.65)$.</p>
+<p><strong>Step 2 to 1:</strong> Updated noise estimate $\varepsilon_\theta(a_2, o, 2) \approx (0.61,\,-0.98)$. New clean estimate $\hat{a}_0 \approx (0.31,\,0.30)$. Re-noising to level 1: $a_1 \approx (0.50,\,0.09)$.</p>
+<p><strong>Step 1 to 0:</strong> Final noise estimate $\varepsilon_\theta(a_1, o, 1) \approx (0.28,\,-0.30)$. Final clean action: $a_0 \approx (0.31,\,0.28)$.</p>
+<p>The denoised action $(0.31, 0.28)$ is close to the goal location $(0.3, 0.3)$. Note that the intermediate noisy samples $a_3, a_2, a_1$ look nothing like the final action; the diffusion process extracts the signal from noise over multiple steps, using the observation to guide each refinement. A second independent denoising run starting from different noise would produce a slightly different action $(0.29, 0.32)$ from the same distribution, illustrating the stochasticity that allows Diffusion Policy to represent multimodal expert behavior.</p>
+</div>
+
+<h3>Minimal Implementation: Training and Sampling</h3>
+<p>The following code builds the essential Diffusion Policy training loop and DDIM sampler from scratch in PyTorch. The noise predictor is a simple 1D U-Net over the action sequence dimension; real implementations add FiLM conditioning or cross-attention for the observation, but the noise prediction and denoising logic is identical.</p>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+import numpy as np
+
+# ---- Noise schedule ----
+def cosine_beta_schedule(T, s=0.008):
+    """Cosine schedule from Nichol and Dhariwal (2021)."""
+    t = torch.linspace(0, T, T + 1)
+    alpha_bar = torch.cos(((t / T) + s) / (1 + s) * np.pi / 2) ** 2
+    alpha_bar = alpha_bar / alpha_bar[0]
+    betas = 1 - alpha_bar[1:] / alpha_bar[:-1]
+    return betas.clamp(0, 0.999)
+
+T = 100                                    # DDPM steps; use 10 for DDIM
+betas = cosine_beta_schedule(T)
+alphas = 1.0 - betas
+alpha_bars = torch.cumprod(alphas, dim=0)  # cumulative product
+
+# ---- Minimal 1D U-Net noise predictor ----
+# Obs is concatenated as a constant channel; real models use cross-attention.
+class DiffusionPolicy1DUNet(nn.Module):
+    def __init__(self, act_dim=2, obs_dim=16, H=16, hidden=128):
+        super().__init__()
+        self.H = H
+        inp = act_dim + obs_dim + 1    # action + obs + normalized timestep
+        self.enc1 = nn.Conv1d(inp, hidden, 3, padding=1)
+        self.enc2 = nn.Conv1d(hidden, hidden * 2, 3, stride=2, padding=1)
+        self.mid  = nn.Conv1d(hidden * 2, hidden * 2, 3, padding=1)
+        self.dec1 = nn.ConvTranspose1d(hidden * 4, hidden, 4, stride=2, padding=1)
+        self.dec2 = nn.Conv1d(hidden * 2, act_dim, 3, padding=1)
+        self.act  = nn.Mish()
+
+    def forward(self, a_k, obs_embed, k_norm):
+        # a_k: (B, H, act_dim); obs_embed: (B, obs_dim); k_norm: (B,)
+        B, H, A = a_k.shape
+        obs_tiled = obs_embed[:, :, None].expand(B, -1, H)   # (B, obs_dim, H)
+        k_tiled   = k_norm[:, None, None].expand(B, 1, H)     # (B, 1, H)
+        x = torch.cat([a_k.permute(0,2,1), obs_tiled, k_tiled], dim=1)  # (B, C, H)
+        e1 = self.act(self.enc1(x))
+        e2 = self.act(self.enc2(e1))
+        m  = self.act(self.mid(e2))
+        d1 = self.act(self.dec1(torch.cat([m, e2], dim=1)))
+        eps_pred = self.dec2(torch.cat([d1, e1], dim=1))      # (B, act_dim, H)
+        return eps_pred.permute(0, 2, 1)                       # (B, H, act_dim)
+
+act_dim, obs_dim, H = 2, 16, 16
+model = DiffusionPolicy1DUNet(act_dim=act_dim, obs_dim=obs_dim, H=H)
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+
+# ---- Training step ----
+def diffusion_policy_train_step(a0_batch, obs_batch):
+    """
+    a0_batch: (B, H, act_dim) clean action chunks from demonstrations
+    obs_batch: (B, obs_dim)    observation embeddings
+    """
+    B = a0_batch.shape[0]
+    k = torch.randint(1, T + 1, (B,))          # random diffusion step per sample
+    eps = torch.randn_like(a0_batch)            # target noise
+    ab  = alpha_bars[k - 1].view(B, 1, 1)      # (B, 1, 1) for broadcasting
+    a_k = torch.sqrt(ab) * a0_batch + torch.sqrt(1 - ab) * eps   # noisy action
+    k_norm = k.float() / T                      # normalize to [0, 1]
+    eps_pred = model(a_k, obs_batch, k_norm)    # noise prediction
+    loss = ((eps - eps_pred) ** 2).mean()       # MSE noise loss
+    optimizer.zero_grad(); loss.backward(); optimizer.step()
+    return loss.item()
+
+# ---- DDIM sampling (10-step deterministic inference) ----
+@torch.no_grad()
+def ddim_sample(obs_batch, n_steps=10):
+    """Sample an action chunk conditioned on obs_batch using DDIM."""
+    B = obs_batch.shape[0]
+    timesteps = torch.linspace(T, 0, n_steps + 1).long().clamp(0, T - 1)
+    a = torch.randn(B, H, act_dim)              # start from pure noise
+    for i in range(n_steps):
+        k     = timesteps[i]
+        k_prev = timesteps[i + 1]
+        k_norm = torch.full((B,), k.item() / T)
+        ab_k  = alpha_bars[k]
+        ab_kp = alpha_bars[k_prev] if k_prev > 0 else torch.tensor(1.0)
+        eps_pred = model(a, obs_batch, k_norm)
+        a0_hat = (a - torch.sqrt(1 - ab_k) * eps_pred) / torch.sqrt(ab_k)
+        a0_hat = a0_hat.clamp(-1, 1)            # clip to valid action range
+        # DDIM update: deterministic (no stochastic z term)
+        a = torch.sqrt(ab_kp) * a0_hat + torch.sqrt(1 - ab_kp) * eps_pred
+    return a                                    # (B, H, act_dim): predicted action chunk
+</code></pre>
+<div class="code-caption"><strong>Code 27.4.4:</strong> Minimal Diffusion Policy training loop and DDIM sampler from scratch. <code>diffusion_policy_train_step</code> adds noise at a random level and trains the 1D U-Net to predict it; <code>ddim_sample</code> iteratively denoises Gaussian noise into a full action chunk using 10 deterministic DDIM steps. The core loss is a plain MSE; the architecture complexity lives in how the observation is injected, not in the denoising math.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: HuggingFace Diffusers and LeRobot</div>
+<p>Two libraries cover Diffusion Policy in production. The <code>diffusers</code> library from HuggingFace provides the DDPM and DDIM schedulers (noise schedules, step functions, sample functions) so you need not implement them; a <code>DDIMScheduler</code> object handles the entire denoising loop with a single <code>scheduler.step()</code> call per timestep. The <code>lerobot</code> library (Hugging Face, 2024) provides a full Diffusion Policy implementation for real robot imitation learning, including the 1D U-Net and Transformer backbones, action chunking, dataset loading for standard benchmarks (PushT, ALOHA, RoboMimic), and an evaluation harness. Install with <code>pip install lerobot diffusers</code>. A typical starting point is to instantiate <code>lerobot.common.policies.diffusion.DiffusionPolicy</code>, pass it a pre-collected demonstration dataset, and call <code>policy.train()</code>; the library handles batching, noise scheduling, and DDIM inference automatically. For rapid prototyping on custom tasks, the from-scratch code of Code 27.4.4 is faster to adapt because every component is visible; for deployment on a real robot, reach for LeRobot's hardened pipeline.</p>
+<pre><code class="language-python">from diffusers import DDIMScheduler
+
+# Use HuggingFace DDIMScheduler instead of hand-rolled DDIM logic above.
+scheduler = DDIMScheduler(num_train_timesteps=100, beta_schedule="squaredcos_cap_v2")
+scheduler.set_timesteps(10)          # 10-step DDIM at inference
+
+noisy_action = torch.randn(1, H, act_dim)
+obs_embed    = torch.zeros(1, obs_dim)   # replace with real observation
+
+for t in scheduler.timesteps:
+    k_norm     = torch.full((1,), t.item() / 100.0)
+    eps_pred   = model(noisy_action, obs_embed, k_norm)
+    noisy_action = scheduler.step(eps_pred.flatten(-2), t,
+                                  noisy_action.flatten(-2)).prev_sample
+    noisy_action = noisy_action.view(1, H, act_dim)
+
+clean_action = noisy_action    # shape (1, H, act_dim)
+</code></pre>
+</div>
+
+<h3>Advantages Over Behavioral Cloning and Connection to DAgger</h3>
+<p>Diffusion Policy has three structural advantages over standard behavioral cloning. First, it handles multimodal demonstrations: because the full distribution $p(a \mid o)$ is modeled, distinct action modes appear as separate peaks in the denoised distribution rather than being averaged away. Second, action chunking reduces compounding error: by predicting and executing $H$ steps before replanning, the policy spends fewer total decision points where a distributional mismatch can compound, directly addressing the quadratic error growth derived in <a href="section-27.3.html">Section 27.3</a>. Third, temporal consistency: denoising all $H$ future actions simultaneously forces internal consistency across the chunk, so the policy cannot produce physically inconsistent transitions between consecutive predicted actions.</p>
+<p>The relationship to DAgger is complementary rather than competitive. DAgger corrects the <em>state distribution shift</em> problem by querying the expert on states the learner visits; Diffusion Policy corrects the <em>action distribution collapse</em> problem by modeling the full multimodal distribution rather than averaging. Diff-DAgger (Ze et al., 2024) combines both repairs: it uses the variance across denoising runs as an uncertainty signal to trigger expert queries only at genuinely novel states, achieving the distribution coverage of DAgger with the action fidelity of Diffusion Policy. Together, this section and <a href="section-27.3.html">Section 27.3</a> now give you the complete imitation-learning toolkit: behavioral cloning for the simplest cases, DAgger when distribution shift is the bottleneck, Diffusion Policy when multimodal demonstrations are the bottleneck, and Diff-DAgger when both problems appear simultaneously. The adversarial methods of this section's earlier subsections add the further layer of reward recovery for transfer, and the preference-based learning of <a href="section-27.5.html">Section 27.5</a> extends imitation to settings where demonstrations are replaced by human comparisons.</p>
+
 <h2>Exercises</h2>
 <div class="callout exercise">
 <div class="callout-title">Exercise 27.4.1 (Conceptual): Why the All-Zero Reward Explains Everything</div>

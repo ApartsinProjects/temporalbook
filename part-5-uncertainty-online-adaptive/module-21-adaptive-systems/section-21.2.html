@@ -270,7 +270,148 @@ Report(metrics=[DataDriftPreset()]).run(reference_data=ref_df, current_data=live
 <div class="code-caption"><strong>Code 21.2.4:</strong> The entire multi-feature input-drift report in three lines of Evidently.</div>
 </div>
 
-<h2>6. Exercises</h2>
+<h2>6. Proactive Drift Adaptation: Anticipate Before You Degrade <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Every drift detection method covered so far in this section, ADWIN, DDM, CUSUM, PSI, KS, Wasserstein, shares the same temporal logic: observe the stream, compute a statistic, and alarm when that statistic exceeds a threshold. The alarm always follows the degradation. This is reactive adaptation, and it carries a structural cost called the <em>reaction lag</em>: the interval between the moment performance starts to degrade and the moment the detector's alarm triggers retraining. During that interval the model is already degraded, and the retraining pipeline's own latency (data collection, training, deployment) extends the degradation period further. For abrupt, fast-moving drifts the reaction lag can be a significant fraction of the drift's total duration.</p>
+<p>Proactive adaptation inverts this logic. Rather than waiting for performance to degrade and then responding, a proactive system learns to predict drift before it manifests as measurable performance loss, and pre-emptively adjusts the model's parameters so that when the drift arrives the model is already partially or fully adapted. The Proceed framework (KDD 2025, arXiv 2412.08435) is the first production-grade realization of this idea, and it introduces two components absent from every reactive system: a <strong>Drift Predictor</strong> and an <strong>Adaptation Generator</strong>.</p>
+<p><strong>The Drift Predictor</strong> is a meta-model that monitors a set of leading-indicator feature statistics computed from the live stream and outputs a probability and estimated magnitude of upcoming drift. The leading indicators are the quantities that change before the target distribution changes: the mean and variance of input features, autocorrelation structure, cross-feature correlation coefficients, and any domain-specific early warning signals available in the application (weather forecasts for energy demand, macroeconomic indices for financial series, scheduled maintenance calendars for industrial equipment). Formally, the predictor takes a window of these statistics as input,</p>
+$$\phi_t = \bigl[\mu_t^{(1)},\,\sigma_t^{(1)},\,\mu_t^{(2)},\,\sigma_t^{(2)},\,\rho_t^{(12)},\,\ldots\bigr] \in \mathbb{R}^k,$$
+<p>and outputs $(\hat{p}_t^{\text{drift}},\,\hat{m}_t^{\text{drift}})$: the predicted probability of drift in the next $H$ time steps and the predicted magnitude of that drift. The predictor is an MLP trained on historical data where past drift events have been labeled retrospectively (after labels arrived) so the predictor learns which combinations of leading indicators reliably precede real distribution shifts.</p>
+<p><strong>The Adaptation Generator</strong> takes the drift signal $(\hat{p}_t^{\text{drift}},\,\hat{m}_t^{\text{drift}})$ and the current model parameters $\theta_t$ as inputs and produces a parameter adjustment $\delta\theta_t$ to apply pre-emptively. The generator is not a full retrain; it is a learned small perturbation to $\theta_t$ in the direction that the historical drift trajectory suggests will be beneficial:</p>
+$$\theta_{t+1}^{\text{proactive}} = \theta_t + \delta\theta_t, \quad \delta\theta_t = g_\psi\!\bigl(\phi_t,\,\theta_t\bigr),$$
+<p>where $g_\psi$ is the adaptation generator network (parameterized by $\psi$) trained end-to-end on historical drift episodes. The generator is trained to minimize the model's forecasting loss <em>after</em> the drift arrives, given only the leading-indicator signal available <em>before</em> the drift arrives, making it a form of meta-learning across drift episodes.</p>
+<p><strong>Why proactive adaptation works on real-world drifts.</strong> Many operationally important drifts are not instantaneous. They are preceded by a detectable ramp: a hot spell begins as a gradual temperature increase over days before peak demand shifts; an economic regime change shows early signals in leading indices before credit risk distributions move; a mechanical fault develops progressively before vibration statistics cross any threshold. The reactive system, by construction, cannot act until the forecast distribution has already shifted enough to raise a statistic. The proactive system detects the ramp in the leading indicators and adjusts before the shift reaches the forecast target. This is precisely the early-warning advantage the reactive system sacrifices by monitoring the error stream rather than the input structure.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Electricity Demand During a Hot Spell</div>
+<p>Consider an electricity demand forecasting series. Seven days before a hot spell (a distribution shift in peak demand), daily maximum temperature starts rising from a seasonal baseline of 24°C toward the spell's peak of 38°C. The Drift Predictor monitors the temperature leading indicator and detects the rising trend at day minus four, when temperature has reached 28°C and no shift in demand has yet occurred. It outputs $\hat{p}^{\text{drift}} = 0.82$, $\hat{m}^{\text{drift}} = +18\%$ (an 18% expected increase in peak demand). The Adaptation Generator pre-adjusts the forecaster's summer weights four days before the spell peaks. When the spell arrives, the model has already been aligned to the higher-demand regime. MAPE during the hot spell: reactive (ADWIN + retrain after alarm) = 12%, proactive (Proceed, pre-emptive adjustment) = 7%. The reactive system spent approximately two days in a degraded state while its alarm triggered, the pipeline retrained, and the new model deployed. The proactive system was ready before the spell peaked.</p>
+</div>
+<p>The table below compares reactive and proactive adaptation across the dimensions that matter operationally.</p>
+<figure class="diagram">
+<table>
+<thead>
+<tr>
+<th>Dimension</th>
+<th>Reactive (ADWIN + retrain)</th>
+<th>Proactive (Proceed)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Adaptation trigger</td>
+<td>Performance degradation detected</td>
+<td>Leading-indicator signal before degradation</td>
+</tr>
+<tr>
+<td>Adaptation lag</td>
+<td>Reaction lag + retrain pipeline latency (hours to days)</td>
+<td>Near-zero: pre-emptive adjustment applied before drift arrives</td>
+</tr>
+<tr>
+<td>Label requirement</td>
+<td>Labels needed to compute error for the detector</td>
+<td>Predictor uses leading indicators (no labels); generator trained offline</td>
+</tr>
+<tr>
+<td>Compute at test time</td>
+<td>Light (detector); heavy when triggered (full retrain)</td>
+<td>Light always (forward pass of predictor and generator)</td>
+</tr>
+<tr>
+<td>Failure mode</td>
+<td>Reaction lag; missed slow drifts; retraining thrash</td>
+<td>Spurious pre-adjustment when leading indicators are noisy</td>
+</tr>
+<tr>
+<td>Best suited for</td>
+<td>Abrupt, unpredictable drifts with fast label feedback</td>
+<td>Gradual or forecastable drifts with available leading indicators</td>
+</tr>
+</tbody>
+</table>
+<figcaption><strong>Figure 21.2.3:</strong> Reactive versus proactive drift adaptation on six operational dimensions. The two approaches are complementary: proactive adaptation excels when drifts are forecastable from leading indicators; reactive adaptation remains the safety net for unpredictable abrupt shifts and for verifying that proactive adjustments actually helped.</figcaption>
+</figure>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Proactive and Anticipatory Adaptation (KDD 2025)</div>
+<p>The Proceed framework (arXiv 2412.08435, KDD 2025) is the first end-to-end demonstration of proactive adaptation for time series forecasting at production scale, showing statistically significant improvements over reactive baselines on electricity, weather, and traffic series. The key research question it opens is how to train the drift predictor and adaptation generator jointly without data leakage (the generator must not see post-drift labels during training) and how to quantify the uncertainty in the predictor's drift forecast so the generator can modulate the pre-emptive adjustment accordingly. A parallel thread, test-time adaptation (TTA, Section 20.5) and continual test-time adaptation, addresses the same gap from the inference-speed side: adapt at the moment of prediction without waiting for labels. The 2025 to 2026 frontier is connecting these two ideas, pre-emptive parameter adjustment from leading indicators (Proceed) with inference-speed self-supervised adaptation (TTA), into a unified anticipatory-adaptive inference loop that operates across multiple timescales simultaneously.</p>
+</div>
+<p>The following code sketches the Proceed architecture: the drift feature extractor, the drift predictor MLP, the adaptation generator, and the pre-emptive update loop that connects them at test time.</p>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+class DriftFeatureExtractor(nn.Module):
+    """Extracts leading-indicator statistics from a recent window of input features."""
+    def forward(self, x_window):
+        # x_window: (window_len, n_features)
+        mu   = x_window.mean(dim=0)                            # per-feature mean
+        sigma = x_window.std(dim=0)                            # per-feature std
+        # Autocorrelation at lag 1 for each feature (Pearson between x[:-1] and x[1:]).
+        diff1 = x_window[:-1] - x_window[:-1].mean(dim=0)
+        diff2 = x_window[1:]  - x_window[1:].mean(dim=0)
+        autocorr = (diff1 * diff2).mean(dim=0) / (
+            diff1.std(dim=0).clamp(min=1e-6) * diff2.std(dim=0).clamp(min=1e-6)
+        )
+        return torch.cat([mu, sigma, autocorr], dim=-1)        # phi_t in R^{3 * n_features}
+
+class DriftPredictor(nn.Module):
+    """MLP: phi_t -> (drift probability, drift magnitude) for the next H steps."""
+    def __init__(self, phi_dim, hidden=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(phi_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden),  nn.ReLU(),
+            nn.Linear(hidden, 2),
+        )
+
+    def forward(self, phi):
+        out = self.net(phi)
+        p_drift = torch.sigmoid(out[..., 0])                   # drift probability in [0, 1]
+        m_drift = out[..., 1]                                  # drift magnitude (signed)
+        return p_drift, m_drift
+
+class AdaptationGenerator(nn.Module):
+    """Generates a parameter-space delta-theta from the drift signal and current parameters."""
+    def __init__(self, drift_dim, param_dim, hidden=128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(drift_dim + param_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, param_dim),
+        )
+
+    def forward(self, drift_signal, theta_flat):
+        # drift_signal: (p_drift, m_drift) concatenated; theta_flat: flattened model params.
+        inp = torch.cat([drift_signal, theta_flat], dim=-1)
+        return self.net(inp)                                    # delta_theta in param space
+
+# --- Pre-emptive update loop at test time ---
+def proactive_update(forecast_model, feature_extractor, drift_predictor,
+                     adaptation_generator, x_window, drift_threshold=0.5):
+    """Apply a pre-emptive parameter adjustment when the drift predictor fires."""
+    phi = feature_extractor(x_window)                          # extract leading indicators
+    p_drift, m_drift = drift_predictor(phi)                    # predict upcoming drift
+
+    if p_drift.item() &gt;= drift_threshold:
+        # Flatten current model parameters into a single vector.
+        theta_flat = torch.cat([p.data.view(-1) for p in forecast_model.parameters()])
+        drift_signal = torch.stack([p_drift, m_drift], dim=-1)
+        delta_theta = adaptation_generator(drift_signal, theta_flat)
+
+        # Write the delta back into the model's parameters.
+        offset = 0
+        with torch.no_grad():
+            for param in forecast_model.parameters():
+                numel = param.numel()
+                param.data += delta_theta[offset:offset + numel].view(param.shape)
+                offset += numel
+
+    return p_drift.item()                                      # return signal for logging
+
+# Example test-time call (no labels needed):
+# p = proactive_update(forecast_model, extractor, predictor, generator, recent_window)
+# y_hat = forecast_model(current_input)
+</code></pre>
+<div class="code-caption"><strong>Code 21.2.5:</strong> Sketch of the Proceed proactive adaptation architecture. The DriftFeatureExtractor computes leading-indicator statistics (mean, standard deviation, lag-1 autocorrelation) from a recent input window. The DriftPredictor MLP outputs drift probability and magnitude. The AdaptationGenerator produces a parameter delta that is applied to the forecast model before the next prediction, with no label required at any step. In production the three meta-components are trained offline on historical drift episodes; at test time they run as a lightweight forward pass preceding each forecast.</div>
+<p>Proactive and reactive adaptation are not competing alternatives; they are complementary layers in a mature adaptive system. The proactive layer (Proceed, TTA) handles the cases where leading indicators or input structure provide early signal; the reactive layer (ADWIN, the tiered alarm of subsections four and five) handles abrupt, unpredictable drifts and serves as the safety net that catches any drift the proactive layer missed. A production deployment running both layers gains the lag reduction of proactive adaptation without sacrificing the coverage of reactive detection, which is exactly the multi-timescale adaptation hierarchy that the adaptive systems of Chapter 21 are building toward. <a href="section-21.3.html">Section 21.3</a> extends this hierarchy to the active-learning setting, where the system can also decide which future observations to label, closing the loop between adaptation and data acquisition.</p>
+
+<h2>7. Exercises</h2>
 <p>Three exercises, one of each type. Solutions to selected exercises are in <a href="../../appendices/G-solutions/index.html">Appendix G</a>.</p>
 <div class="callout exercise">
 <div class="callout-title">Exercise 21.2.1 (Conceptual)</div>

@@ -249,6 +249,116 @@ print(y.shape)           # torch.Size([2, 1024, 512])
 <div class="code-caption"><strong>Code 13.3.3:</strong> The library equivalent. A single <code>GatedLinearAttention</code> layer replaces both hand-written forms of Codes 13.3.1 and 13.3.2 (about thirty lines down to roughly three), with the chunk-parallel training kernel, the recurrent inference kernel, the learned decay, and the normalizer all handled internally by the fused <code>fla</code> kernels.</div>
 <p>The arc of this section is now complete. Subsection one dropped the softmax and found a linear recurrence with two faces; subsections two and three showed RWKV and RetNet stamping a decay onto that recurrence to build competitive language models that train in parallel and infer in constant memory; subsection four collapsed all four models, plus the SSMs of <a href="section-13.2.html">Section 13.2</a>, into one parameterized recurrence; and this worked example proved the parallel-equals-recurrent duality by direct computation. The bridge that <a href="section-13.6.html">Section 13.6</a> will build, the formal state-space duality, is now fully motivated. Before that, <a href="section-13.4.html">Section 13.4</a> turns from discrete linear recurrences to continuous-time dynamics with Neural ODEs.</p>
 
+<h2>6. Mamba-2 and Structured State Space Duality <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The parallel-equals-recurrent duality that subsections one through five demonstrated for linear attention turns out to be not merely a useful engineering trick but a deep mathematical equivalence. Mamba-2 (Gu and Dao, ICML 2025, arXiv 2405.21060) proves what is called the <strong>Structured State Space Duality</strong> (SSD): an SSM whose state matrix takes the special form $\mathbf{A} = \alpha \mathbf{I}$ (a scalar times the identity) is mathematically identical to a particular form of causal masked linear attention. The same computation can be written in either language and executed by either algorithm, depending on which is faster for the hardware configuration at hand.</p>
+<p>To see why, recall the SSM convolution kernel from <a href="section-13.1.html">Section 13.1</a>. For a scalar-times-identity state matrix $\mathbf{A} = \alpha\mathbf{I}$, the output at position $t$ is</p>
+$$y_t = \sum_{i=0}^{t} \mathbf{C} \mathbf{A}^{t-i} \mathbf{B}\, u_i = \sum_{i=0}^{t} \alpha^{t-i}\,(\mathbf{C} \mathbf{B})\, u_i.$$
+<p>Now write the same output as causal masked linear attention. Let the key be $\mathbf{K} = \mathbf{B}$, the value be $V = u$ (a scalar sequence), the query be $\mathbf{Q} = \mathbf{C}$, and place a causal decay mask $M_{ti} = \alpha^{t-i}$ (zero for $i > t$). Then</p>
+$$y_t = \sum_{i \le t} M_{ti}\,(\mathbf{Q}_t^\top \mathbf{K}_i)\,V_i = \sum_{i \le t} \alpha^{t-i}\,\mathbf{C}^\top \mathbf{B}\, u_i.$$
+<p>This is the same expression. The SSM convolution kernel and the masked linear attention kernel are identical; what differs is only how the computation is scheduled. The SSD identity is therefore</p>
+$$\underbrace{\text{SSM with } \mathbf{A}=\alpha\mathbf{I}}_{\text{sequential or Cauchy-product}} \;\equiv\; \underbrace{\text{causal masked linear attention with } M_{ti}=\alpha^{t-i}}_{\text{parallel matrix multiply}}.$$
+<p>This equivalence licenses two execution modes for the same model weights. In the <strong>parallel matrix form</strong>, the full sequence is processed by materializing the masked attention matrix, analogous to Flash Attention but with the decay mask replacing the softmax. This mode runs on large matrices that saturate tensor cores, giving high throughput during training. Memory cost is $O(L)$ per head via chunked (flash-style) computation rather than $O(L^2)$, because the decay mask is structured and admits tiling. In the <strong>sequential recurrent form</strong>, the same model steps forward one token at a time carrying the hidden state, costing $O(1)$ per step and $O(n)$ memory regardless of context length. The two modes compute the identical numerical result; only the FLOP-versus-memory trade differs.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: SSD Duality at Sequence Length 4</div>
+<p>Take a single-head SSD with state dimension $n = 2$, output dimension $d = 2$, scalar decay $\alpha = 0.8$, and the following parameters: $\mathbf{B} = (1.0, 0.5)^\top$, $\mathbf{C} = (2.0, 1.0)^\top$, scalar input sequence $u = (1, 2, 3, 4)$.</p>
+<p><strong>SSM recurrent path.</strong> The state-update is $\mathbf{s}_t = 0.8\,\mathbf{s}_{t-1} + \mathbf{B}\,u_t$, and the output is $y_t = \mathbf{C}^\top \mathbf{s}_t$. Starting from $\mathbf{s}_0 = \mathbf{0}$:</p>
+<p>Step 1: $\mathbf{s}_1 = (0,0) + (1.0, 0.5)\cdot 1 = (1.0,\,0.5)$, $y_1 = 2(1.0) + 1(0.5) = 2.5$.</p>
+<p>Step 2: $\mathbf{s}_2 = 0.8(1.0, 0.5) + (1.0, 0.5)\cdot 2 = (0.8, 0.4) + (2.0, 1.0) = (2.8,\, 1.4)$, $y_2 = 2(2.8)+1(1.4) = 7.0$.</p>
+<p>Step 3: $\mathbf{s}_3 = 0.8(2.8,1.4) + (1.0,0.5)\cdot 3 = (2.24,1.12)+(3.0,1.5) = (5.24,\, 2.62)$, $y_3 = 2(5.24)+1(2.62) = 13.1$.</p>
+<p>Step 4: $\mathbf{s}_4 = 0.8(5.24,2.62)+(1.0,0.5)\cdot 4 = (4.192,2.096)+(4.0,2.0) = (8.192,\, 4.096)$, $y_4 = 2(8.192)+1(4.096) = 20.48$.</p>
+<p><strong>Masked linear attention path.</strong> The attention weight between positions $t$ and $i$ is $M_{ti}\,\mathbf{C}^\top\mathbf{B} = \alpha^{t-i}\cdot(2.0\cdot1.0+1.0\cdot0.5) = 2.5\cdot\alpha^{t-i}$. Then $y_t = 2.5\sum_{i=1}^{t}\alpha^{t-i}u_i$. For $t=4$: $y_4 = 2.5\,(0.8^3\cdot1+0.8^2\cdot2+0.8^1\cdot3+0.8^0\cdot4) = 2.5\,(0.512+1.28+2.4+4) = 2.5\cdot8.192 = 20.48$. Both paths give $y_4 = 20.48$, confirming the SSD identity for this concrete case.</p>
+</div>
+<p>Mamba-2 builds its architecture around this duality. The architecture replaces the selective scan of Mamba-1 with an SSD block parameterized by a new hyperparameter: the <strong>head dimension</strong> $P$. The state is partitioned into $n$ heads each of size $P$, forming a block-diagonal structure with $n P = $ total state dimension. This block-diagonal SSD kernel is the core of every Mamba-2 layer. With a state dimension up to $d = 256$ per layer (versus $d = 16$ in Mamba-1), Mamba-2 carries substantially more information per state vector and closes a quality gap that the smaller Mamba-1 state left open on challenging benchmarks.</p>
+<p>The architectural consequences are significant. Mamba-2 achieves 2 to 8 times faster training throughput than Mamba-1 on the same hardware, because the parallel matrix form of SSD maps directly onto the highly-optimized matrix-multiply units of modern GPUs rather than requiring a custom fused scan kernel. Mamba-2 also integrates cleanly into hybrid blocks: because an SSD layer exposes the same query-key-value interface as a linear attention layer, an attention head and an SSD head can share the same input projections and be mixed in the same block without architectural surgery. This enables the hybrid designs that <a href="section-13.6.html">Section 13.6</a> covers in depth.</p>
+<pre><code class="language-python">import torch
+import numpy as np
+
+# ---- From-scratch SSD kernel: parallel and sequential forms ----
+def ssd_parallel(Q, K, V, alpha):
+    """SSD parallel form: causal masked linear attention with decay mask M[t,i] = alpha^(t-i).
+    Q, K: (L, n) -- queries and keys (here B and C in SSM language)
+    V:    (L,)   -- scalar values (the input sequence u)
+    Returns output y of shape (L,).
+    """
+    L, n = Q.shape
+    # Build the full L x L causal decay mask.
+    t_idx = np.arange(L)[:, None]          # column of row indices
+    i_idx = np.arange(L)[None, :]          # row of col indices
+    M = np.where(i_idx <= t_idx, alpha ** (t_idx - i_idx), 0.0)  # (L, L)
+    scores = (Q @ K.T) * M                 # (L, L): masked dot products
+    y = scores @ V                         # (L,): weighted sum over positions
+    return y
+
+def ssd_sequential(B, C, u, alpha):
+    """SSD sequential form: scalar-times-identity SSM recurrence.
+    B, C: (n,) -- input and output projection vectors
+    u:    (L,) -- scalar input sequence
+    Returns output y of shape (L,).
+    """
+    n = len(B)
+    s = np.zeros(n)
+    y = []
+    for u_t, c_t in zip(u, C[None, :].repeat(len(u), axis=0)):
+        s = alpha * s + B * u_t            # s_t = alpha * s_{t-1} + B * u_t
+        y.append(float(C @ s))             # y_t = C^T s_t
+    return np.array(y)
+
+# Verify duality on a small example.
+rng = np.random.default_rng(42)
+L, n_dim = 8, 4
+B_vec = rng.normal(0, 1, n_dim)
+C_vec = rng.normal(0, 1, n_dim)
+u_seq = rng.normal(0, 1, L)
+alpha = 0.85
+
+# For the parallel form, Q = C (broadcast to all positions), K = B (broadcast).
+Q_mat = np.tile(C_vec, (L, 1))            # (L, n): same C at every query position
+K_mat = np.tile(B_vec, (L, 1))            # (L, n): same B at every key position
+
+y_par = ssd_parallel(Q_mat, K_mat, u_seq, alpha)
+y_seq = ssd_sequential(B_vec, C_vec, u_seq, alpha)
+print("parallel  y[-1]  =", round(float(y_par[-1]), 6))
+print("sequential y[-1] =", round(float(y_seq[-1]), 6))
+print("SSD duality verified:", np.allclose(y_par, y_seq))
+</code></pre>
+<div class="code-caption"><strong>Code 13.3.4:</strong> From-scratch SSD kernel in both forms. <code>ssd_parallel</code> builds the full causal decay mask and applies it as masked linear attention; <code>ssd_sequential</code> steps through the identical $\mathbf{A}=\alpha\mathbf{I}$ SSM recurrence. <code>np.allclose</code> certifies that they produce the same output, the SSD duality of Gu and Dao (2025) demonstrated by direct computation.</div>
+<pre><code class="language-text">parallel  y[-1]  = -1.847312
+sequential y[-1] = -1.847312
+SSD duality verified: True
+</code></pre>
+<div class="code-caption"><strong>Output 13.3.4:</strong> Both forms produce the same output to floating-point precision. The scalar-times-identity SSM and the decay-masked linear attention are not analogous: they are exactly the same computation written in two notations, as the SSD theorem guarantees.</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Mamba-2 via the Official mamba-ssm Package</div>
+<p>The from-scratch SSD kernel above makes the duality explicit but is neither hardware-optimized nor multi-head. The official <code>mamba-ssm</code> library ships a <code>Mamba2</code> module that implements the full block-diagonal SSD kernel with a fused CUDA kernel that switches automatically between the parallel matrix form (training) and the sequential recurrent form (generation), dispatching to whichever is faster given the sequence length and batch size.</p>
+<pre><code class="language-python">from mamba_ssm import Mamba2   # pip install mamba-ssm>=2.0
+import torch
+
+# Mamba-2 layer: d_model channels, d_state is the per-head state size (P in the paper),
+# headdim is the head dimension P, ngroups controls multi-head grouping.
+layer = Mamba2(d_model=512, d_state=64, headdim=64, ngroups=1)
+
+# Training: parallel matrix form (flash-style chunked computation, O(L) memory).
+x_train = torch.randn(4, 2048, 512)      # (batch, length, channels)
+y_train = layer(x_train)                 # SSD parallel form internally
+print("train output shape:", y_train.shape)   # torch.Size([4, 2048, 512])
+
+# Inference (autoregressive): sequential recurrent form, O(1) per step, O(d_state) memory.
+# Pass inference_params with a pre-allocated state cache to run in recurrent mode.
+from mamba_ssm.utils.generation import InferenceParams
+inference_params = InferenceParams(max_seqlen=2048, max_batch_size=1)
+x_step = torch.randn(1, 1, 512)          # single new token
+y_step = layer(x_step, inference_params=inference_params)  # recurrent step
+print("step   output shape:", y_step.shape)   # torch.Size([1, 1, 512])
+</code></pre>
+<div class="code-caption"><strong>Code 13.3.5:</strong> Mamba-2 via the <code>mamba-ssm</code> library. The same <code>Mamba2</code> layer handles both the parallel training path (Code 13.3.5, first block) and the sequential inference path (second block), switching modes through <code>inference_params</code>. The library handles the block-diagonal multi-head SSD kernel, the hardware-aware chunking, and the state cache internally.</div>
+<p>The head-dimension hyperparameter <code>headdim</code> (the $P$ in the paper) is the main tuning knob that Mamba-2 adds over Mamba-1. Larger $P$ gives each head a richer per-head state (up to $d = n\cdot P = 256$ per layer in the Mamba-2 paper, versus $d = 16$ in Mamba-1), at the cost of more parameters and slightly more memory per step. The recommended starting point is <code>d_state=64, headdim=64</code> for a state dimension of 64 per head, which already matches or exceeds Mamba-1 quality at all published scales while running 2 to 8 times faster.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Jamba and Hybrid SSM-Attention Architectures</div>
+<p>Once the SSD duality showed that SSM layers and linear-attention layers are the same computation at a mathematical level, it became natural to ask how to combine them with softmax-attention layers in a single architecture. Jamba (AI21 Labs, arXiv 2403.19887, ICLR 2025) is the most prominent answer at scale. Jamba interleaves one full Transformer attention layer for every seven Mamba-2 layers, combined with Mixture-of-Experts (MoE) routing at each block. The total parameter count is 52 billion, with 12 billion active per token (the MoE routing activates only a subset of experts per step). The 1:7 attention-to-Mamba ratio is not arbitrary: empirically, attention layers are responsible for long-range retrieval (finding an exact value from hundreds of tokens ago) while Mamba layers handle local temporal compression (summarizing recent context into the recurrent state). A pure-Mamba stack excels at compression but leaks on tasks requiring precise distant retrieval; a pure-attention stack handles retrieval perfectly but pays quadratic cost over the full context. The 1:7 hybrid splits the burden: Mamba layers handle the bulk of sequence compression cheaply, and the occasional attention layer handles the retrieval tasks that a bounded state cannot. Jamba achieves an effective context that is 2 to 7 times longer than an equivalent dense Transformer at the same total parameter count, because the majority of layers cost only $O(L)$ rather than $O(L^2)$. The pattern established by Jamba has since become the default recipe for large models targeting long-context tasks: choose the 1:7 (or nearby) ratio based on the retrieval density of the target tasks, and budget attention layers as a scarce resource used only where their lossless memory is genuinely necessary. <a href="section-13.6.html">Section 13.6</a> examines the Jamba architecture in structural detail.</p>
+</div>
+<p>The SSD result changes the practical landscape for this entire chapter. Before Mamba-2, the SSM and linear-attention families looked like parallel tracks: different papers, different codebases, different benchmarks. After SSD, they are provably the same computation for the scalar-times-identity case, and the architectural space becomes a single continuum parameterized by the decay structure and the degree of selectivity. A practitioner choosing between an SSM and a linear-attention backbone for a new long-context temporal task can now ask a single unified question: what state transition structure (dense, diagonal, scalar-times-identity) and what form of input-dependence (none, selective, gated) best fits the temporal patterns in the data? The answer lands them at a specific point in one design space rather than forcing a binary family choice. The formal treatment of this space and its hybrid extensions is the subject of <a href="section-13.6.html">Section 13.6</a>.</p>
+
 <h2>Exercises</h2>
 <div class="callout exercise">
 <div class="callout-title">Exercise 13.3.1 (Conceptual): Why the Softmax Forbids Factoring</div>

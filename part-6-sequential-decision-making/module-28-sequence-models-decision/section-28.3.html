@@ -245,7 +245,114 @@ model.learn(total_timesteps=50_000)      # off-policy SAC consumes relabeled tra
 <p>The hand-written relabeling trainer of Code 28.3.2 ran about 25 lines of trajectory bookkeeping (collecting episodes, sampling future achieved goals, recomputing sparse rewards, building the cloning set). In Stable-Baselines3 the whole of it is the <code>HerReplayBuffer</code> with two keyword arguments, <code>n_sampled_goal</code> and <code>goal_selection_strategy</code>, as shown in Code 28.3.3; the library handles the achieved-goal extraction, the reward recomputation, the off-policy sampling, and the coupling to the universal value function internally. For return-conditioned (Decision Transformer style) policies, the offline-reinforcement-learning library <code>d3rlpy</code> exposes a <code>DecisionTransformer</code> learner whose <code>fit</code> takes a logged dataset and whose <code>predict</code> takes a target return, so the conditioning loop of <a href="section-28.2.html">Section 28.2</a> is likewise a few lines. The line-count reduction is roughly twenty-five to two; what you give up is visibility into the relabeling, which is exactly why we built it by hand first.</p>
 </div>
 
-<h2>6. Exercises</h2>
+<h2>6. Diffusion Planners: Denoising a Path to the Goal <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Return-conditioning and goal-conditioning both share a structural assumption: the policy produces one action at a time, conditioning on a desired outcome supplied up front. An alternative approach asks a different question entirely. Instead of conditioning on a scalar target and generating actions sequentially, what if we represented the <em>entire trajectory</em> as a single object and learned to generate high-reward trajectories all at once? This is the central idea of diffusion-based planning, most directly realized in Janner et al.'s Diffuser (NeurIPS 2022, "Planning with Diffusion Models"). A diffusion planner treats planning as denoising: it starts from a completely noisy trajectory and iteratively refines it toward a coherent, high-reward path. The reward function is not baked into the model's parameters as a return-conditioned target; instead, it acts as a <em>guidance signal</em> during denoising, nudging each refinement step toward higher-reward regions of trajectory space.</p>
+<p>The connection to the rest of this chapter is precise. The Decision Transformer of <a href="section-28.2.html">Section 28.2</a> generates actions autoregressively: it produces $a_0$ given $(R, s_0)$, then $a_1$ given $(R - r_0, s_1)$, and so on. Each step is local. A diffusion planner instead generates the <em>whole sequence</em> $\tau = (s_0, a_0, s_1, a_1, \ldots, s_H, a_H)$ jointly, which means it can enforce global consistency across the trajectory, a quality no autoregressive model can guarantee without special architectural tricks. The denoising process is also, viewed from the right angle, a learned dynamics model: the forward process destroys the temporal structure of a real trajectory, and the reverse process reconstructs it, learning in the process what physically consistent trajectories look like. Planning via diffusion is therefore model-predictive control with the dynamics implicit in the reverse-diffusion neural network, a connection we make explicit at the end of this subsection.</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Planning Is Denoising</div>
+<p>Classical planning asks: "starting from $s_0$, find the sequence of actions that maximizes cumulative reward." Diffusion planning reframes this as: "starting from a Gaussian noise trajectory, iteratively remove noise to produce a trajectory that (a) is physically consistent with the learned dynamics and (b) achieves high reward." The reward function is not an optimization objective in the traditional sense. It is a <em>guidance signal</em> applied at each denoising step, analogous to classifier guidance in image diffusion. This means the planner can use any differentiable reward function at inference time, including rewards that were never seen during training, which is a strictly more flexible conditioning mechanism than the return-conditioning of <a href="section-28.2.html">Section 28.2</a>.</p>
+</div>
+
+<p>The training procedure is standard denoising diffusion (DDPM) applied to trajectories. Given a dataset of offline trajectories $\mathcal{D} = \{\tau^{(i)}\}$, the forward process adds Gaussian noise to a trajectory over $K$ steps:</p>
+$$q(\tau_k \mid \tau_{k-1}) = \mathcal{N}(\tau_k;\, \sqrt{1 - \beta_k}\,\tau_{k-1},\, \beta_k \mathbf{I}),$$
+<p>until at step $K$ the trajectory is indistinguishable from pure Gaussian noise. The reverse process learns a noise-prediction network $\varepsilon_\theta(\tau_k, k)$ that estimates the noise added at step $k$, trained by</p>
+$$\mathcal{L}(\theta) = \mathbb{E}_{\tau \sim \mathcal{D},\, \varepsilon \sim \mathcal{N}(0,\mathbf{I}),\, k}\Big[\|\varepsilon - \varepsilon_\theta(\tau_k, k)\|^2\Big].$$
+<p>No reward label is used during training: the model learns the data distribution $p(\tau)$ over the entire trajectory space. At inference time, reward guidance is injected into the reverse process. Starting from $\tau_K \sim \mathcal{N}(0, \mathbf{I})$, each denoising step applies the standard DDPM reverse update followed by a gradient step in the direction of higher reward:</p>
+$$\tau_{k-1} = \underbrace{\mu_\theta(\tau_k, k)}_{\text{DDPM reverse step}} + \underbrace{\alpha_k \,\nabla_{\tau_k} r(\tau_k)}_{\text{reward guidance}},$$
+<p>where $\mu_\theta$ is the mean of the DDPM reverse step, $\alpha_k$ is a step-size schedule, and $r(\tau_k)$ is the reward evaluated on the current (still noisy) trajectory. After $K$ denoising steps the trajectory $\tau_0$ is clean and high-reward. The first action $a_0$ is extracted and executed; the agent then replans from the new state.</p>
+
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Denoising a 1D Navigation Trajectory</div>
+<p>We trace a complete diffusion planning run in a minimal 1D environment with a 3-step horizon to make every number visible.</p>
+
+<p><strong>Setup.</strong> State $s \in \mathbb{R}$. Action $a \in \mathbb{R}$ (rounded to $-1$, $0$, or $+1$ for execution). Horizon $H = 3$. Starting state $s_0 = 0.0$. Goal: reach $s = 5.0$. Reward: $r(\tau) = -|s_3 - 5.0|$ (terminal only, evaluated on the final state). Diffusion uses $K = 3$ noise steps for illustration. A trajectory is the flat vector $\tau = (s_0, a_0, s_1, a_1, s_2, a_2, s_3)$. We pin $s_0 = 0.0$ throughout (the current observed state is never noised).</p>
+
+<p><strong>Initialization (step $k = 3$, maximum noise).</strong> Draw $\tau_3$ from Gaussian noise, then clamp $s_0 = 0.0$:</p>
+<table style="border-collapse:collapse;margin:0.75rem 0;font-size:0.93em;">
+<thead><tr style="background:var(--color-surface-raised,#f5f5f5);">
+<th style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">$t$</th>
+<th style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">$s_t$</th>
+<th style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">$a_t$</th>
+</tr></thead>
+<tbody>
+<tr><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">0</td><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">0.00</td><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">0.8</td></tr>
+<tr><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">1</td><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">2.10</td><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">&minus;0.3</td></tr>
+<tr><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">2</td><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">0.90</td><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">1.5</td></tr>
+<tr><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">3</td><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">3.10</td><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">&mdash;</td></tr>
+</tbody>
+</table>
+<p>This trajectory is incoherent: the state jumps from $2.10$ back to $0.90$ in one step, which no physical dynamics would permit. The noise is doing its job.</p>
+
+<p><strong>Denoising step $3 \to 2$: apply $\varepsilon_\theta(\tau_3, 3)$, then reward guidance.</strong></p>
+<p>The reverse-diffusion update $\mu_\theta(\tau_3, 3)$ reduces the noise level, producing a more physically plausible trajectory:</p>
+<table style="border-collapse:collapse;margin:0.75rem 0;font-size:0.93em;">
+<thead><tr style="background:var(--color-surface-raised,#f5f5f5);">
+<th style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">$t$</th>
+<th style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">$s_t$ (after denoise)</th>
+<th style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">$a_t$</th>
+</tr></thead>
+<tbody>
+<tr><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">0</td><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">0.00</td><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">1.2</td></tr>
+<tr><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">1</td><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">1.80</td><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">0.9</td></tr>
+<tr><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">2</td><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">3.00</td><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">1.1</td></tr>
+<tr><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">3</td><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">4.30</td><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">&mdash;</td></tr>
+</tbody>
+</table>
+<p>The trajectory is now monotonically increasing, which is physically plausible. Apply the reward guidance gradient. The reward is $r = -|s_3 - 5.0|$, so $\nabla_{s_3} r = +1.0$ when $s_3 &lt; 5.0$ (the gradient pushes $s_3$ toward $5.0$). All other gradient components are zero. With step size $\alpha_2 = 0.10$:</p>
+$$s_3 \leftarrow 4.30 + 0.10 \times 0.70 = 4.37.$$
+<p>After guidance: $\tau_2$ has $s_3 = 4.37$.</p>
+
+<p><strong>Denoising step $2 \to 1$: apply $\varepsilon_\theta(\tau_2, 2)$, then reward guidance.</strong></p>
+<table style="border-collapse:collapse;margin:0.75rem 0;font-size:0.93em;">
+<thead><tr style="background:var(--color-surface-raised,#f5f5f5);">
+<th style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">$t$</th>
+<th style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">$s_t$ (after denoise)</th>
+<th style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">$a_t$</th>
+</tr></thead>
+<tbody>
+<tr><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">0</td><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">0.00</td><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">1.1</td></tr>
+<tr><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">1</td><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">1.40</td><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">1.2</td></tr>
+<tr><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">2</td><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">2.90</td><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">1.4</td></tr>
+<tr><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">3</td><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">4.60</td><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">&mdash;</td></tr>
+</tbody>
+</table>
+<p>The diffusion network has tightened the trajectory further. Reward guidance with $\alpha_1 = 0.10$ and $\nabla_{s_3} r = +0.40$ (as $s_3 = 4.60$ is now closer to $5.0$, the magnitude of the gradient contribution is smaller under this specific reward landscape):</p>
+$$s_3 \leftarrow 4.60 + 0.10 \times 0.40 = 4.64.$$
+
+<p><strong>Denoising step $1 \to 0$: final clean trajectory.</strong></p>
+<table style="border-collapse:collapse;margin:0.75rem 0;font-size:0.93em;">
+<thead><tr style="background:var(--color-surface-raised,#f5f5f5);">
+<th style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">$t$</th>
+<th style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">$s_t$ (clean)</th>
+<th style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">$a_t$</th>
+</tr></thead>
+<tbody>
+<tr><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">0</td><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">0.00</td><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">1.0</td></tr>
+<tr><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">1</td><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">1.20</td><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">1.2</td></tr>
+<tr><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">2</td><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">2.50</td><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">1.5</td></tr>
+<tr><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">3</td><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">4.90</td><td style="padding:4px 10px;border:1px solid var(--color-border,#ddd);">&mdash;</td></tr>
+</tbody>
+</table>
+<p>The denoised trajectory is now physically consistent (states increase monotonically, each step is within the action range) and near-optimal ($s_3 = 4.90 \approx 5.0$, reward $= -0.10$). Without guidance the final state would typically be around $3$ to $4$ depending on the training data distribution. The three guidance nudges cumulatively moved $s_3$ from $3.10 \to 4.37 \to 4.64 \to 4.90$, a net improvement of $+1.80$ in final position, entirely from gradient information about the reward function.</p>
+
+<p><strong>Execution and replanning.</strong> Extract $a_0 = 1.0$ from $\tau_0$. Round to the nearest integer action: execute $+1$ (move right). The actual next state, from the real environment dynamics, is $s_1 = 0.0 + 1.0 = 1.0$. Observe $s_1 = 1.0$. Launch a new diffusion planning run with initial state $1.0$ and the same goal $5.0$, horizon reduced to $H = 2$. This is model-predictive control: plan, execute one step, replan. The new plan will start from $\tau_K$ with $s_0 = 1.0$ pinned and needs only to get from $1.0$ to $5.0$ in two steps.</p>
+
+<p><strong>Comparison to the return-conditioned baseline.</strong> If we had used a Decision Transformer with $R = -0.10$ as the target return-to-go, we would condition the policy on a return it may never have seen in training (if the offline dataset's best return was $-0.5$). The diffusion planner avoids this issue entirely: it does not need the target return as an input, because the reward gradient provides guidance at every denoising step. The planner can, in principle, produce a trajectory better than any in the training data if the gradient of the reward consistently points in a useful direction, which is the property that makes diffusion planners one of the first practical approaches to offline planning that can exceed the data's return ceiling.</p>
+</div>
+
+<p>The relationship to the Decision Transformer of <a href="section-28.2.html">Section 28.2</a> is instructive because the two methods answer the same question with opposite conditioning strategies. The Decision Transformer says: "tell me at the start what return you want, and I will produce actions to match it." The diffusion planner says: "give me a reward function I can differentiate, and I will find a trajectory that scores high under it by gradient descent during denoising." The Decision Transformer conditions on a <em>scalar goal stated up front</em>; the diffusion planner conditions on a <em>differentiable reward evaluated throughout the generation process</em>. This means the diffusion planner can follow rewards that shift mid-generation (for example, a reward that depends on the trajectory's own intermediate states), which is structurally impossible for an autoregressive sequence model. The cost is inference time: $K$ neural-network forward passes to generate one trajectory versus one pass for the Decision Transformer.</p>
+
+<p>The relationship to model-predictive control (Chapter 29) is equally tight and worth naming explicitly. Classical MPC plans a trajectory over a finite horizon using an explicit dynamics model, optimizes it with respect to a reward or cost function, executes the first action, and replans. The diffusion planner is MPC where the dynamics model is <em>implicit</em>: the reverse diffusion process, conditioned on the current state, generates trajectories that are physically consistent by the learned dynamics the training data encoded. The reward guidance gradient plays the role of the MPC cost function. Replanning after each step (as in the numeric example above) is exactly the receding-horizon structure of MPC. This connection matters practically: when Chapter 29 discusses hybrid learned-model and real-model planning, the diffusion planner occupies the "fully learned implicit model" end of the spectrum, and its strengths (rich offline learning, joint trajectory consistency) and weaknesses (slow inference, no model error correction without replanning) track directly from the MPC analysis.</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Faster Diffusion Planning and Constraint Satisfaction (2023 to 2026)</div>
+<p>Diffusion planning in its original DDPM form requires tens to hundreds of reverse steps per planning call, which is too slow for real-time control. Three research directions address this. First, consistency models and DDIM sampling reduce planning to a handful of steps with minimal quality loss, bringing diffusion-plan latency close to autoregressive methods on short horizons. Second, decision diffusion (Chi et al., 2023, Diffusion Policy) applies the same denoising idea directly to robot action sequences in imitation learning, using as few as $10$ denoising steps for manipulation tasks that require sub-second inference; this variant conditions on the current observation rather than the full trajectory and has seen rapid adoption in robotic manipulation. Third, constrained diffusion planning (2024 to 2025) adds hard constraint satisfaction (collision avoidance, actuator limits, state constraints) by projecting each denoised trajectory onto the feasible set, replacing the soft gradient guidance with a projection step, which yields trajectories that satisfy constraints exactly rather than approximately. A concurrent line of work applies diffusion planning to combinatorial and graph-structured decision problems (scheduling, routing, molecule design), where "denoising a plan" is performed in a discrete token space using masked diffusion, connecting back to the masked sequence models of Chapter 28 with an explicit planning objective. The 2026 state of the art: diffusion-based planners are competitive with or superior to autoregressive planners on long-horizon offline tasks, and the main remaining barrier to deployment is inference speed on edge hardware, which the consistency-model and rectified-flow lines of work are actively eroding.</p>
+</div>
+
+<p>The worked numeric example above makes a pedagogically important point concrete: denoising and guidance are separable. The diffusion network $\varepsilon_\theta$ handles physical plausibility, learning from offline data what consistent trajectories look like. The reward gradient handles optimality, steering the denoising toward high-value regions of trajectory space. This separation means you can swap reward functions at inference time without retraining the model, a flexibility unavailable in return-conditioned models and available in goal-conditioned models only when the goal space matches the reward structure. It is also what connects diffusion planners to the broader class of "test-time compute" methods in Chapter 29: the planner spends its inference budget on gradient-guided search rather than beam search or MCTS, but the structural logic, invest compute at decision time to improve decision quality, is identical.</p>
+
+<h2>7. Exercises</h2>
 <p>Three exercises, one conceptual, one implementation, one open-ended, building on the policies and relabeling of this section. Selected solutions appear in <a href="../../appendices/G-solutions/index.html">Appendix G</a>.</p>
 <ol>
 <li><strong>Conceptual (the extrapolation limit).</strong> A return-conditioned policy is trained on a dataset whose trajectory returns lie in $[0, 80]$. Explain, in terms of the supervised objective of subsection one, why conditioning on a target return of $200$ does not produce a policy that achieves $200$, and construct a small two-segment example (an A-to-B path and a B-to-C path, no logged A-to-B-to-C) where a value-based method would find a high-return policy that the return-conditioned policy cannot. State precisely which property of the Bellman backup enables the stitching.</li>

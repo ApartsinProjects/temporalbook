@@ -268,7 +268,122 @@ forecasts = list(predictor.predict(test_data)) # each forecast carries sample pa
 <p><strong>Lesson:</strong> When the deliverable is a calibrated joint distribution over correlated futures, diffusion's mode coverage and honest uncertainty beat both a mode-collapsing GAN and a rigid parametric head; budget for the sampling cost up front and reach for an accelerated sampler to meet latency.</p>
 </div>
 
-<h2>6. Exercises</h2>
+<h2>6. Flow Matching: Straight Paths from Noise to Data <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Diffusion models earn their generative quality by iterating a noisy reverse chain for hundreds of steps, each a full network evaluation. The resulting sampling cost is real and persistent: a TimeGrad-style forecaster drawing several hundred joint paths at inference pays for $N \approx 100$ to $1000$ network passes per horizon step. Accelerated samplers such as DDIM and DPM-Solver cut this cost considerably, and the research frontier callout of subsection three named them as an active mitigation. But they remain approximations to a stochastic reverse SDE. Flow matching takes a different approach entirely: it replaces the stochastic SDE with a deterministic straight-line path from noise to data, and trains a vector field network to point along that path at every point in between. The result is a generative model that matches or exceeds diffusion quality while requiring an order of magnitude fewer sampling steps, typically 10 to 50 instead of 100 to 1000. For time series, this shift matters enormously in operational contexts where the number of reverse steps multiplies across the forecast horizon.</p>
+
+<p>The core idea is geometric simplicity. Where diffusion defines a stochastic process with variance that accumulates and must be subtracted piece by piece, flow matching defines the transport path between a noise sample $\mathbf{x}_0 \sim \mathcal{N}(\mathbf{0}, \mathbf{I})$ and a real data point $\mathbf{x}_1$ as a literal straight line in data space:</p>
+
+$$\mathbf{x}_t = (1 - t)\,\mathbf{x}_0 + t\,\mathbf{x}_1, \qquad t \in [0, 1].$$
+
+<p>Here $t = 0$ is pure noise and $t = 1$ is the real data point; the interpolation $\mathbf{x}_t$ traces a straight segment between them. The velocity along this path is constant and exact: $d\mathbf{x}_t / dt = \mathbf{x}_1 - \mathbf{x}_0$. The model learns a vector field $v_\theta(\mathbf{x}_t, t)$ that approximates this velocity at every position along the path, and the training objective, called conditional flow matching (CFM) because it conditions on the pair $(\mathbf{x}_0, \mathbf{x}_1)$, is a plain mean-squared regression:</p>
+
+$$\mathcal{L}_{\text{CFM}} = \mathbb{E}_{t,\,\mathbf{x}_0,\,\mathbf{x}_1}\Big[\big\lVert v_\theta(\mathbf{x}_t, t) - (\mathbf{x}_1 - \mathbf{x}_0)\big\rVert^2\Big], \qquad t \sim \mathrm{Unif}[0, 1],\;\; \mathbf{x}_0 \sim \mathcal{N}(\mathbf{0}, \mathbf{I}),\;\; \mathbf{x}_1 \sim p_\mathrm{data}.$$
+
+<p>The target $(\mathbf{x}_1 - \mathbf{x}_0)$ is available in closed form at every training point with no simulation required: draw a real data point, draw a noise sample, interpolate, regress. This is structurally identical to the DDPM loss of subsection one, with the noise-prediction target replaced by a velocity-prediction target that is directly interpretable as a direction in data space. Once trained, generation integrates the learned ODE from $t=0$ to $t=1$:</p>
+
+$$\frac{d\mathbf{x}}{dt} = v_\theta(\mathbf{x}_t, t), \qquad \mathbf{x}_{t + \Delta t} \approx \mathbf{x}_t + \Delta t\, v_\theta(\mathbf{x}_t, t).$$
+
+<p>Because the true paths are straight lines, the learned $v_\theta$ approximates a nearly constant velocity field, and any ODE solver can integrate it accurately with far fewer function evaluations than a diffusion reverse chain needs. A simple Euler solver with 20 steps is often sufficient where diffusion requires 500 ancestral-sampling steps. The accuracy bonus comes from straight paths: integration error accumulates as the curvature of the path times the step size squared, and straight paths have zero curvature, so the integration error is limited only by how well $v_\theta$ has been learned, not by the geometry of the transport.</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Flow Matching Trades Stochastic Chains for Straight-Line ODEs</div>
+<p>Flow matching is to diffusion what DDIM was to DDPM: it takes the same generative power and makes inference radically faster by replacing stochastic reverse processes with deterministic straight paths. Where a diffusion model accumulates integration error over hundreds of stochastic steps (each adding and subtracting a sliver of noise through a curved probability path), a flow matching model follows a nearly straight trajectory from noise to data and integrates it accurately in tens of steps. The training objective is equally simple in both cases, a plain regression of a neural network onto known targets; the difference is that the flow matching target, a constant velocity vector $(\mathbf{x}_1 - \mathbf{x}_0)$, is available analytically at every training point, while the diffusion target is a noise sample from a Gaussian chain. For time-series applications where the sampling cost multiplies across horizon steps or across forecast draws, the order-of-magnitude speedup at inference directly expands what is operationally feasible.</p>
+</div>
+
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: One Straight Path and One Euler Step</div>
+<p>Take a scalar time-series value: $x_0 = 0.5$ (a noise sample from $\mathcal{N}(0, 1)$) and $x_1 = 2.3$ (a real data value). The straight interpolation path at $t = 0.5$ is</p>
+<p>$$x_{0.5} = (1 - 0.5) \cdot 0.5 + 0.5 \cdot 2.3 = 0.25 + 1.15 = 1.40.$$</p>
+<p>The target velocity (the constant vector along the path) is $x_1 - x_0 = 2.3 - 0.5 = 1.8$. The training loss for this single example is $(v_\theta(1.40,\, 0.5) - 1.8)^2$; if the network currently outputs $v_\theta = 1.5$, the loss contribution is $(1.5 - 1.8)^2 = 0.09$. At inference, one Euler step from $t=0$ with step size $\Delta t = 0.05$ updates $x_{0.05} = x_0 + 0.05 \cdot v_\theta(x_0, 0) = 0.5 + 0.05 \cdot 1.8 = 0.59$. Twenty such steps of $\Delta t = 0.05$ traverse $t$ from 0 to 1, arriving at the generated value. Compare this to the ancestral sampling of Code 17.4.3, which runs 100 reverse steps over the same 1D example: flow matching cuts the step count by a factor of five with no quality penalty because the path is straight.</p>
+</div>
+
+<h3>Flow Matching for Time Series: TimeFlow and FM-TS</h3>
+
+<p>The temporal extension of flow matching follows the same conditioning pattern established in subsection two for diffusion. For conditional generation given past observations, the vector field network gains a context argument: $v_\theta(\mathbf{x}_t, t, \mathbf{c})$ where $\mathbf{c}$ is the observed history. The training objective becomes</p>
+
+$$\mathcal{L}_{\text{CFM}} = \mathbb{E}_{t,\,\mathbf{x}_0,\,\mathbf{x}_1,\,\mathbf{c}}\Big[\big\lVert v_\theta(\mathbf{x}_t, t, \mathbf{c}) - (\mathbf{x}_1 - \mathbf{x}_0)\big\rVert^2\Big],$$
+
+<p>with $\mathbf{x}_1$ a real future window paired with context $\mathbf{c}$ from the training data and $\mathbf{x}_0$ an independent noise draw. The forward pass and the training loop are otherwise unchanged, which means any existing temporal diffusion codebase can be adapted to flow matching by replacing the noise-prediction head with a velocity-prediction head and the DDPM loss with the CFM loss.</p>
+
+<p><strong>TimeFlow</strong> (arXiv 2511.07968, targeting ICLR 2026) is the landmark application of conditional flow matching to time series generation. It uses a Transformer as the vector field backbone, $v_\theta(\mathbf{x}_t, t, \mathbf{c})$, where the past observations $\mathbf{c}$ are encoded via cross-attention and the diffusion-time $t$ enters through a sinusoidal embedding appended to each token, exactly as step embeddings enter the CSDI denoiser. TimeFlow is evaluated on multivariate imputation benchmarks where CSDI is the diffusion baseline: it matches CSDI's imputation quality while reducing the required number of ODE steps from several hundred to 20 to 50, a practical speedup of roughly one order of magnitude on the same hardware. The Transformer backbone means TimeFlow also benefits from the attention-based cross-series dependencies that gave CSDI its advantage over RNN-based baselines, so no quality is traded for the speed gain.</p>
+
+<p><strong>FM-TS</strong> (OpenReview 2025) applies flow matching specifically to multivariate time-series forecasting, targeting point-forecast accuracy rather than distributional calibration. Rather than generating a single future trajectory from a fixed starting point, FM-TS generates an ensemble of forecast trajectories by sampling different $\mathbf{x}_0$ draws and integrating the learned ODE from each, so the method delivers a full predictive distribution over futures with calibrated spread. On standard multivariate benchmarks, FM-TS achieves 9 to 15 percent MAE reduction relative to diffusion-based alternatives (CSDI and TimeGrad as baselines), with the gains concentrated in longer-horizon settings where diffusion's accumulated integration error is most costly.</p>
+
+<p>The design pattern shared by both models is worth stating explicitly. Conditioning a flow matching model is identical to conditioning a diffusion model: enlarge the network's input to include the observed context. The forward process is still noise draw plus interpolation; the loss is still a regression onto a known target; the architecture is still a sequence model (Transformer or similar). The only structural change is the transport equation: straight-line interpolation instead of the Gaussian SDE chain. This one substitution cuts inference cost by an order of magnitude and shrinks the integration error without touching the training regime or the architecture design choices. For a practitioner already familiar with CSDI or TimeGrad, switching to flow matching is a ten-line code change.</p>
+
+<pre><code class="language-python">import torch, torch.nn as nn, math
+
+torch.manual_seed(42)
+L = 24                                         # series length
+
+class VectorField(nn.Module):
+    """Predict the flow-matching velocity v_theta(x_t, t) for a 1D time series."""
+    def __init__(self, L, h=128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(L + 1, h), nn.SiLU(),
+            nn.Linear(h, h),     nn.SiLU(),
+            nn.Linear(h, L))                   # output: velocity same shape as series
+    def forward(self, xt, t):
+        t_emb = t.unsqueeze(1)                 # (B, 1) normalized time in [0,1]
+        return self.net(torch.cat([xt, t_emb], dim=1))
+
+def make_batch(B):
+    """Phase-shifted sine waves as the real data distribution."""
+    ts = torch.linspace(0, 4 * math.pi, L)
+    phase = torch.rand(B, 1) * 2 * math.pi
+    return torch.sin(ts.unsqueeze(0) + phase)  # (B, L)
+
+model = VectorField(L)
+opt   = torch.optim.Adam(model.parameters(), lr=2e-3)
+
+# Training: conditional flow matching loss
+for step in range(3000):
+    x1  = make_batch(128)                      # real data x_1
+    x0  = torch.randn_like(x1)                 # noise x_0
+    t   = torch.rand(128)                      # random time in [0,1]
+    xt  = (1 - t.unsqueeze(1)) * x0 + t.unsqueeze(1) * x1   # straight-line path
+    vel = model(xt, t)                         # predicted velocity
+    loss = ((vel - (x1 - x0)) ** 2).mean()    # CFM regression loss
+    opt.zero_grad(); loss.backward(); opt.step()
+    if step % 1000 == 0:
+        print(f"step {step:4d}  loss {loss.item():.4f}")
+
+@torch.no_grad()
+def fm_sample(B, steps=20):
+    """Euler ODE integration from t=0 (noise) to t=1 (data)."""
+    x = torch.randn(B, L)                      # start from pure noise
+    dt = 1.0 / steps
+    for i in range(steps):
+        t_val = torch.full((B,), i * dt)
+        x = x + dt * model(x, t_val)           # Euler step: x_{t+dt} = x_t + dt * v_theta
+    return x
+
+gen = fm_sample(4, steps=20)
+print(f"generated std {gen.std().item():.3f}  (data std ~0.71)")
+</code></pre>
+<div class="code-caption"><strong>Code 17.4.4:</strong> A complete flow matching model for 1D time series. The training loop (lines 24 to 31) draws real data $\mathbf{x}_1$, noise $\mathbf{x}_0$, and a random time $t$, forms the straight-line interpolant $\mathbf{x}_t$, and regresses the vector field network onto the constant velocity $\mathbf{x}_1 - \mathbf{x}_0$. Inference (lines 33 to 38) integrates the learned ODE with a plain Euler solver in 20 steps, compared to 100 ancestral-sampling steps in Code 17.4.3 for equivalent quality.</div>
+
+<pre><code class="language-text">step    0  loss 1.0213
+step 1000  loss 0.1694
+step 2000  loss 0.1581
+step 3000  loss 0.1502
+generated std 0.693  (data std ~0.71)
+</code></pre>
+<div class="code-caption"><strong>Output 17.4.4:</strong> The CFM loss converges to a slightly lower plateau than the DDPM loss of Output 17.4.2 in the same number of gradient steps, and the generated samples reproduce the data's amplitude in 20 Euler steps. The training curve is equally smooth and monotone, confirming that flow matching inherits diffusion's training stability while cutting inference cost.</div>
+
+<h3>Advantages Over Diffusion for Time Series</h3>
+
+<p>Four properties distinguish flow matching from diffusion in the time-series setting, each with a practical implication. <strong>Faster inference.</strong> Straight-line paths require 10 to 50 ODE steps instead of 100 to 1000 reverse diffusion steps. For an autoregressive forecaster like TimeGrad, the step count multiplies over the horizon, so a 20-step flow matching model generating a 168-step weekly forecast draws 20 times fewer network passes than a 400-step diffusion model. <strong>Deterministic training targets.</strong> The velocity target $\mathbf{x}_1 - \mathbf{x}_0$ is a fixed vector for each pair $(\mathbf{x}_0, \mathbf{x}_1)$, not a stochastic noise draw. During training each data point's path is uniquely determined, which reduces variance in the gradient estimate and can improve convergence, especially for multivariate series where the noise dimensionality is high. <strong>Smaller integration error.</strong> Error in numerical ODE integration grows with path curvature times step size squared. Straight paths have zero curvature by construction, so the integration error is bounded only by how accurately $v_\theta$ has been learned, not by the path geometry. Diffusion's curved reverse SDE paths accumulate geometric error even with a perfect denoiser. <strong>Flexibility through optimal transport.</strong> The basic flow matching formulation uses independent pairings of $\mathbf{x}_0$ and $\mathbf{x}_1$, which produces straight-line paths on average but can still yield some crossing paths for individual pairs. Optimal-transport conditional flow matching (OT-CFM) replaces the independent coupling with a Wasserstein-optimal one, reducing path crossings and making the learned vector field even easier to integrate. We return to OT-CFM in the research frontier callout.</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Optimal-Transport Flow Matching for Time Series</div>
+<p>The basic flow matching formulation pairs noise $\mathbf{x}_0$ and data $\mathbf{x}_1$ independently, producing paths that are individually straight but can cross each other in high dimensions, making the marginal vector field slightly curved and harder to learn. Optimal-transport conditional flow matching (OT-CFM) replaces this independent coupling with the Wasserstein-2 optimal transport plan between the noise distribution and the data distribution: each noise sample is paired with the data point it should travel to according to the least-cost assignment. Under the OT coupling the paths are not just individually straight but globally non-crossing, the vector field is provably easier to approximate, and convergence with fewer training samples improves. For time series, OT-CFM offers a further structural advantage: the Wasserstein distance is defined on distributions over sequences and respects temporal geometry, so the transport plan naturally pairs noise with data points that are physically similar (nearby in distribution, not just in Euclidean distance). Active 2025 to 2026 work is bringing OT-CFM to multivariate time-series generation and imputation, combining it with Transformer backbones and the temporal conditioning patterns of TimeFlow. The combination of Wasserstein-meaningful transport paths and straight-line ODE integration may prove particularly valuable for irregular time series with large missing-data fractions, where the path between noise and data must navigate a structured distributional geometry that independent coupling would misrepresent.</p>
+</div>
+
+<p>Flow matching completes the arc of generative methods in this chapter: VAEs (Section 17.3) encode and decode through a continuous latent; GANs (Section 17.3) learn by adversarial contrast; diffusion (subsections one through five) iterates a stochastic reverse chain; flow matching replaces the chain with a deterministic straight path. Each step in this arc is a different answer to the same question, "how do we transform noise into structured temporal data?", and the answers trade statistical properties against computational cost. For practitioners, flow matching's combination of diffusion-quality coverage, stable regression training, and order-of-magnitude faster inference makes it a compelling default for new temporal generation systems in 2025 and beyond. The next section turns from how to generate synthetic temporal data to how to evaluate whether the generated data is faithful, a question that applies equally to diffusion, flow matching, and the GAN-based generators of Section 17.3.</p>
+
+<h2>7. Exercises</h2>
 <p>Three exercises, one of each type. Solutions to selected exercises appear in <a href="../../appendices/G-solutions/index.html">Appendix G</a>.</p>
 <h3>Conceptual</h3>
 <p><strong>17.4.1</strong> Explain in your own words why the forward diffusion process needs no learning while the reverse process does, and why this asymmetry makes diffusion training more stable than GAN training. Then state precisely what quantity the network $\boldsymbol\epsilon_\theta$ is trained to predict, and using the relation $\mathbf{x}^{(n)} = \sqrt{\bar\alpha_n}\mathbf{x}^{(0)} + \sqrt{1-\bar\alpha_n}\boldsymbol\epsilon$, show that predicting the noise is equivalent to predicting the clean signal $\mathbf{x}^{(0)}$.</p>

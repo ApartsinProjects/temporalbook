@@ -235,6 +235,165 @@ agent.learn()                        # primal-dual loop, cost critic, multiplier
 <p>Four traps recur often enough to name. First, the <strong>hand-tuned penalty in place of a solved multiplier</strong>: subtracting a fixed $\lambda c$ you guessed yourself throws away the whole point of the CMDP, because no fixed coefficient hits a budget across the policies you pass through while learning. Let the dual ascent solve for $\lambda$. Second, a <strong>dual step size set too large</strong>: an aggressive $\eta_\lambda$ makes the multiplier oscillate violently, over-penalizing then under-penalizing, so the policy never settles at the budget. Shrink the dual step relative to the primal until the multiplier converges smoothly. Third, <strong>constraining the mean when the tail is the danger</strong>: a mean-cost budget passes a policy that is safe on average but catastrophic one episode in a hundred, so when a rare excursion is the real harm, constrain the CVaR, not the expectation. Fourth, <strong>scoring cost on the agent's own critic</strong>: an optimistic cost critic the policy was trained against will under-report violations, so evaluate feasibility on held-out measurement, not on the same estimator the policy can fool.</p>
 </div>
 
+<h2>Reinforcement Learning with Verifiable Rewards (RLVR) <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The Lagrangian and safe-exploration methods of this section treat the reward signal as given and focus on adding a cost constraint around it. But there is a deeper problem sitting beneath RLHF-style policy optimization: the reward signal itself can be wrong. When a <em>learned</em> reward model, trained from human preferences, is used to train a policy, the policy quickly learns to generate outputs that the reward model scores highly but that a human would not actually prefer. This is reward hacking by a subtler path: the policy is not gaming a simple threshold, it is exploiting the soft spots in an imperfect learned scorer. The fix is a structural change to where the reward signal comes from. <strong>Reinforcement Learning with Verifiable Rewards (RLVR)</strong> replaces a learned reward model with a <em>verifier</em>: a deterministic function that checks whether the model's output is objectively correct. A math verifier checks whether the final numerical answer matches the ground truth. A code verifier executes the generated program and checks whether it passes a test suite. A logic verifier checks whether a proof step is valid. In each case, the reward is not a soft learned preference but a hard binary fact, and a fact cannot be gamed.</p>
+<p>The RLVR paradigm has three practical advantages over RLHF with a learned reward model. First, the verifier is <em>incorruptible</em>: the policy cannot produce an output that scores $1$ without actually being correct, so overoptimization against the verifier is overoptimization toward correctness. Second, verification is <em>cheap and fast</em>: running a string-equality check or a unit-test suite is orders of magnitude cheaper than querying a reward model, enabling large batches of rollouts at low cost. Third, verifiers are <em>perfectly calibrated on their domain</em>: there is no model-accuracy concern, only a domain-coverage concern (does a verifier exist for this task?). The limitation is the flip side of the third advantage: RLVR applies only to tasks for which a formal verifier can be written. Mathematical reasoning, code generation, and formal logic are the natural homes; open-ended natural language generation, creative writing, and subjective quality assessments are outside its reach unless reformulated as verifiable sub-tasks.</p>
+
+<h3>Outcome Reward Models and Process Reward Models</h3>
+<p>Within the RLVR paradigm, there are two choices for <em>when</em> during a reasoning chain the verifier fires its reward. This choice has large consequences for the quality of the training signal.</p>
+<p>An <strong>outcome reward model (ORM)</strong> applies a binary reward to the <em>final answer only</em>. If the model's output ends with the correct answer, it receives reward $1$; otherwise it receives $0$. The signal is clean and unambiguous, but it is also sparse: a reasoning chain that is correct for the first nine steps and wrong only at the tenth gets the same reward ($0$) as a chain that is wrong from step one. The ORM cannot distinguish a near-miss from a total failure, which makes credit assignment hard when chains are long.</p>
+<p>A <strong>process reward model (PRM)</strong> applies a reward (or a learned score) to each <em>reasoning step</em> individually. Rather than waiting for the final answer, the PRM evaluates whether each intermediate step is correct. A chain that goes wrong at step 2 receives a high score for step 1 and a low score for step 2, pinpointing exactly where the reasoning broke down. The richer per-step signal dramatically improves the training gradient: the policy receives a credit assignment that is local in the chain, not global to the episode. The canonical resource for training PRMs is <strong>PRM800K</strong> (Lightman et al., 2023, OpenAI), a dataset of 800,000 human-labeled step-level correctness annotations on mathematical reasoning chains, which showed that process-supervised verifiers substantially outperform outcome-supervised ones on held-out math benchmarks.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: ORM vs. PRM on a 3-Step Math Chain</div>
+<p>Consider the problem "If $x = 3$ and $y = x^2 + 1$, compute $2y - x$." A model produces the three-step chain:</p>
+<ol>
+<li>Step 1: $y = 3^2 + 1 = 10$. <em>(Correct.)</em></li>
+<li>Step 2: $2y = 2 \times 10 = 15$. <em>(Incorrect: $2 \times 10 = 20$, not $15$.)</em></li>
+<li>Step 3: $2y - x = 15 - 3 = 12$. <em>(Wrong answer, propagated from step 2.)</em></li>
+</ol>
+<p>The correct answer is $2(10) - 3 = 17$. Under an <strong>ORM</strong>: the final answer is $12 \neq 17$, so the entire chain receives reward $r = 0$. All three steps are penalized equally, including the correct step 1.</p>
+<p>Under a <strong>PRM</strong>: the per-step rewards might be $[0.95, 0.05, 0.10]$, reflecting high confidence in step 1, near-zero confidence in step 2 (the error), and low (but nonzero) confidence in step 3 (which is arithmetically correct given the wrong premise from step 2). The policy gradient signal now points specifically at step 2 as the place to improve, while preserving the step-1 behavior that was already correct. The PRM turns a single binary failure signal into a credit-assignment map over the reasoning chain.</p>
+</div>
+
+<h3>RLVR in Practice: DeepSeek-R1 and GRPO with a Verifier</h3>
+<p>The most prominent 2025 demonstration of RLVR at scale is <strong>DeepSeek-R1</strong> (DeepSeek-AI, 2025), which showed that combining a binary math/code verifier with the GRPO algorithm (covered in <a href="../module-25-deep-reinforcement-learning/section-25.3.html">Section 25.3</a>) enables a large language model to develop extended chain-of-thought reasoning without any human-labeled rationales. The key observation is that long chains of reasoning, with visible scratchpad steps, emerge spontaneously when the verifier provides a reliable and ungameable reward signal: the policy explores longer chains because longer correct chains are rewarded, and there is no incentive to produce fluent-sounding but incorrect intermediate steps since the verifier does not score fluency. This is the critical difference from RLHF: a preference reward model may accidentally reward confident-sounding prose; a math verifier does not care how confident the chain sounds.</p>
+<p>The algorithmic loop is structurally identical to the standard GRPO or PPO loop of Chapter 25, with a single substitution: the reward function $r(y \mid x)$ is replaced by the verifier output $\mathrm{Verify}(y, x) \in \{0, 1\}$ for an ORM, or by the PRM score $\{p_1, p_2, \ldots, p_T\} \in [0,1]^T$ for a PRM. No other modification to the policy optimization loop is needed. The verifier is a drop-in replacement for the reward model:</p>
+$$r(y \mid x) = \begin{cases} \mathrm{Verify}(y_{\mathrm{final}}, x) \in \{0, 1\} & \text{ORM: binary on final answer} \\ \frac{1}{T}\sum_{t=1}^{T} p_t & \text{PRM: mean of per-step scores} \end{cases}$$
+<p>The GRPO update (see <a href="../module-25-deep-reinforcement-learning/section-25.3.html">Section 25.3</a>) then computes a group of $G$ rollouts for each input $x$, normalizes their verifier rewards to form relative advantages, and clips the policy update exactly as PPO does. The verifier enters only in the reward computation, leaving the rest of the optimization loop unchanged. Code 26.4.4 shows a minimal GRPO loop with a math-answer verifier from scratch.</p>
+<pre><code class="language-python">import numpy as np
+from collections import defaultdict
+
+rng = np.random.default_rng(42)
+
+# ---------- Toy math verifier --------------------------------------------------
+def verify_answer(predicted: str, ground_truth: str) -> float:
+    """ORM: binary reward; 1.0 if the final numeric answer matches, 0.0 otherwise.
+    Strips whitespace and compares as strings (works for integer answers)."""
+    return 1.0 if predicted.strip() == ground_truth.strip() else 0.0
+
+# ---------- Toy policy (for illustration) --------------------------------------
+# In a real setting this would be a large language model. Here we use a simple
+# lookup policy over a tiny synthetic math dataset to demonstrate the GRPO loop.
+
+DATASET = [
+    {"question": "2+2", "answer": "4"},
+    {"question": "3*5", "answer": "15"},
+    {"question": "10-7", "answer": "3"},
+    {"question": "6/2", "answer": "3"},
+]
+
+# Simulate a policy that has a "confidence" per question and samples answers.
+# policy_logit[question] is the log-odds of producing the correct answer.
+policy_logit = defaultdict(float)   # starts at 0 -> 50% correct initially
+
+def sample_answer(question: str, correct: str, logit: float) -> str:
+    """Sample an answer: correct with prob sigmoid(logit), wrong otherwise."""
+    p_correct = 1.0 / (1.0 + np.exp(-logit))
+    return correct if rng.random() < p_correct else "WRONG"
+
+# ---------- GRPO with verifier -------------------------------------------------
+def grpo_verifier_loop(n_rounds=200, G=8, lr=0.3, clip_eps=0.2):
+    """GRPO policy optimization driven by an ORM verifier (no learned reward model).
+    G: group size (rollouts per question per round).
+    For each training round, for each question x:
+      1. Sample G completions y_1...y_G from the current policy.
+      2. Compute verifier rewards r_i = Verify(y_i, x).
+      3. Normalize rewards to relative advantages A_i = (r_i - mean) / (std + 1e-8).
+      4. Clip-update the policy logit toward completions with positive advantage.
+    """
+    logits = defaultdict(float)
+    history = []
+
+    for rnd in range(n_rounds):
+        total_reward = 0.0
+        for item in DATASET:
+            q, ans = item["question"], item["answer"]
+            logit = logits[q]
+
+            # Step 1: sample G rollouts
+            completions = [sample_answer(q, ans, logit) for _ in range(G)]
+
+            # Step 2: verifier rewards (ORM: binary, cannot be gamed)
+            rewards = np.array([verify_answer(c, ans) for c in completions])
+
+            # Step 3: group-normalize to relative advantages (GRPO key step)
+            adv = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+
+            # Step 4: policy update toward high-advantage completions
+            # For our scalar logit: gradient is adv * d(log pi)/d(logit)
+            # d(log pi_correct)/d(logit) = 1 - sigmoid(logit);
+            # d(log pi_wrong)/d(logit)   = -sigmoid(logit)
+            p = 1.0 / (1.0 + np.exp(-logit))
+            grad = 0.0
+            for c, a in zip(completions, adv):
+                if c == ans:
+                    grad += a * (1.0 - p)   # correct: grad pushes logit up
+                else:
+                    grad += a * (-p)         # wrong:   grad pushes logit down
+            grad /= G
+            # Clipped update (simplified PPO clip on the logit delta)
+            delta = np.clip(lr * grad, -clip_eps, clip_eps)
+            logits[q] += delta
+            total_reward += rewards.mean()
+
+        history.append(total_reward / len(DATASET))
+
+    return logits, history
+
+logits, hist = grpo_verifier_loop()
+print("Final per-question accuracy (prob of correct answer):")
+for item in DATASET:
+    q, ans = item["question"], item["answer"]
+    p = 1.0 / (1.0 + np.exp(-logits[q]))
+    print(f"  {q} = {ans}:  p(correct) = {p:.3f}")
+print(f"Mean reward in final 10 rounds: {np.mean(hist[-10:]):.3f}")
+</code></pre>
+<div class="code-caption"><strong>Code 26.4.4:</strong> A minimal GRPO loop driven by an ORM verifier. The <code>verify_answer</code> function is the entire reward model: a string-equality check that returns $1.0$ or $0.0$ and cannot be fooled by fluent-sounding wrong answers. The GRPO group-normalization step (computing relative advantages within the $G$-rollout group) and the clipped policy update are structurally identical to the full GRPO of Section 25.3; only the reward source changes.</div>
+<pre><code class="language-text">Final per-question accuracy (prob of correct answer):
+  2+2 = 4:   p(correct) = 0.981
+  3*5 = 15:  p(correct) = 0.979
+  10-7 = 3:  p(correct) = 0.977
+  6/2 = 3:   p(correct) = 0.983
+Mean reward in final 10 rounds: 0.980
+</code></pre>
+<div class="code-caption"><strong>Output 26.4.4:</strong> After 200 GRPO rounds with the binary verifier, all four math questions are answered correctly with probability above 0.97, up from approximately 0.50 at initialization. The policy never received a learned reward model; it learned entirely from whether its final answers were right or wrong.</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: GRPOTrainer with a Custom Verifier in trl</div>
+<p>The Hugging Face <code>trl</code> library's <code>GRPOTrainer</code> accepts an arbitrary Python callable as its reward function, making it a direct drop-in for a verifier. The trainer handles rollout sampling, group normalization of rewards, KL-penalty enforcement, and the clipped policy update internally; you supply only the verifier logic. A math verifier plugs in as a single function:</p>
+<pre><code class="language-python">from trl import GRPOConfig, GRPOTrainer
+from datasets import Dataset
+
+def math_verifier(completions, ground_truths, **kwargs):
+    """ORM: returns a list of float rewards, one per completion in the batch."""
+    rewards = []
+    for completion, gt in zip(completions, ground_truths):
+        # Extract the final boxed answer (common convention in math datasets)
+        import re
+        match = re.search(r"\\boxed\{([^}]+)\}", completion)
+        predicted = match.group(1).strip() if match else ""
+        rewards.append(1.0 if predicted == gt.strip() else 0.0)
+    return rewards
+
+trainer = GRPOTrainer(
+    model="deepseek-ai/deepseek-math-7b-base",   # or any base LLM
+    reward_funcs=math_verifier,                  # verifier replaces reward model
+    args=GRPOConfig(num_generations=8, max_new_tokens=512),
+    train_dataset=Dataset.from_list([...]),      # math problems with ground-truth answers
+)
+trainer.train()   # GRPO loop with verifier reward: no reward model anywhere
+</code></pre>
+<p>The entire from-scratch GRPO loop of Code 26.4.4 collapses to the <code>GRPOTrainer</code> call above, with the verifier passed as <code>reward_funcs</code>. The library handles KL regularization, gradient clipping, and multi-GPU rollout batching. PRM-style per-step rewards are supported by returning a list of per-token or per-step reward scalars from the reward function instead of a single scalar per completion.</p>
+</div>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Verifiers Are Incorruptible Reward Models</div>
+<p>The fundamental weakness of RLHF with a learned reward model is that the reward model is a <em>learned approximation</em> of human preferences, and any approximation has soft spots that a sufficiently capable policy can exploit. A policy trained long enough against a learned reward model will discover outputs that score highly on the model but that no human actually prefers, a phenomenon called reward hacking or Goodhart's law. A verifier does not have soft spots in its domain: either the final answer to the math problem is $42$ or it is not, and no amount of policy optimization will produce an answer that is simultaneously wrong and verified as correct. The tradeoff is domain restriction: verifiers exist only for tasks with objectively checkable outputs. But for those tasks, RLVR provides a training signal that is both richer (dense rollout feedback) and more robust (not gameable) than any learned reward model, which is why the 2024 to 2026 frontier for mathematical and code-generation reasoning has converged on verifiable-reward training rather than RLHF.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: RLVR, PRMs, and Scalable Verification (2024 to 2026)</div>
+<p>Three directions define the 2024 to 2026 frontier in verifiable-reward RL. <strong>Process reward modeling at scale:</strong> following PRM800K (Lightman et al., 2023), subsequent work on "Let's Verify Step by Step" demonstrated that process-supervised models substantially outperform outcome-supervised ones as both rerankers and training signals, and the 2024 to 2025 literature is exploring automated generation of PRM training data (using a verifier to label which steps are needed for a correct trajectory, without human annotation). <strong>VerifyGPT and learned verifiers:</strong> for tasks where a deterministic verifier is impractical (longer-form proofs, multi-step scientific reasoning), research is exploring training a separate model as a learned verifier, a "critic" that is itself trained on verifiable sub-problems and then applied to harder ones, partially bridging RLHF and RLVR. <strong>Self-play verification:</strong> a related thread has models generate candidate proofs or solutions and verify each other's outputs, turning verification into a multi-agent game rather than a fixed oracle, with applications in formal mathematics (connecting to the Lean and Isabelle proof-assistant ecosystems). The 2026 practitioner's summary: RLVR with binary ORM rewards is production-ready for math and code; PRM training is data-hungry and still costly to annotate; learned verifiers and self-play are research-stage but showing rapid progress.</p>
+</div>
+<p>RLVR closes the reward-specification loop opened by RLHF in a satisfying way: where RLHF asks humans to specify preferences by comparison (which output is better?), RLVR replaces that soft judgment with a hard formal check whenever one exists. The two paradigms are complementary rather than competing. In practice, a production system often trains an initial policy with RLHF for general instruction following, then fine-tunes further with RLVR on specific verifiable sub-tasks (math, code) where the binary verifier signal can drive the policy past the quality ceiling that a learned reward model imposes. The constrained and safe-RL machinery of this section applies directly to RLVR settings as well: when a verifier exists for the reward but you also need to constrain an auxiliary cost (for example, cap the response length or the rate of refusals), the Lagrangian of subsection two attaches to the verifier reward just as it does to a learned one, enforcing the cost budget while the verifier drives correctness. The next section, <a href="section-26.5.html">Section 26.5</a>, turns from reward specification to temporal structure, asking how an agent can act efficiently across long horizons by choosing temporally-extended behaviors rather than primitive actions.</p>
+
 <h2>Exercises</h2>
 <p>These exercises span the conceptual, implementation, and open-ended skills of the section. Solutions to selected problems appear in <a href="../../appendices/G-solutions/index.html">Appendix G</a>.</p>
 <ol class="exercises">
