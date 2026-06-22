@@ -270,6 +270,127 @@ clip+orthogonal   : pre-clip gradient norm =       6.41
 <p>Chapter 9 built the neural sequence model from its parts. We met the recurrent cell and its carried state, saw it as the learned descendant of the classical filters of <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/section-7.6.html">Section 7.6</a>, unrolled it through time and derived backpropagation through time in <a href="section-9.3.html">Section 9.3</a>, and in this section discovered the price of that unrolling: a product of Jacobians that generically vanishes or explodes, making long-range learning the central obstacle of the whole enterprise. That obstacle is the hinge to <a href="../module-10-recurrent-neural-networks/index.html">Chapter 10</a>. The gated recurrent networks, the LSTM and the GRU, are the direct response: they build the near-linear carry path of subsection four into the cell itself, so the forget gate becomes a learned, per-step control over the recurrent Jacobian, holding it near one wherever long memory is needed. <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/section-7.6.html">Section 7.6</a> told you the forget gate would be a learned Kalman gain; this section told you <em>why</em> the network needs one. Chapter 10 builds it. From there Part III branches into the convolutional answer (<a href="../module-11-temporal-convolutional-networks/index.html">Chapter 11</a>), the attention answer that abolishes the temporal gradient chain (<a href="../module-12-attention-transformers/index.html">Chapter 12</a>), and the structured state-space answer that keeps the recurrence linear and stable (<a href="../module-13-ssm-continuous-time/index.html">Chapter 13</a>). Every one of them is a reply to the single pathology you now understand.</p>
 </div>
 
+<h2>6. Sequence Packing and Flash-Attention for Variable-Length Series <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The gradient pathologies of this section are one reason attention-based sequence models have largely displaced vanilla recurrences for long time series. But attention introduces its own compute and memory challenges, and two engineering innovations from 2023 and 2024 changed what is practical: sequence packing and FlashAttention. Both are invisible to the model's mathematical behavior but determine whether a given architecture can actually run on available hardware for realistic series lengths. Understanding them is no longer optional for practitioners working with attention-based temporal models.</p>
+
+<h3>Sequence packing for heterogeneous batches</h3>
+<p>When a training batch contains time series of different lengths, the standard approach is to pad shorter series to the length of the longest, filling the surplus positions with a PAD token and masking them out of the attention computation. Padding is conceptually simple but computationally wasteful: on a batch where series lengths range from 128 to 2048, average occupancy after padding is often below 60%, meaning 40% or more of every matrix multiply is spent on tokens that contribute zero to the gradient. For heterogeneous datasets, common in clinical records, financial tick data, and sensor traces, this waste is the rule rather than the exception.</p>
+<p>Sequence packing solves this by concatenating all series end-to-end into one long sequence of length $L_{\text{total}} = \sum_i L_i$ and enforcing a block-diagonal attention mask: each position can only attend to positions within its own original series. Formally, if series $i$ occupies positions $[a_i, b_i)$ in the packed sequence, then position $t \in [a_i, b_i)$ attends only to positions $s \in [a_i, b_i)$ (causal: $s \le t$). The attention mask $M$ is block-diagonal with blocks of shape $L_i \times L_i$:</p>
+$$M_{ts} = \begin{cases} 0 & \text{if } s \in [a_i, b_i) \text{ and } s \le t \\ -\infty & \text{otherwise} \end{cases}$$
+<p>Every token in the packed sequence is a real data token, so the matrix multiplies have 100% occupancy. The reduction in wasted compute is 40 to 60% on typical heterogeneous batches, with higher gains when the length distribution has high variance. The trade-off is that the attention mask must be constructed and communicated to the kernel, which adds a small bookkeeping overhead; for homogeneous batches with uniform length there is no benefit and plain padding is simpler.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Packing Turns Length Variance Into a Non-Issue</div>
+<p>The reason sequence packing matters for time series specifically is that real-world temporal datasets almost never have uniform series length. Clinical records differ in admission duration. Financial tick series vary with trading activity. Industrial sensor logs differ by equipment uptime. Without packing, a high-variance length distribution forces an implementation to either truncate series to a fixed length (losing long-range information), pad them (wasting compute), or use a batch size of one (losing parallelism). Packing resolves all three problems simultaneously: every token is real, every series is full-length, and the batch is a single efficient fused computation.</p>
+</div>
+
+<h3>FlashAttention-2 and FlashAttention-3</h3>
+<p>Standard attention computes $\text{Attn}(Q,K,V) = \text{softmax}(QK^\top / \sqrt{d}) V$ by materializing the full $L \times L$ score matrix in GPU HBM (high-bandwidth memory). For a sequence of length $L$ this costs $O(L^2)$ memory, which limits practical sequence lengths to around 2048 on typical GPUs before memory becomes the bottleneck rather than compute.</p>
+<p>FlashAttention (Dao and colleagues, 2022) and its successors FlashAttention-2 (2023) and FlashAttention-3 (2024) reorder the attention computation so that the $L \times L$ matrix is never fully materialized. The key insight is a tiling scheme: partition $Q$, $K$, and $V$ into tiles that fit in GPU SRAM (on-chip cache, roughly 100 to 200 KB per streaming multiprocessor on an A100), and compute the softmax-weighted sum incrementally across tiles using the log-sum-exp trick to maintain numerical equivalence to the full computation:</p>
+$$\text{for tile } (i, j): \quad m_i \leftarrow \max(m_i,\, \text{rowmax}(Q_i K_j^\top / \sqrt{d})), \quad O_i \leftarrow \text{rescale}(O_i) + e^{Q_i K_j^\top / \sqrt{d} - m_i} V_j.$$
+<p>Because each tile fits in SRAM, the reuse of $K$ and $V$ tiles across multiple $Q$ tiles is served from fast on-chip memory rather than slow HBM. The result is that attention memory drops from $O(L^2)$ to $O(L)$ (only the output $O$ and the running statistics $m_i, \ell_i$ need HBM), while the mathematical output is identical to standard attention, no approximation is made. For time series, this makes sequence lengths of $L = 8192$ and beyond feasible on a single A100 GPU, enabling models that directly attend over long clinical records, multi-day sensor traces, and long financial histories that would previously have required truncation or hierarchical chunking.</p>
+<p>FlashAttention-2 improves parallelism by reducing non-matmul operations and better partitioning work across warps, achieving roughly 2 times the throughput of the original. FlashAttention-3 (2024) exploits Hopper GPU architecture features (asynchronous memory copies, warp-specialized pipelines) to push utilization further, reaching above 75% of theoretical FLOP/s on H100 GPUs on sequence lengths above 4096.</p>
+
+<h3>Causal attention and the diagonal tile skip</h3>
+<p>Autoregressive time series models require causal (lower-triangular) attention masks: position $t$ can only attend to positions $s \le t$. In the tiled FlashAttention computation, causal masking introduces an important optimization: tiles above the main diagonal of the $Q \times K$ score matrix are entirely masked to $-\infty$ and their softmax contribution is zero, so those tiles need not be computed at all. In the tiled traversal, only tiles on or below the diagonal are processed, and diagonal tiles are half-masked (lower-triangular within the tile). The result is that causal attention has roughly half the FLOPs of full attention, and for $L \le 4096$ on modern GPUs the causal mask is essentially free in wall-clock time because the tile skipping is handled within the kernel without launching additional compute.</p>
+
+<h3>xFormers memory-efficient attention for irregular series</h3>
+<p>Not all temporal attention patterns are purely causal or purely full. Irregularly-sampled time series, multi-resolution series where coarse and fine time steps interact, and series with structured missing data all require custom sparse attention masks. The xFormers library (Meta, 2022 onward) provides a memory-efficient attention kernel that accepts an arbitrary dense or sparse attention bias matrix, enabling custom patterns without writing a new CUDA kernel. For a time series with irregular sampling, a natural choice is to encode the time-gap between positions into the attention bias:</p>
+$$\text{bias}_{ts} = -\lambda \cdot |t_{\text{real}} - s_{\text{real}}|,$$
+<p>where $t_{\text{real}}$ and $s_{\text{real}}$ are the actual timestamps (not token indices). This penalizes attending across large time gaps without making distant positions impossible to attend to, matching the inductive bias that recent observations are more relevant than distant ones for most temporal tasks. The xFormers kernel handles this bias during the tiled computation with the same $O(L)$ memory footprint as FlashAttention, as long as the bias can be computed on-the-fly or stored sparsely.</p>
+
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Memory and Throughput at Different Sequence Lengths</div>
+<p>On a single A100-80GB GPU with batch size 8, head dimension 64, and 8 attention heads, the peak attention layer memory for standard PyTorch eager attention is approximately $8 \times L^2 \times 8 \times 2$ bytes (float16 score matrix per head). At $L = 1024$ this is roughly 128 MB, well within budget. At $L = 4096$ it is 2 GB, occupying 2.5% of the 80 GB total but competing with activations and weights. At $L = 8192$ it is 8 GB, a significant fraction, and at $L = 16384$ it is 32 GB, leaving little room for parameters. FlashAttention reduces the attention memory to $O(L)$: at $L = 8192$ the running-statistics buffer is under 50 MB regardless of head count, freeing the 80 GB budget for a much larger model or batch. Throughput on a H100 at $L = 4096$: standard attention runs at approximately 35% of theoretical FLOP/s (memory-bound), while FlashAttention-2 runs at approximately 65% and FlashAttention-3 at approximately 78%, a 2.2 times wall-clock speedup for no accuracy change.</p>
+</div>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+# ── Option 1: FlashAttention-2 via HuggingFace transformers ──
+# Any HuggingFace model that supports it can be loaded with
+# attn_implementation="flash_attention_2". Requires flash-attn>=2.0 installed.
+
+from transformers import AutoModel
+
+# model = AutoModel.from_pretrained(
+#     "your-temporal-model",
+#     attn_implementation="flash_attention_2",
+#     torch_dtype=torch.float16,
+# ).cuda()
+
+# ── Option 2: flash_attn_func directly (most control) ──
+# pip install flash-attn --no-build-isolation
+# from flash_attn import flash_attn_func
+#
+# q = torch.randn(B, L, H, D, device="cuda", dtype=torch.float16)
+# k = torch.randn(B, L, H, D, device="cuda", dtype=torch.float16)
+# v = torch.randn(B, L, H, D, device="cuda", dtype=torch.float16)
+# out = flash_attn_func(q, k, v, causal=True)   # O(L) memory, causal mask
+
+# ── Sequence packing with block-diagonal attention mask ──
+def pack_sequences(sequences, device="cpu"):
+    """
+    Pack a list of variable-length 1-D series into one long sequence.
+    Returns:
+        packed   : (1, L_total) concatenated series
+        attn_mask: (L_total, L_total) causal block-diagonal attention mask
+                   (True = attend, False = mask out)
+    """
+    lengths = [len(s) for s in sequences]
+    packed = torch.cat([torch.tensor(s, dtype=torch.float32) for s in sequences])
+    L = len(packed)
+    # Build block-diagonal causal mask.
+    mask = torch.zeros(L, L, dtype=torch.bool)
+    offset = 0
+    for length in lengths:
+        for i in range(length):
+            # Causal: position (offset+i) attends to (offset+0) through (offset+i).
+            mask[offset + i, offset : offset + i + 1] = True
+        offset += length
+    return packed.unsqueeze(0).to(device), mask.to(device)
+
+# Demo: a batch of three series with lengths 10, 7, 13 (total 30 tokens).
+series = [
+    [float(i) for i in range(10)],
+    [float(i) * 0.5 for i in range(7)],
+    [float(i) * 2.0 for i in range(13)],
+]
+packed, mask = pack_sequences(series)
+print("Packed length:", packed.shape[1])           # 30, no padding
+print("Mask diagonal blocks nonzero:", mask.sum().item())
+
+# ── Using the mask in nn.MultiheadAttention ──
+# nn.MultiheadAttention accepts attn_mask as a (L, L) boolean or additive mask.
+d_model, n_heads = 16, 2
+mha = nn.MultiheadAttention(embed_dim=d_model, num_heads=n_heads, batch_first=True)
+
+# Project packed scalar series to d_model (toy linear embedding).
+embed = nn.Linear(1, d_model)
+x = embed(packed.unsqueeze(-1))                    # (1, 30, d_model)
+# Convert boolean mask to additive float mask (0 = attend, -inf = ignore).
+additive_mask = torch.zeros(30, 30)
+additive_mask[~mask] = float("-inf")
+out, _ = mha(x, x, x, attn_mask=additive_mask)
+print("Packed attention output shape:", out.shape) # (1, 30, d_model)
+</code></pre>
+<div class="code-caption"><strong>Code 9.4.4:</strong> Sequence packing with a block-diagonal causal attention mask, and two paths to FlashAttention-2 (the HuggingFace <code>attn_implementation</code> flag and the direct <code>flash_attn_func</code> call). The packing function concatenates variable-length series end-to-end and builds a boolean mask that restricts each position to attend only within its own series, achieving 100% token utilization with no padding waste. FlashAttention requires <code>flash-attn</code> installed; the HuggingFace path is the lowest-friction option for models already in that ecosystem.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Three Lines to Enable Flash-Attention in Practice</div>
+<p>For new projects the fastest path is the <code>flash-attn</code> package. Install with <code>pip install flash-attn --no-build-isolation</code> (requires CUDA 11.6 or later and a supported GPU: A100, H100, RTX 3090/4090, or newer). Then choose based on your stack: (1) HuggingFace model: add <code>attn_implementation="flash_attention_2"</code> to <code>from_pretrained</code> or the model config. (2) Custom PyTorch model: replace the attention block with <code>from flash_attn import flash_attn_func</code> and call it with <code>(q, k, v, causal=True)</code>, where tensors are <code>(batch, seqlen, heads, head_dim)</code> in float16 or bfloat16. (3) xFormers for custom masks: <code>from xformers.ops import memory_efficient_attention</code> then <code>memory_efficient_attention(q, k, v, attn_bias=bias)</code> where <code>bias</code> is a dense or <code>LowerTriangularMask</code> object. The practical decision rule: always use FlashAttention when $L > 512$; add sequence packing when batch length variance is high (coefficient of variation above 0.3); use xFormers when the attention pattern is neither causal nor full (irregular timestamps, structured missing data).</p>
+<pre><code class="language-python"># Three-line FlashAttention-2 drop-in for a custom attention block.
+from flash_attn import flash_attn_func   # pip install flash-attn
+# q, k, v: (batch, seqlen, nheads, headdim), float16 or bfloat16, on CUDA.
+out = flash_attn_func(q, k, v, causal=True)   # O(L) memory, exact, causal
+
+# xFormers for a time-gap-penalized attention bias on irregular series.
+from xformers.ops import memory_efficient_attention, LowerTriangularMask
+# bias shape: (batch, nheads, L, L), or LowerTriangularMask() for causal.
+out = memory_efficient_attention(q, k, v, attn_bias=LowerTriangularMask())
+</code></pre>
+<div class="code-caption"><strong>Code 9.4.5:</strong> Minimal FlashAttention-2 and xFormers calls for production use. The <code>flash_attn_func</code> call is a drop-in replacement for any scaled-dot-product attention block on CUDA with float16 or bfloat16 inputs. The xFormers <code>memory_efficient_attention</code> call supports both the standard causal mask and custom dense bias tensors for irregular temporal attention patterns.</div>
+</div>
+
 <div class="callout exercise">
 <div class="callout-title">Exercise 9.4.1: Derive the Vanishing Bound <span class="exercise-type conceptual">Conceptual</span></div>
 <p>For the cell $\mathbf{h}_k = \tanh(\mathbf{W}\mathbf{h}_{k-1} + \mathbf{U}\mathbf{x}_k)$, the one-step Jacobian is $\mathbf{J}_k = \operatorname{diag}(\tanh'(\mathbf{a}_k))\,\mathbf{W}$. Using sub-multiplicativity of the spectral norm and the fact that $\tanh'(\cdot) \le 1$ everywhere, show that if $\sigma_{\max}(\mathbf{W}) < 1$ then $\|\partial L_T/\partial \mathbf{h}_t\|$ is bounded above by a geometric sequence in $T - t$ and therefore vanishes. State explicitly why this is a <em>sufficient</em> but not a <em>necessary</em> condition for vanishing, and give a one-sentence reason the same bound says nothing useful about the exploding case.</p>

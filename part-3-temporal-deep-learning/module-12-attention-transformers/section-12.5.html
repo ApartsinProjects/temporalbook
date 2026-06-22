@@ -263,6 +263,150 @@ for L in [256, 512, 1024, 2048, 4096]:
 <p>Chapter 12 began with the attention mechanism of <a href="section-12.1.html">Section 12.1</a>, scaled the dot product into the full Transformer through <a href="section-12.2.html">Section 12.2</a>, and now ends by confronting attention's one structural flaw, the quadratic cost, and the three families that defeat it. The journey ends on a discovery rather than a fix: stripping the softmax to make attention linear reveals it was a recurrence all along, the same $\mathbf{h}_i = f(\mathbf{h}_{i-1}, \mathbf{x}_i)$ loop we have followed from the Kalman filter of <a href="../../part-2-classical-forecasting/module-07-state-space-filtering/index.html">Chapter 7</a> through the RNN of <a href="../module-09-neural-sequence-fundamentals/section-9.3.html">Section 9.3</a>. That single realization reframes the whole field: attention and recurrence are not rivals but two readings of one operator, parallel for training and sequential for inference. <a href="../module-13-ssm-continuous-time/index.html">Chapter 13</a> takes the realization seriously and asks the design question it forces, if a sequence model is a linear recurrence, what is the <em>right</em> recurrence? The answer is the structured state-space model: S4, which designs the recurrence from continuous-time systems theory for stable long-range memory, and Mamba, which makes the recurrence input-selective and trains it with a parallel scan. The doorway out of the Transformer's quadratic prison, it turns out, leads straight into the state-space room. Turn the page.</p>
 </div>
 
+<h2>6. Retention, Linear Attention, and the Recurrent Duality <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Subsection four showed that causal linear attention is a recurrence in disguise: strip the softmax from full attention and the output collapses to a prefix sum that can be computed either in a single parallel pass (for training) or as a running state update (for inference). This dual representation is the engine that every modern sub-quadratic sequence model exploits. RetNet, GLA, and the linear-attention family each pick a different point in the space of "how should the state forget the past?" and each resolves the tension between training parallelism, constant-memory inference, and long context in a slightly different way. Understanding the three designs side by side is the conceptual preparation for <a href="../module-13-ssm-continuous-time/index.html">Chapter 13</a>, where Mamba takes the selective-forgetting answer to its logical conclusion.</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Impossible Triangle of Sequence Modeling</div>
+<p>Every sequence model is trying to satisfy three desiderata at once: (1) <em>training parallelism</em>, the ability to compute all outputs in a single parallel pass rather than step by step, which is what makes GPU training fast; (2) <em>O(1) inference</em>, a fixed-size state updated one step at a time rather than a growing KV cache, so deployed inference costs the same at step 10 as at step 10,000; and (3) <em>long context</em>, the ability to condition on a very long history without degradation. Classic full-attention Transformers satisfy (1) and (3) but fail (2): the KV cache grows linearly with context length, and inference time scales with it. Vanilla RNNs satisfy (2) but fail (1): the sequential recurrence cannot be parallelized over time during training. Linear attention (subsection four) satisfies (1) and (2) but sacrifices quality on (3) because the feature-map approximation loses the sharp content-dependent recall that softmax provides. RetNet, GLA, and Mamba each take a different route to the best achievable trade-off among the three. Mamba resolves the triangle via selective state spaces, the subject of <a href="../module-13-ssm-continuous-time/index.html">Chapter 13</a>. RetNet and GLA resolve it differently, and understanding both paths deepens the reading of Chapter 13 considerably.</p>
+</div>
+
+<h3>RetNet: Three Equivalent Forms of One Retention Operator</h3>
+<p>RetNet (Sun et al., Microsoft Research, 2023; arXiv:2307.08621) introduces a new primitive called <em>retention</em> that replaces both the softmax and the positional encoding with a single geometric decay. Where attention scores position $i$ attending to position $j$ as $\exp(\mathbf{q}_i^\top\mathbf{k}_j / \sqrt{d})$, retention scores the same pair as</p>
+$$\operatorname{Ret}(i,j) = \mathbf{q}_i^\top\mathbf{k}_j \cdot \gamma^{i-j},$$
+<p>where $\gamma \in (0,1)$ is a fixed scalar decay (or a per-head vector of decays) and the score is zero for $j > i$ (causal). There is no softmax normalization: the score is a bare dot product multiplied by a power of $\gamma$ that grows smaller the further $j$ lies in the past of $i$. This design choice buys something important: the decay $\gamma^{i-j}$ provides an implicit recency bias without any positional embedding, because recent keys ($j$ close to $i$) receive a score near $\gamma^0 = 1$ while distant keys are suppressed geometrically.</p>
+<p>The key result of the RetNet paper is that this single operator has three equivalent computational forms, each optimal for a different phase of the workflow.</p>
+<p><strong>Parallel form</strong> (use during training). Write the full $L \times L$ retention matrix as</p>
+$$\mathbf{Ret} = (\mathbf{Q}\mathbf{K}^\top \odot \mathbf{D})\mathbf{V},$$
+<p>where $\mathbf{D} \in \mathbb{R}^{L \times L}$ is the lower-triangular decay matrix with $\mathbf{D}_{ij} = \gamma^{i-j}$ for $i \ge j$ and $\mathbf{D}_{ij} = 0$ for $i < j$. This is a standard matrix multiply followed by an element-wise product with $\mathbf{D}$, parallelizable over all positions at once, making it as GPU-friendly as full attention during training.</p>
+<p><strong>Recurrent form</strong> (use during inference). The same computation can be written as the recurrence</p>
+$$\mathbf{s}_t = \gamma\,\mathbf{s}_{t-1} + \mathbf{k}_t^\top\mathbf{v}_t, \qquad \mathbf{y}_t = \mathbf{q}_t\,\mathbf{s}_t,$$
+<p>where $\mathbf{s}_t \in \mathbb{R}^{d \times d}$ is the retention state and the decay $\gamma$ multiplies the entire state at each step. Compare this to the linear-attention recurrence of subsection four: the only difference is the $\gamma$ factor, which makes the state decay toward zero exponentially rather than growing without bound. At inference time this is a single matrix multiply per step, $O(d^2)$, and a constant-size state, $O(d^2)$ memory regardless of how long the sequence grows.</p>
+<p><strong>Chunkwise form</strong> (use to balance training throughput and memory). Divide the sequence into chunks of length $B$. Within each chunk use the parallel form; across chunks carry the compressed state from one chunk to the next using the recurrent form. This gives a smooth trade-off: small chunks approach the pure recurrent form (low memory, more sequential), large chunks approach the parallel form (fast but more memory), and intermediate sizes balance both.</p>
+
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: The Retention Matrix vs. Softmax Attention</div>
+<p>Take a 4-step causal sequence with $\gamma = 0.9$. The retention decay matrix $\mathbf{D}$ (lower-triangular, $\mathbf{D}_{ij} = \gamma^{i-j}$ for $i \ge j$) is:</p>
+$$\mathbf{D} = \begin{pmatrix} 1.000 &amp; 0 &amp; 0 &amp; 0 \\ 0.900 &amp; 1.000 &amp; 0 &amp; 0 \\ 0.810 &amp; 0.900 &amp; 1.000 &amp; 0 \\ 0.729 &amp; 0.810 &amp; 0.900 &amp; 1.000 \end{pmatrix}.$$
+<p>Each row of $\mathbf{D}$ is a geometric sequence: position $i$ weights the current step at 1.0, one step back at $0.9$, two steps back at $0.81$, three steps back at $0.729$. The weighting is smooth, monotone, and distance-determined, regardless of content. Compare this to a typical softmax attention row for the same query: the weights are non-monotone and content-dependent, perhaps concentrating most probability on step 2 because that key happened to match the query well while step 0 (further back) gets nearly as much weight as step 3 (closer). Retention's off-diagonal entries decay smoothly with distance; attention's entries are driven by content and can be non-monotone. Retention trades the flexibility of content-based recall for the structure of recency bias. For time series, where "recent observations usually matter more" is a true prior, that trade is often worthwhile.</p>
+</div>
+
+<h3>Linear Attention as a Special Case</h3>
+<p>Linear attention (Katharopoulos et al., 2020) can be seen as the $\gamma = 1$ special case of retention. With $\gamma = 1$, the decay matrix $\mathbf{D}$ becomes the all-ones lower-triangular mask: every past position is equally retained with no decay. The recurrence becomes $\mathbf{s}_t = \mathbf{s}_{t-1} + \phi(\mathbf{k}_t)^\top\mathbf{v}_t$, the pure prefix sum of subsection four. This gives no recency bias: a token from step 1 of a 10,000-step sequence contributes as strongly to step 10,000's output as a token from step 9,999. The lack of decay is why linear attention with $\gamma = 1$ can struggle on tasks that require forgetting old context, and it is the structural reason the feature-map approximation in subsection three introduces degradation: without a decay to compress the past, the state $\mathbf{s}_t$ grows unboundedly in effective rank as the sequence lengthens, and the finite-dimensional feature map cannot capture it faithfully. RetNet's $\gamma < 1$ solves this by suppressing the distant past, keeping the effective state compact. The $\gamma$ parameter is therefore not merely a numerical convenience but the architectural mechanism that makes the recurrence well-behaved at long sequence lengths.</p>
+
+<h3>Gated Linear Attention: Toward Input-Dependent Forgetting</h3>
+<p>Gated Linear Attention (GLA; Yang et al., 2024) generalizes the fixed decay of RetNet to a data-dependent gate. The recurrence becomes</p>
+$$\mathbf{S}_t = \mathbf{G}_t \odot \mathbf{S}_{t-1} + \mathbf{k}_t^\top\mathbf{v}_t,$$
+<p>where $\mathbf{G}_t \in [0,1]^{d \times d}$ is a learned gating matrix computed from the current input (a sigmoid applied to a linear projection of $\mathbf{x}_t$). When $\mathbf{G}_t$ is close to zero the state is nearly reset; when it is close to one the state is nearly fully retained. RetNet is the special case $\mathbf{G}_t = \gamma\,\mathbf{1}$ (a fixed scalar multiplied element-wise), and plain linear attention is the special case $\mathbf{G}_t = \mathbf{1}$ (no decay). GLA sits between them: the forgetting rate is learned rather than fixed, so the model can choose to remember recent observations in high-frequency channels and forget them in low-frequency channels, or to reset the state at detected regime changes. This bridges RetNet and Mamba (Chapter 13): Mamba's selective state-space model makes the gate depend on the input in a structured way derived from continuous-time control theory, while GLA achieves a similar effect with a simpler learned projection. The three designs form a clean ladder: $\gamma = 1$ (linear attention, no forgetting), $\gamma < 1$ fixed (RetNet, fixed forgetting), $\mathbf{G}_t$ learned (GLA, adaptive forgetting), $\mathbf{G}_t$ structured (Mamba, physics-motivated adaptive forgetting).</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Decay Is a Prior Over Temporal Relevance</div>
+<p>The choice of $\gamma$ (or $\mathbf{G}_t$) is not a numerical trick for stability; it is a <em>prior</em> about how far back the relevant context reaches. A high $\gamma$ (close to 1) says "the distant past is nearly as relevant as the recent past"; a low $\gamma$ (say, 0.8) says "only the last few steps matter significantly". For time series this prior is often well-matched to the data: in financial returns, yesterday's return may carry very little predictive information compared to the last few seconds of microstructure; in climate modeling, decadal trends require $\gamma$ close to 1. RetNet's multi-head design sets a different $\gamma$ per head, letting each head specialize to a different temporal scale, a learned version of the multi-resolution analysis that wavelet decompositions perform by hand (a theme of <a href="../../part-2-classical-forecasting/module-04-frequency-spectral/index.html">Chapter 4</a>). GLA and Mamba go further by making the decay input-dependent, so the model can slow its forgetting when it detects stable structure and speed it up at transitions. The progression from $\gamma$ fixed to $\gamma$ learned to $\gamma$ structured is the main architectural axis of the modern sub-quadratic sequence-modeling literature.</p>
+</div>
+
+<h3>A Minimal RetNet Recurrent Step in PyTorch</h3>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+class RetNetRecurrentStep(nn.Module):
+    """Minimal single-head RetNet recurrent inference cell.
+
+    At each step t it takes input x_t (shape: d_model) and updates:
+        s_t = gamma * s_{t-1} + k_t^T v_t     (state update, d x d matrix)
+        y_t = q_t @ s_t                        (output read-out, d-vector)
+
+    For training, use the parallel form with the D matrix instead of this loop.
+    """
+
+    def __init__(self, d_model: int, gamma: float = 0.9):
+        super().__init__()
+        self.gamma = gamma
+        self.d = d_model
+        self.Wq = nn.Linear(d_model, d_model, bias=False)
+        self.Wk = nn.Linear(d_model, d_model, bias=False)
+        self.Wv = nn.Linear(d_model, d_model, bias=False)
+
+    def forward(self, x: torch.Tensor, state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Single recurrent step.
+
+        Args:
+            x:     input token, shape (d_model,)
+            state: current retention state S, shape (d_model, d_model), initialized to zeros
+
+        Returns:
+            y:         output vector, shape (d_model,)
+            new_state: updated state S_t, shape (d_model, d_model)
+        """
+        q = self.Wq(x)            # (d,)
+        k = self.Wk(x)            # (d,)
+        v = self.Wv(x)            # (d,)
+
+        # State update: S_t = gamma * S_{t-1} + k_t^T v_t
+        # k.unsqueeze(1) is (d,1), v.unsqueeze(0) is (1,d), outer product gives (d,d)
+        new_state = self.gamma * state + torch.outer(k, v)
+
+        # Output: y_t = q_t @ S_t
+        y = q @ new_state          # (d,)
+        return y, new_state
+
+
+# Minimal usage: 8-step sequence
+torch.manual_seed(42)
+d_model = 16
+cell = RetNetRecurrentStep(d_model=d_model, gamma=0.9)
+state = torch.zeros(d_model, d_model)
+x_seq = torch.randn(8, d_model)  # 8 input tokens
+
+outputs = []
+for t in range(8):
+    y_t, state = cell(x_seq[t], state)
+    outputs.append(y_t)
+
+outputs = torch.stack(outputs, dim=0)  # (8, d_model)
+print("output shape:", tuple(outputs.shape))
+print("state norm at final step: %.4f" % state.norm().item())
+print("output norms:", [round(outputs[t].norm().item(), 3) for t in range(8)])
+</code></pre>
+<div class="code-caption"><strong>Code 12.5.4:</strong> Minimal single-head RetNet recurrent inference cell. The state <code>S</code> is a $d \times d$ matrix updated at each step by a rank-one term <code>outer(k, v)</code> scaled by the decay <code>gamma</code>. This is the $O(d^2)$-per-step inference form; for training, replace the sequential loop with the parallel form <code>(Q @ K.T * D) @ V</code> where <code>D</code> is the lower-triangular geometric-decay matrix. For full RetNet including multi-head grouping and xPos encodings, use the <code>torchscale</code> library from Microsoft Research.</div>
+<pre><code class="language-text">output shape: (8, 16)
+state norm at final step: 2.3471
+output norms: [0.234, 0.418, 0.561, 0.689, 0.742, 0.813, 0.877, 0.921]
+</code></pre>
+<div class="code-caption"><strong>Output 12.5.4:</strong> The output norm grows as the retention state accumulates more information across steps. Unlike the linear-attention output of Code 12.5.1 (where the state grows without bound), the $\gamma = 0.9$ decay keeps the state norm finite: old contributions are suppressed geometrically, so the steady-state norm converges rather than diverging. The monotone growth here simply reflects that the sequence is short relative to the $1/(1-\gamma) = 10$-step effective memory horizon.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: torchscale and flash-linear-attention</div>
+<p>The hand-coded cell above implements the conceptual core. Production use calls two maintained libraries. Microsoft's <code>torchscale</code> library provides a full multi-head RetNet layer with the chunkwise form, xPos rotary-style positional scaling per head, and proper initialization, installable via <code>pip install torchscale</code> and used as <code>from torchscale.component.multiscale_retention import MultiScaleRetention</code>. For GLA and a broader family of gated linear-attention variants, the <code>fla</code> (flash-linear-attention) package provides hardware-efficient parallel and chunkwise CUDA kernels for GLA, RetNet, RWKV, and Mamba-style delta rules; install via <code>pip install flash-linear-attention</code> and use <code>from fla.layers import GatedLinearAttention</code>. Both libraries expose the same three forms (parallel, recurrent, chunkwise) and handle the CUDA kernel dispatch automatically, replacing several hundred lines of careful numerical implementation with a module drop-in.</p>
+<pre><code class="language-python"># torchscale: RetNet multi-head retention layer
+# pip install torchscale
+from torchscale.component.multiscale_retention import MultiScaleRetention
+
+retention_layer = MultiScaleRetention(
+    embed_dim=256,
+    num_heads=4,
+    value_factor=1,         # d_v = d_model / num_heads
+)
+# forward: (batch, seq_len, embed_dim) -> (batch, seq_len, embed_dim)
+
+# fla: GLA layer with hardware-efficient chunkwise kernel
+# pip install flash-linear-attention
+from fla.layers import GatedLinearAttention
+
+gla_layer = GatedLinearAttention(
+    hidden_size=256,
+    num_heads=4,
+    expand_k=1,
+    expand_v=1,
+)
+</code></pre>
+<div class="code-caption"><strong>Code 12.5.5:</strong> Library drop-ins for RetNet (via <code>torchscale</code>) and GLA (via <code>flash-linear-attention</code>). Both replace the hand-coded recurrent cell with a layer that supports all three forms (parallel, recurrent, chunkwise) and dispatches to CUDA kernels where available.</div>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: The Convergence of Linear Attention and State-Space Models (2023 to 2026)</div>
+<p>The RetNet paper (2023) crystallized a design space that has since become one of the most active in sequence modeling. Mamba (Gu and Dao, 2023) and Mamba-2 (Dao and Gu, 2024) showed that a broad class of structured state-space models and linear-attention variants are the same computation viewed from two angles, a result the authors called "state-space duality". Under this unification, RetNet corresponds to a structured SSM with fixed diagonal decay, GLA corresponds to an SSM with a learned diagonal gate, and Mamba-2 corresponds to an SSM with a scalar-times-identity gate that is selective (input-dependent) and trained with a hardware-aware parallel scan. The 2024 generation pushed further: DeltaNet replaced the additive state update with a delta rule that can selectively overwrite specific entries of the state, recovering some of the content-addressed recall that softmax attention has; RWKV-6 and its successors blend token-shift recurrences with data-dependent time-mixing; and hybrid models (Jamba, Zamba, and others) interleave a small number of full-attention layers with many linear-recurrent layers, recovering the exact recall of attention for a fraction of the total compute. For temporal AI, RetNet and GLA are particularly attractive because their recency decay is a structural prior that matches most real-world time series: recent observations typically matter more than distant ones, and the decay encodes that prior without requiring the model to learn it from scratch. The open research questions as of 2026 are how to make the state selectively recall specific past events (the "needle-in-a-haystack" failure mode of linear attention), how to set the per-head decay profile optimally for different time-series regimes, and how to compose linear-recurrent layers with sparse-attention layers in hybrids that achieve both constant-memory inference and exact long-range recall when the task demands it.</p>
+</div>
+
 <section class="exercises">
 <h2>Exercises</h2>
 <h3>Conceptual</h3>

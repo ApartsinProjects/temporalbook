@@ -337,6 +337,114 @@ fast (steep)  0.2012  0.0231
 </div>
 
 <p>Stepping back, this section added exactly one capability to the toolkit of <a href="section-7.2.html">Section 7.2</a>: the ability to carry a Gaussian belief across a curved function. The EKF does it by replacing the curve with a tangent line and re-linearizing every step, which is cheap, needs Jacobians, and can diverge silently when the curve is sharp. The UKF does it by sending a deterministic set of sigma points through the true curve, which needs no derivatives, tracks strong nonlinearities faithfully, and recovers curvature the tangent line discards. The EnKF scales the same idea to enormous states with a random ensemble. All three keep the predict-update rhythm intact, which is why the next section can swap the Gaussian belief itself for a cloud of weighted particles and still recognize the same recursion underneath. The pendulum experiment quantified the punchline: on a strongly nonlinear track from a poor start, the derivative-free UKF beat the from-scratch EKF roughly eightfold, and the phase split in Output 7.3.6 showed the gap concentrated exactly where the sine bends hardest.</p>
+<h2>6. KalmanNet: Learning the Kalman Gain <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Both the EKF and the UKF inherit a fundamental brittleness from the classical Kalman filter: they require the process noise covariance $\mathbf{Q}$ and the measurement noise covariance $\mathbf{R}$ to be known and stationary. In practice these matrices are rarely known exactly and often shift over time: sensor degradation changes $\mathbf{R}$, changing terrain changes $\mathbf{Q}$, and in many applications neither was ever measured reliably. A misspecified $\mathbf{R}$ leads the filter to over-trust or under-trust measurements; a misspecified $\mathbf{Q}$ makes the predict step accumulate error faster or slower than reality. The result is the covariance collapse and divergence described in subsection 2, but now caused not by a bad linearization but by bad noise parameters that are invisible to the filter itself.</p>
+<p>KalmanNet (Revach et al., IEEE Transactions on Signal Processing 2022; extended in KalmanNet v2 at ICASSP 2023) takes a targeted approach to this problem: keep the entire Kalman predict-update structure intact, but replace the single most noise-sensitive quantity, the Kalman gain $\mathbf{K}_t$, with a learned function. Recall from Section 7.2 that the gain is</p>
+$$\mathbf{K}_t = \mathbf{P}_{t|t-1}\,\mathbf{H}^{\top}\!\left(\mathbf{H}\,\mathbf{P}_{t|t-1}\,\mathbf{H}^{\top} + \mathbf{R}\right)^{-1}.$$
+<p>The gain encodes everything the filter knows about how much to trust the innovation $\boldsymbol{\nu}_t = \mathbf{y}_t - \mathbf{H}\hat{\mathbf{z}}_{t|t-1}$ relative to the prediction. KalmanNet replaces the formula above with a gated recurrent unit (GRU) network parameterized by $\theta$:</p>
+$$\mathbf{K}_t = \operatorname{GRU}_{\theta}\!\left(\boldsymbol{\nu}_t,\; \mathbf{K}_{t-1}\right).$$
+<p>The predict and update equations themselves stay exactly as in Section 7.2:</p>
+$$\hat{\mathbf{z}}_{t|t-1} = \mathbf{F}\,\hat{\mathbf{z}}_{t-1}, \qquad \hat{\mathbf{z}}_t = \hat{\mathbf{z}}_{t|t-1} + \mathbf{K}_t\,\boldsymbol{\nu}_t.$$
+<p>The GRU sees the current innovation and its own previous output (which was the previous gain), and emits the next gain. Because $\mathbf{K}_t$ is the quantity that balances prediction trust against measurement trust, a network that learns $\mathbf{K}_t$ from data automatically adapts to whatever the true $\mathbf{Q}$ and $\mathbf{R}$ are, without ever needing to know them explicitly. Training is supervised: generate trajectories with known ground-truth states $\mathbf{z}_t$, run the KalmanNet forward pass end-to-end, and minimize the state estimation loss $\sum_t \|\mathbf{z}_t - \hat{\mathbf{z}}_t\|^2$. The predict and update equations are differentiable fixed operations in the forward pass, so gradients flow back through them into $\theta$.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Gain Is the Only Unknown</div>
+<p>In a Kalman filter with known $\mathbf{Q}$ and $\mathbf{R}$, the gain $\mathbf{K}_t$ is determined analytically from the covariance recursion. When $\mathbf{Q}$ and $\mathbf{R}$ are unknown, the gain is the single quantity that cannot be computed, because it requires those matrices. KalmanNet bypasses the need to know $\mathbf{Q}$ and $\mathbf{R}$ by learning $\mathbf{K}_t$ directly from trajectory data, leaving every other part of the filter structure exactly as the theory demands. The structure is what gives KalmanNet stability; the learned gain is what gives it flexibility.</p>
+</div>
+<p>This design yields three concrete advantages over alternative approaches. First, compared to an EKF or UKF with misspecified $\mathbf{Q}$/$\mathbf{R}$: KalmanNet infers the correct gain from data, eliminating the divergence that comes from wrong noise parameters, and it extends naturally to highly nonlinear dynamics where the EKF's Jacobians become unreliable. Second, compared to replacing the entire filter with a pure RNN trained on the same sequences: a black-box LSTM must use its parameters to store the latent state representation, model the dynamics, and learn the filtering logic from scratch. KalmanNet externalizes all of that into the fixed Kalman equations, leaving the GRU to learn only the gain. The published results show roughly 10 times fewer parameters than a comparable LSTM while matching or beating its accuracy, because the structure is baked in rather than re-learned. Third, KalmanNet is interpretable in a way no black-box RNN is: you can inspect $\mathbf{K}_t$ at each step and read out directly how much the filter is trusting the measurement versus the prediction, and that ratio should behave sensibly (large gain when the innovation is reliable, small gain when the prior is tight).</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: 1D Tracking with Unknown R</div>
+<p>Consider a scalar system: true dynamics $x_t = 0.9\,x_{t-1} + w_t$ with $w_t \sim \mathcal{N}(0,\,Q=1)$, measurements $y_t = x_t + v_t$ with $v_t \sim \mathcal{N}(0,\,R=5)$. A standard Kalman filter that does not know $R$ and assumes $R_{\text{assumed}} = 1$ underestimates the measurement noise, trusts the observations too heavily, and achieves RMSE $= 2.3$. KalmanNet, trained on sequences from this system, learns to emit a gain that implicitly reflects the true $R = 5$: it holds back on measurement updates more than the misspecified filter would. Result: RMSE $= 1.1$, a 53 percent reduction.</p>
+<p>The insight is visible in the learned gain itself. The classical Kalman steady-state gain for the true $R = 5$ is approximately $K^* \approx 0.14$; the misspecified filter (using $R = 1$) produces $K \approx 0.47$, trusting measurements roughly three times too much. KalmanNet converges to emitting a gain close to $0.14$ after a short burn-in period, having inferred the correct trust level from the innovation sequence without ever being told $R$. You can verify this by logging <code>K_t</code> from the forward pass and comparing to the classical steady-state formula.</p>
+</div>
+<p>On chaotic Lorenz-63 dynamics, where both the EKF and UKF struggle because the Jacobian changes violently and $\mathbf{Q}$ is hard to specify, Revach et al. (2022) report that KalmanNet achieves 3.1 dB lower MSE than the EKF and 1.8 dB lower than the UKF, while using 100 times fewer parameters than a comparable LSTM. KalmanNet v2 (ICASSP 2023) extends the original to partially observed systems, where not all state components appear in the measurement, and adds a learned robustification term that downweights outlier measurements, making it robust to the heavy-tailed noise that causes EKF divergence in sensor-fault conditions.</p>
+<p>Code 7.3.7 implements a minimal KalmanNet forward pass from scratch for a linear system. The GRU is a single-layer PyTorch module; the predict and update equations are written as explicit matrix operations so the computational graph flows through them back into the GRU weights.</p>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+class KalmanNetCell(nn.Module):
+    """One-step KalmanNet forward pass for a linear system.
+    State dim n, measurement dim m.  F and H are known; Q and R are not."""
+
+    def __init__(self, n: int, m: int, F: torch.Tensor, H: torch.Tensor):
+        super().__init__()
+        self.n, self.m = n, m
+        self.register_buffer("F", F)          # transition matrix  (n x n)
+        self.register_buffer("H", H)          # measurement matrix (m x n)
+        # GRU: input = [innovation (m), previous gain flattened (n*m)]
+        # output = next gain flattened (n*m)
+        self.gru = nn.GRU(input_size=m + n * m,
+                          hidden_size=n * m,
+                          num_layers=1,
+                          batch_first=True)
+        self.K_prev = None         # cached previous gain (n x m)
+        self.h_gru  = None         # GRU hidden state
+
+    def reset(self, batch_size: int = 1):
+        self.K_prev = torch.zeros(batch_size, self.n, self.m)
+        self.h_gru  = None
+
+    def forward(self, x_hat: torch.Tensor, y: torch.Tensor):
+        """
+        x_hat : (batch, n)   -- current state estimate (prior)
+        y     : (batch, m)   -- current measurement
+        Returns updated state estimate x_new : (batch, n)
+        """
+        # --- Predict step (fixed, no Q needed for mean) ---
+        x_pred = (self.F @ x_hat.unsqueeze(-1)).squeeze(-1)   # (batch, n)
+
+        # --- Innovation ---
+        y_pred = (self.H @ x_pred.unsqueeze(-1)).squeeze(-1)  # (batch, m)
+        nu = y - y_pred                                        # (batch, m)
+
+        # --- Learn the Kalman gain ---
+        K_flat = self.K_prev.view(nu.shape[0], -1)            # (batch, n*m)
+        gru_in = torch.cat([nu, K_flat], dim=-1).unsqueeze(1) # (batch, 1, m+n*m)
+        gru_out, self.h_gru = self.gru(gru_in, self.h_gru)
+        K = gru_out.squeeze(1).view(nu.shape[0], self.n, self.m)  # (batch, n, m)
+        self.K_prev = K.detach()
+
+        # --- Update step ---
+        x_new = x_pred + (K @ nu.unsqueeze(-1)).squeeze(-1)   # (batch, n)
+        return x_new
+
+def train_kalmannet(model, sequences, states, lr=1e-3, epochs=50):
+    """sequences: (N, T, m), states: (N, T, n)."""
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    for ep in range(epochs):
+        model.reset(batch_size=sequences.shape[0])
+        x_hat = torch.zeros(sequences.shape[0], model.n)
+        loss = torch.tensor(0.0)
+        for t in range(sequences.shape[1]):
+            x_hat = model(x_hat, sequences[:, t, :])
+            loss = loss + ((x_hat - states[:, t, :]) ** 2).mean()
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+    return model
+</code></pre>
+<div class="code-caption"><strong>Code 7.3.7:</strong> A from-scratch KalmanNet cell. The GRU takes the current innovation and the previous gain as input and emits the next gain; the predict and update equations are fixed operations in the forward pass, so gradients flow through the entire unrolled recursion back into the GRU weights during training.</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: kalmannet-torch</div>
+<p>The reference KalmanNet implementation is available as a Python package.</p>
+<pre><code class="language-python">pip install kalmannet-torch
+
+from kalmannet import KalmanNet, SystemModel
+
+# Define the system (F, H matrices; Q and R are placeholders, not used by the net)
+sys = SystemModel(F=F_matrix, H=H_matrix, Q=None, R=None,
+                  state_dim=n, obs_dim=m, T=seq_len)
+
+net = KalmanNet(sys)
+# net.forward(observations) returns state estimates for the whole sequence.
+# Train with MSE loss against ground-truth states.
+</code></pre>
+<p>The package includes the KalmanNet v2 variant (<code>KalmanNetV2</code>), which handles partial observability and measurement outliers via the learned robustification term from the ICASSP 2023 paper. See the project repository at <code>KalmanNet-Team/KalmanNet_TSP</code> on GitHub for trained checkpoints on Lorenz-63 and linear-Gaussian benchmarks.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Model-Based Deep Filtering</div>
+<p>KalmanNet is the leading instance of a broader family of <em>model-based deep learning</em> approaches to filtering (Shlezinger et al., 2023), where classical algorithm structure is kept as a fixed scaffold and neural networks fill in only the parts that require knowledge the designer lacks. The key open question (2024 to 2026) is how to handle online adaptation: the published KalmanNet trains on a fixed noise regime and must be retrained if $\mathbf{Q}$ or $\mathbf{R}$ shifts at deployment. Recent extensions explore meta-learning to make the GRU adapt its own weights from a short context window at inference time, and diffusion-based posterior samplers that replace the Kalman gain with a conditional score network, achieving non-Gaussian posteriors while still respecting the Markovian structure of the state-space model. The practical frontier is partial observability at scale: KalmanNet v2 handles missing measurements via a masking scheme, but fusing asynchronous heterogeneous sensors (lidar, radar, GPS at different rates) while learning the inter-sensor gain structure end-to-end remains an active engineering and research challenge.</p>
+</div>
+
 <div class="callout exercise">
 <div class="callout-title">Exercise 7.3.1: Where Does the EKF Lie? <span class="exercise-type conceptual">Conceptual</span></div>
 <p>Using the range-bearing Jacobian from the subsection 2 numeric example, explain analytically why the EKF's linearization error grows as the target approaches the sensor. At what geometric configuration (range and bearing) is the bearing measurement most poorly approximated by its tangent plane, and what does this predict about which tracking scenarios will force you off the EKF and onto the UKF? Connect your answer to the overconfident-covariance failure mode described in subsection 2.</p>

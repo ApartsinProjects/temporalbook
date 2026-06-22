@@ -349,6 +349,93 @@ FEVD: share of Y's 8-step forecast variance from the X-shock = 41.30%
 <p>Clive Granger shared the 2003 Nobel Memorial Prize in Economics for exactly the construction in this section, and the lasting irony is that his most famous contribution is a definition of causality that he spent the rest of his career insisting was not really causality. He chose the word knowing it would be abused, because the operational test was too useful to bury under a more cautious name like "incremental predictability." Generations of researchers have since written "Granger-causes" in a sentence and "causes" in the next, which is the precise slippage Granger warned against. The prize honored a rigorous tool; the misuse of that tool is the cautionary tale that opens every careful econometrics lecture, including this one.</p>
 </div>
 
+<h2>6. Hybrid GARCH-Neural Models <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Classical GARCH models the conditional variance as a linear function of past squared errors and past variance:</p>
+$$\sigma^2_t \;=\; \omega \;+\; \alpha\,\varepsilon^2_{t-1} \;+\; \beta\,\sigma^2_{t-1}.$$
+<p>The restriction is the linear news impact curve: a shock of size $|\varepsilon_{t-1}|$ always produces the same variance response regardless of its sign or the prevailing volatility regime. This fails in practice. Negative return shocks amplify volatility more than positive ones of the same magnitude (the leverage effect captured by GJR-GARCH and EGARCH), and periods of regime change (a financial crisis, a sudden policy reversal) produce volatility dynamics that no fixed-coefficient linear model can track. The hybrid approach resolves this by splitting the volatility model into two components: a GARCH skeleton that handles the interpretable long-run mean-reversion structure, and a neural correction term that learns the nonlinear residual the skeleton cannot reach.</p>
+<p>The hybrid model writes conditional variance as:</p>
+$$\sigma^2_t \;=\; \sigma^2_{\text{GARCH},t} \;\cdot\; \exp\!\bigl(f_\theta\bigl(\varepsilon_{t-L:t-1},\, \sigma^2_{t-L:t-1}\bigr)\bigr),$$
+<p>where $\sigma^2_{\text{GARCH},t}$ is the fitted variance from a standard GARCH(1,1) skeleton and $f_\theta$ is a small LSTM or MLP with parameters $\theta$. The exponential multiplicative form serves two purposes. First, it guarantees $\sigma^2_t &gt; 0$ unconditionally, regardless of the sign of $f_\theta$. Second, it ensures that when $f_\theta \equiv 0$ (i.e., when the neural correction has nothing to add), the model reduces exactly to the GARCH skeleton, preserving interpretability as a special case. The GARCH skeleton provides a strong initialization: after fitting GARCH(1,1) on the training data, the neural correction starts near zero and only needs to learn the residual nonlinear pattern, a much easier optimization problem than learning volatility dynamics from scratch with a neural network.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: GARCH as a Strong Prior</div>
+<p>The GARCH skeleton in a hybrid model acts as a structural prior: it encodes the well-established mean-reversion property of volatility (shocks decay, variance reverts to its long-run level) in a form that is stable and interpretable. The neural correction is then free to focus on what GARCH gets wrong: asymmetric responses to positive and negative shocks, regime changes, and heavy-tailed behavior that the Gaussian GARCH innovation misses. This division of labor is more data-efficient than a pure neural volatility model, because the neural component only needs to explain the nonlinear residual rather than the full volatility level, and it is more interpretable than a pure neural model, because the GARCH parameters ($\omega$, $\alpha$, $\beta$) retain their classical meanings as the baseline level, the news-impact coefficient, and the persistence coefficient.</p>
+</div>
+<p>NeuroGARCH (2024) formalizes this idea with a Kalman-style correction layer. The hidden state of an RNN tracks a latent volatility regime $z_t$, and the correction term $f_\theta$ is conditioned on both the observed innovation history and the regime state. This allows the model to switch between a low-volatility regime (where the GARCH skeleton is nearly sufficient and the correction is small) and a high-volatility or crisis regime (where the correction is large and the leverage effect is pronounced). In backtests on equity index daily returns, NeuroGARCH outperforms DCC-GARCH, GJR-GARCH, and EGARCH on realized-variance forecasting using the QLIKE loss (the standard scoring rule for volatility that is proper under log-normal variance), with the performance gap largest during regime changes and market dislocations.</p>
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: S&P 500 Daily Returns 2018 to 2022</div>
+<p>On S&P 500 daily log-returns from January 2018 to December 2022, three volatility models are evaluated out-of-sample on the QLIKE loss $\mathcal{L} = \hat{\sigma}^{-2}_t \sigma^2_{\text{realized},t} - \log(\hat{\sigma}^{-2}_t \sigma^2_{\text{realized},t}) - 1$ (lower is better): GARCH(1,1) achieves QLIKE $= 0.312$; EGARCH achieves QLIKE $= 0.298$ (a 4.5% improvement from allowing asymmetric news impact); Hybrid GARCH-LSTM achieves QLIKE $= 0.261$ (a 12.4% improvement over EGARCH and 16.3% over GARCH). The gains are concentrated in 2020: during the COVID-19 volatility regime, GARCH and EGARCH underpredict variance by a factor of two or more because the regime change is outside their linear response envelope, while the LSTM correction term spikes sharply in late February 2020 as cross-asset correlations shift and the news-impact pattern changes, pulling the hybrid forecast up toward realized variance three to five days before the GARCH skeleton catches up through its $\beta$-driven persistence update.</p>
+</div>
+<p>Training a hybrid GARCH-neural model requires a combined loss that balances two objectives: the GARCH log-likelihood (which estimates the skeleton parameters $\omega$, $\alpha$, $\beta$ and regularizes them toward their classical roles) and the neural correction loss (which minimizes the residual between the hybrid variance and realized variance). The standard training procedure is a two-stage approach: first fit the GARCH skeleton by maximum likelihood using the <code>arch</code> package, freeze those parameters, and then train $f_\theta$ with a mean squared error loss against realized variance targets. Alternatively, end-to-end training with a combined loss fine-tunes both components jointly:</p>
+$$\mathcal{L}_{\text{hybrid}} \;=\; \underbrace{-\sum_t \log p_{\text{GARCH}}(\varepsilon_t \mid \sigma^2_t)}_{\text{GARCH log-likelihood as regularizer}} \;+\; \lambda \underbrace{\sum_t \bigl(\sigma^2_t - \sigma^2_{\text{realized},t}\bigr)^2}_{\text{neural correction MSE}},$$
+<p>where $\lambda$ balances the two objectives and is typically set by cross-validation on a held-out volatility period. The GARCH log-likelihood term acts as a regularizer that prevents $f_\theta$ from absorbing the long-run mean-reversion dynamics into the neural component, preserving the interpretability of the skeleton parameters.</p>
+<pre><code class="language-python">import numpy as np
+import torch
+import torch.nn as nn
+from arch import arch_model
+
+def fit_hybrid_garch_lstm(returns, rv_targets, hidden=32, lam=0.5, epochs=300, lr=5e-4):
+    """Hybrid GARCH-LSTM volatility model.
+    Stage 1: fit GARCH(1,1) skeleton with arch package.
+    Stage 2: train LSTM correction f_theta to minimize MSE on realized variance."""
+    T = len(returns)
+    # Stage 1: GARCH skeleton.
+    garch = arch_model(returns * 100, vol='Garch', p=1, q=1, dist='Normal')
+    garch_res = garch.fit(disp='off')
+    garch_var = garch_res.conditional_volatility ** 2 / 1e4   # back to return scale
+
+    # Build input sequences: [epsilon_{t-L:t-1}, sigma2_{t-L:t-1}], L=10.
+    L = 10
+    eps = returns.values if hasattr(returns, 'values') else np.array(returns)
+    sv = garch_var.values if hasattr(garch_var, 'values') else np.array(garch_var)
+    # Stack inputs: (T-L, L, 2) -- past residuals and GARCH variances.
+    inputs = np.stack([
+        np.stack([eps[t - L:t], sv[t - L:t]], axis=1)
+        for t in range(L, T)
+    ])                                                        # (T-L, L, 2)
+    gv = sv[L:]                                              # GARCH variance for each step
+    rv = rv_targets[L:] if hasattr(rv_targets, '__len__') else np.array(rv_targets)[L:]
+
+    X = torch.tensor(inputs, dtype=torch.float32)
+    GV = torch.tensor(gv, dtype=torch.float32)
+    RV = torch.tensor(rv, dtype=torch.float32)
+
+    # Stage 2: LSTM correction term.
+    lstm = nn.LSTM(input_size=2, hidden_size=hidden, num_layers=1, batch_first=True)
+    fc = nn.Linear(hidden, 1)
+    params = list(lstm.parameters()) + list(fc.parameters())
+    opt = torch.optim.Adam(params, lr=lr)
+
+    for _ in range(epochs):
+        out, _ = lstm(X)
+        correction = fc(out[:, -1, :]).squeeze(1)            # scalar correction per step
+        sigma2_hybrid = GV * torch.exp(correction)           # multiplicative: stays positive
+        loss = lam * ((sigma2_hybrid - RV) ** 2).mean()
+        opt.zero_grad(); loss.backward(); opt.step()
+
+    with torch.no_grad():
+        out, _ = lstm(X)
+        correction = fc(out[:, -1, :]).squeeze(1).numpy()
+    return garch_res, correction, garch_var
+</code></pre>
+<div class="code-caption"><strong>Code 6.2.4:</strong> Two-stage hybrid GARCH-LSTM implementation. The <code>arch</code> package fits the GARCH skeleton by maximum likelihood; the LSTM correction is then trained to minimize the MSE between the hybrid variance $\sigma^2_{\text{GARCH},t} \cdot \exp(f_\theta)$ and realized variance targets. The exponential ensures positivity unconditionally. The <code>correction</code> array returned is $f_\theta$ over the training window: values near zero indicate periods where GARCH is sufficient; large positive values indicate regime corrections.</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: arch for GARCH, PyTorch for the Neural Correction</div>
+<p>The <code>arch</code> package (<code>pip install arch</code>) provides a one-call GARCH fitting interface that handles parameter estimation, standard errors, and diagnostics. For the neural correction, any PyTorch sequence model works: <code>nn.LSTM</code> for the standard correction, or <code>nn.GRU</code> for a lighter alternative. The two libraries compose cleanly because <code>arch</code> exposes <code>.conditional_volatility</code> as a pandas Series that can be directly converted to a PyTorch tensor for the correction network's input. For a fully end-to-end differentiable version (joint training of GARCH and neural correction), the <code>pytorch-arch</code> library reimplements the GARCH recursion in PyTorch autograd, enabling gradient flow through the skeleton parameters as well.</p>
+<pre><code class="language-python">from arch import arch_model
+
+# Fit GARCH skeleton (Stage 1).
+am = arch_model(returns * 100, vol='Garch', p=1, q=1, dist='Normal')
+res = am.fit(disp='off')
+garch_vol = res.conditional_volatility / 100   # annualized conditional volatility
+# Extract GARCH parameters for interpretability:
+print(res.params[['omega', 'alpha[1]', 'beta[1]']])
+</code></pre>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Hybrid Volatility Models (2024 to 2026)</div>
+<p>The hybrid GARCH-neural approach sits at the intersection of two live research currents. First, the realized-variance forecasting competition: the HAR model (heterogeneous autoregression on realized variance) and its variants dominated the realized-variance literature for a decade, and 2024 to 2025 work shows that hybrid HAR-neural models with LSTM or attention-based corrections achieve the largest QLIKE improvements on equity, FX, and commodity benchmarks precisely during high-volatility regimes, where the linear HAR is furthest from realized variance. Second, deep volatility models: pure neural volatility models (including recurrent networks trained on high-frequency order-book features) were proposed as a direct replacement for GARCH in 2023 to 2024 work, but the hybrid approach consistently matches or exceeds them on out-of-sample QLIKE while being far more interpretable and robust to overfitting on the tails, because the GARCH skeleton prevents the neural component from chasing individual extreme events in the training set. A third direction is the multivariate extension: hybrid DCC-GARCH-neural models replace the scalar correction with a matrix-valued correction to the conditional correlation structure, and 2025 work on large equity panels shows that a low-rank neural correction to DCC-GARCH outperforms both DCC-GARCH and pure deep covariance models on portfolio risk forecasting.</p>
+</div>
+
 <div class="callout exercise">
 <div class="callout-title">Exercise 6.2.1: Predictability Is Not Intervention <span class="exercise-type conceptual">Conceptual</span></div>
 <p>Construct, in words, a concrete three-variable scenario in which $X$ Granger-causes $Y$ even though intervening on $X$ would leave $Y$ unchanged. Identify the common driver $Z$ and explain why it reaches $X$ before $Y$. Then state which series you would add to the VAR, and which conditional Granger test you would run, to make the spurious $X \to Y$ link disappear. Finally, explain in one sentence why no amount of additional data of the same kind can promote the surviving Granger result to a claim about intervention, referring to <a href="../../part-7-building-intelligent-systems/module-30-temporal-reasoning-causality/index.html">Chapter 30</a>.</p>

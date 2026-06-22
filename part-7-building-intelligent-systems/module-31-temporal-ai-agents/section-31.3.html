@@ -283,6 +283,144 @@ agent.run("Forecast demand from 800,840,..., and tell me whether to pre-order ab
 <p><strong>Lesson:</strong> The value of a temporal agent is not that it always answers; it is that it answers when its own calibrated uncertainty says it may, and escalates when it may not. Tool use supplies the quantitative answer; the uncertainty gate supplies the discipline to know when to use it.</p>
 </div>
 
+<h2>6. Hierarchical Temporal Agent Memory: Beyond the Context Window <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The planning and tool-use machinery of this section gives the agent the ability to act. The memory architecture of <a href="section-31.2.html">Section 31.2</a> gives it short-term context. A third challenge appears only when the agent operates over long time horizons: an agent monitoring a sensor fleet for weeks, or tracking a financial position across hundreds of trading sessions, accumulates far more observations than any context window can hold. The naive solution is to drop old observations. The cost is severe: the agent loses access to past anomalies, long-horizon trends, and prior decisions that may be directly relevant to the current situation. This subsection develops the architectural answer, hierarchical temporal memory, starting from the MemGPT framework (NeurIPS 2023) and extending to adaptive importance-weighted memory management (A-MEM, 2025).</p>
+<p>The core problem is precise. Suppose the agent receives one observation per hour. After $K = 100$ observations the context window fills. At hour 101 a new observation arrives. The agent must choose which 99 of its 100 in-context observations to retain and which to evict. If it evicts uniformly (oldest first), it forgets an anomaly from six days ago that is directly analogous to today's reading. If it evicts randomly, it incoherently fragments its temporal record. A principled memory architecture must answer three design questions: where observations go when they leave the context, how to retrieve the right past observations at query time, and which observations to evict or compress when storage itself is bounded.</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: OS Virtual Memory as the Organizing Metaphor</div>
+<p>MemGPT (2023) observes that operating systems solved exactly this problem for programs: main memory (RAM) holds the working set, disk holds the rest, and the OS moves pages between tiers transparently. MemGPT applies the same two-tier architecture to LLM agents. The context window is main memory (fast, limited, always visible to the model). An external vector database is the disk (large, indexed, accessed by explicit retrieval calls). The agent manages its own memory by issuing two function calls: RECALL(query) fetches semantically relevant past observations from the external store into the context, and ARCHIVE(content) moves content from the context to the external store. Unlike an OS, the agent issues these calls explicitly as part of its reasoning, so the memory management is inspectable and auditable.</p>
+</div>
+
+<h3>MemGPT Architecture: Two-Tier Temporal Memory</h3>
+<p>The MemGPT memory system has two tiers with distinct access semantics. The <em>main context</em> tier contains the agent's current system prompt, the recent observation buffer (the last $K$ observations the agent has seen), the current task state, and any observations retrieved in the current turn. Everything in the main context is visible to the LLM at inference time. The <em>external storage</em> tier contains all observations and facts that have been archived. External storage is a vector database augmented with a timestamp index: each stored item carries both a dense embedding (for semantic search) and a Unix timestamp (for temporal filtering). This dual index enables hybrid retrieval: a query like "anomalies similar to today's reading, from the last 30 days" is executed as a vector similarity search filtered to $t \ge t_{\text{now}} - 30 \text{ days}$.</p>
+<p>The agent manages movement between tiers via two function calls that appear in its tool schema alongside domain tools like the forecaster of Section 31.3.3. ARCHIVE$(c)$ serializes content $c$ to a JSON record with fields $\{$text, embedding, timestamp$\}$ and writes it to the vector DB, then removes $c$ from the context. RECALL$(q, k, t_{\text{start}}, t_{\text{end}})$ encodes query $q$ as a dense vector, retrieves the top-$k$ records by cosine similarity from the time window $[t_{\text{start}}, t_{\text{end}}]$, and injects the retrieved texts into the current context. The LLM decides when to call each function: it is trained (or prompted) to ARCHIVE old observations before the context overflows and to RECALL before answering any question that requires long-horizon context.</p>
+
+<h3>A-MEM: Adaptive Importance-Weighted Memory</h3>
+<p>A-MEM (2025) extends MemGPT with an importance scoring function that governs both retrieval ranking and eviction. Each memory record at time $t$ has an importance score</p>
+$$I(m, t) = w_1 \cdot \text{recency}(m, t) + w_2 \cdot \text{relevance}(m, t, q) + w_3 \cdot \text{surprise}(m),$$
+<p>where recency$(m, t) = \exp(-\lambda(t - t_m))$ decays exponentially with age, relevance$(m, t, q)$ is the cosine similarity between the stored embedding and the current query embedding, and surprise$(m)$ is a novelty score computed at archive time (for example, the reconstruction error of a local autoencoder trained on the recent stream). The weights $w_1, w_2, w_3$ are hyperparameters that encode the relative value of fresh versus semantically close versus unusual observations. During retrieval, records are ranked by $I(m, t)$ rather than by raw cosine similarity alone, so a moderately similar but very recent observation outranks a highly similar but ancient one. During eviction, records with $I(m, t) &lt; \theta$ are candidates for compression (their text is replaced by a LLM-generated summary) or deletion. Compression rather than deletion is preferable for temporal AI agents because aggregate patterns over long windows (daily maximums, weekly anomaly counts) are often more useful for trend detection than individual raw observations.</p>
+
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: Sensor Agent over 30 Days</div>
+<p>An agent monitors a single sensor at hourly resolution for 30 days: $30 \times 24 = 720$ observations total. The context window holds $K = 100$ observations. After day 5 (observation 120), the context is full and ARCHIVE must be called for at least 20 observations before the next one can be ingested. After 30 days, the external store holds $720 - 100 = 620$ archived observations; the context holds the most recent 100.</p>
+<p>The query "any anomalies like today's spike in the past month?" is executed as: (1) encode the current spike observation as a dense vector $\mathbf{q}$; (2) call RECALL($\mathbf{q}$, $k=5$, $t_{\text{start}} = t_{\text{now}} - 30\text{d}$, $t_{\text{end}} = t_{\text{now}}$); (3) the vector DB returns the top-5 archived records by cosine similarity within the 30-day window. Suppose the two most similar records are from day 8 at 14:00 and day 21 at 09:00, with similarities 0.91 and 0.87. These two are injected into the context alongside today's observation. The agent can now reason: "similar spikes occurred on day 8 and day 21; both were followed by a return to baseline within 4 hours; this spike is likely transient." Without MemGPT-style memory, observations from day 8 and day 21 would have been permanently lost to context overflow 3 and 19 days earlier, respectively.</p>
+</div>
+
+<h3>Temporal AI Design Choices</h3>
+<p>Three design decisions determine the quality of a MemGPT-style temporal memory system. The first is <em>granularity</em>: should raw observations be archived, or should the agent first compress them into summaries? Raw observations preserve all detail but fill storage quickly; summaries (e.g., hourly maximums compressed to daily records) scale to longer horizons at the cost of detail. A practical pattern is a two-stage pipeline: raw observations are archived for the first 7 days, then a background process compresses them to daily summaries for retention up to 90 days. The second decision is the <em>eviction policy</em>: least-recently-used (LRU) eviction is simple but discards old anomalies that are infrequent by definition; importance-weighted eviction (A-MEM) retains surprises but requires calibrating the surprise scorer. The third decision is the <em>retrieval strategy</em>: semantic-only retrieval finds similar observations regardless of age, which is appropriate for pattern matching but wrong for trend detection; semantic-plus-time retrieval (the RECALL API above) supports both uses by allowing the caller to specify the time window explicitly.</p>
+
+<pre><code class="language-python">"""MemGPT-style temporal memory manager sketch.
+
+Requires: pip install letta chromadb numpy
+letta is the production MemGPT package; chromadb is the vector DB backend.
+"""
+import time
+import numpy as np
+from dataclasses import dataclass, field
+from typing import Any
+
+
+@dataclass
+class MemoryRecord:
+    text: str
+    embedding: np.ndarray
+    timestamp: float  # Unix epoch seconds
+    importance: float = 1.0
+
+
+class TemporalMemoryManager:
+    """Two-tier MemGPT-style memory manager with timestamp-filtered retrieval."""
+
+    def __init__(self, context_limit: int = 100, embed_fn=None):
+        self.context_limit = context_limit
+        self.context: list[MemoryRecord] = []          # main context (in-window)
+        self.external: list[MemoryRecord] = []         # external store (archived)
+        # embed_fn: str -> np.ndarray; replace with a real encoder in production
+        self.embed_fn = embed_fn or (lambda text: np.random.randn(64))
+
+    # ------------------------------------------------------------------
+    # Core memory management primitives
+    # ------------------------------------------------------------------
+
+    def ingest(self, text: str) -> None:
+        """Add a new observation; auto-archive oldest if context is full."""
+        if len(self.context) >= self.context_limit:
+            self._archive_oldest()
+        record = MemoryRecord(
+            text=text,
+            embedding=self.embed_fn(text),
+            timestamp=time.time(),
+        )
+        self.context.append(record)
+
+    def archive(self, record: MemoryRecord) -> None:
+        """Move a record from the context to external storage."""
+        if record in self.context:
+            self.context.remove(record)
+        self.external.append(record)
+
+    def recall(self, query: str, k: int = 5,
+               t_start: float = 0.0, t_end: float = float("inf")
+               ) -> list[MemoryRecord]:
+        """Retrieve top-k external records by cosine similarity within [t_start, t_end]."""
+        q_emb = self.embed_fn(query)
+        candidates = [r for r in self.external
+                      if t_start <= r.timestamp <= t_end]
+        if not candidates:
+            return []
+        # Cosine similarities
+        embs = np.stack([r.embedding for r in candidates])
+        sims = embs @ q_emb / (
+            np.linalg.norm(embs, axis=1) * np.linalg.norm(q_emb) + 1e-9
+        )
+        top_k_idx = np.argsort(sims)[::-1][:k]
+        retrieved = [candidates[i] for i in top_k_idx]
+        # Inject retrieved records into context temporarily
+        self.context.extend(retrieved)
+        return retrieved
+
+    # ------------------------------------------------------------------
+    # A-MEM importance scoring (simplified)
+    # ------------------------------------------------------------------
+
+    def importance(self, record: MemoryRecord, query_emb: np.ndarray,
+                   lambda_decay: float = 0.01,
+                   w: tuple[float, float, float] = (0.4, 0.4, 0.2)) -> float:
+        t_now = time.time()
+        recency = np.exp(-lambda_decay * (t_now - record.timestamp))
+        relevance = float(
+            record.embedding @ query_emb
+            / (np.linalg.norm(record.embedding) * np.linalg.norm(query_emb) + 1e-9)
+        )
+        surprise = record.importance   # pre-computed at archive time
+        return w[0] * recency + w[1] * relevance + w[2] * surprise
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _archive_oldest(self) -> None:
+        """Evict the oldest context record to external storage."""
+        oldest = min(self.context, key=lambda r: r.timestamp)
+        self.archive(oldest)
+
+
+# --- letta (production MemGPT) shortcut ---
+# from letta import create_client
+# client = create_client()
+# agent = client.create_agent(name="sensor-monitor")
+# # Ingest an observation
+# client.send_message(agent_id=agent.id, message="sensor reading: 42.7 at 14:00", role="user")
+# # The agent automatically manages RECALL / ARCHIVE via its built-in memory tools
+</code></pre>
+<div class="code-caption"><strong>Code 31.3.3:</strong> Temporal memory manager implementing the MemGPT two-tier architecture. <code>ingest</code> adds observations and auto-archives when the context limit is reached; <code>recall</code> performs time-filtered cosine-similarity retrieval from external storage; <code>importance</code> implements the A-MEM scoring function. The commented block shows the equivalent <code>letta</code> production API.</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: TempAgent Memory Survey (2025)</div>
+<p>A 2025 survey of temporal agent memory systems finds that MemGPT-style two-tier architectures have become the de facto standard for long-horizon LLM agents but identifies three open problems. First, the context-to-external handoff point is almost always a fixed count threshold ($K$ observations), yet the informationally correct handoff depends on the entropy of the incoming stream: a burst of anomalies should be retained longer than a quiet baseline period. Second, retrieval latency in vector DBs grows sub-linearly but non-trivially with archive size, and at the scale of months of hourly data the RECALL latency can exceed the agent's allowed response time. Third, the importance scoring of A-MEM requires a calibrated surprise detector, and calibration drift over long deployment periods causes the system to mis-classify routine events as novel. The survey recommends drift-aware recalibration of the importance scorer every 7 days using the preceding window's distribution, an explicit pattern that practitioners should build into any production temporal agent memory system.</p>
+</div>
+
 <div class="callout exercise">
 <div class="callout-title">Exercise 31.3.1: Classical Versus LLM Planning for a Given Task <span class="exercise-type conceptual">Conceptual</span></div>
 <p>For each of the following tasks, decide whether classical search/PDDL planning or LLM plan-and-execute is the better fit, and justify your choice using the dimensions of Table 31.3.1 (size and knownness of the action space, availability of a transition model, need for guarantees): (a) scheduling jobs on five machines to minimize makespan; (b) deciding whether to hedge a currency position given a forecast and a news feed; (c) stacking colored blocks into a named configuration; (d) triaging an unfamiliar production incident from logs. In one sentence per task, name the single dimension that decides the answer.</p>

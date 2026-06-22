@@ -294,6 +294,135 @@ print("library value(start)  : %.4f" % vi.V[0])
 <p><strong>Lesson:</strong> When the model is genuinely known and the states genuinely enumerable, do not reach for reinforcement learning, solve the MDP exactly. Dynamic programming is not a fallback; it is the correct and optimal tool whenever its two assumptions hold. Reinforcement learning earns its keep precisely when one of those assumptions fails.</p>
 </div>
 
+<h2>6. Constrained MDPs and Safe Reinforcement Learning <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Every MDP formulation so far has a single objective: maximize expected discounted return. Real deployments almost never work that way. A trading agent must limit its drawdown. A clinical decision system must not exceed a drug dosage threshold. A robotics agent must avoid collisions. These are constraints, not just soft penalties, and ignoring them in training produces agents that are optimal by one measure but undeployable by any real standard. The <strong>Constrained MDP (CMDP)</strong> framework (Altman 1999) extends the standard MDP by adding one or more cost functions alongside the reward, and the optimization becomes: maximize the expected cumulative reward subject to the expected cumulative cost staying below a threshold.</p>
+<p>Formally, a CMDP augments the MDP tuple $(\mathcal{S}, \mathcal{A}, P, R, \gamma)$ with $K$ cost functions $c_1, \ldots, c_K$ and thresholds $d_1, \ldots, d_K$. The problem is</p>
+$$\max_{\pi} \; J_r(\pi) = \mathbb{E}_{\pi}\!\left[\sum_{t=0}^{\infty} \gamma^t r_t\right] \quad \text{subject to} \quad J_{c_k}(\pi) = \mathbb{E}_{\pi}\!\left[\sum_{t=0}^{\infty} \gamma^t c_{k,t}\right] \le d_k \quad \text{for each } k.$$
+<p>Two points about this formulation deserve emphasis. First, the constraint is on the <em>expected cumulative cost</em>, not the per-step cost: the agent may occasionally violate it if the average stays below $d_k$. Second, the feasible set of policies is generally not convex in the policy space, so naively applying policy gradient to the constrained problem requires special care. The two main algorithmic families for CMDPs are Lagrangian relaxation and constrained policy optimization.</p>
+
+<h3>Lagrangian Relaxation</h3>
+<p>The Lagrangian approach converts the CMDP to an unconstrained primal-dual problem. Introduce a dual variable $\lambda_k \ge 0$ for each constraint and form the Lagrangian</p>
+$$L(\pi, \lambda) = J_r(\pi) - \sum_{k} \lambda_k \left(J_{c_k}(\pi) - d_k\right).$$
+<p>The saddle-point problem $\max_{\pi} \min_{\lambda \ge 0} L(\pi, \lambda)$ recovers the constrained optimum under mild convexity conditions. In practice the primal-dual update alternates two steps. The primal step updates the policy to maximize $L$ for fixed $\lambda$: any policy gradient method applies directly because the Lagrangian is a reward with an added penalty $-\lambda_k c_k$. The dual step updates $\lambda$ to penalize constraint violations:</p>
+$$\lambda_k \leftarrow \max\!\big(0,\; \lambda_k + \alpha \left(J_{c_k}(\pi) - d_k\right)\big).$$
+<p>When the constraint is violated ($J_{c_k} > d_k$), $\lambda_k$ increases, making the penalty term heavier and pushing the policy back toward feasibility. When the constraint is satisfied with slack, $\lambda_k$ decreases. At convergence, $\lambda_k > 0$ only if the constraint is tight (complementary slackness), exactly as in classical constrained optimization.</p>
+
+<div class="callout numeric-example">
+<div class="callout-title">Numeric Example: 2-State Safety Constraint</div>
+<p>Consider a two-state MDP with $\mathcal{S} = \{\text{safe}, \text{risky}\}$ and $\mathcal{A} = \{\text{aggressive}, \text{cautious}\}$. Rewards: aggressive in risky $= +10$, cautious anywhere $= +1$. Cost: aggressive in risky $= 1$ (a safety violation), all others $= 0$. Threshold $d = 0.1$, meaning at most a 10% violation rate is allowed. The unconstrained optimal policy is always aggressive (collect $+10$ whenever possible). The constrained optimal policy is aggressive in the safe state and cautious in the risky state, which keeps the long-run cost rate near $d = 0.1$ without forgoing all reward. The Lagrangian dual variable $\lambda$ grows until it makes the cost of being aggressive in the risky state ($\lambda \cdot 1$) outweigh the reward gain ($+10 - +1 = +9$), forcing a switch to cautious once $\lambda > 9$.</p>
+</div>
+
+<h3>Constrained Policy Optimization (CPO)</h3>
+<p>The Lagrangian approach can violate constraints during training, because the policy update step does not enforce feasibility on each iterate. CPO (Achiam et al., NeurIPS 2017) is a trust-region method that enforces the constraint on every policy update. Each step solves</p>
+$$\max_{\pi} \; J_r(\pi) \quad \text{s.t.} \quad J_{c_k}(\pi) \le d_k \;\text{ for each }k, \quad D_{\mathrm{KL}}(\pi \,\|\, \pi_{\mathrm{old}}) \le \delta,$$
+<p>simultaneously imposing the safety constraint and a KL trust-region constraint to prevent large policy steps. CPO approximates both the objective and constraints with their first-order surrogates at $\pi_{\mathrm{old}}$ and solves the resulting quadratic program analytically. The key result is a recovery step: if no feasible point exists within the trust region, CPO falls back to minimizing constraint violation rather than maximizing reward, prioritizing safety over performance. This makes CPO's training trajectory constraint-respecting from the first iteration, a meaningful property when running in a physical or clinical environment.</p>
+
+<h3>FOCOPS: First-Order Constrained Optimization in Policy Space</h3>
+<p>CPO's trust-region solve involves a second-order quadratic program that is expensive to compute exactly for large policy networks. FOCOPS (Zhang et al., NeurIPS 2020) achieves comparable constraint satisfaction at much lower cost using two first-order steps per iteration. The first step projects the unconstrained policy gradient onto the subspace that is consistent with the linearized constraint: if the gradient $g$ would increase $J_c$ above $d$, subtract the component of $g$ that points in the direction of increasing cost. The second step takes a standard gradient ascent step on the projected gradient. The linearization discards some of the curvature information that CPO uses, but the cost is proportional to a standard policy gradient update rather than a quadratic solve, making FOCOPS practical with deep policy networks where CPO's solve is prohibitive.</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Lagrangian vs. Projection Methods</div>
+<p>Lagrangian RL is simple to implement: add a penalty term to the reward and update a scalar dual variable after each rollout. The drawback is that constraint satisfaction is only guaranteed in expectation at convergence, and violations can be large during training. Projection methods (CPO, FOCOPS) enforce a linearized version of the constraint on every update, reducing mid-training violations at the cost of more algebra per step. For systems where mid-training safety violations are tolerable (simulated environments with a safety supervisor), Lagrangian RL is the practical starting point. For systems where mid-training violations are unacceptable (physical robots, clinical pilots), CPO or FOCOPS is the appropriate choice.</p>
+</div>
+
+<h3>Evaluating Safe RL: Safety Gym</h3>
+<p>Comparing safe RL algorithms requires benchmarks that measure both performance and constraint satisfaction. Safety Gym (Ray et al., OpenAI 2019) provides standardized CMDP environments for this purpose. The three task families are PointGoal (a point-mass robot navigating to a goal while avoiding hazards), CarGoal (a car-like robot with dynamics), and AntGoal (a legged robot). Each task is parameterized by difficulty level 0, 1, or 2. The evaluation metric is a pair: the episodic return (reward) and the cost-rate (average number of constraint violations per episode). An algorithm that achieves a high return with a low cost-rate is the goal; algorithms that sacrifice all return to avoid all violations, or that achieve high return by ignoring constraints, both fail the benchmark. The Python package is <code>safety-gymnasium</code>, the maintained successor to Safety Gym.</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Lagrangian Safe RL Loop</div>
+<p>The code below implements a minimal primal-dual safe RL loop using a linear policy and a PyTorch-based dual variable update. Install the benchmark environment with <code>pip install safety-gymnasium</code>. For production use, the <code>omnisafe</code> library implements CPO, FOCOPS, and Lagrangian RL with the same interface.</p>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+
+# A minimal Lagrangian safe RL loop.
+# Policy: linear mapping from state to action logits (for discrete action spaces).
+# Constraint threshold d: max allowed expected cumulative cost per episode.
+
+class LinearPolicy(nn.Module):
+    def __init__(self, obs_dim, act_dim):
+        super().__init__()
+        self.fc = nn.Linear(obs_dim, act_dim)
+
+    def forward(self, obs):
+        return torch.softmax(self.fc(obs), dim=-1)
+
+def collect_rollout(env, policy, max_steps=200):
+    """Run one episode; return rewards, costs, log-probs."""
+    obs, _ = env.reset()
+    rewards, costs, log_probs = [], [], []
+    for _ in range(max_steps):
+        obs_t = torch.tensor(obs, dtype=torch.float32)
+        probs = policy(obs_t)
+        dist = torch.distributions.Categorical(probs)
+        action = dist.sample()
+        log_probs.append(dist.log_prob(action))
+        obs, reward, terminated, truncated, info = env.step(action.item())
+        rewards.append(reward)
+        costs.append(info.get("cost", 0.0))   # Safety Gym stores cost in info
+        if terminated or truncated:
+            break
+    return rewards, costs, log_probs
+
+def lagrangian_update(policy, optimizer, lam, lam_lr, rewards, costs, log_probs,
+                      gamma=0.99, d=25.0):
+    """One primal-dual update step.
+    d: constraint threshold (cumulative cost per episode; Safety Gym default ~25).
+    """
+    # Discounted returns for reward and cost.
+    G_r, G_c = [], []
+    g_r = g_c = 0.0
+    for r, c in zip(reversed(rewards), reversed(costs)):
+        g_r = r + gamma * g_r
+        g_c = c + gamma * g_c
+        G_r.insert(0, g_r)
+        G_c.insert(0, g_c)
+    G_r = torch.tensor(G_r, dtype=torch.float32)
+    G_c = torch.tensor(G_c, dtype=torch.float32)
+    log_probs = torch.stack(log_probs)
+
+    # Lagrangian objective: maximize J_r - lambda * (J_c - d).
+    J_c_ep = G_c[0].item()          # episode cumulative cost (rough scalar)
+    lagrangian_loss = -(G_r * log_probs).mean() + lam * (G_c * log_probs).mean()
+    optimizer.zero_grad()
+    lagrangian_loss.backward()
+    optimizer.step()
+
+    # Dual update: increase lambda if constraint violated, decrease if satisfied.
+    lam = max(0.0, lam + lam_lr * (J_c_ep - d))
+    return lam, J_c_ep
+
+# --- Training loop (replace DummyEnv with a safety-gymnasium environment) ---
+# import safety_gymnasium
+# env = safety_gymnasium.make("SafetyPointGoal1-v0")
+# obs_dim = env.observation_space.shape[0]
+# act_dim = env.action_space.n
+
+obs_dim, act_dim = 8, 4            # placeholder dimensions
+policy = LinearPolicy(obs_dim, act_dim)
+optimizer = optim.Adam(policy.parameters(), lr=1e-3)
+lam = 0.0                          # dual variable, starts at zero
+lam_lr = 0.01
+d = 25.0                           # cost threshold
+
+# Uncomment to train:
+# for episode in range(500):
+#     rewards, costs, log_probs = collect_rollout(env, policy)
+#     lam, ep_cost = lagrangian_update(
+#         policy, optimizer, lam, lam_lr, rewards, costs, log_probs, d=d)
+#     if episode % 50 == 0:
+#         print(f"ep {episode}: return={sum(rewards):.1f} cost={ep_cost:.1f} lam={lam:.3f}")
+print("Lagrangian loop defined. Swap DummyEnv for safety_gymnasium.make(...) to run.")
+</code></pre>
+</div>
+<div class="code-caption"><strong>Code 22.4.5:</strong> Minimal primal-dual Lagrangian safe RL. The dual variable <code>lam</code> increases whenever the episode cost exceeds threshold <code>d</code>, making the policy gradient penalize constraint violations more heavily. At convergence <code>lam</code> stabilizes and the expected cost sits near <code>d</code>. Replace the placeholder dimensions with a real <code>safety-gymnasium</code> environment for a complete training run.</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Safe RL in Deployed Temporal AI Systems</div>
+<p>Safe RL is not merely a robotics concern. Any temporal AI pipeline that translates a forecast into an automated action inherits the CMDP structure. An algorithmic trading system whose forecasting module triggers orders must satisfy drawdown constraints (a financial regulatory constraint), position-size limits (a risk-management constraint), and execution-impact constraints (a market-microstructure constraint). A clinical decision-support system that recommends drug dosages based on a patient-state forecast must not exceed toxicity thresholds, even if a higher dose produces a better predicted outcome. The 2024 to 2026 research frontier in safe RL for these domains includes three open problems. First, constraint-conditioned generalization: how should a safe RL agent behave when the constraint threshold $d$ shifts at deployment time, for instance because a new regulation tightens the drawdown limit? Offline-to-online safe RL transfer and constraint-adaptive policies are active areas. Second, multi-constraint feasibility detection: with many simultaneous constraints, the feasible policy set may be empty or nearly empty, and identifying this before wasted training is unsolved. Third, distributional safety: the CMDP constraint is on the <em>expected</em> cumulative cost, but practitioners often want tail-risk guarantees, for example a 95th-percentile cost bound, which requires connecting safe RL to conditional value-at-risk objectives, an active line connecting the risk-measures literature of <a href="../../part-5-risk-uncertainty/index.html">Part V</a> to the safe RL methods of this section.</p>
+</div>
+
 <h2>Exercises</h2>
 <p>These exercises split into conceptual, implementation, and open-ended work. Selected solutions appear in <a href="../../appendices/G-solutions/index.html">Appendix G</a>.</p>
 <ol>
